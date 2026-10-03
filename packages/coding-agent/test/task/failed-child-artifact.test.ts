@@ -40,7 +40,7 @@ const BLOCKING_AGENT: AgentDefinition = {
 };
 
 async function initRepo(dir: string): Promise<void> {
-	const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: dir, stdout: "ignore" });
+	const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: dir, env: process.env, stdout: "ignore" });
 	git("init", "-q");
 	await fs.writeFile(path.join(dir, "README.md"), "seed\n");
 	git("add", "README.md");

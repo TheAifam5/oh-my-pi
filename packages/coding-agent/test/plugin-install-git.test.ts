@@ -42,6 +42,7 @@ function emptyStream(): ReadableStream<Uint8Array> {
 async function runCommand(command: string[], cwd: string): Promise<string> {
 	const proc = Bun.spawn(command, {
 		cwd,
+		env: process.env,
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

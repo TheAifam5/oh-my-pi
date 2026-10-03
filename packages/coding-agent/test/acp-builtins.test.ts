@@ -1163,7 +1163,7 @@ describe("wave 3 commands", () => {
 		const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
 		process.env.OMP_WORKTREE_DIR = worktreeBase;
 		const git = async (...args: string[]) => {
-			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, env: process.env, stdout: "pipe", stderr: "pipe" });
 			const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 			expect(code).toBe(0);
 			return stdout.trim();
@@ -1216,7 +1216,7 @@ describe("wave 3 commands", () => {
 		const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
 		process.env.OMP_WORKTREE_DIR = worktreeBase;
 		const git = async (...args: string[]) => {
-			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, env: process.env, stdout: "pipe", stderr: "pipe" });
 			const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 			expect(code).toBe(0);
 			return stdout.trim();
@@ -1274,7 +1274,7 @@ describe("wave 3 commands", () => {
 		const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
 		process.env.OMP_WORKTREE_DIR = worktreeBase;
 		const git = async (...args: string[]) => {
-			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, env: process.env, stdout: "pipe", stderr: "pipe" });
 			const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 			expect(code).toBe(0);
 			return stdout.trim();
