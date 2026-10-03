@@ -51,6 +51,7 @@ omp config set compaction.enabled false
 omp config set defaultThinkingLevel medium
 omp config reset steeringMode   # remove a key from config.yml so its default applies
 omp config path                 # print the active agent directory
+omp config schema --out omp-config.schema.json  # JSON Schema of config.yml
 ```
 
 For users who want the full first-run animation on normal launches, set `startup.showSplash`:
@@ -70,9 +71,20 @@ This only controls the startup splash animation. It does not rerun setup or chan
 | `omp config set <key> <value>` | Parse `<value>` against the key's schema type, write it to the global main YAML file, and print the value written. When another source still supplies the effective value, it says which instead (`--json`: `overriddenBy` is the env var name, or `project`, `overlay`, or `runtime`; `fallbackEnv` names a fallback env var used while the saved value is blank). |
 | `omp config reset <key>`       | Delete the global key, allowing another configured layer or the schema default to apply. Prints the resulting effective value, masking non-empty credentials as `********`; JSON omits a credential's `value` and emits `{ key, redacted: true }`. |
 | `omp config path`              | Print the active agent directory (honors `PI_CODING_AGENT_DIR`).                                                                                                                                                                                                                                  |
+| `omp config schema`            | Print the JSON Schema (draft 2020-12) of `config.yml` to stdout, built from the setting definitions: each key's type, enum values, default, and description. Credential defaults are omitted. Configured values never affect the output. `-o, --out <file>` writes it to a file instead. |
 | `omp config init-xdg`          | On Linux and macOS, create the `omp` directories under the effective XDG data, state, and cache homes. It does not move existing files or set the XDG environment variables. Other platforms exit non-zero.                                                                                       |
 
 `omp config` with no subcommand lists settings. `--help` or `-h` displays command help. The `--json` flag is accepted by `list`, `get`, `set`, and `reset`.
+
+### Editor validation
+
+The schema is committed as [`packages/coding-agent/src/config/omp-config.schema.json`](../packages/coding-agent/src/config/omp-config.schema.json) (regenerate with `bun run gen:config-schema`; CI fails when it is stale) and attached to every GitHub release as `omp-config.schema.json`. Editors using the YAML language server validate and autocomplete `config.yml` when the schema is associated with the file. Prefer the editor-side association (`yaml.schemas`), because OMP rewrites `config.yml` without comments whenever it saves settings, which drops a modeline such as:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/omp-config.schema.json
+```
+
+Keys outside the setting definitions are reported as errors. OMP writes no other keys itself; the ones it still reads only to migrate and drop on load (for example `queueMode`, `lastChangelogVersion`, `collapseChangelog`, a string `theme`, `inspect_image`, and quoted dotted keys such as `"compaction.strategy"`) are legacy and are reported too, as are top-level blocks that extensions read through the raw settings layer. Record settings accept any entries, and array settings do not constrain their items.
 
 ### Value parsing
 
