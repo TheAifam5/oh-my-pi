@@ -441,6 +441,10 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 // private test-runtime marker set, all CI credential / cloud-config variables
 // scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
 //
+// Git config pins: set at process start they also reach git spawned by bare
+// `Bun.spawn` and the native addon, which read the launch environment rather
+// than `process.env`, so `test-git-env.ts` alone cannot cover them.
+//
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
 //   with the mutator (868789972, an earlier GC crash under bun test).
@@ -464,6 +468,8 @@ function buildChildEnv(): Record<string, string | undefined> {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
 		PI_TEST_RUNTIME: "1",
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_CONFIG_NOSYSTEM: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};

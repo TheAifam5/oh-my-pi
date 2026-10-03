@@ -24,6 +24,7 @@ const tempDirs: string[] = [];
 async function runGit(repo: string, args: string[]): Promise<string> {
 	const proc = Bun.spawn(["git", ...args], {
 		cwd: repo,
+		env: process.env,
 		stderr: "pipe",
 		stdout: "pipe",
 		windowsHide: true,
