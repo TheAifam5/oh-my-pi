@@ -613,6 +613,10 @@ jobs:
            with:
               targets: linux-x64-baseline linux-x64-modern
               stash: ${{ needs.native_addons.outputs.stash }}
+         # Runs here rather than in `check`: loading the settings registry
+         # needs the native addon.
+         - name: Check generated config schema
+           run: bun scripts/gen-config-schema.ts --check
          - name: Test workspace packages and repo scripts (TS)
            env:
               OMP_TEST_CONCURRENCY: "4"
@@ -1086,6 +1090,7 @@ jobs:
               bun run ci:release:checksums SHA256SUMS.txt \
                 packages/coding-agent/binaries/omp-* \
                 packages/browser-relay/dist/omp-browser-relay-extension.zip \
+                packages/coding-agent/src/config/omp-config.schema.json \
                 LICENSE \
                 THIRD-PARTY-NOTICES.txt
          - name: Create GitHub Release
@@ -1096,6 +1101,7 @@ jobs:
               files: |
                  packages/coding-agent/binaries/omp-*
                  packages/browser-relay/dist/omp-browser-relay-extension.zip
+                 packages/coding-agent/src/config/omp-config.schema.json
                  LICENSE
                  THIRD-PARTY-NOTICES.txt
                  SHA256SUMS.txt
