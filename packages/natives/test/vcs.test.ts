@@ -16,7 +16,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 	// host's global git config. `--no-ext-diff` is the reliable switch here; setting
 	// `diff.external=` to empty makes git execute "" as the driver and fail.
 	if (args[0] === "diff") args = ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)];
-	const process = Bun.spawn(["git", ...args], { cwd, stderr: "pipe", stdout: "pipe" });
+	const process = Bun.spawn(["git", ...args], { cwd, env: Bun.env, stderr: "pipe", stdout: "pipe" });
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(process.stdout).text(),
 		new Response(process.stderr).text(),
