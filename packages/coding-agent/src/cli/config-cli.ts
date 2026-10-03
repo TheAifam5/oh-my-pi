@@ -10,6 +10,7 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { orderedSettings } from "../config/all-settings";
 import { type AnySetting, lookup } from "../config/registry";
 import { Settings, settings } from "../config/settings";
+import { renderSettingsSchema } from "../config/settings-schema";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { initXdg } from "./commands/init-xdg";
 
@@ -17,7 +18,7 @@ import { initXdg } from "./commands/init-xdg";
 // Types
 // =============================================================================
 
-export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "init-xdg";
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "schema" | "init-xdg";
 
 export interface ConfigCommandArgs {
 	action: ConfigAction;
@@ -25,6 +26,8 @@ export interface ConfigCommandArgs {
 	value?: string;
 	flags: {
 		json?: boolean;
+		/** File `schema` writes to instead of stdout. */
+		out?: string;
 	};
 }
 // =============================================================================
@@ -63,7 +66,7 @@ function findSettingDef(path: string): CliSettingDef | undefined {
 // Argument Parser
 // =============================================================================
 
-const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg"];
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "schema", "init-xdg"];
 
 /**
  * Parse config subcommand arguments.
@@ -161,6 +164,12 @@ function getTypeDisplay(def: CliSettingDef): string {
 // =============================================================================
 
 export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
+	// The schema comes from setting definitions alone; configured values must not shape it.
+	if (cmd.action === "schema") {
+		await handleSchema(cmd.flags);
+		return;
+	}
+
 	await Settings.init();
 
 	switch (cmd.action) {
@@ -394,6 +403,15 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 	}
 }
 
+async function handleSchema(flags: { out?: string }): Promise<void> {
+	const schema = renderSettingsSchema();
+	if (flags.out !== undefined) {
+		await Bun.write(flags.out, schema);
+		return;
+	}
+	await writeStdout(schema);
+}
+
 function handlePath(): void {
 	console.log(getAgentDir());
 }
@@ -411,10 +429,12 @@ ${chalk.bold("Commands:")}
   set <key> <value>  Set a setting value
   reset <key>        Remove a setting from config.yml so its default applies
   path               Print the config directory path
+  schema             Print the JSON Schema of config.yml
   init-xdg           Initialize XDG Base Directory structure
 
 ${chalk.bold("Options:")}
   --json             Output as JSON
+  -o, --out <file>   Write the schema to <file> instead of stdout
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} config list
@@ -424,6 +444,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} config set defaultThinkingLevel medium
   ${APP_NAME} config reset steeringMode
   ${APP_NAME} config list --json
+  ${APP_NAME} config schema --out omp-config.schema.json
   ${APP_NAME} config init-xdg
 
 ${chalk.bold("Boolean Values:")}

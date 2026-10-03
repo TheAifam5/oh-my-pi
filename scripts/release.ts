@@ -313,6 +313,18 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 	}
 	console.log(`  Bazel: ${bazel}`);
 
+	// The committed config schema ships as a release asset. The version bump
+	// cannot change it, so it must already match the settings registry; the
+	// check also needs the native addon, so a missing one fails here.
+	const schemaCheck = await $`bun scripts/gen-config-schema.ts --check`.quiet().nothrow();
+	if (schemaCheck.exitCode !== 0) {
+		console.error("Error: config schema check failed (`bun scripts/gen-config-schema.ts --check`).");
+		console.error(schemaCheck.stderr.toString().trim());
+		console.error("Run `bun run gen:config-schema` (after building the native addon if it is missing) and commit.");
+		process.exit(1);
+	}
+	console.log("  Config schema up to date");
+
 	const latestTag = (await git(["describe", "--tags", "--abbrev=0", "--match", "v*"]).text()).trim();
 	let version = versionOrBump;
 	if (version === "major" || version === "minor" || version === "patch") {
