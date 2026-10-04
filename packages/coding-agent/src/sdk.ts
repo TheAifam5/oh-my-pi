@@ -643,6 +643,13 @@ export interface CreateAgentSessionOptions {
 	resolveServiceTierByFamily?: (model: Model | undefined) => ServiceTierByFamily;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/**
+	 * Restrict a pool `default` role to {@link scopedModels}: members outside it are passed over as
+	 * unavailable, and with no eligible member and no funding or quota exclusion the session starts on
+	 * the first scoped model with a warning. The CLI sets it for an explicit `--models` scope, which the
+	 * `enabledModels`-filtered candidates do not reflect.
+	 */
+	restrictDefaultRolePoolToScope?: boolean;
 	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
 	prewalk?: Prewalk;
 	/** CLI prewalk selector awaiting extension provider registration; patterns retain role fallback order. */
@@ -2109,14 +2116,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let defaultRolePoolPick: { pick: RolePoolPick; revision: number } | undefined;
 	/** Picks of `--model @role` selectors; the one the session starts on is recorded as used. */
 	const deferredRolePoolPicks: RolePoolPick[] = [];
+	const defaultRolePoolScope =
+		options.restrictDefaultRolePoolToScope && options.scopedModels?.length ? options.scopedModels : undefined;
 	const resolveDefaultRolePool = async (candidates: Model[]): Promise<ResolvedModelRoleValue> => {
 		const pickRevision = settings.revision;
-		const resolution = await resolveRolePool(defaultRolePoolTarget?.role ?? "default", {
+		const poolRole = defaultRolePoolTarget?.role ?? "default";
+		const poolCandidates = defaultRolePoolScope?.map(entry => entry.model) ?? candidates;
+		const resolution = await resolveRolePool(poolRole, {
 			settings,
 			modelRegistry,
 			sessionId: () => providerSessionId,
 			emitNotice: async () => {},
-			availableModels: () => candidates,
+			availableModels: () => poolCandidates,
 		});
 		defaultRolePoolBlocked = resolution?.kind === "none" && rolePoolPolicyBlocked(resolution.skipped);
 		if (resolution?.kind !== "picked") {
@@ -2124,6 +2135,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			defaultRolePoolNotice = undefined;
 			defaultRolePoolPick = undefined;
 			if (defaultRolePoolBlocked) return { model: undefined, explicitThinkingLevel: false, warning: undefined };
+			const scopeFallback = defaultRolePoolScope?.[0];
+			if (scopeFallback) {
+				defaultRolePoolNotice = `No member of the model role pool "${poolRole}" is eligible within the model scope. Using ${scopeFallback.model.provider}/${scopeFallback.model.id}`;
+				return {
+					model: scopeFallback.model,
+					thinkingLevel: scopeFallback.thinkingLevel,
+					explicitThinkingLevel: scopeFallback.thinkingLevel !== undefined,
+					warning: undefined,
+				};
+			}
 			return resolveModelRoleValue(settings.getModelRole("default"), candidates, {
 				settings,
 				matchPreferences: modelMatchPreferences,
