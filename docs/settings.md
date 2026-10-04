@@ -177,7 +177,9 @@ Layers are combined with a deep merge:
 
 - **Objects are deep-merged** — keys present only in a lower layer are kept; keys present in a higher layer override.
 - **Scalars and arrays are replaced wholesale** by the higher-precedence layer. A higher layer's array does not append to a lower layer's array. `defaultTools` is the exception: a higher layer's list of only `+name`/`-name` entries changes the lower layer's selection (see [Default tool selection](#default-tool-selection)).
-- **A configured `null` counts as unset at read time**, so the schema default (or a fallback env var) applies rather than a lower-layer value. Project `modelRoles` entries are an exception: cleared/null project roles fall back to global roles. A project `null` for `defaultTools` or `compaction.modelOverrides`, and project `null` entries and fields of `compaction.modelOverrides`, are ignored, so lower layers apply.
+- **A configured `null` counts as unset at read time**, so the schema default (or a fallback env var) applies rather than a lower-layer value. The project layer is the exception: a project `null` at any depth (a whole setting, an object key, a record entry, or an entry field, including a YAML key left without a value) is ignored with a warning, so lower layers apply; cleared/null project `modelRoles` entries fall back to global roles without a warning. Array items are kept as they are. A `null` in a `--config` overlay or a runtime override still clears lower layers. Project settings files are deep-merged with each other before `null` values are dropped, so a `null` in a higher-priority project file also hides a lower-priority project file's value.
+- **Project nesting is bounded.** A project value nested more than 64 objects deep is ignored with a warning; deeper objects in any layer replace lower-layer objects whole instead of merging.
+- **`__proto__` is a plain key.** A `__proto__` key in a settings file is kept as an ordinary entry and never changes how merged settings resolve. Constructor override keys may not contain `__proto__`, `constructor`, or `prototype` segments.
 - **Named model presets are resolved whole**, not deep-merged across layers. A project preset of the same name replaces the global preset. Runtime/overlay `null` entries can hide a lower-layer preset.
 
 Use nested YAML mappings for dotted setting paths:
@@ -850,7 +852,7 @@ task:
 
 - Keys are exact, case-sensitive agent names (`scout` does not match `Scout`).
 - A number is a fixed token trigger (positive integer); a `"N%"` string is a percentage of the context window, `0 < N ≤ 100`. An entry replaces both `compaction.thresholdTokens` and `compaction.thresholdPercent` for that agent.
-- `null` clears an entry set by a lower-priority settings layer. Any other value fails settings load.
+- `null` clears an entry set by a lower-priority settings layer, except in the project layer, where it is ignored. Any other value fails settings load.
 - Agents without an entry — including agents spawned by an overridden agent — use the main session's `compaction.*` thresholds. The main session and Vibe workers are unaffected.
 - The resolved trigger is stored with the subagent session and reused when it is revived.
 

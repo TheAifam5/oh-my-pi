@@ -38,6 +38,7 @@ import { AgentStorage } from "../session/agent-storage";
 import { type CompactionMethod, DEFAULT_COMPACTION_METHOD_ORDER } from "../session/compaction-methods";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import { replaceFileAtomically } from "../utils/atomic-file";
+import { sanitizeNoticeLine } from "../utils/notice-text";
 import { isRegisteredSearchEngine } from "../web/search/provider";
 import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import {
@@ -174,8 +175,23 @@ export interface SettingsOptions {
 // Path Utilities
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Path segments a dotted constructor override key may not contain. */
+const RESERVED_OVERRIDE_SEGMENTS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/** The own entry `key` of `record`; never an inherited member such as `Object.prototype` for `__proto__`. */
+function ownEntry(record: RawSettings, key: string): unknown {
+	return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+/** Sets own enumerable `key` on `target`; unlike assignment, a `__proto__` key never replaces the prototype. */
+function defineOwn(target: RawSettings, key: string, value: unknown): void {
+	if (key === "__proto__")
+		Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+	else target[key] = value;
+}
+
 /**
- * Get a nested value from an object by path segments.
+ * Get a nested value from an object by path segments. Only own entries are followed.
  */
 function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 	let current: unknown = obj;
@@ -183,7 +199,7 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 		if (current === null || current === undefined || typeof current !== "object") {
 			return undefined;
 		}
-		current = (current as Record<string, unknown>)[segment];
+		current = ownEntry(current as RawSettings, segment);
 	}
 	return current;
 }
@@ -191,28 +207,16 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 /**
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed, replacing whatever non-record (a malformed `[]` included) is in the way.
+ * Only own entries are followed and written, so a `__proto__` segment never reaches a prototype.
  */
 function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
-		if (!isRecord(current[segment])) current[segment] = {};
+		if (!isRecord(ownEntry(current, segment))) defineOwn(current, segment, {});
 		current = current[segment] as RawSettings;
 	}
-	current[segments[segments.length - 1]] = value;
-}
-
-/**
- * Assign `obj[key]` as an own property. Plain assignment of a parsed
- * `__proto__` key (an agent name, say) would replace the prototype instead,
- * silently dropping that entry.
- */
-function setOwn(obj: RawSettings, key: string, value: unknown): void {
-	if (key === "__proto__") {
-		Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
-	} else {
-		obj[key] = value;
-	}
+	defineOwn(current, segments[segments.length - 1], value);
 }
 
 /**
@@ -222,7 +226,7 @@ function setOwn(obj: RawSettings, key: string, value: unknown): void {
 function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
 	const containers: RawSettings[] = [obj];
 	for (let i = 0; i < segments.length - 1; i++) {
-		const next = containers[i][segments[i]];
+		const next = ownEntry(containers[i], segments[i]);
 		if (!isRecord(next)) return;
 		containers.push(next);
 	}
@@ -230,7 +234,7 @@ function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
 	let replacement: RawSettings | undefined;
 	for (let i = containers.length - 1; i >= 0; i--) {
 		const container = i === 0 ? obj : { ...containers[i] };
-		if (replacement) container[segments[i]] = replacement;
+		if (replacement) defineOwn(container, segments[i], replacement);
 		else delete container[segments[i]];
 		replacement = Object.keys(container).length > 0 ? container : undefined;
 	}
@@ -283,63 +287,99 @@ function assertKnownSettingPaths(layer: RawSettings, prefix = ""): void {
 	}
 }
 
-/**
- * `project` as it merges over the global layer: `null` (cleared) model roles fall back to global,
- * and `ignoreProjectNulls` settings lose their `null` entries and entry fields.
- */
-function projectLayerForMerge(project: RawSettings): RawSettings {
-	const result = projectLayerWithoutIgnoredNulls(project);
-	const projectRoles = getByPath(result, ["modelRoles"]);
-	if (!isRecord(projectRoles)) return result;
+/** Distinct ignored project paths one instance warns about per project scope before it stops reporting them. */
+const MAX_PROJECT_NULL_WARNINGS = 32;
 
-	let filteredRoles: Record<string, unknown> | undefined;
-	for (const role in projectRoles) {
-		if (!Object.hasOwn(projectRoles, role) || modelRoleValueFromUnknown(projectRoles[role]) !== undefined) continue;
-		filteredRoles ??= { ...projectRoles };
-		delete filteredRoles[role];
-	}
-	return filteredRoles ? { ...result, modelRoles: filteredRoles } : result;
+/** Characters of an ignored project path kept before sanitizing and quoting it for a warning. */
+const MAX_LOGGED_PROJECT_PATH_LENGTH = 200;
+
+/**
+ * Deepest record nesting kept in the project layer (the layer itself is depth 0). A record nested
+ * deeper is dropped whole, so walking and merging the layer stays within a fixed stack depth.
+ */
+const MAX_PROJECT_LAYER_DEPTH = 64;
+
+/** Record nesting below which `#deepMerge` merges key by key; deeper records are replaced whole. */
+const MAX_SETTINGS_MERGE_DEPTH = MAX_PROJECT_LAYER_DEPTH;
+
+/** Why {@link withoutNullValues} dropped a project value. */
+type ProjectDropReason = "null" | "too-deep";
+
+/** Receives the full path of each value {@link withoutNullValues} drops. */
+type ProjectDropListener = (segments: readonly string[], reason: ProjectDropReason) => void;
+
+/** One key on the path from the project layer to a nested record; built into segments only on a drop. */
+interface ProjectPathNode {
+	readonly parent: ProjectPathNode | undefined;
+	readonly key: string;
+}
+
+function projectPathSegments(node: ProjectPathNode): string[] {
+	const segments: string[] = [];
+	for (let current: ProjectPathNode | undefined = node; current; current = current.parent) segments.push(current.key);
+	return segments.reverse();
 }
 
 /**
- * `record` without `null` entries and without `null` fields of its object entries; itself when it
- * has none. Copies are built with `Object.fromEntries`, so a `__proto__` key stays an own entry.
+ * `project` as it merges over the global layer: `null` (cleared) and unreadable model roles fall back
+ * to global without a warning, then every other `null` value and every record nested deeper than
+ * {@link MAX_PROJECT_LAYER_DEPTH} is dropped (see {@link withoutNullValues}), so a repository cannot
+ * clear what lower layers configure.
  */
-function withoutNullEntries(record: Record<string, unknown>): Record<string, unknown> {
-	const hasNull = Object.values(record).some(
-		entry => entry === null || (isRecord(entry) && Object.values(entry).includes(null)),
-	);
-	if (!hasNull) return record;
-	return Object.fromEntries(
-		Object.entries(record).flatMap(([key, entry]): [string, unknown][] => {
-			if (entry === null) return [];
-			if (!isRecord(entry)) return [[key, entry]];
-			return [[key, Object.fromEntries(Object.entries(entry).filter(([, value]) => value !== null))]];
-		}),
-	);
-}
-
-/**
- * `project` without the `null` values of every `ignoreProjectNulls` setting: a whole-value `null`
- * is removed, and a record value goes through {@link withoutNullEntries}. Itself when nothing changes.
- */
-function projectLayerWithoutIgnoredNulls(project: RawSettings): RawSettings {
+function projectLayerForMerge(project: RawSettings, onDrop?: ProjectDropListener): RawSettings {
 	let result = project;
-	for (const setting of allSettings()) {
-		if (!setting.definition.ignoreProjectNulls) continue;
-		const value = getByPath(result, setting.segments);
+	const projectRoles = getByPath(result, ["modelRoles"]);
+	if (isRecord(projectRoles)) {
+		let filteredRoles: Record<string, unknown> | undefined;
+		for (const role in projectRoles) {
+			if (!Object.hasOwn(projectRoles, role) || modelRoleValueFromUnknown(projectRoles[role]) !== undefined)
+				continue;
+			filteredRoles ??= { ...projectRoles };
+			delete filteredRoles[role];
+		}
+		if (filteredRoles) result = { ...result, modelRoles: filteredRoles };
+	}
+	return withoutNullValues(result, onDrop);
+}
+
+/**
+ * `record` without the `null` values of its keys at any depth and without records nested deeper
+ * than {@link MAX_PROJECT_LAYER_DEPTH}; arrays and their items are kept as they are. Itself when
+ * nothing is dropped; otherwise only the records on a changed path are copied, with
+ * `Object.fromEntries`, so a `__proto__` key stays an own entry.
+ */
+function withoutNullValues(
+	record: RawSettings,
+	onDrop?: ProjectDropListener,
+	parent?: ProjectPathNode,
+	depth = 0,
+): RawSettings {
+	let entries: [string, unknown][] | undefined;
+	const keys = Object.keys(record);
+	for (let index = 0; index < keys.length; index++) {
+		const key = keys[index];
+		const value = record[key];
+		let next: unknown = value;
 		if (value === null) {
-			if (result === project) result = { ...project };
-			deleteByPath(result, setting.segments);
+			onDrop?.(projectPathSegments({ parent, key }), "null");
+			next = undefined;
+		} else if (isRecord(value)) {
+			const node: ProjectPathNode = { parent, key };
+			if (depth + 1 > MAX_PROJECT_LAYER_DEPTH) {
+				onDrop?.(projectPathSegments(node), "too-deep");
+				next = undefined;
+			} else {
+				next = withoutNullValues(value, onDrop, node, depth + 1);
+			}
+		}
+		if (next === value) {
+			entries?.push([key, value]);
 			continue;
 		}
-		if (!isRecord(value)) continue;
-		const filtered = withoutNullEntries(value);
-		if (filtered === value) continue;
-		if (result === project) result = structuredClone(project);
-		setByPath(result, setting.segments, filtered);
+		entries ??= keys.slice(0, index).map((kept): [string, unknown] => [kept, record[kept]]);
+		if (next !== undefined) entries.push([key, next]);
 	}
-	return result;
+	return entries ? Object.fromEntries(entries) : record;
 }
 
 /**
@@ -428,7 +468,7 @@ export function dropSettingsGroupShadows(data: RawSettings, sourcePath: string, 
 		const value = data[key];
 		const path = basePrefix === "" ? key : `${basePrefix}.${key}`;
 		if (!Object.hasOwn(settingsGroupOnlyPrefixes(), path)) {
-			result[key] = value;
+			defineOwn(result, key, value);
 			continue;
 		}
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -438,7 +478,7 @@ export function dropSettingsGroupShadows(data: RawSettings, sourcePath: string, 
 			});
 			continue;
 		}
-		result[key] = dropSettingsGroupShadows(value as RawSettings, sourcePath, path);
+		defineOwn(result, key, dropSettingsGroupShadows(value as RawSettings, sourcePath, path));
 	}
 	return result;
 }
@@ -701,6 +741,13 @@ export class Settings {
 	readonly valueCache: (ValueCacheEntry | undefined)[] = [];
 	/** Registry-owned warn-once diagnostics of this instance; see `config/registry.ts`. */
 	readonly warnState: WarnState = { invalid: new Map(), items: new Map() };
+	/**
+	 * Hashes of the paths and reasons of ignored project values already warned about in the current
+	 * project scope; holds at most {@link MAX_PROJECT_NULL_WARNINGS} entries.
+	 */
+	#projectDropWarnings = new Set<number | bigint>();
+	/** Whether the one warning that further ignored project values go unreported was logged. */
+	#projectDropWarningsCapped = false;
 	/** Change listeners bucketed by the `slot` of the setting they observe ({@link onEffectiveChange}). */
 	#changeListeners: (Set<SettingChangeListener> | undefined)[] = [];
 	/** Forwarders of every change into live {@link overlay} children. */
@@ -770,13 +817,21 @@ export class Settings {
 	 * path must belong to a registered setting and every value is normalized and checked like a
 	 * handle `override`. `undefined` values are skipped; `null` stays as an unset tombstone.
 	 *
-	 * @throws Error on an unknown setting or a value its definition rejects.
+	 * @throws Error on an unknown setting, a key with a `__proto__`, `constructor`, or `prototype`
+	 * segment, or a value its definition rejects.
 	 */
 	#overrideLayer(overrides: Readonly<Record<string, unknown>>): RawSettings {
 		const raw: RawSettings = {};
 		for (const key in overrides) {
 			const value = overrides[key];
-			if (value !== undefined) setByPath(raw, key.split("."), value);
+			if (value === undefined) continue;
+			const segments = key.split(".");
+			if (segments.some(segment => RESERVED_OVERRIDE_SEGMENTS.has(segment))) {
+				throw new Error(
+					`Invalid setting override ${describeSettingValue(key)}: "__proto__", "constructor", and "prototype" are not allowed as path segments`,
+				);
+			}
+			setByPath(raw, segments, value);
 		}
 		const layer = this.#migrateRawSettings(raw);
 		assertKnownSettingPaths(layer);
@@ -1597,6 +1652,7 @@ export class Settings {
 		settled.promise.catch(() => {});
 		const entry = { kind: "rescope" as const, promise: settled.promise };
 		this.#activeReload = entry;
+		let previousDropWarnings: { paths: Set<number | bigint>; capped: boolean } | undefined;
 		try {
 			if (normalized === this.#cwd) return;
 			await this.flush();
@@ -1609,6 +1665,10 @@ export class Settings {
 					this.#savedRuntimeModelRoleOverrides.size === 0 ? this.#overrides : this.#buildOriginalOverrides(),
 			};
 			const settledPins = this.#settlePins(candidate);
+			// The new scope's ignored project values warn afresh, from the validation merge on.
+			previousDropWarnings = { paths: this.#projectDropWarnings, capped: this.#projectDropWarningsCapped };
+			this.#projectDropWarnings = new Set();
+			this.#projectDropWarningsCapped = false;
 			this.#validateAll(this.#mergeOverParent(this.#mergeOwnLayers(candidate)), normalized);
 
 			const previous = this.#snapshot();
@@ -1624,6 +1684,10 @@ export class Settings {
 			this.#fireChangesSince(previous);
 			this.#syncFileWatchers();
 		} catch (error) {
+			if (previousDropWarnings && this.#cwd !== normalized) {
+				this.#projectDropWarnings = previousDropWarnings.paths;
+				this.#projectDropWarningsCapped = previousDropWarnings.capped;
+			}
 			settled.reject(error);
 			throw error;
 		} finally {
@@ -4069,7 +4133,7 @@ export class Settings {
 
 	/** The uncached body of `#projectLayerForMerge`. */
 	#prepareProjectLayer(layers: OwnLayers): RawSettings {
-		let project = projectLayerForMerge(layers.project);
+		let project = projectLayerForMerge(layers.project, (segments, reason) => this.#warnProjectDrop(segments, reason));
 		for (const setting of allSettings()) {
 			const validate = setting.definition.validate;
 			if (!setting.definition.dropInvalidInProject || !validate) continue;
@@ -4106,6 +4170,31 @@ export class Settings {
 		return project;
 	}
 
+	/**
+	 * Warns once per path and reason that a project value is ignored. The path is logged without
+	 * bidirectional or control characters, truncated, and quoted; the value is never logged.
+	 */
+	#warnProjectDrop(segments: readonly string[], reason: ProjectDropReason): void {
+		const key = Bun.hash(`${reason}:${JSON.stringify(segments)}`);
+		if (this.#projectDropWarnings.has(key)) return;
+		if (this.#projectDropWarnings.size >= MAX_PROJECT_NULL_WARNINGS) {
+			if (this.#projectDropWarningsCapped) return;
+			this.#projectDropWarningsCapped = true;
+			logger.warn("Settings: further ignored project values are not reported", { limit: MAX_PROJECT_NULL_WARNINGS });
+			return;
+		}
+		this.#projectDropWarnings.add(key);
+		const shown = describeSettingValue(
+			sanitizeNoticeLine(segments.join(".").slice(0, MAX_LOGGED_PROJECT_PATH_LENGTH)),
+		);
+		if (reason === "null") logger.warn("Settings: ignoring project null value; lower layers apply", { path: shown });
+		else
+			logger.warn("Settings: ignoring project value nested too deeply", {
+				path: shown,
+				limit: MAX_PROJECT_LAYER_DEPTH,
+			});
+	}
+
 	/** `own` merged over an overlay parent's current view (itself for a root instance). */
 	#mergeOverParent(own: RawSettings): RawSettings {
 		if (!this.#parent) return own;
@@ -4124,16 +4213,21 @@ export class Settings {
 	/**
 	 * `overrides` deep-merged over `base`. Keys follow the higher layer's order, then base-only keys:
 	 * record order is meaningful to some consumers (`retry.fallbackChains` is searched in order).
+	 * Only own keys are read and every key is defined as an own entry, so a `__proto__` key never
+	 * changes a prototype. Records nested {@link MAX_SETTINGS_MERGE_DEPTH} levels deep (`depth` is the
+	 * nesting of `base` and `overrides`) are taken whole from the higher layer instead of merged, so the
+	 * recursion depth stays bounded.
 	 */
-	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {
+	#deepMerge(base: RawSettings, overrides: RawSettings, depth = 0): RawSettings {
 		const result: RawSettings = {};
 		for (const key of Object.keys(overrides)) {
 			const override = overrides[key];
-			const baseVal = Object.hasOwn(base, key) ? base[key] : undefined;
+			const baseVal = ownEntry(base, key);
 
 			if (override === undefined) continue;
 
 			if (
+				depth < MAX_SETTINGS_MERGE_DEPTH &&
 				typeof override === "object" &&
 				override !== null &&
 				!Array.isArray(override) &&
@@ -4141,12 +4235,12 @@ export class Settings {
 				baseVal !== null &&
 				!Array.isArray(baseVal)
 			) {
-				setOwn(result, key, this.#deepMerge(baseVal as RawSettings, override as RawSettings));
+				defineOwn(result, key, this.#deepMerge(baseVal as RawSettings, override as RawSettings, depth + 1));
 			} else {
-				setOwn(result, key, override);
+				defineOwn(result, key, override);
 			}
 		}
-		for (const key of Object.keys(base)) if (!Object.hasOwn(result, key)) setOwn(result, key, base[key]);
+		for (const key of Object.keys(base)) if (!Object.hasOwn(result, key)) defineOwn(result, key, base[key]);
 		return result;
 	}
 }

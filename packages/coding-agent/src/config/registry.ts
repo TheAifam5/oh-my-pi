@@ -143,12 +143,6 @@ interface DefinitionBase {
 	 * warning, so lower layers show through; other layers still fail the load.
 	 */
 	dropInvalidInProject?: boolean;
-	/**
-	 * When true, a project-layer `null` value, the `null` entries of a project-layer record value,
-	 * and the `null` fields of its object entries are dropped before the project layer merges, so a
-	 * repository cannot clear what lower layers configure. Other layers' `null` values still clear.
-	 */
-	ignoreProjectNulls?: boolean;
 }
 
 export interface BooleanDefinition extends DefinitionBase {

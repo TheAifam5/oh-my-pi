@@ -266,7 +266,6 @@ export const cfgCompactionModelOverrides = register({
 	default: EMPTY_COMPACTION_MODEL_OVERRIDES,
 	validate: validateCompactionModelOverrides,
 	dropInvalidInProject: true,
-	ignoreProjectNulls: true,
 });
 
 export const cfgCompactionAutoContinue = register({ id: "compaction.autoContinue", type: "boolean", default: true });
