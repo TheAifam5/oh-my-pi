@@ -2,6 +2,7 @@ import { normalizeCharmHyperBaseUrl } from "@oh-my-pi/pi-catalog/wire/charm-hype
 import { ProviderHttpError } from "../error";
 import type { UsageFetchContext, UsageFetchParams, UsageLimit, UsageProvider, UsageReport } from "../usage";
 import { isRecord } from "../utils";
+import { knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 
 const PROVIDER = "charm-hyper";
 const CREDITS_PATH = "/credits";
@@ -92,4 +93,15 @@ export const charmHyperUsageProvider: UsageProvider = {
 	fetchUsage: fetchCharmHyperUsage,
 	supports: params => params.provider === PROVIDER && params.credential.type === "api_key",
 	validatesCredentials: true,
+};
+
+/** Charm Hyper billing: one account-wide prepaid credit balance. */
+export const charmHyperBilling: ProviderBilling = {
+	id: PROVIDER,
+	readBilling(report) {
+		const limit = report.limits.find(entry => entry.id === "charm-hyper:credits");
+		if (!limit) return unknownBilling(report, "no-evidence");
+		const source = sourceFromLimit("prepaid-credits", limit);
+		return source ? knownBilling(report, [source]) : unknownBilling(report, "malformed");
+	},
 };

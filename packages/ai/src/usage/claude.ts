@@ -17,6 +17,7 @@ import {
 } from "../usage";
 import { isRecord } from "../utils";
 import { waitForRetry } from "../utils/retry-wait";
+import { type BillingSource, knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls } from "./claude-api";
 import { listClaudeResetCredits, parseClaudeResetCreditsFromUsagePayload } from "./claude-reset";
 import { HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
@@ -511,6 +512,15 @@ function buildClaudeExtraUsageLimit(payload: ClaudeUsageResponse): UsageLimit | 
 	};
 }
 
+/** The account's extra-usage switch as reported; the `spend` block wins over legacy `extra_usage`. */
+function readClaudeExtraUsageEnabled(payload: ClaudeUsageResponse): boolean | undefined {
+	if (isRecord(payload.spend) && typeof payload.spend.enabled === "boolean") return payload.spend.enabled;
+	if (isRecord(payload.extra_usage) && typeof payload.extra_usage.is_enabled === "boolean") {
+		return payload.extra_usage.is_enabled;
+	}
+	return undefined;
+}
+
 function buildUsageLimit(args: {
 	id: string;
 	label: string;
@@ -775,6 +785,7 @@ export function parseClaudeUsagePayload(
 	const payloadIdentity = extractUsageIdentity(payload);
 	const accountId = payloadIdentity.accountId ?? identity.accountId;
 	const email = payloadIdentity.email ?? identity.email;
+	const extraUsageEnabled = readClaudeExtraUsageEnabled(payload);
 	return {
 		provider: "anthropic",
 		fetchedAt,
@@ -784,6 +795,7 @@ export function parseClaudeUsagePayload(
 			...(accountId ? { accountId } : {}),
 			...(email ? { email } : {}),
 			...(identity.orgId ? { orgId: identity.orgId } : {}),
+			...(extraUsageEnabled !== undefined ? { extraUsageEnabled } : {}),
 		},
 		raw: payload,
 	};
@@ -975,4 +987,28 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 		];
 	},
 	windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
+};
+
+/**
+ * Claude subscription billing: the plan allowance, then paid extra usage in
+ * USD when the account enabled it. Rate-limit-header reports carry no extra
+ * usage fields, so their extra source reads `unknown`.
+ */
+export const claudeBilling: ProviderBilling = {
+	id: "anthropic",
+	readBilling(report) {
+		const sources: BillingSource[] = [{ mode: "subscription-included", state: "unknown" }];
+		const extraLimit = report.limits.find(limit => limit.id === "anthropic:extra");
+		// The fetcher emits an extra-usage row without a cap only when the account reports no monthly limit.
+		const extraSource = extraLimit
+			? sourceFromLimit("paid-extra-usage", extraLimit, {
+					uncapped: extraLimit.amount.limit === undefined,
+					remainingFromUsed: true,
+				})
+			: undefined;
+		if (extraLimit && !extraSource) return unknownBilling(report, "malformed");
+		const enabled = report.metadata?.extraUsageEnabled;
+		sources.push(extraSource ?? { mode: "paid-extra-usage", state: enabled === false ? "disabled" : "unknown" });
+		return knownBilling(report, sources);
+	},
 };

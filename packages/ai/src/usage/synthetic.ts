@@ -8,6 +8,7 @@ import type {
 	UsageStatus,
 	UsageWindow,
 } from "../usage";
+import { knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { buildUsageAmount, HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const QUOTAS_URL = "https://api.synthetic.new/v2/quotas";
@@ -134,4 +135,15 @@ export const syntheticUsageProvider: UsageProvider = {
 	id: "synthetic",
 	fetchUsage: fetchSyntheticUsage,
 	supports: params => params.provider === "synthetic" && params.credential.type === "api_key",
+};
+
+/** Synthetic billing: the subscription's weekly USD credit allowance. */
+export const syntheticBilling: ProviderBilling = {
+	id: "synthetic",
+	readBilling(report) {
+		const limit = report.limits.find(entry => entry.id === "synthetic:usd:7d");
+		if (!limit) return unknownBilling(report, "no-evidence");
+		const source = sourceFromLimit("subscription-included", limit);
+		return source ? knownBilling(report, [source]) : unknownBilling(report, "malformed");
+	},
 };

@@ -15,6 +15,7 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { DAY_MS, HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const WINDOW_DEFS = [
@@ -114,7 +115,13 @@ export function parseFactoryDroidUsage(payload: unknown, fetchedAt = Date.now())
 	}
 
 	if (limits.length === 0) return null;
-	return { provider: "factory-droid", fetchedAt, limits, raw: payload };
+	return {
+		provider: "factory-droid",
+		fetchedAt,
+		limits,
+		...(balanceCents !== undefined ? { metadata: { extraUsageBalanceCents: balanceCents } } : {}),
+		raw: payload,
+	};
 }
 
 /**
@@ -223,4 +230,29 @@ export const factoryDroidRankingStrategy: CredentialRankingStrategy = {
 		];
 	},
 	windowDefaults: { primaryMs: 5 * HOUR_MS, secondaryMs: WEEK_MS },
+};
+
+/**
+ * Factory billing: the subscription credit pools, then the prepaid extra usage
+ * balance in USD. An empty balance has no limit row and is read from the
+ * reported `extraUsageBalanceCents` metadata.
+ */
+export const factoryDroidBilling: ProviderBilling = {
+	id: "factory-droid",
+	readBilling(report) {
+		const balanceLimit = report.limits.find(limit => limit.id === "factory-droid:extra-balance");
+		let balance = balanceLimit ? sourceFromLimit("prepaid-credits", balanceLimit) : undefined;
+		if (balanceLimit && !balance) return unknownBilling(report, "malformed");
+		if (!balance && report.metadata?.extraUsageBalanceCents === 0) {
+			balance = {
+				mode: "prepaid-credits",
+				state: "exhausted",
+				allowance: { kind: "money", remaining: { amountMinor: 0, currency: "USD" } },
+			};
+		}
+		return knownBilling(report, [
+			{ mode: "subscription-included", state: "unknown" },
+			balance ?? { mode: "prepaid-credits", state: "unknown" },
+		]);
+	},
 };

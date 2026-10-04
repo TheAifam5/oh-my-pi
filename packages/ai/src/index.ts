@@ -44,6 +44,7 @@ export * from "./env-api-key";
 export * from "./stream";
 export * from "./types";
 export * from "./usage";
+export * from "./usage/billing";
 export * from "./usage/claude";
 export * from "./usage/claude-reset";
 export * from "./usage/cursor";
