@@ -17,6 +17,8 @@ import type {
 	ThinkingContent,
 	ToolChoice,
 	AnthropicFallbackCreditHandle,
+	BillingResult,
+	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { calculateRateLimitBackoffMs, parseRateLimitReason } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -25,7 +27,15 @@ import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-cred
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
+import {
+	isSqliteBusyError,
+	isUnexpectedSocketCloseMessage,
+	logger,
+	prompt,
+	sleepLong,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
+import type { GroupBudget } from "../config/model-groups";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 
@@ -74,27 +84,39 @@ import {
 } from "./retry-fallback-chains";
 import { describeUsageFallback } from "./retry-fallback-reason";
 import {
+	chargeNeedsBillingEvidence,
+	chargesLocalBudget,
+	DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS,
+	describeFundingSkip,
+	type FundingSkipReason,
 	type GroupFallbackChain,
 	getRetryFallbackChainsWithGroups,
+	ledgerBudgetSpend,
+	hasLocalBudgets,
+	meteredSpendingRefusal,
+	providerBillingResults,
 	resolveChainGroupPolicy,
 	resolveRetryFallbackGroupPolicy,
 	resolveRolePoolGroup,
 	rolePoolMemberSelectors,
 	withRolePoolChainKeys,
 } from "./retry-fallback-groups";
-import { PoolSelection } from "./pool-selection";
+import { PoolSelection, QUOTA_ORDERING_DEADLINE_MS } from "./pool-selection";
 import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
+import { SPEND_RETENTION_MS, type SpendEntry, type SpendLedger, usdToNanos } from "./spend-ledger";
+import { sanitizeNoticeLine } from "../utils/notice-text";
 
 import {
 	cfgFeaturesUnexpectedStopDetection,
 	cfgModelLoopGuardEnabled,
 	cfgRetry,
 	cfgRetryEnabled,
+	cfgRetryFallbackChains,
 	cfgRetryModelFallback,
 	cfgRetryUsageAwareFallback,
 	cfgRetryUsageReservePct,
@@ -107,6 +129,13 @@ const UNEXPECTED_STOP_TIMEOUT_MS = 4000;
 const EMPTY_STOP_MAX_RETRIES = 3;
 const MALFORMED_FUNCTION_CALL_MAX_RETRIES = 3;
 const STREAM_STALL_CONTINUE_MAX_RETRIES = 3;
+/** Pending local budget charges past which a new charge skips the usage-report read (up to 1.5 s). */
+const MAX_PENDING_BUDGET_CHARGES = 32;
+/** Attempts to write one charge while agent.db is busy, and the backoff before the second, in ms. */
+const SPEND_RECORD_MAX_ATTEMPTS = 3;
+const SPEND_RECORD_RETRY_BASE_MS = 50;
+/** Longest a session waits for pending local budget charges at run end and dispose, in ms. */
+export const BUDGET_CHARGE_FLUSH_TIMEOUT_MS = 2_000;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
@@ -304,6 +333,14 @@ type PendingRetryError = {
 	note: string;
 };
 
+/** A `local-hard-budget` governing a model: the group, its owner key, and the matched member. */
+interface LocalBudgetTarget {
+	owner: string;
+	member: string;
+	policy: GroupFallbackChain;
+	budget: GroupBudget;
+}
+
 type UsageLimitOutcome = {
 	switchedCredential: boolean;
 	retryAfterMs: number;
@@ -374,6 +411,12 @@ export class TurnRecovery {
 	#pendingDiscoveryDeferredValidation = false;
 	/** Whether startup fallback-chain validation has run; later checks go through the post-discovery reconcile. */
 	#fallbackChainsValidated = false;
+	/** {@link chargeLocalBudget} calls still running. */
+	readonly #pendingBudgetCharges = new Set<Promise<void>>();
+	/** Calls already charged, so a repeated `message_end` of the same message is charged once. */
+	readonly #chargedCalls = new WeakSet<AssistantMessage>();
+	/** `provider/model` keys already warned about reporting usage without a cost. */
+	readonly #unpricedBudgetModels = new Set<string>();
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -2010,6 +2053,291 @@ export class TurnRecovery {
 			getRetryFallbackChain(this.#getRetryFallbackResolutionContext(), role, currentSelector, currentModel),
 			selector,
 		);
+	}
+
+	/**
+	 * Charges the cost of the completed call `message` to every distinct `local-hard-budget` that
+	 * governs its model ({@link #localBudgetTargets}), once per `budget.id`. A call a group's funding
+	 * order would fund from an `included` or `free` source is not charged to that group's budget
+	 * ({@link chargesLocalBudget}); with {@link MAX_PENDING_BUDGET_CHARGES} charges already pending,
+	 * the call is charged without reading billing evidence. Never rejects: an invalid cost or a
+	 * ledger failure is logged and leaves the call uncharged. The charge stays pending until
+	 * {@link flushLocalBudgetCharges} or completion. The same message is never charged twice.
+	 */
+	chargeLocalBudget(message: AssistantMessage): Promise<void> {
+		if (this.#chargedCalls.has(message)) return Promise.resolve();
+		this.#chargedCalls.add(message);
+		const conservative = this.#pendingBudgetCharges.size >= MAX_PENDING_BUDGET_CHARGES;
+		const charge = this.#chargeLocalBudget(message, conservative).finally(() =>
+			this.#pendingBudgetCharges.delete(charge),
+		);
+		this.#pendingBudgetCharges.add(charge);
+		return charge;
+	}
+
+	/**
+	 * Waits for pending {@link chargeLocalBudget} calls, for at most `timeoutMs`. Charges still
+	 * pending at the deadline keep running; one that finds the ledger closed is logged, not written.
+	 */
+	async flushLocalBudgetCharges(timeoutMs = BUDGET_CHARGE_FLUSH_TIMEOUT_MS): Promise<void> {
+		if (this.#pendingBudgetCharges.size === 0) return;
+		const timeout = Promise.withResolvers<void>();
+		const timer = setTimeout(timeout.resolve, timeoutMs);
+		try {
+			await Promise.race([Promise.all(this.#pendingBudgetCharges), timeout.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
+		if (this.#pendingBudgetCharges.size > 0) {
+			logger.warn("Local budget charges still pending at the flush deadline", {
+				pending: this.#pendingBudgetCharges.size,
+				timeoutMs,
+			});
+		}
+	}
+
+	async #chargeLocalBudget(message: AssistantMessage, conservative: boolean): Promise<void> {
+		const atMs = Date.now();
+		try {
+			const model = this.#host.modelRegistry.find(message.provider, message.model);
+			const targets = model ? this.#localBudgetTargets(model) : [];
+			if (targets.length === 0) return;
+			const costNanos = usdToNanos(message.usage.cost.total);
+			if (costNanos === undefined) {
+				logger.warn("Local budget left a call uncharged: its cost is not a valid amount", {
+					budgets: targets.map(target => target.budget.id),
+				});
+				return;
+			}
+			if (costNanos === 0) {
+				this.#warnUnpricedBudgetModel(message);
+				return;
+			}
+			const ledger = this.#host.settings.getStorage()?.spendLedger;
+			if (!ledger) {
+				logger.warn("Local budget left a call uncharged: no spend ledger is open", {
+					budgets: targets.map(target => target.budget.id),
+				});
+				return;
+			}
+			const evidence = this.#billingEvidenceReader(message.provider, atMs);
+			for (const target of targets) {
+				// Each budget is recorded on its own, so one failure never skips the others.
+				try {
+					if (!conservative && !(await this.#chargesTarget(target, evidence))) continue;
+					await this.#recordSpend(ledger, {
+						atMs,
+						budgetId: target.budget.id,
+						owner: target.owner,
+						member: target.member,
+						provider: message.provider,
+						model: message.model,
+						costNanos,
+					});
+				} catch (error) {
+					logger.warn("Local budget could not record a model call", {
+						budget: target.budget.id,
+						provider: message.provider,
+						model: message.model,
+						error: String(error),
+					});
+				}
+			}
+		} catch (error) {
+			logger.warn("Local budget could not record a model call", {
+				provider: message.provider,
+				model: message.model,
+				error: String(error),
+			});
+		}
+	}
+
+	/** Writes `entry`, retrying up to {@link SPEND_RECORD_MAX_ATTEMPTS} times while agent.db is busy. */
+	async #recordSpend(ledger: SpendLedger, entry: SpendEntry): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				ledger.record(entry, SPEND_RETENTION_MS);
+				return;
+			} catch (error) {
+				if (!isSqliteBusyError(error) || attempt >= SPEND_RECORD_MAX_ATTEMPTS) throw error;
+			}
+			await Bun.sleep(SPEND_RECORD_RETRY_BASE_MS * 2 ** (attempt - 1));
+		}
+	}
+
+	/**
+	 * Warns once per model when a budget-governed call reports token usage without a cost: such a
+	 * model is unpriced, so its calls never count against the budget.
+	 */
+	#warnUnpricedBudgetModel(message: AssistantMessage): void {
+		const { input, output, cacheRead, cacheWrite } = message.usage;
+		if (input + output + cacheRead + cacheWrite <= 0) return;
+		const key = `${message.provider}/${message.model}`;
+		if (this.#unpricedBudgetModels.has(key)) return;
+		this.#unpricedBudgetModels.add(key);
+		const notice = sanitizeNoticeLine(
+			`Local budget cannot count ${key}: its calls report no cost, so they are not charged.`,
+		);
+		logger.warn("Local budget cannot count an unpriced model", { provider: message.provider, model: message.model });
+		void this.#host
+			.emitSessionEvent({ type: "notice", level: "warning", message: notice, source: "retry-fallback" })
+			.catch(error => logger.debug("Local budget notice failed", { error: String(error) }));
+	}
+
+	/** Billing results of `provider` for funding classification, read at most once per reader. */
+	#billingEvidenceReader(
+		provider: string,
+		nowMs: number,
+	): (maxAgeMs: number) => Promise<BillingResult[] | "unavailable"> {
+		let reports: Promise<UsageReport[] | undefined> | undefined;
+		return async maxAgeMs => {
+			reports ??= (async () => {
+				const deadline = AbortSignal.timeout(QUOTA_ORDERING_DEADLINE_MS);
+				try {
+					return (
+						(await untilAborted(
+							deadline,
+							this.#host.modelRegistry.authStorage.usage.reports({ signal: deadline }),
+						)) ?? undefined
+					);
+				} catch (error) {
+					logger.debug("Local budget could not read usage reports", { provider, error: String(error) });
+					return undefined;
+				}
+			})();
+			return providerBillingResults(provider, await reports, nowMs, maxAgeMs);
+		};
+	}
+
+	/** Whether a call on `target`'s group is charged to its budget; reads evidence only when it can matter. */
+	async #chargesTarget(
+		target: LocalBudgetTarget,
+		evidence: (maxAgeMs: number) => Promise<BillingResult[] | "unavailable">,
+	): Promise<boolean> {
+		const funding = target.policy.group.routing?.funding ?? [];
+		if (!chargeNeedsBillingEvidence(funding)) return true;
+		const maxAgeMs = target.policy.group.routing?.quota?.maxObservationAgeMs ?? DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS;
+		return chargesLocalBudget(funding, await evidence(maxAgeMs));
+	}
+
+	/**
+	 * Every distinct `local-hard-budget` governing `model`, once per `budget.id`: each role pool or
+	 * fallback-chain group with a member resolving to `model`, however the model was chosen. The
+	 * chain keys owning the walk ({@link retryFallbackChainKeys}) are tried first, so they own the
+	 * charge when several keys share a budget.
+	 */
+	#localBudgetTargets(model: Model): LocalBudgetTarget[] {
+		const settings = this.#host.settings;
+		if (!hasLocalBudgets(settings)) return [];
+		const selector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
+		const registry = this.#host.modelRegistry;
+		const owners = new Set([
+			...this.retryFallbackChainKeys(selector, model),
+			...Object.keys(settings.getModelRoles()),
+			...Object.keys(cfgRetryFallbackChains.get(settings)),
+		]);
+		const targets: LocalBudgetTarget[] = [];
+		for (const owner of owners) {
+			const pool = this.#rolePoolMembers(owner);
+			const chainPolicy = resolveChainGroupPolicy(this.#host.settings, owner);
+			const groups: { policy: GroupFallbackChain; members: RetryFallbackSelector[] }[] = pool ? [pool] : [];
+			if (chainPolicy) {
+				const members = chainPolicy.members.flatMap(
+					entry => parseRetryFallbackSelector(entry.selector, registry) ?? [],
+				);
+				groups.push({ policy: chainPolicy, members });
+			}
+			for (const { policy, members } of groups) {
+				const spending = policy.group.routing?.spending;
+				if (spending?.policy !== "local-hard-budget") continue;
+				if (targets.some(target => target.budget.id === spending.budget.id)) continue;
+				const member = members.find(candidate => {
+					const resolved = this.resolveRetryFallbackCandidate(owner, candidate);
+					return resolved !== undefined && modelsAreEqual(resolved, model);
+				});
+				if (member) targets.push({ owner, member: member.raw, policy, budget: spending.budget });
+			}
+		}
+		return targets;
+	}
+
+	/**
+	 * Budgets governing `model` that refuse another call on it ({@link meteredSpendingRefusal}),
+	 * counting only groups that would charge the call.
+	 */
+	async #refusedLocalBudgets(model: Model, nowMs: number): Promise<{ id: string; reason: FundingSkipReason }[]> {
+		const targets = this.#localBudgetTargets(model);
+		if (targets.length === 0) return [];
+		const budgetSpend = ledgerBudgetSpend(this.#host.settings.getStorage()?.spendLedger, nowMs);
+		const evidence = this.#billingEvidenceReader(model.provider, nowMs);
+		const refused: { id: string; reason: FundingSkipReason }[] = [];
+		for (const target of targets) {
+			const reason = meteredSpendingRefusal(target.policy.group.routing?.spending, budgetSpend);
+			if (reason && (await this.#chargesTarget(target, evidence))) refused.push({ id: target.budget.id, reason });
+		}
+		return refused;
+	}
+
+	/**
+	 * Re-checks the local budgets governing the active model before a model call. When one refuses
+	 * the call, switches to the first eligible fallback candidate whose own budgets admit it, through
+	 * the retry fallback path; does nothing for a model no local budget governs.
+	 *
+	 * @throws Error when a budget refuses the active model and no eligible fallback exists; retry and
+	 *   fallback do not act on it.
+	 */
+	async enforceLocalBudgets(signal?: AbortSignal): Promise<void> {
+		if (!hasLocalBudgets(this.#host.settings)) return;
+		const model = this.#host.model();
+		if (!model || signal?.aborted) return;
+		const nowMs = Date.now();
+		const refused = await this.#refusedLocalBudgets(model, nowMs);
+		if (refused.length === 0 || signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
+		const currentSelector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
+		const reason = refused.map(entry => `${entry.id}: ${describeFundingSkip(entry.reason)}`).join(", ");
+		if (cfgRetryModelFallback.get(this.#host.settings)) {
+			const ceiling = this.#host.thinkingLevelCeiling();
+			for (const role of this.retryFallbackChainKeys(currentSelector, model)) {
+				const ordered = await this.orderedRetryFallbackCandidates(role, currentSelector, model, {
+					walkActive: this.#activeRetryFallback !== undefined,
+					signal,
+				});
+				if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
+				for (const candidate of ordered.candidates) {
+					if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
+					const candidateModel = this.resolveRetryFallbackCandidate(role, candidate);
+					if (!candidateModel || modelsAreEqual(candidateModel, model)) continue;
+					if (!this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
+					if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
+					if (!this.#host.contextFitsModel(candidateModel)) continue;
+					if ((await this.#refusedLocalBudgets(candidateModel, nowMs)).length > 0) continue;
+					if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
+					try {
+						if (
+							await this.applyRetryFallbackCandidate(role, candidate, currentSelector, {
+								pinFallback: true,
+								signal,
+								reason: `local budget refused (${reason})`,
+							})
+						) {
+							return;
+						}
+					} catch (error) {
+						if (signal?.aborted) return;
+						logger.debug("Local budget fallback candidate could not be applied", {
+							selector: candidate.raw,
+							error: String(error),
+						});
+					}
+					if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
+				}
+			}
+		}
+		const message = sanitizeNoticeLine(
+			`${USAGE_PREFLIGHT_BLOCKED_PREFIX} local budget refused ${currentSelector} (${reason}) and no fallback model is eligible.`,
+		);
+		await this.#host.emitSessionEvent({ type: "notice", level: "warning", message, source: "retry-fallback" });
+		throw new Error(message);
 	}
 
 	async #maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<boolean> {

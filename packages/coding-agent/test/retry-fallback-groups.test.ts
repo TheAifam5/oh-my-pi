@@ -67,6 +67,50 @@ describe("group funding verdicts", () => {
 			reason: { kind: "unauthorized" },
 		});
 	});
+
+	it("authorizes metered spending under a local hard budget only while a request still fits", () => {
+		const budget = {
+			policy: "local-hard-budget",
+			budget: {
+				id: "team",
+				currency: "USD",
+				perRequestMax: "1",
+				window: { type: "rolling", durationMs: 86_400_000, maxSpend: "10" },
+			},
+		} as const;
+		const metered = [known({ mode: "metered", state: "available" })];
+		const spent = (nanos: bigint) => () => nanos;
+
+		expect(fundingVerdict(["metered"], metered, budget, spent(9_000_000_000n))).toEqual({
+			kind: "funded",
+			stage: 0,
+			billingClass: "metered",
+		});
+		// One more request at perRequestMax would pass maxSpend.
+		expect(fundingVerdict(["metered"], metered, budget, spent(9_000_000_001n))).toEqual({
+			kind: "skipped",
+			reason: { kind: "budget-exhausted" },
+		});
+		// With no per-request headroom, a window spent exactly to maxSpend still admits nothing.
+		const noHeadroom = { ...budget, budget: { ...budget.budget, perRequestMax: "0" } };
+		expect(fundingVerdict(["metered"], metered, noHeadroom, spent(10_000_000_000n))).toEqual({
+			kind: "skipped",
+			reason: { kind: "budget-exhausted" },
+		});
+		expect(fundingVerdict(["metered"], metered, budget, () => "unavailable")).toEqual({
+			kind: "skipped",
+			reason: { kind: "budget-unreadable" },
+		});
+		// An exhausted local budget never blocks a source of an earlier, included stage.
+		expect(
+			fundingVerdict(
+				["included", "metered"],
+				[known({ mode: "subscription-included", state: "available" }, { mode: "metered", state: "available" })],
+				budget,
+				spent(10_000_000_000n),
+			),
+		).toEqual({ kind: "funded", stage: 0, billingClass: "included" });
+	});
 });
 
 describe("group fallback chain resolution", () => {

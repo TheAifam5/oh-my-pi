@@ -6,6 +6,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	notePoolPickApplied,
@@ -152,6 +153,52 @@ describe("model role pools", () => {
 				[selectorOf(OPENAI), "unknown-evidence"],
 			]);
 			expect(notices).toHaveLength(1);
+		});
+
+		it("refuses a pool whose only member is metered under a spent local budget", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "spent-budget.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: {
+							engineer: pool("priority", [OPENAI], {
+								funding: { order: ["metered"] },
+								spending: {
+									policy: "local-hard-budget",
+									budget: {
+										id: "team",
+										currency: "USD",
+										perRequestMax: "0.25",
+										window: { type: "rolling", durationMs: 86_400_000, maxSpend: "1" },
+									},
+								},
+							}),
+						},
+					},
+					{ storage },
+				);
+				stubBilling({ openai: { mode: "metered", state: "available" } });
+				storage.spendLedger.record({
+					atMs: Date.now(),
+					budgetId: "team",
+					owner: "engineer",
+					member: selectorOf(OPENAI),
+					provider: OPENAI.provider,
+					model: OPENAI.id,
+					costNanos: 900_000_000,
+				});
+
+				const resolution = await resolveRolePool("engineer", deps(settings));
+
+				expect(resolution?.kind).toBe("none");
+				if (resolution?.kind !== "none") return;
+				expect(resolution.skipped.map(entry => [entry.selector, entry.reason.kind])).toEqual([
+					[selectorOf(OPENAI), "budget-exhausted"],
+				]);
+				expect(rolePoolPolicyBlocked(resolution.skipped)).toBe(true);
+			} finally {
+				AgentStorage.close();
+			}
 		});
 	});
 

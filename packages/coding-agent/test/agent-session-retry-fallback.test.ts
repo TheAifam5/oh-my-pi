@@ -40,6 +40,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -7002,6 +7003,212 @@ describe("AgentSession retry fallback", () => {
 			});
 			return notices;
 		}
+
+		describe("local budgets", () => {
+			let ledgerCount = 0;
+
+			afterEach(async () => {
+				// The session must flush its charges before the shared storage closes.
+				if (session) {
+					await session.dispose();
+					session = undefined;
+				}
+				AgentStorage.close();
+			});
+
+			/** `role` pool of `members` under a $0.25-per-request local budget of `maxSpend` USD per day. */
+			async function budgetSettings(
+				members: Model[],
+				maxSpend: string,
+				order: string[],
+				role = "default",
+			): Promise<{ settings: Settings; storage: AgentStorage }> {
+				const storage = await AgentStorage.open(path.join(tempDir.path(), `budget-${++ledgerCount}.db`));
+				const settings = Settings.isolated(
+					{
+						"compaction.enabled": false,
+						modelRoles: {
+							[role]: fallbackGroup(
+								"priority",
+								members.map(model => `${model.provider}/${model.id}`),
+								{
+									funding: { order },
+									spending: {
+										policy: "local-hard-budget",
+										budget: {
+											id: "team",
+											currency: "USD",
+											perRequestMax: "0.25",
+											window: { type: "rolling", durationMs: 86_400_000, maxSpend },
+										},
+									},
+								},
+							),
+						},
+					},
+					{ storage },
+				);
+				return { settings, storage };
+			}
+
+			function spent(storage: AgentStorage): bigint {
+				return storage.spendLedger.spentInWindow("team", 86_400_000, Date.now() + 1);
+			}
+
+			function charge(storage: AgentStorage, nanos: number): void {
+				storage.spendLedger.record({
+					atMs: Date.now(),
+					budgetId: "team",
+					owner: "test",
+					member: "openai/gpt-4o-mini",
+					provider: "openai",
+					model: "gpt-4o-mini",
+					costNanos: nanos,
+				});
+			}
+
+			function recordingAgent(model: Model, requestedModels: string[], cost = 0): Agent {
+				return new Agent({
+					getApiKey: target => `${target.provider}-test-key`,
+					initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+					streamFn: (target, context, options) => {
+						requestedModels.push(`${target.provider}/${target.id}`);
+						// Replies as the requested model, as a real provider does, so charges attribute to it.
+						const mock = createMockModel({ provider: target.provider, id: target.id });
+						mock.push({ content: [`ok:${target.provider}/${target.id}`], usage: { cost: { total: cost } } });
+						return mock.stream(target, context, options);
+					},
+				});
+			}
+
+			it("switches a running session off a metered member once its budget is spent, before the request", async () => {
+				const metered = getBundledModel("openai", "gpt-4o-mini");
+				const included = getBundledModel("google", "gemini-2.5-flash");
+				if (!metered || !included) throw new Error("Expected bundled test models to exist");
+				const { settings, storage } = await budgetSettings([metered, included], "1", ["included", "metered"]);
+				stubBilling({
+					openai: { mode: "metered", state: "available" },
+					google: { mode: "subscription-included", state: "available" },
+				});
+				charge(storage, 900_000_000);
+				const requestedModels: string[] = [];
+				session = new AgentSession({
+					agent: recordingAgent(metered, requestedModels),
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				});
+
+				await session.prompt("Keep working within the budget");
+				await session.waitForIdle();
+
+				expect(requestedModels).toEqual([`${included.provider}/${included.id}`]);
+			});
+
+			it("fails the request with a notice when the budget is spent and no member can take over", async () => {
+				const metered = getBundledModel("openai", "gpt-4o-mini");
+				if (!metered) throw new Error("Expected bundled test model to exist");
+				const { settings, storage } = await budgetSettings([metered], "1", ["metered"]);
+				stubBilling({ openai: { mode: "metered", state: "available" } });
+				charge(storage, 1_000_000_000);
+				const requestedModels: string[] = [];
+				session = new AgentSession({
+					agent: recordingAgent(metered, requestedModels),
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				});
+				const notices = collectNotices(session);
+
+				await session.prompt("Do not overspend");
+				await session.waitForIdle();
+
+				expect(requestedModels).toEqual([]);
+				expect(getLastAssistantMessage(session)).toMatchObject({
+					stopReason: "error",
+					errorMessage: expect.stringContaining("local budget refused openai/gpt-4o-mini"),
+				});
+				expect(notices).toEqual([expect.stringContaining("team: local budget exhausted")]);
+			});
+
+			it("charges and then refuses a pool member chosen directly rather than through its role", async () => {
+				const metered = getBundledModel("openai", "gpt-4o-mini");
+				if (!metered) throw new Error("Expected bundled test model to exist");
+				const { settings, storage } = await budgetSettings([metered], "1", ["metered"], "engineer");
+				stubBilling({ openai: { mode: "metered", state: "available" } });
+				const requestedModels: string[] = [];
+				// A `--model provider/id` start: the session runs the member without any role assignment.
+				session = new AgentSession({
+					agent: recordingAgent(metered, requestedModels, 0.8),
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				});
+
+				await session.prompt("First call fits the budget");
+				await session.waitForIdle();
+				await session.prompt("Second call would pass it");
+				await session.waitForIdle();
+
+				expect(requestedModels).toEqual([`${metered.provider}/${metered.id}`]);
+				expect(spent(storage)).toBe(800_000_000n);
+				expect(getLastAssistantMessage(session).errorMessage).toContain("local budget refused");
+			});
+
+			it("charges and then refuses a subagent running a pool member under a different role", async () => {
+				const metered = getBundledModel("openai", "gpt-4o-mini");
+				if (!metered) throw new Error("Expected bundled test model to exist");
+				const { settings, storage } = await budgetSettings([metered], "1", ["metered"], "engineer");
+				stubBilling({ openai: { mode: "metered", state: "available" } });
+				const sessionManager = SessionManager.inMemory();
+				sessionManager.appendModelChange(`${metered.provider}/${metered.id}`, "task");
+				const requestedModels: string[] = [];
+				session = new AgentSession({
+					agent: recordingAgent(metered, requestedModels, 0.8),
+					sessionManager,
+					settings: settings.overlay(),
+					modelRegistry,
+				});
+
+				await session.prompt("First call fits the budget");
+				await session.waitForIdle();
+				await session.prompt("Second call would pass it");
+				await session.waitForIdle();
+
+				expect(requestedModels).toEqual([`${metered.provider}/${metered.id}`]);
+				expect(spent(storage)).toBe(800_000_000n);
+				expect(getLastAssistantMessage(session).errorMessage).toContain("local budget refused");
+			});
+
+			it("records a call's charge before the session finishes disposing", async () => {
+				const metered = getBundledModel("openai", "gpt-4o-mini");
+				const included = getBundledModel("google", "gemini-2.5-flash");
+				if (!metered || !included) throw new Error("Expected bundled test models to exist");
+				const { settings, storage } = await budgetSettings([metered, included], "5", ["included", "metered"]);
+				stubBilling({
+					openai: { mode: "metered", state: "available" },
+					google: { mode: "subscription-included", state: "available" },
+				});
+				// Slow billing evidence keeps the charge pending past the end of the run.
+				vi.spyOn(modelRegistry.authStorage.usage, "reports").mockImplementation(async () => {
+					await Bun.sleep(200);
+					return ["openai", "google"].map(provider => ({ provider, fetchedAt: Date.now(), limits: [] }));
+				});
+				const requestedModels: string[] = [];
+				const target = new AgentSession({
+					agent: recordingAgent(metered, requestedModels, 0.5),
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				});
+
+				await target.prompt("Spend once");
+				await target.dispose();
+
+				expect(requestedModels).toEqual([`${metered.provider}/${metered.id}`]);
+				expect(spent(storage)).toBe(500_000_000n);
+			});
+		});
 
 		it("cancels a quota fallback search when the retry is aborted during a usage lookup", async () => {
 			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");

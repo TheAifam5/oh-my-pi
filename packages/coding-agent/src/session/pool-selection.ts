@@ -29,6 +29,7 @@ import {
 	type FundingSkipReason,
 	fundingVerdict,
 	type GroupFallbackChain,
+	ledgerBudgetSpend,
 	providerBillingResults,
 	resolveRolePoolGroup,
 } from "./retry-fallback-groups";
@@ -286,12 +287,18 @@ export class PoolSelection {
 		}
 		const nowMs = this.#now();
 		const maxAgeMs = routing?.quota?.maxObservationAgeMs ?? DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS;
+		const budgetSpend = ledgerBudgetSpend(this.#host.settings.getStorage()?.spendLedger, nowMs);
 		const funded: { candidate: RetryFallbackSelector; stage: number; index: number }[] = [];
 		const skipped: FundingSkip[] = [];
 		const noticed: FundingSkip[] = [];
 		for (const [index, candidate] of candidates.entries()) {
 			const provider = options.resolveCandidate(candidate)?.provider ?? candidate.provider;
-			const verdict = fundingVerdict(funding, providerBillingResults(provider, reports, nowMs, maxAgeMs));
+			const verdict = fundingVerdict(
+				funding,
+				providerBillingResults(provider, reports, nowMs, maxAgeMs),
+				routing?.spending,
+				budgetSpend,
+			);
 			if (verdict.kind === "funded") {
 				funded.push({ candidate, stage: verdict.stage, index });
 			} else if (!this.#host.modelRegistry.isSelectorSuppressed(candidate.raw)) {
@@ -406,6 +413,8 @@ export function isPolicySkipReason(reason: RolePoolSkipReason): boolean {
 		case "exhausted":
 		case "disabled":
 		case "unauthorized":
+		case "budget-exhausted":
+		case "budget-unreadable":
 			return true;
 		default:
 			return false;

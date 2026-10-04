@@ -21,6 +21,7 @@ import {
 	postmortem,
 } from "@oh-my-pi/pi-utils";
 import type { RawSettings as Settings } from "../config/settings";
+import { SpendLedger } from "./spend-ledger";
 
 /** Row shape for settings table queries */
 type SettingsRow = {
@@ -185,6 +186,8 @@ export class AgentStorage {
 	#upsertModelPerfStmt: Statement;
 	#listModelPerfStmt: Statement;
 	#usageStmts: Record<UsageKind, UsageStatements>;
+	/** Per-budget spend of `local-hard-budget` model groups. */
+	readonly spendLedger: SpendLedger;
 	#modelUsageCache: string[] | null = null;
 	/** Only the real user db auto-imports stats.db history; custom paths (tests, embedding) opt in explicitly. */
 	#autoPerfBackfill: boolean;
@@ -229,6 +232,7 @@ ON CONFLICT(model_key) DO UPDATE SET
 			command: this.#prepareUsageStatements("command"),
 			hint: this.#prepareUsageStatements("hint"),
 		};
+		this.spendLedger = new SpendLedger(this.#db);
 	}
 
 	#prepareUsageStatements(kind: UsageKind): UsageStatements {
@@ -473,6 +477,7 @@ FROM model_usage_legacy
 			stmts.upsert.finalize();
 			stmts.list.finalize();
 		}
+		this.spendLedger.close();
 		// SqliteAuthCredentialStore.close() finalizes its own statements and
 		// closes the shared #db handle — must run after our statements finalize.
 		this.#authStore.close();

@@ -7,17 +7,23 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { createDefaultBillingRegistry } from "@oh-my-pi/pi-ai/usage/registry";
+import { logger } from "@oh-my-pi/pi-utils";
 import {
 	type BillingClass,
+	decimalNanos,
+	type GroupBudget,
 	type GroupMemberSelector,
+	type GroupSpendingPolicy,
 	groupMemberSelectors,
 	isModelGroupForm,
 	type ModelGroup,
 	type ParsedModelValue,
 } from "../config/model-groups";
 import { isKindRole } from "../config/model-role-ids";
+import { cfgModelGroups } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import { cfgRetryFallbackChains } from "./settings";
+import type { SpendLedger } from "./spend-ledger";
 
 /** Oldest usage or billing observation a group acts on when `routing.quota.maxObservationAgeMs` is unset, in ms. */
 export const DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS = 15 * 60 * 1000;
@@ -168,17 +174,77 @@ export function billingClassOfMode(mode: BillingMode): BillingClass | undefined 
  *   could not be read in time.
  * - `exhausted` / `disabled`: every source of an authorized class is exhausted or disabled.
  * - `unauthorized`: the account draws only on classes `funding.order` does not list.
+ * - `budget-exhausted`: metered funding under `local-hard-budget` whose window has no room left
+ *   for another request ({@link meteredSpendingRefusal}).
+ * - `budget-unreadable`: metered funding under `local-hard-budget` whose spend ledger could not be
+ *   read, so the budget cannot be checked.
  */
 export type FundingSkipReason =
 	| { kind: "unknown-evidence"; reason: BillingUnknownReason | "unavailable" }
 	| { kind: "exhausted" }
 	| { kind: "disabled" }
-	| { kind: "unauthorized" };
+	| { kind: "unauthorized" }
+	| { kind: "budget-exhausted" }
+	| { kind: "budget-unreadable" };
 
 /** Funding stage a candidate draws on, or why it is skipped. `stage` indexes `funding.order`. */
 export type FundingVerdict =
 	| { kind: "funded"; stage: number; billingClass: BillingClass }
 	| { kind: "skipped"; reason: FundingSkipReason };
+
+/**
+ * Spend charged to `budget` in its rolling window ending now, in nano-USD, or `unavailable` when
+ * the spend ledger cannot be read.
+ */
+export type BudgetSpendReader = (budget: GroupBudget) => bigint | "unavailable";
+
+/**
+ * A {@link BudgetSpendReader} over `ledger` for the window ending at `nowMs`, reading each budget
+ * window once. Without a ledger, or when a read fails, every budget reads `unavailable`.
+ */
+export function ledgerBudgetSpend(ledger: SpendLedger | undefined, nowMs: number): BudgetSpendReader {
+	const spent = new Map<string, bigint | "unavailable">();
+	return budget => {
+		if (!ledger) return "unavailable";
+		const key = `${budget.id}\n${budget.window.durationMs}`;
+		let result = spent.get(key);
+		if (result === undefined) {
+			try {
+				result = ledger.spentInWindow(budget.id, budget.window.durationMs, nowMs);
+			} catch (error) {
+				logger.warn("Spend ledger could not be read; local budget members are skipped", {
+					budget: budget.id,
+					error: String(error),
+				});
+				result = "unavailable";
+			}
+			spent.set(key, result);
+		}
+		return result;
+	};
+}
+
+/**
+ * Why metered spending may not proceed under `spending`, or `undefined` when it may.
+ *
+ * Only `local-hard-budget` is checked: it admits a request while its window's spend plus
+ * `perRequestMax` stays within `window.maxSpend`. A request's cost is known only after it
+ * completes, so the window can overshoot by what one request costs above `perRequestMax`. A
+ * budget whose spend cannot be read, including one checked without `budgetSpend`, is refused.
+ */
+export function meteredSpendingRefusal(
+	spending: GroupSpendingPolicy | undefined,
+	budgetSpend: BudgetSpendReader | undefined,
+): FundingSkipReason | undefined {
+	if (spending?.policy !== "local-hard-budget") return undefined;
+	const spent = budgetSpend?.(spending.budget) ?? "unavailable";
+	const maxSpend = decimalNanos(spending.budget.window.maxSpend);
+	const perRequestMax = decimalNanos(spending.budget.perRequestMax);
+	if (spent === "unavailable" || maxSpend === undefined || perRequestMax === undefined) {
+		return { kind: "budget-unreadable" };
+	}
+	return spent >= maxSpend || spent + perRequestMax > maxSpend ? { kind: "budget-exhausted" } : undefined;
+}
 
 /**
  * Funding verdict for one candidate from the billing results of its provider's accounts (one per
@@ -190,11 +256,14 @@ export type FundingVerdict =
  * exhaustion is judged by quota ranking, see `BillingSourceState`). A `metered` source counts only
  * when reported `available`, since an unknown state is not authorization to spend.
  * Results that are all `unknown`, or `unavailable` reports, skip the candidate: missing evidence
- * is never read as free.
+ * is never read as free. A usable metered source is further gated by `spending`
+ * ({@link meteredSpendingRefusal}).
  */
 export function fundingVerdict(
 	funding: readonly BillingClass[],
 	results: readonly BillingResult[] | "unavailable",
+	spending?: GroupSpendingPolicy,
+	budgetSpend?: BudgetSpendReader,
 ): FundingVerdict {
 	if (results === "unavailable") {
 		return { kind: "skipped", reason: { kind: "unknown-evidence", reason: "unavailable" } };
@@ -216,7 +285,11 @@ export function fundingVerdict(
 				source.state !== "disabled" &&
 				(billingClass !== "metered" || source.state === "available"),
 		);
-		if (usable) return { kind: "funded", stage, billingClass };
+		if (usable) {
+			const refused = billingClass === "metered" ? meteredSpendingRefusal(spending, budgetSpend) : undefined;
+			if (refused) return { kind: "skipped", reason: refused };
+			return { kind: "funded", stage, billingClass };
+		}
 		if (ofClass.some(source => source.state === "disabled")) blocked ??= { kind: "disabled" };
 		else if (ofClass.some(source => source.state === "exhausted")) blocked ??= { kind: "exhausted" };
 		else if (ofClass.length > 0) blocked ??= { kind: "unknown-evidence", reason: "no-evidence" };
@@ -259,5 +332,53 @@ export function describeFundingSkip(reason: FundingSkipReason): string {
 			return "funding disabled";
 		case "unauthorized":
 			return "billing class not authorized";
+		case "budget-exhausted":
+			return "local budget exhausted";
+		case "budget-unreadable":
+			return "local budget spend unreadable";
 	}
+}
+
+/**
+ * Whether a completed call funded by `results` is charged to a local budget: every call except one
+ * that `funding` would fund from an `included` or `free` source. Missing or unknown evidence charges
+ * the call, so a budget over-counts rather than under-counts.
+ */
+export function chargesLocalBudget(
+	funding: readonly BillingClass[],
+	results: readonly BillingResult[] | "unavailable",
+): boolean {
+	// No spending gate: a call that already ran is classified, not authorized.
+	const verdict = fundingVerdict(funding, results);
+	return verdict.kind !== "funded" || verdict.billingClass === "metered";
+}
+
+/**
+ * Whether {@link chargesLocalBudget} needs billing evidence for `funding`: only an `included` or
+ * `free` stage can leave a call uncharged, so a metered-only order charges every call.
+ */
+export function chargeNeedsBillingEvidence(funding: readonly BillingClass[]): boolean {
+	return funding.some(billingClass => billingClass !== "metered");
+}
+
+/** Whether a settings instance configures a local budget, recomputed only when its revision moves on. */
+const localBudgetsCache = new WeakMap<Settings, { revision: number; configured: boolean }>();
+
+/**
+ * Whether any effective model group, role pool, or fallback chain of `settings` uses
+ * `local-hard-budget`. Computed once per settings revision.
+ */
+export function hasLocalBudgets(settings: Settings): boolean {
+	const revision = settings.revision;
+	const cached = localBudgetsCache.get(settings);
+	if (cached?.revision === revision) return cached.configured;
+	const groups: (ModelGroup | undefined)[] = [];
+	for (const name of Object.keys(cfgModelGroups.get(settings))) groups.push(settings.getModelGroup(name));
+	for (const role of Object.keys(settings.getModelRoles())) groups.push(resolveRolePoolGroup(settings, role)?.group);
+	for (const key of Object.keys(cfgRetryFallbackChains.get(settings))) {
+		groups.push(resolveGroupFallbackChain(settings, key)?.group);
+	}
+	const configured = groups.some(group => group?.routing?.spending?.policy === "local-hard-budget");
+	localBudgetsCache.set(settings, { revision, configured });
+	return configured;
 }

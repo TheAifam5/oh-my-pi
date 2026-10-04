@@ -20,7 +20,7 @@ import {
 } from "./model-role-ids";
 
 /**
- * Grammar of group names, member aliases, and profile names.
+ * Grammar of group names, member aliases, profile names, and budget ids.
  * Lowercase only, so case-insensitive lookups cannot confuse two names.
  */
 export const MODEL_GROUP_NAME = /^[a-z0-9][a-z0-9_-]*$/;
@@ -55,7 +55,7 @@ export const FORBIDDEN_ENTRY_KEYS: readonly string[] = ["__proto__", "constructo
 
 const RESERVED_KEY_MESSAGE = `is a reserved key (${FORBIDDEN_ENTRY_KEYS.join(", ")})`;
 
-/** Longest group name, member alias, or profile name, in characters. */
+/** Longest group name, member alias, profile name, or budget id, in characters. */
 export const MAX_MODEL_GROUP_NAME_LENGTH = 64;
 /** Most members one group may define. */
 export const MAX_GROUP_MODELS = 64;
@@ -63,6 +63,10 @@ export const MAX_GROUP_MODELS = 64;
 export const MAX_GROUP_PROFILES = 32;
 /** Longest member `model` id, in characters. */
 export const MAX_MEMBER_MODEL_LENGTH = 256;
+/** Most integer digits of a budget amount; fractional digits are capped at 9 separately. */
+export const MAX_AMOUNT_INTEGER_DIGITS = 12;
+/** Longest budget window, in ms (365 days). */
+export const MAX_BUDGET_WINDOW_MS = 365 * 24 * 60 * 60 * 1000;
 /** Longest configured text echoed into a message, in characters. */
 const MAX_ECHO_LENGTH = 64;
 
@@ -133,8 +137,19 @@ export interface GroupQuotaPolicy {
 	unknown?: "exclude" | "allow";
 }
 
-/** How metered spending is authorized; the provider enforces its own account limits. */
-export type GroupSpendingPolicy = { policy: "provider-managed" };
+export interface GroupBudget {
+	id: string;
+	currency: "USD";
+	/** Non-negative decimal amount with at most 9 fractional digits; never above `window.maxSpend`. */
+	perRequestMax: string;
+	window: { type: "rolling"; durationMs: number; maxSpend: string };
+}
+
+/**
+ * How metered spending is authorized: `provider-managed` leaves limits to the provider;
+ * `local-hard-budget` spends only while the local spend ledger shows room in `budget`.
+ */
+export type GroupSpendingPolicy = { policy: "provider-managed" } | { policy: "local-hard-budget"; budget: GroupBudget };
 
 export interface GroupRouting {
 	/** Authorized billing classes in funding order (from `funding.order`); `metered` only last. */
@@ -506,15 +521,94 @@ function parseStrategy(
 
 // ----- routing ---------------------------------------------------------------
 
+const DECIMAL_AMOUNT = new RegExp(`^(\\d{1,${MAX_AMOUNT_INTEGER_DIGITS}})(?:\\.(\\d{1,9}))?$`);
+
+/** Amount in nano-units, or undefined when `value` is not a quoted decimal amount. */
+export function decimalNanos(value: unknown): bigint | undefined {
+	const match = typeof value === "string" ? DECIMAL_AMOUNT.exec(value) : null;
+	if (!match) return undefined;
+	return BigInt(match[1]!) * 1_000_000_000n + BigInt((match[2] ?? "").padEnd(9, "0"));
+}
+
+function readAmount(c: Collector, path: string, value: unknown): bigint | undefined {
+	const nanos = decimalNanos(value);
+	if (nanos === undefined) {
+		c.add(
+			path,
+			`must be a quoted decimal amount with at most ${MAX_AMOUNT_INTEGER_DIGITS} integer and 9 fractional digits, such as "0.25"`,
+		);
+	}
+	return nanos;
+}
+
+function parseBudget(c: Collector, path: string, raw: unknown): GroupBudget | undefined {
+	const before = c.issues.length;
+	if (!checkFields(c, path, raw, ["id", "currency", "perRequestMax", "window"])) return undefined;
+	for (const field of ["id", "currency", "perRequestMax", "window"]) {
+		if (raw[field] === undefined) c.add(path, `${field} is required`);
+	}
+	if (raw.id !== undefined && raw.id !== null) {
+		if (typeof raw.id !== "string") c.add(`${path}.id`, "must be a string");
+		else readName(c, `${path}.id`, "budget id", raw.id);
+	}
+	if (raw.currency !== undefined && raw.currency !== null && raw.currency !== "USD") {
+		c.add(`${path}.currency`, 'must be "USD"');
+	}
+	const perRequestMax = present(raw, "perRequestMax")
+		? readAmount(c, `${path}.perRequestMax`, raw.perRequestMax)
+		: undefined;
+	let durationMs: number | undefined;
+	let maxSpend: bigint | undefined;
+	const windowPath = `${path}.window`;
+	if (present(raw, "window") && checkFields(c, windowPath, raw.window, ["type", "durationMs", "maxSpend"])) {
+		const w = raw.window;
+		if (w.type !== undefined && w.type !== null && w.type !== "rolling") {
+			c.add(`${windowPath}.type`, 'must be "rolling"');
+		}
+		for (const field of ["type", "durationMs", "maxSpend"]) {
+			if (w[field] === undefined) c.add(windowPath, `${field} is required`);
+		}
+		if (present(w, "durationMs")) durationMs = readPositive(c, `${windowPath}.durationMs`, w.durationMs, true);
+		if (durationMs !== undefined && durationMs > MAX_BUDGET_WINDOW_MS) {
+			c.add(`${windowPath}.durationMs`, `must be at most ${MAX_BUDGET_WINDOW_MS} (365 days)`);
+		}
+		if (present(w, "maxSpend")) maxSpend = readAmount(c, `${windowPath}.maxSpend`, w.maxSpend);
+	}
+	if (perRequestMax !== undefined && maxSpend !== undefined && perRequestMax > maxSpend) {
+		c.add(path, "perRequestMax exceeds window.maxSpend");
+	}
+	if (c.issues.length > before || durationMs === undefined) return undefined;
+	return {
+		id: raw.id as string,
+		currency: "USD",
+		perRequestMax: raw.perRequestMax as string,
+		window: { type: "rolling", durationMs, maxSpend: (raw.window as Record<string, unknown>).maxSpend as string },
+	};
+}
+
 function parseSpending(c: Collector, path: string, raw: unknown): GroupSpendingPolicy | undefined {
-	if (!checkFields(c, path, raw, ["policy"])) return undefined;
+	const before = c.issues.length;
+	if (!checkFields(c, path, raw, ["policy", "budget"])) return undefined;
 	if (!present(raw, "policy")) {
-		c.add(path, "policy is required: provider-managed");
+		c.add(path, "policy is required: provider-managed or local-hard-budget");
 		return undefined;
 	}
-	return readOneOf(c, `${path}.policy`, ["provider-managed"] as const, raw.policy)
-		? { policy: "provider-managed" }
-		: undefined;
+	const policy = readOneOf(c, `${path}.policy`, ["provider-managed", "local-hard-budget"] as const, raw.policy);
+	if (policy === "provider-managed") {
+		if (present(raw, "budget")) {
+			c.add(`${path}.budget`, "provider-managed takes no budget; use policy local-hard-budget for a local limit");
+		}
+		return c.issues.length > before ? undefined : { policy };
+	}
+	if (policy === "local-hard-budget") {
+		if (!present(raw, "budget")) {
+			c.add(path, "local-hard-budget requires a budget");
+			return undefined;
+		}
+		const budget = parseBudget(c, `${path}.budget`, raw.budget);
+		return budget && c.issues.length === before ? { policy, budget } : undefined;
+	}
+	return undefined;
 }
 
 function parseFunding(c: Collector, path: string, raw: unknown): BillingClass[] | undefined {
@@ -551,7 +645,7 @@ function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | 
 	if (!present(raw, "funding") || funding !== undefined) {
 		const metered = funding?.includes("metered") === true;
 		if (metered && spendingRaw === undefined) {
-			c.add(path, "funding includes metered, which requires spending.policy: provider-managed");
+			c.add(path, "funding includes metered, which requires spending.policy: provider-managed or local-hard-budget");
 		}
 		if (!metered && spendingRaw !== undefined) {
 			c.add(`${path}.spending`, "applies only when funding includes metered");
