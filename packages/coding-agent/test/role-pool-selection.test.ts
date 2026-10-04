@@ -2,8 +2,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as path from "node:path";
 import { type BillingSource, knownBilling, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -428,6 +431,60 @@ describe("model role pools", () => {
 			const { session } = await createAgentSession(startupOptions(settings));
 			try {
 				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		/** Session options as main builds them for a `--models` or `enabledModels` scope, over the test startup options. */
+		async function scopedStartupOptions(
+			roles: Record<string, unknown>,
+			scope: Model[],
+			source: "--models" | "enabledModels",
+		) {
+			const patterns = scope.map(selectorOf);
+			const settings = Settings.isolated({
+				modelRoles: roles,
+				...(source === "enabledModels" ? { enabledModels: patterns } : {}),
+			});
+			const scoped = await resolveModelScope(patterns, modelRegistry, undefined, settings);
+			const built = await buildSessionOptions(
+				parseArgs(source === "--models" ? ["--models", patterns.join(",")] : []),
+				scoped,
+				SessionManager.inMemory(),
+				modelRegistry,
+				settings,
+			);
+			return { ...startupOptions(settings), ...built, cwd: tempDir.path() };
+		}
+
+		it.each(["--models", "enabledModels"] as const)(
+			"starts on the funded default pool member within a %s scope",
+			async source => {
+				const roles = {
+					default: pool("priority", [ANTHROPIC, OPENAI, GOOGLE], { funding: { order: ["included"] } }),
+				};
+				stubBilling({
+					openai: { mode: "subscription-included", state: "exhausted" },
+					google: { mode: "subscription-included", state: "available" },
+				});
+
+				const { session } = await createAgentSession(await scopedStartupOptions(roles, [OPENAI, GOOGLE], source));
+				try {
+					expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+				} finally {
+					await session.dispose();
+				}
+			},
+		);
+
+		it("starts on the first scoped model with a warning when no default pool member is in a --models scope", async () => {
+			const { session, modelFallbackMessage } = await createAgentSession(
+				await scopedStartupOptions({ default: pool("priority", [ANTHROPIC]) }, [GOOGLE, OPENAI], "--models"),
+			);
+			try {
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+				expect(modelFallbackMessage).toContain('model role pool "default"');
 			} finally {
 				await session.dispose();
 			}
