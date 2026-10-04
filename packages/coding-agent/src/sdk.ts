@@ -80,6 +80,7 @@ import {
 	resolveCliModel,
 	type ResolveCliModelResult,
 	resolveConfiguredModelPatterns,
+	type ResolvedModelRoleValue,
 	resolveModelRoleValue,
 	resolveSessionModelSelector,
 	sessionModelDiscoveryProviders,
@@ -223,8 +224,22 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "./session/retry-fallback-chains";
+import { getSelectorFallbackChains } from "./session/retry-fallback-selector-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { loadRuntimeIdentity } from "./session/runtime-identity";
+import { rolePoolMemberSelectors } from "./session/retry-fallback-groups";
+import { createRolePoolCall, pickRolePoolTarget } from "./session/role-pool-resolution";
+import {
+	notePoolPickApplied,
+	type RolePoolPick,
+	type RolePoolSkip,
+	rolePoolAliasTarget,
+	rolePoolTarget,
+	RolePoolUnavailableError,
+	resolveRolePool,
+	rolePoolEvidenceHint,
+	rolePoolPolicyBlocked,
+} from "./session/pool-selection";
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import {
@@ -366,7 +381,6 @@ import {
 	cfgProviderAppendOnlyContext,
 	cfgProvidersCacheWarming,
 	cfgProvidersKimiApiFormat,
-	cfgRetryFallbackChains,
 	cfgRetryModelFallback,
 	cfgRetryUsageAwareFallback,
 	cfgRetryUsageReservePct,
@@ -2187,6 +2201,61 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 	}
 
+	// A pool default role resolves by its strategy and funding policy. When its funding or quota
+	// policy excluded a member and nothing else is eligible, it selects nothing and startup fails
+	// below instead of falling back; without a policy skip the legacy resolution and fallbacks apply.
+	// A `default` that aliases a pool role resolves through that pool, its `:level` replacing the member's effort.
+	const defaultRolePoolTarget = hasExplicitModel ? undefined : rolePoolTarget(settings, "default");
+	const defaultRoleIsPool = defaultRolePoolTarget !== undefined;
+	let defaultRolePoolSkips: RolePoolSkip[] = [];
+	let defaultRolePoolBlocked = false;
+	/** Funding notice of the applied default-role pick, shown as the startup model warning. */
+	let defaultRolePoolNotice: string | undefined;
+	/** The applied default-role pick and the settings revision it was made at, kept as the session's pick. */
+	let defaultRolePoolPick: { pick: RolePoolPick; revision: number } | undefined;
+	/** Picks of `--model @role` selectors; the one the session starts on is recorded as used. */
+	const deferredRolePoolPicks: RolePoolPick[] = [];
+	const resolveDefaultRolePool = async (candidates: Model[]): Promise<ResolvedModelRoleValue> => {
+		const pickRevision = settings.revision;
+		const resolution = await resolveRolePool(defaultRolePoolTarget?.role ?? "default", {
+			settings,
+			modelRegistry,
+			sessionId: () => providerSessionId,
+			emitNotice: async () => {},
+			availableModels: () => candidates,
+		});
+		defaultRolePoolBlocked = resolution?.kind === "none" && rolePoolPolicyBlocked(resolution.skipped);
+		if (resolution?.kind !== "picked") {
+			defaultRolePoolSkips = resolution?.kind === "none" ? resolution.skipped : [];
+			defaultRolePoolNotice = undefined;
+			defaultRolePoolPick = undefined;
+			if (defaultRolePoolBlocked) return { model: undefined, explicitThinkingLevel: false, warning: undefined };
+			return resolveModelRoleValue(settings.getModelRole("default"), candidates, {
+				settings,
+				matchPreferences: modelMatchPreferences,
+			});
+		}
+		defaultRolePoolNotice = resolution.notice;
+		const aliasLevel = defaultRolePoolTarget?.thinkingLevel;
+		defaultRolePoolPick = {
+			pick:
+				aliasLevel === undefined
+					? resolution.pick
+					: { ...resolution.pick, thinkingLevel: aliasLevel, explicitThinkingLevel: true },
+			revision: pickRevision,
+		};
+		return {
+			model: resolution.pick.model,
+			thinkingLevel: aliasLevel ?? resolution.pick.thinkingLevel,
+			explicitThinkingLevel: aliasLevel !== undefined || resolution.pick.explicitThinkingLevel,
+			warning: undefined,
+		};
+	};
+	if (defaultRoleIsPool && !model) {
+		defaultRoleSpec = await logger.time("resolveDefaultModelRolePool", () => resolveDefaultRolePool(allowedModels));
+		if (defaultRoleSpec.model) modelFallbackMessage ??= defaultRolePoolNotice;
+	}
+
 	// If still no model, try settings default.
 	// Skip settings fallback when an explicit model was requested.
 	if (!hasExplicitModel && !model && defaultRoleSpec.model) {
@@ -3093,6 +3162,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				disabledProviders.size === 0
 					? modelRegistry.getAvailable()
 					: modelRegistry.getAvailable().filter(candidate => !disabledProviders.has(candidate.provider));
+			// A selector naming a pool role as a whole (`@role`, `@role:level`) starts on the pool's pick
+			// (strategy and funding, the suffix's effort winning), and falls back over its other eligible
+			// members before the role's configured chain.
+			const rolePoolPicks = new Map<string, { pick: RolePoolPick; pattern: string }>();
+			const rolePoolCall = createRolePoolCall(settings, { modelRegistry, sessionId: providerSessionId });
+			for (const pattern of deferredModelPatterns) {
+				for (const selector of pattern.split(",")) {
+					const trimmedSelector = selector.trim();
+					const target = trimmedSelector ? rolePoolAliasTarget(trimmedSelector, settings) : undefined;
+					if (target === undefined || rolePoolPicks.has(trimmedSelector)) continue;
+					const pick = await pickRolePoolTarget(
+						target,
+						settings,
+						availableModels,
+						{ modelRegistry, sessionId: providerSessionId },
+						rolePoolCall,
+					);
+					if (!pick) continue;
+					deferredRolePoolPicks.push(pick);
+					const pickPattern =
+						target.thinkingLevel === undefined
+							? pick.selector.raw
+							: formatModelSelectorValue(formatModelStringWithRouting(pick.model), target.thinkingLevel);
+					rolePoolPicks.set(trimmedSelector, { pick, pattern: pickPattern });
+				}
+			}
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -3103,11 +3198,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						settings,
 						preferences: matchPreferences,
 					});
-					if (resolved.configuredPatterns && resolved.configuredPatterns.length > 0) {
+					const rolePoolEntry = rolePoolPicks.get(trimmedSelector);
+					const rolePoolPick = rolePoolEntry?.pick;
+					const configuredPatterns = rolePoolEntry ? [rolePoolEntry.pattern] : resolved.configuredPatterns;
+					if (configuredPatterns && configuredPatterns.length > 0) {
 						const primaryPatterns: Array<{
 							pattern: string;
 							retryFallback: InitialRetryFallbackState | undefined;
-						}> = resolved.configuredPatterns.map(pattern => ({
+						}> = configuredPatterns.map(pattern => ({
 							pattern,
 							retryFallback: undefined,
 						}));
@@ -3115,14 +3213,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							return primaryPatterns;
 						}
 						const fallbackContext: RetryFallbackResolutionContext = {
-							chains: expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
+							chains: expandDefaultRetryFallbackChains(getSelectorFallbackChains(settings), [
 								...Object.keys(settings.getModelRoles()),
 								resolved.configuredRole,
 							]),
 							getModelRole: role => settings.getModelRole(role),
 							modelLookup: modelRegistry,
+							getRolePoolMembers: role => rolePoolMemberSelectors(settings, role),
 						};
-						const originalSelector = resolved.configuredPatterns[0];
+						// Pool members the pick's strategy and funding left out are not fallbacks.
+						const excludedMembers = new Set<string>();
+						if (rolePoolPick) {
+							const eligible = new Set([rolePoolPick.selector, ...rolePoolPick.rest].map(entry => entry.raw));
+							for (const member of rolePoolPick.members) {
+								if (!eligible.has(member.raw)) excludedMembers.add(member.raw);
+							}
+						}
+						const originalSelector = configuredPatterns[0];
 						const availableOriginal = parseModelPattern(originalSelector, availableModels, matchPreferences);
 						const originalModel =
 							availableOriginal.model ??
@@ -3148,7 +3255,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							...primaryPatterns,
 							...findRetryFallbackCandidates(fallbackContext, chainKey, originalSelector, originalModel, {
 								allowMissingPrimary: true,
-							}).map(candidate => ({ pattern: candidate.raw, retryFallback })),
+							})
+								.filter(candidate => !excludedMembers.has(candidate.raw))
+								.map(candidate => ({ pattern: candidate.raw, retryFallback })),
 						];
 					}
 					if (resolved.model) {
@@ -3366,15 +3475,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// Re-resolve the allowed set: extension factories and discovery
 				// refreshes above may have registered models not visible earlier.
 				const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-				const reResolvedRoleSpec = resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
-					settings,
-					matchPreferences: modelMatchPreferences,
-				});
+				const reResolvedRoleSpec = defaultRoleIsPool
+					? await resolveDefaultRolePool(fallbackCandidates)
+					: resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
+							settings,
+							matchPreferences: modelMatchPreferences,
+						});
 				if (!reResolvedRoleSpec.model) return false;
 				defaultRoleSpec = reResolvedRoleSpec;
 				const resolvedDefaultModel = reResolvedRoleSpec.model;
 				model = resolvedDefaultModel;
-				modelFallbackMessage = undefined;
+				modelFallbackMessage = defaultRoleIsPool ? defaultRolePoolNotice : undefined;
 				// Recompute the thinking level against the now-real model.
 				// `pickInitialThinkingLevel` closes over `defaultRoleSpec`,
 				// so the role's explicit selector (e.g. `:max`) now applies.
@@ -3386,7 +3497,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const tryResolveDefaultRoleFallback = (fallbackCandidates: Model[]): boolean => {
 				const originalSelector = settings.getModelRole("default");
 				if (hasExplicitModel || !originalSelector || !cfgRetryModelFallback.get(settings)) return false;
-				const chains = expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
+				const chains = expandDefaultRetryFallbackChains(getSelectorFallbackChains(settings), [
 					...Object.keys(settings.getModelRoles()),
 					"default",
 				]);
@@ -3463,9 +3574,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 			if (!model) {
 				let fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-				let pick = pickDefaultAvailableModel(fallbackCandidates.filter(hasModelAuth), provider =>
-					modelRegistry.hasConcreteAuth(provider),
-				);
+				let pick = defaultRolePoolBlocked
+					? undefined
+					: pickDefaultAvailableModel(fallbackCandidates.filter(hasModelAuth), provider =>
+							modelRegistry.hasConcreteAuth(provider),
+						);
 
 				// Cold-cache discovery race (issues #6114, #6162): a discovery
 				// provider (models.yml openai-models-list, LM Studio/Ollama/
@@ -3482,7 +3595,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.getDiscoverableProviders().length > 0
 				) {
 					await logger.time("resolveModelDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
-					if (!(await tryResolveDefaultRole()) && !model) {
+					if (!(await tryResolveDefaultRole()) && !model && !defaultRolePoolBlocked) {
 						fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
 						pick = pickDefaultAvailableModel(fallbackCandidates.filter(hasModelAuth), provider =>
 							modelRegistry.hasConcreteAuth(provider),
@@ -3490,6 +3603,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				}
 
+				// A blocked default pool is never replaced by its selector chain or an unrelated default.
+				if (!model && defaultRolePoolBlocked) {
+					throw new RolePoolUnavailableError(
+						defaultRolePoolTarget?.role ?? "default",
+						defaultRolePoolSkips,
+						rolePoolEvidenceHint(defaultRolePoolSkips),
+					);
+				}
 				if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates) && pick) {
 					model = pick;
 					adoptThinkingForModel(pick);
@@ -5070,6 +5191,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 		hasSession = true;
 		credentialNoticeSession = session;
+		// A session started on its default pool's pick keeps it, so role cycling starts from that member.
+		// A pool pick advances its round-robin position only once the session starts on it.
+		const startedModel = session.model;
+		const startedRoute = startedModel ? formatModelStringWithRouting(startedModel) : undefined;
+		if (defaultRolePoolPick && startedRoute === formatModelStringWithRouting(defaultRolePoolPick.pick.model)) {
+			notePoolPickApplied(defaultRolePoolPick.pick);
+			session.adoptRolePoolPick("default", defaultRolePoolPick.pick, defaultRolePoolPick.revision);
+		}
+		for (const pick of deferredRolePoolPicks) {
+			if (startedRoute === formatModelStringWithRouting(pick.model)) notePoolPickApplied(pick);
+		}
 		// Hashline snapshots are session-scoped: /new and switchSession fire the
 		// change callbacks, so clear the tool-side store there — stale tags would
 		// otherwise surface as "issued in this session" in mismatch diagnostics

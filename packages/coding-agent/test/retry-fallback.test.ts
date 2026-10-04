@@ -5,8 +5,11 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
+	orderRetryFallbackCandidates,
+	type RetryFallbackQuotaEvidence,
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
+	retryFallbackQuotaEvidence,
 	validateRetryFallbackChains,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -357,5 +360,83 @@ describe("retry fallback kind-role validation", () => {
 		});
 
 		expect(warnings).toEqual([]);
+	});
+});
+
+describe("retry fallback strategies", () => {
+	const NOW = 1_000_000;
+	const MAX_AGE = 60_000;
+	const order = (
+		candidates: string[],
+		strategy: "priority" | "quota" | "round-robin",
+		evidence: Record<string, RetryFallbackQuotaEvidence> = {},
+	) =>
+		orderRetryFallbackCandidates(candidates, strategy, {
+			evidence: candidate => evidence[candidate],
+			nowMs: NOW,
+			maxAgeMs: MAX_AGE,
+		});
+	// Full chain: primary "p", then entries "a", "b", "c".
+	const CHAIN = ["p", "a", "b", "c"];
+	const roundRobin = (candidates: string[], lastAppliedPosition: number | undefined) =>
+		orderRetryFallbackCandidates(candidates, "round-robin", {
+			nowMs: NOW,
+			maxAgeMs: MAX_AGE,
+			chainPosition: candidate => {
+				const position = CHAIN.indexOf(candidate);
+				return position < 0 ? undefined : position;
+			},
+			chainLength: CHAIN.length,
+			lastAppliedPosition,
+		});
+
+	it("keeps configured order under priority even when quota evidence disagrees", () => {
+		expect(order(["a", "b"], "priority", { b: { state: "healthy", remainingFraction: 1, observedAt: NOW } })).toEqual(
+			["a", "b"],
+		);
+	});
+
+	it("starts round-robin after the last applied chain entry and wraps past the end", () => {
+		expect(roundRobin(["a", "b", "c"], undefined)).toEqual(["a", "b", "c"]);
+		expect(roundRobin(["a", "b", "c"], 1)).toEqual(["b", "c", "a"]);
+		expect(roundRobin(["a", "b", "c"], 3)).toEqual(["a", "b", "c"]);
+	});
+
+	it("tries more remaining quota first, then reserve, unknown, and depleted entries", () => {
+		const evidence: Record<string, RetryFallbackQuotaEvidence> = {
+			depleted: { state: "depleted", observedAt: NOW },
+			unknown: { state: "unknown", observedAt: NOW },
+			reserve: { state: "reserve", remainingFraction: 0.05, observedAt: NOW },
+			lowHealthy: { state: "healthy", remainingFraction: 0.3, observedAt: NOW },
+			highHealthy: { state: "healthy", remainingFraction: 0.9, observedAt: NOW },
+		};
+		expect(
+			order(["depleted", "missing", "unknown", "reserve", "lowHealthy", "highHealthy"], "quota", evidence),
+		).toEqual(["highHealthy", "lowHealthy", "reserve", "missing", "unknown", "depleted"]);
+	});
+
+	it("ranks stale or undated healthy evidence as unknown, below fresh reserve", () => {
+		const evidence: Record<string, RetryFallbackQuotaEvidence> = {
+			stale: { state: "healthy", remainingFraction: 1, observedAt: NOW - MAX_AGE - 1 },
+			undated: { state: "healthy", remainingFraction: 1 },
+			reserve: { state: "reserve", remainingFraction: 0.05, observedAt: NOW - MAX_AGE },
+		};
+		expect(order(["stale", "undated", "reserve"], "quota", evidence)).toEqual(["reserve", "stale", "undated"]);
+	});
+
+	it("summarizes usage health by the best usable account and the newest report", () => {
+		expect(
+			retryFallbackQuotaEvidence(
+				{
+					state: "healthy",
+					accounts: [
+						{ credentialId: 1, credentialType: "oauth", state: "healthy", remainingFraction: 0.4, fetchedAt: 10 },
+						{ credentialId: 2, credentialType: "oauth", state: "healthy", remainingFraction: 0.7, fetchedAt: 30 },
+						{ credentialId: 3, credentialType: "oauth", state: "depleted", fetchedAt: 20 },
+					],
+				},
+				NOW,
+			),
+		).toEqual({ state: "healthy", remainingFraction: 0.7, observedAt: 30 });
 	});
 });

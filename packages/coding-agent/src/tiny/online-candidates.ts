@@ -1,4 +1,5 @@
 import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { logger } from "@oh-my-pi/pi-utils";
 import { formatModelStringWithRouting, resolveModelOverride, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import {
@@ -8,8 +9,17 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "../session/retry-fallback-chains";
+import { getSelectorFallbackChains } from "../session/retry-fallback-selector-chains";
+import { type RolePoolPick, RolePoolUnavailableError } from "../session/pool-selection";
+import {
+	createRolePoolCall,
+	pickRolePool,
+	type RolePoolCall,
+	type RolePoolContext,
+	rolePoolPickCandidates,
+} from "../session/role-pool-resolution";
 
-import { cfgRetryFallbackChains, cfgRetryModelFallback } from "../session/settings";
+import { cfgRetryModelFallback } from "../session/settings";
 
 /** Role-resolved model used by online tiny tasks (auto-thinking, titles). */
 export interface OnlineTinyCandidate {
@@ -117,7 +127,11 @@ export function collectOnlineTinyCandidates(
 	roles: readonly string[],
 	settings: Settings,
 	availableModels: Model<Api>[],
-	options?: { tryAllRoles?: boolean },
+	options?: {
+		tryAllRoles?: boolean;
+		/** Models a role resolves to instead of its configured value, primary first; empty skips the role. */
+		resolvedRoles?: ReadonlyMap<string, readonly Model<Api>[]>;
+	},
 ): OnlineTinyCandidate[] {
 	const seen = new Set<string>();
 	const out: OnlineTinyCandidate[] = [];
@@ -133,19 +147,20 @@ export function collectOnlineTinyCandidates(
 	const fallbackEnabled = cfgRetryModelFallback.get(settings) !== false;
 	const primaries: OnlineTinyCandidate[] = [];
 	for (const role of roles) {
-		const resolved = resolveRoleSelection([role], settings, availableModels);
+		const overridden = options?.resolvedRoles?.get(role);
+		if (overridden?.length === 0) continue;
+		const [picked, ...members] = overridden ?? [];
+		const resolved = picked ? { role, model: picked } : resolveRoleSelection([role], settings, availableModels);
 		if (!resolved?.model) continue;
 		addPrimary(resolved.role, resolved.model);
+		for (const member of members) addPrimary(role, member);
 		if (!fallbackEnabled && !options?.tryAllRoles) return out;
 		if (fallbackEnabled) primaries.push({ role: resolved.role, model: resolved.model });
 	}
 	if (!fallbackEnabled) return out;
 
-	const configuredChains = cfgRetryFallbackChains.get(settings);
-	if (!configuredChains || typeof configuredChains !== "object") return out;
-
 	const context = createFallbackContext(
-		expandDefaultRetryFallbackChains(configuredChains, roles),
+		expandDefaultRetryFallbackChains(getSelectorFallbackChains(settings), roles),
 		settings,
 		availableModels,
 	);
@@ -166,6 +181,56 @@ export function collectOnlineTinyCandidates(
 }
 
 /**
+ * {@link collectOnlineTinyCandidates} that resolves a pool role through {@link pickRolePool}: its
+ * pick, then the pool's other eligible members, lead that role's candidates. A role whose pool its
+ * policy blocks is skipped (and logged) while the other roles still contribute; legacy roles and
+ * pool roles without a pick contribute exactly what the sync variant collects. All roles share
+ * one funding read, and their picks are made in `call`; the consumer records a pick's position
+ * with {@link noteRolePoolModelUsed} when it sends a request to that model.
+ *
+ * @throws RolePoolUnavailableError, the first blocked pool's, when no role contributes a candidate and one was blocked.
+ * @throws the abort reason when `context.signal` aborts.
+ */
+export async function collectOnlineTinyCandidatesAsync(
+	roles: readonly string[],
+	settings: Settings,
+	availableModels: Model<Api>[],
+	context: RolePoolContext,
+	options?: { tryAllRoles?: boolean },
+	call: RolePoolCall = createRolePoolCall(settings, context),
+): Promise<OnlineTinyCandidate[]> {
+	const fallbackEnabled = cfgRetryModelFallback.get(settings) !== false;
+	const stopAtFirst = !fallbackEnabled && !options?.tryAllRoles;
+	const resolvedRoles = new Map<string, Model<Api>[]>();
+	let blocked: RolePoolUnavailableError | undefined;
+	for (const role of roles) {
+		let pick: RolePoolPick | undefined;
+		try {
+			pick = await pickRolePool(role, settings, availableModels, context, call);
+		} catch (error) {
+			if (!(error instanceof RolePoolUnavailableError)) throw error;
+			logger.info("Skipped a blocked model role pool for tiny-model candidates", { role, error: error.message });
+			blocked ??= error;
+			resolvedRoles.set(role, []);
+			continue;
+		}
+		if (pick) {
+			// The pool's other members are fallbacks, so disabling model fallback leaves only the pick.
+			const candidates = rolePoolPickCandidates(pick, settings, availableModels, { includeRest: fallbackEnabled });
+			resolvedRoles.set(
+				role,
+				candidates.map(candidate => candidate.model),
+			);
+		}
+		// The sync collection stops after the first resolvable primary; later roles are never picked.
+		if (stopAtFirst && (pick || resolveRoleSelection([role], settings, availableModels))) break;
+	}
+	const candidates = collectOnlineTinyCandidates(roles, settings, availableModels, { ...options, resolvedRoles });
+	if (candidates.length === 0 && blocked) throw blocked;
+	return candidates;
+}
+
+/**
  * Expand one model's own `retry.fallbackChains` transitively.
  *
  * Does not merge role/`default` chains into the seed via
@@ -183,10 +248,7 @@ export function expandOnlineTinyModelFallbacks(
 	const out: OnlineTinyCandidate[] = [{ role: "current", model }];
 	if (cfgRetryModelFallback.get(settings) === false) return [model];
 
-	const configuredChains = cfgRetryFallbackChains.get(settings);
-	if (!configuredChains || typeof configuredChains !== "object") return [model];
-
-	const context = createFallbackContext(configuredChains, settings, availableModels);
+	const context = createFallbackContext(getSelectorFallbackChains(settings), settings, availableModels);
 	expandFallbackCandidates(
 		[
 			{

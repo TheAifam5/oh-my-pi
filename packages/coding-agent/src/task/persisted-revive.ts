@@ -178,7 +178,7 @@ export function createPersistedSubagentReviverFactory(
 							...(init.advisor !== "on"
 								? {
 										modelRoles: {
-											...ctx.settings.getModelRoles(),
+											...ctx.settings.getModelRoleEntries(),
 											advisor: resolveAgentAdvisorRolePattern(init.advisor, ctx.settings),
 										},
 									}

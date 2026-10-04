@@ -1,4 +1,4 @@
-import { createModelBrowserSource } from "../src/modes/model-browser-source";
+import { createModelBrowserSource, writeModelHubPool } from "../src/modes/model-browser-source";
 import { afterEach, beforeAll, describe, expect, type Mock, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -150,6 +150,8 @@ function createHub(options: {
 			onSavePreset: options.callbacks?.onSavePreset,
 			onSwitchPreset: options.callbacks?.onSwitchPreset,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
+			onPoolChange:
+				options.callbacks?.onPoolChange ?? ((target, value) => writeModelHubPool(settings, target, value)),
 			onCancel: options.callbacks?.onCancel ?? onCancel,
 		},
 		options.hub,
@@ -1253,6 +1255,109 @@ describe("ModelHub", () => {
 			// Cursor followed the moved entry: x removes model-a, not model-b.
 			hub.handleInput("x");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b"]);
+		});
+
+		/** `smol` holds a global weighted-random pool: `a` weighted, `b` with an effort, funded from included plans. */
+		function pooledSettings(models: Record<string, Record<string, unknown>> | undefined = undefined): Settings {
+			const settings = Settings.isolated();
+			settings.setModelRoleSpec("smol", {
+				strategy: "weighted-random",
+				models: models ?? {
+					a: { model: "test/model-a", weight: 2 },
+					b: { model: "test/model-b", defaultEffort: "high" },
+				},
+				routing: { funding: { order: ["included"] } },
+			});
+			return settings;
+		}
+
+		function smolGroup(settings: Settings) {
+			const spec = settings.getModelRoleSpec("smol");
+			if (spec?.kind !== "group") throw new Error(`smol is not a pool: ${spec?.kind}`);
+			return spec.group;
+		}
+
+		test("the source maps pools to scheduling-ordered members with routing text, and gates writes by layer", () => {
+			const settings = Settings.isolated({ modelRoles: { slow: "+fast@deep" } });
+			settings.setModelRoleSpec("smol", {
+				strategy: "priority",
+				strategyOptions: { order: ["z", "a"] },
+				models: { a: { model: "test/model-a" }, z: { model: "test/model-z", defaultEffort: "low" } },
+				profile: "quick",
+				profiles: { quick: { a: { effort: "minimal" } } },
+				routing: {
+					funding: { order: ["free", "metered"] },
+					spending: { policy: "provider-managed" },
+				},
+			});
+			settings.setModelGroup("fast", {
+				strategy: "random",
+				models: { m: { model: "test/model-m" } },
+				profiles: { deep: { m: { effort: "high" } } },
+			});
+			settings.setModelRole("default", "test/model-a");
+			const source = createModelBrowserSource(settings);
+
+			const pool = source.getPool?.({ kind: "role", key: "smol" });
+			expect(pool).toMatchObject({
+				source: { kind: "inline" },
+				strategy: "priority",
+				members: [
+					{ alias: "z", model: "test/model-z", effort: "low" },
+					{ alias: "a", model: "test/model-a", effort: "minimal" },
+				],
+				funding: ["free", "metered"],
+				spending: "provider-managed",
+			});
+			expect(pool?.readOnly).toBeUndefined();
+			expect(pool?.raw).toEqual(settings.getModelRoleEntries().smol as Record<string, unknown>);
+
+			// A reference shows the shared group through its profile and is never written from the hub.
+			const ref = source.getPool?.({ kind: "role", key: "slow" });
+			expect(ref).toMatchObject({
+				source: { kind: "ref", group: "fast", profile: "deep" },
+				members: [{ alias: "m", model: "test/model-m", effort: "high" }],
+			});
+			expect(ref?.readOnly).toBe("edit modelGroups.fast in config");
+			expect(ref?.raw).toBeUndefined();
+			// A runtime-layer value would shadow a global write.
+			expect(source.poolWriteBlocker?.({ kind: "role", key: "slow" })).toBe("set in the runtime layer");
+			expect(source.poolWriteBlocker?.({ kind: "role", key: "smol" })).toBeUndefined();
+			expect(source.getPool?.({ kind: "role", key: "default" })).toBeUndefined();
+		});
+
+		test("m turns a legacy role into a priority pool that keeps its order and efforts", () => {
+			const settings = Settings.isolated();
+			settings.setModelRole("smol", "test/model-b:high,test/model-a");
+			const { hub } = createHub({ models: [makeModel("test", "model-a"), makeModel("test", "model-b")], settings });
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // DEFAULT → SMOL
+			expect(footerLine(hub.render(220))).toContain("m pool");
+			hub.handleInput("m");
+
+			const group = smolGroup(settings);
+			expect(group.strategy).toEqual({ name: "priority", order: ["model-b", "model-a"] });
+			expect(group.models as readonly unknown[]).toEqual([
+				{ kind: "model", alias: "model-a", model: "test/model-a" },
+				{ kind: "model", alias: "model-b", model: "test/model-b", defaultEffort: "high" },
+			]);
+			expect(normalize(hub.render(220))).toContain("SMOL pool · 2 models · priority");
+		});
+
+		test("a refused pool edit shows the validator's message and writes nothing", () => {
+			const settings = pooledSettings({ a: { model: "test/model-a" } });
+			const { hub } = createHub({ models: [makeModel("test", "model-a")], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput(DOWN); // its only member
+			hub.handleInput("x");
+
+			expect(normalize(hub.render(220))).toContain("modelRoles.smol.models: must define at least one model");
+			expect(smolGroup(settings).models.map(member => member.alias)).toEqual(["a"]);
+			hub.handleInput(UP);
+			expect(normalize(hub.render(220))).not.toContain("must define at least one model");
 		});
 
 		test("windows the roles list so model-keyed chains past the panel height stay reachable", () => {

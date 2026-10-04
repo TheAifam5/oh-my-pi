@@ -17,6 +17,8 @@ import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, parseModelPattern, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import compressDescriptionPrompt from "../prompts/skills/compress-description.md" with { type: "text" };
+import { notePoolPickApplied, RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
+import { resolveRoleSelectionAsync } from "../session/role-pool-resolution";
 import { Semaphore } from "../task/parallel";
 import type { Skill } from "./skills";
 
@@ -30,7 +32,10 @@ const compressionSlots = new Semaphore(4);
 
 /** Background compression through a fast model; the model key scopes cached unusable answers. */
 export interface SkillDescriptionCompressor {
-	/** `provider/id` of the model the next request would use; `undefined` when none is available. */
+	/**
+	 * `provider/id` of the model the next request would use; `undefined` when none is available or
+	 * when a pool role picks the model per request.
+	 */
 	modelKey(): string | undefined;
 	/** @throws on transport failures, missing models or credentials, and non-`stop` completions. */
 	compress(name: string, description: string, request: string): Promise<string>;
@@ -49,27 +54,47 @@ export function createSkillDescriptionCompressor(
 	sessionId?: string,
 	getTelemetry?: () => AgentTelemetry | undefined,
 ): SkillDescriptionCompressor {
-	const select = (): Model<Api> | undefined => {
-		const available = registry.getAvailable();
-		const configured = resolveRoleSelection(["smol"], settings, available);
-		if (configured) return configured.model;
+	const smolDefault = (available: Model<Api>[]): Model<Api> | undefined => {
 		const preferences = getModelMatchPreferences(settings);
 		for (const pattern of roleDefaultModels().smol) {
 			const preferred = parseModelPattern(pattern, available, preferences).model;
 			if (preferred) return preferred;
 		}
-		return resolveRoleSelection(["tiny"], settings, available)?.model;
+		return undefined;
 	};
 	return {
 		modelKey() {
-			const model = select();
+			// A pool role picks its member per request, so no single model scopes the cached answers.
+			if (rolePoolTarget(settings, "smol") || rolePoolTarget(settings, "tiny")) return undefined;
+			const available = registry.getAvailable();
+			const model =
+				resolveRoleSelection(["smol"], settings, available)?.model ??
+				smolDefault(available) ??
+				resolveRoleSelection(["tiny"], settings, available)?.model;
 			return model ? `${model.provider}/${model.id}` : undefined;
 		},
 		async compress(_name, _description, request) {
-			const model = select();
-			if (!model) throw new Error("No smol or tiny model available");
+			const available = registry.getAvailable();
+			const context = { modelRegistry: registry, sessionId };
+			// A blocked smol pool is skipped for the next role, `tiny`, without smol's built-in substitutes.
+			let blocked: RolePoolUnavailableError | undefined;
+			const configured = await resolveRoleSelectionAsync(["smol"], settings, available, context).catch(
+				(error: unknown) => {
+					if (!(error instanceof RolePoolUnavailableError)) throw error;
+					blocked = error;
+					return undefined;
+				},
+			);
+			const preferred = !configured && !blocked ? smolDefault(available) : undefined;
+			const selected =
+				configured ??
+				(preferred ? { model: preferred, thinkingLevel: undefined } : undefined) ??
+				(await resolveRoleSelectionAsync(["tiny"], settings, available, context));
+			if (!selected) throw blocked ?? new Error("No smol or tiny model available");
+			const { model } = selected;
 			const apiKey = await registry.getApiKey(model, sessionId);
 			if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+			if ("pick" in selected && selected.pick) notePoolPickApplied(selected.pick);
 			const response = await instrumentedCompleteSimple(
 				model,
 				{

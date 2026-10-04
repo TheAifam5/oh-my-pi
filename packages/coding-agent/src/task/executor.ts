@@ -24,6 +24,7 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { type EditMode, getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
 import {
+	disabledProviderIds,
 	formatModelStringWithRouting,
 	resolveAgentAdvisorRolePattern,
 	resolveAgentAdvisorSelection,
@@ -149,7 +150,6 @@ import {
 	cfgTierGoogle,
 	cfgTierAnthropic,
 	cfgTierOpenai,
-	cfgRetryFallbackChains,
 	cfgDefaultThinkingLevel,
 } from "../session/settings";
 import { cfgDisabledProviders } from "../config/model-settings";
@@ -159,6 +159,14 @@ import {
 	cfgCompactionThresholdPercent,
 	cfgCompactionThresholdTokens,
 } from "../session/context-settings";
+import {
+	notePoolPickApplied,
+	type RolePoolPick,
+	RolePoolUnavailableError,
+	rolePoolAliasTarget,
+} from "../session/pool-selection";
+import { getSelectorFallbackChains } from "../session/retry-fallback-selector-chains";
+import { pickRolePool, pickRolePoolTarget } from "../session/role-pool-resolution";
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -297,7 +305,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 ): string[] | undefined {
-	const configuredChains = cfgRetryFallbackChains.get(settings);
+	const configuredChains = getSelectorFallbackChains(settings);
 	// An explicitly emptied role chain means "no fallbacks", not "inherit
 	// default" — mirrors expandDefaultRetryFallbackChains.
 	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
@@ -318,6 +326,8 @@ function installSubagentRetryFallbackChain(args: {
 	inheritedFallbackChain: string[] | undefined;
 	model: Model<Api> | undefined;
 	authFallbackUsed: boolean;
+	/** Walk the inherited chain after the remaining candidates rather than only when none remain. */
+	appendInheritedChain?: boolean;
 }): string | undefined {
 	const { settings, id, candidates, inheritedFallbackChain, model, authFallbackUsed } = args;
 	if (!model || authFallbackUsed || candidates.length === 0) return undefined;
@@ -328,7 +338,11 @@ function installSubagentRetryFallbackChain(args: {
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
 	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
-	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
+	const fallbackChain = args.appendInheritedChain
+		? [...fallbackSelectors, ...(inheritedFallbackChain ?? []).filter(entry => !fallbackSelectors.includes(entry))]
+		: fallbackSelectors.length > 0
+			? fallbackSelectors
+			: inheritedFallbackChain;
 	if (!Array.isArray(fallbackChain) || !fallbackChain.every(entry => typeof entry === "string")) {
 		return undefined;
 	}
@@ -336,6 +350,77 @@ function installSubagentRetryFallbackChain(args: {
 	const role = subagentRetryFallbackRole(id);
 	installRetryFallbackRole(settings, role, { primary: candidates[selectedIndex].selector, chain: fallbackChain });
 	return role;
+}
+
+/**
+ * The pool member a spawn resolves to when it requests exactly a pool role (a role alias whose
+ * expansion is the whole request), or `undefined` when the request is anything else or no member
+ * is eligible without a funding or quota skip; those resolve as before, including the parent-model
+ * auth fallback. The picked member needs a usable key from `getApiKey` (keyless providers count);
+ * the others are probed without resolving their keys ({@link pickRolePool}). Each spawn selects
+ * afresh; nothing is cached. The pick is recorded when the spawn creates its session on it.
+ *
+ * @throws RolePoolUnavailableError when no member is eligible and the funding or quota policy excluded one.
+ * @throws the abort reason when `signal` aborts.
+ */
+async function resolveSubagentRolePool(args: {
+	role: string | undefined;
+	modelPatterns: string[];
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	sessionId: string;
+	signal: AbortSignal;
+}): Promise<RolePoolPick | undefined> {
+	const { role, settings, modelRegistry } = args;
+	if (role === undefined) return undefined;
+	const requested = resolveConfiguredModelPatterns(args.modelPatterns, settings);
+	const rolePatterns = resolveConfiguredModelPatterns(settings.getModelRole(role), settings);
+	if (
+		requested.length !== rolePatterns.length ||
+		requested.some((pattern, index) => pattern !== rolePatterns[index])
+	) {
+		return undefined;
+	}
+	const disabledProviders = disabledProviderIds(settings);
+	// The selection logs skipped members; a spawn has no session to show a notice in yet.
+	return pickRolePool(
+		role,
+		settings,
+		modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider)),
+		{ modelRegistry, sessionId: args.sessionId, signal: args.signal },
+	);
+}
+
+/**
+ * The model a subagent prewalk hands off to. A pattern naming a pool role as a whole (`@role`,
+ * `@role:level`) takes the pool's pick ({@link pickRolePoolTarget}), returned as `pick` for the caller
+ * to record when it arms prewalk; a pool its policy blocks resolves to no model with the error as the
+ * warning, so prewalk is skipped instead of failing the spawn. Any other pattern resolves as before.
+ */
+async function resolvePrewalkTargetModel(
+	pattern: string,
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+	sessionId: string,
+	signal: AbortSignal,
+): Promise<{ model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; warning?: string; pick?: RolePoolPick }> {
+	const target = rolePoolAliasTarget(pattern, settings);
+	if (target !== undefined) {
+		const disabledProviders = disabledProviderIds(settings);
+		try {
+			const pick = await pickRolePoolTarget(
+				target,
+				settings,
+				modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider)),
+				{ modelRegistry, sessionId, signal },
+			);
+			if (pick) return { model: pick.model, thinkingLevel: pick.thinkingLevel, pick };
+		} catch (error) {
+			if (!(error instanceof RolePoolUnavailableError)) throw error;
+			return { warning: error.message };
+		}
+	}
+	return resolveModelOverride([pattern], modelRegistry, settings);
 }
 
 export interface IrcPeerRosterRow {
@@ -4217,7 +4302,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
 			...(advisorSelection ? { "advisor.enabled": true } : undefined),
 			...(advisorRolePattern
-				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorRolePattern } }
+				? { modelRoles: { ...settings.getModelRoleEntries(), advisor: advisorRolePattern } }
 				: undefined),
 		},
 		options.parentServiceTier,
@@ -4412,13 +4497,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			checkAbort();
 
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
+			const spawnRole = modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings);
+			const rolePoolPick = await awaitAbortable(
+				resolveSubagentRolePool({
+					role: spawnRole,
+					modelPatterns,
+					settings,
+					modelRegistry,
+					sessionId: id,
+					signal: abortSignal,
+				}),
+			);
 			const inheritedRetryFallbackChain =
-				configuredModelPatterns.length === 1
-					? resolveSubagentInheritedRetryFallbackChain(
-							subagentSettings,
-							modelRegistry,
-							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
-						)
+				configuredModelPatterns.length === 1 || rolePoolPick
+					? resolveSubagentInheritedRetryFallbackChain(subagentSettings, modelRegistry, spawnRole)
 					: undefined;
 			const {
 				model,
@@ -4426,15 +4518,23 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				explicitThinkingLevel,
 				authFallbackUsed,
 				warning: modelResolutionWarning,
-			} = await awaitAbortable(
-				resolveModelOverrideWithAuthFallback(
-					modelPatterns,
-					options.parentActiveModelPattern,
-					modelRegistry,
-					settings,
-					id,
-				),
-			);
+			} = rolePoolPick
+				? {
+						model: rolePoolPick.model,
+						thinkingLevel: rolePoolPick.thinkingLevel,
+						explicitThinkingLevel: rolePoolPick.explicitThinkingLevel,
+						authFallbackUsed: false,
+						warning: undefined,
+					}
+				: await awaitAbortable(
+						resolveModelOverrideWithAuthFallback(
+							modelPatterns,
+							options.parentActiveModelPattern,
+							modelRegistry,
+							settings,
+							id,
+						),
+					);
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
@@ -4464,13 +4564,19 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 								resolvedModel,
 								inheritedSubagentServiceTiers(settings, options.parentServiceTier),
 							);
+			// A pool pick falls back over the pool's other eligible members, in strategy and funding order.
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, subagentSettings),
+				candidates: resolveSubagentRetryFallbackCandidates(
+					rolePoolPick ? [rolePoolPick.selector.raw, ...rolePoolPick.rest.map(entry => entry.raw)] : modelPatterns,
+					modelRegistry,
+					subagentSettings,
+				),
 				inheritedFallbackChain: inheritedRetryFallbackChain,
 				model,
 				authFallbackUsed,
+				appendInheritedChain: rolePoolPick !== undefined,
 			});
 			if (retryFallbackRole) {
 				logger.debug("Configured subagent runtime model fallback chain", {
@@ -4546,7 +4652,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					});
 			if (prewalkPattern) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
-				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
+				const resolvedPrewalk = await awaitAbortable(
+					resolvePrewalkTargetModel(prewalkPattern, settings, modelRegistry, id, abortSignal),
+				);
 				const target = resolvedPrewalk.model;
 				if (!target || !modelRegistry.hasConfiguredAuth(target)) {
 					logger.warn("Subagent prewalk target unavailable; skipping prewalk", {
@@ -4564,6 +4672,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					});
 				} else {
 					prewalk = { target, thinkingLevel: resolvedPrewalk.thinkingLevel };
+					if (resolvedPrewalk.pick) notePoolPickApplied(resolvedPrewalk.pick);
 				}
 			}
 
@@ -4711,6 +4820,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const mcpFollower = mcpManager
 				? followMCPTools(mcpManager, explicitSubagentToolNames(sessionSpec))
 				: undefined;
+			// The spawn is committed to the pick here; an earlier exit leaves the round-robin position unchanged.
+			if (rolePoolPick) notePoolPickApplied(rolePoolPick);
 			let session: AgentSession;
 			let sessionPromise: Promise<CreateAgentSessionResult> | undefined;
 			try {

@@ -24,7 +24,11 @@ import type { ModelRegistry } from "../config/model-registry";
 
 import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
-import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import {
+	collectOnlineTinyCandidates,
+	collectOnlineTinyCandidatesAsync,
+	expandOnlineTinyModelFallbacks,
+} from "../tiny/online-candidates";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
@@ -32,6 +36,8 @@ import { formatTitleUserMessage } from "../tiny/message-preproc";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
+import { RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
+import { createRolePoolCall, noteRolePoolModelUsed, type RolePoolCall } from "../session/role-pool-resolution";
 import { cfgRetryModelFallback } from "../session/settings";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
@@ -117,13 +123,67 @@ const LEADING_THINKING_FENCE_RE = /^\s*```(?:thinking|reasoning)\b[\s\S]*?```\s*
 const LEADING_PROSE_THINKING_PREAMBLE_RE =
 	/^[ \t]*(?:(?:here(?:['’]s| is)[ \t]+(?:a|the|my)[ \t]+)|my[ \t]+)?(?:thinking|thought|reasoning)[ \t]+process[ \t]*:?[ \t]*(?:\r?\n|$)/i;
 
-function getTitleModels(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api>[] {
+const TITLE_ROLES = ["tiny", "commit", "smol"] as const;
+
+/**
+ * Title candidates in attempt order; empty when none resolves, a role pool is blocked, or `signal`
+ * aborts. Role pool picks are made in `call`; without a pool role the candidates resolve synchronously.
+ */
+function getTitleModels(
+	registry: ModelRegistry,
+	settings: Settings,
+	currentModel: Model<Api> | undefined,
+	sessionId: string | undefined,
+	signal: AbortSignal | undefined,
+	call: RolePoolCall,
+): Model<Api>[] | Promise<Model<Api>[]> {
 	const availableModels = roleCandidatePool("tiny", settings, registry);
 	if (availableModels.length === 0) return [];
+	if (TITLE_ROLES.every(role => rolePoolTarget(settings, role) === undefined)) {
+		const models = collectOnlineTinyCandidates(TITLE_ROLES, settings, availableModels).map(
+			candidate => candidate.model,
+		);
+		return withCurrentModelFallbacks(models, settings, availableModels, currentModel);
+	}
+	return getPooledTitleModels(registry, settings, availableModels, currentModel, sessionId, signal, call);
+}
 
-	const models = collectOnlineTinyCandidates(["tiny", "commit", "smol"], settings, availableModels).map(
-		candidate => candidate.model,
-	);
+async function getPooledTitleModels(
+	registry: ModelRegistry,
+	settings: Settings,
+	availableModels: Model<Api>[],
+	currentModel: Model<Api> | undefined,
+	sessionId: string | undefined,
+	signal: AbortSignal | undefined,
+	call: RolePoolCall,
+): Promise<Model<Api>[]> {
+	let models: Model<Api>[];
+	try {
+		models = (
+			await collectOnlineTinyCandidatesAsync(
+				TITLE_ROLES,
+				settings,
+				availableModels,
+				{ modelRegistry: registry, sessionId, signal },
+				undefined,
+				call,
+			)
+		).map(candidate => candidate.model);
+	} catch (error) {
+		if (signal?.aborted) return [];
+		if (!(error instanceof RolePoolUnavailableError)) throw error;
+		logger.warn("title-generator: role pool unavailable", { sessionId, error: error.message });
+		return [];
+	}
+	return withCurrentModelFallbacks(models, settings, availableModels, currentModel);
+}
+
+function withCurrentModelFallbacks(
+	models: Model<Api>[],
+	settings: Settings,
+	availableModels: Model<Api>[],
+	currentModel: Model<Api> | undefined,
+): Model<Api>[] {
 	if (
 		currentModel &&
 		(models.length === 0 || cfgRetryModelFallback.get(settings) !== false) &&
@@ -179,9 +239,12 @@ export async function generateSessionTitle(
 		return null;
 	}
 
-	const models = getTitleModels(registry, settings, currentModel);
+	const call = createRolePoolCall(settings, { modelRegistry: registry, sessionId, signal });
+	const pending = getTitleModels(registry, settings, currentModel, sessionId, signal, call);
+	const models = pending instanceof Promise ? await pending : pending;
 	const firstModel = models[0];
 	if (!firstModel) {
+		if (signal?.aborted) return null;
 		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
 		return null;
 	}
@@ -197,8 +260,10 @@ export async function generateSessionTitle(
 			signal,
 			titleSystemPrompt,
 			credentialSourceSessionId,
+			call,
 		);
 	}
+	noteRolePoolModelUsed(call, firstModel);
 
 	// A local role selection is an explicit no-billing boundary. If the worker
 	// fails (download missing, runtime crash, abort, or no output), leave the
@@ -248,8 +313,11 @@ export async function generateTitleOnline(
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
 ): Promise<string | null> {
-	const models = getTitleModels(registry, settings, currentModel);
+	const call = createRolePoolCall(settings, { modelRegistry: registry, sessionId, signal });
+	const pending = getTitleModels(registry, settings, currentModel, sessionId, signal, call);
+	const models = pending instanceof Promise ? await pending : pending;
 	if (models.length === 0) {
+		if (signal?.aborted) return null;
 		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
 		return null;
 	}
@@ -262,9 +330,11 @@ export async function generateTitleOnline(
 		signal,
 		customSystemPrompt,
 		credentialSourceSessionId,
+		call,
 	);
 }
 
+/** Tries `models` in order; each model a request is sent to is recorded in `call` ({@link noteRolePoolModelUsed}). */
 async function generateTitleOnlineWithModels(
 	firstMessage: string,
 	models: Model<Api>[],
@@ -274,6 +344,7 @@ async function generateTitleOnlineWithModels(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
+	call?: RolePoolCall,
 ): Promise<string | null> {
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	// The model is always asked to wrap the title in `<title>...</title>` and
@@ -323,6 +394,7 @@ async function generateTitleOnlineWithModels(
 				});
 				return null;
 			}
+			if (call) noteRolePoolModelUsed(call, model);
 			// Resolve metadata after getApiKey so the session-sticky credential for this
 			// request is already recorded; metadataResolver can then return the correct
 			// account_uuid rather than the snapshot-at-call-site value.

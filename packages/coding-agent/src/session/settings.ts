@@ -1,4 +1,5 @@
 import { combine, effect, register, type SettingValueOf } from "../config/registry";
+import { assertModelGroupSectionWritable } from "../config/model-groups";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -860,6 +861,8 @@ export const cfgRetryFallbackChains = register({
 	id: "retry.fallbackChains",
 	type: "record",
 	default: EMPTY_STRING_ARRAYS_RECORD,
+	entryMerge: "replace",
+	validateWrite: raw => assertModelGroupSectionWritable("fallbackChains", raw),
 	ui: {
 		tab: "model",
 		group: "Retry & Fallback",

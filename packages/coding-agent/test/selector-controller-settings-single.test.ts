@@ -3,6 +3,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
+import type { ResolvedRoleModel } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui";
 import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
@@ -61,7 +62,7 @@ function pickerContext(ui: OverlayUi, models: Model[] = [], current?: Model, set
 			getRoleModelCycle: () => undefined,
 			resolveTemporaryModelThinkingLevel: () => undefined,
 			setModelTemporary: vi.fn(async () => {}),
-			applyRoleModel: vi.fn(async () => {}),
+			applyRoleModel: vi.fn(async (entry: ResolvedRoleModel) => entry),
 			modelRegistry: {
 				getError: () => undefined,
 				getAvailable: () => models,
