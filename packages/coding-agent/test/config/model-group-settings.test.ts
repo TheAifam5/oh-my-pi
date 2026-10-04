@@ -237,6 +237,59 @@ describe("project layer hardening", () => {
 	});
 });
 
+describe("project metered funding", () => {
+	const metered = { funding: { order: ["included", "metered"] }, spending: { policy: "provider-managed" } };
+
+	it("drops a project pool with metered funding, ignoring a project-level allowProjectMeteredPools", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		writeGlobal({ modelRoles: { engineer: pool({ a: OPUS }) } });
+		writeProject({
+			allowProjectMeteredPools: true,
+			modelRoles: { engineer: pool({ b: SONNET }, { routing: metered }) },
+			modelGroups: { mine: pool({ b: SONNET }, { routing: metered }), plain: pool({ c: ASTRA }) },
+		});
+		const settings = await load();
+
+		expect(settings.getModelRole("engineer")).toBe(OPUS);
+		expect(settings.getModelRoleProvenance("engineer")).toBe("global");
+		expect(Object.keys(cfgModelGroups.get(settings))).toEqual(["plain"]);
+		expect(warnedPaths(warn)).toEqual(
+			expect.arrayContaining([
+				"allowProjectMeteredPools",
+				"modelRoles.engineer.routing.funding.order",
+				"modelGroups.mine.routing.funding.order",
+			]),
+		);
+		expect(warnedFor(warn, "modelRoles.engineer.routing.funding.order")).toHaveLength(1);
+	});
+
+	it("keeps a project pool with metered funding when the global config allows it", async () => {
+		writeGlobal({ allowProjectMeteredPools: true, modelRoles: { engineer: pool({ a: OPUS }) } });
+		writeProject({ modelRoles: { engineer: pool({ b: SONNET }, { routing: metered }) } });
+		const settings = await load();
+
+		expect(settings.getModelRole("engineer")).toBe(SONNET);
+		expect(settings.getModelRoleSpec("engineer")).toMatchObject({
+			kind: "group",
+			group: { routing: { funding: ["included", "metered"] } },
+		});
+	});
+
+	it("keeps a global group over a project group of the same name unless the global config allows it", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		writeGlobal({ modelGroups: { shared: pool({ a: OPUS }) } });
+		writeProject({ modelGroups: { shared: pool({ b: SONNET }) } });
+		const settings = await load();
+
+		expect(settings.getModelGroup("shared")?.models.map(member => member.model)).toEqual([OPUS]);
+		expect(warnedFor(warn, "modelGroups.shared")).toHaveLength(1);
+
+		writeGlobal({ allowProjectMeteredPools: true, modelGroups: { shared: pool({ a: OPUS }) } });
+		const allowed = await load();
+		expect(allowed.getModelGroup("shared")?.models.map(member => member.model)).toEqual([SONNET]);
+	});
+});
+
 describe("model-group fallback chains in selector-only consumers", () => {
 	it("treats a pool at a role key as unset so the role inherits the default chain, logging the key once", () => {
 		const warn = vi.spyOn(logger, "warn");

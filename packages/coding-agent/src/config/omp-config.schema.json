@@ -59,6 +59,10 @@
       "additionalProperties": true,
       "default": {}
     },
+    "allowProjectMeteredPools": {
+      "type": "boolean",
+      "default": false
+    },
     "modelPresets": {
       "type": "object",
       "additionalProperties": true,
