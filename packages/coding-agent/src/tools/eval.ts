@@ -345,6 +345,8 @@ function formatEvalInputLanguage(value: string): string {
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
+	/** Runs code. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "exec" as const;
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = isRecord(args) ? args : {};

@@ -20,6 +20,8 @@ export type MemoryEditParams = typeof memoryEditSchema.infer;
 export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	readonly name = "memory_edit";
 	readonly approval = "read" as const;
+	/** Edits memory state: re-running after a crash may apply the change twice. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Memory Edit";
 	get description(): string {
 		return prompt.render(memoryEditDescription, {

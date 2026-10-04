@@ -335,6 +335,12 @@ export interface AgentOptions {
 	beforeToolCall?: AgentLoopConfig["beforeToolCall"];
 
 	/**
+	 * Called immediately before a dispatched tool call starts executing.
+	 * See {@link AgentLoopConfig.beforeToolExecution} for full semantics.
+	 */
+	beforeToolExecution?: AgentLoopConfig["beforeToolExecution"];
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and the tool-result
 	 * message are emitted. See {@link AgentLoopConfig.afterToolCall} for full semantics.
 	 */
@@ -506,6 +512,11 @@ export class Agent {
 	 */
 	beforeToolCall?: AgentLoopConfig["beforeToolCall"];
 	/**
+	 * Hook invoked immediately before a dispatched tool call starts executing.
+	 * Reassign at any time to swap the implementation.
+	 */
+	beforeToolExecution?: AgentLoopConfig["beforeToolExecution"];
+	/**
 	 * Hook invoked after tool execution and before `tool_execution_end` / tool-result
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
@@ -580,6 +591,7 @@ export class Agent {
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
+		this.beforeToolExecution = opts.beforeToolExecution;
 		this.afterToolCall = opts.afterToolCall;
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.transformAssistantMessagePreservesToolCalls = opts.transformAssistantMessagePreservesToolCalls;
@@ -1829,6 +1841,9 @@ export class Agent {
 			abortOnFabricatedToolResult: this.#abortOnFabricatedToolResult,
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
+			beforeToolExecution: this.beforeToolExecution
+				? (ctx, signal) => this.beforeToolExecution?.(ctx, signal)
+				: undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)

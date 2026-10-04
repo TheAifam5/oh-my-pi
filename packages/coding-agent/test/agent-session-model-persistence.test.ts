@@ -466,6 +466,8 @@ describe("AgentSession model persistence", () => {
 		await sessionManager.flush();
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected interrupted session file");
+		// The writing process is gone; a still-open writer would count as a live in-process owner.
+		await sessionManager.close();
 
 		const result = await createStartupResumeSession(sessionFile);
 		const messages = result.session.sessionManager.buildSessionContext({ transcript: true }).messages;

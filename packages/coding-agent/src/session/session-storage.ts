@@ -134,6 +134,13 @@ export interface SessionStorage {
 	 * it.
 	 */
 	confirmWrites?(path: string): Promise<void>;
+	/**
+	 * Force the bytes already written to `path` to stable storage, and its
+	 * directory entry where the filesystem allows it. Throws when the file sync
+	 * fails. Optional: backends without a local file to sync (memory, remote
+	 * indexed stores) omit it.
+	 */
+	fsyncSync?(path: string): void;
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void;
@@ -188,6 +195,8 @@ export interface SessionStorage {
 	 * another process writes a session.
 	 */
 	claimSession?(sessionId: string, sessionPath: string): (() => void) | null;
+	/** Number of live claims this process holds on session `sessionId` through {@link claimSession}. */
+	sessionClaimCount?(sessionId: string): number;
 	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a
@@ -561,7 +570,43 @@ export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null
 	return tryAcquireFileLock(lockPath);
 }
 
+/** Session directories whose fsync the filesystem rejected; warned about once per process, then skipped. */
+const unsyncableSessionDirs = new Set<string>();
+
 export class FileSessionStorage implements SessionStorage {
+	fsyncSync(fpath: string): void {
+		// FlushFileBuffers on Windows needs a handle opened for writing. O_NONBLOCK keeps a FIFO
+		// swapped in at the session path from blocking the open; the regular-file check rejects it.
+		const flags =
+			process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0);
+		const fd = openCloexecSync(fpath, flags);
+		try {
+			if (!fs.fstatSync(fd).isFile()) throw new Error(`Session path is not a regular file: ${fpath}`);
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+		// Windows cannot open a directory for fsync; NTFS journals the entry itself.
+		if (process.platform === "win32") return;
+		const dir = path.dirname(fpath);
+		if (unsyncableSessionDirs.has(dir)) return;
+		try {
+			const dirFd = openCloexecSync(dir, fs.constants.O_RDONLY);
+			try {
+				fs.fsyncSync(dirFd);
+			} finally {
+				fs.closeSync(dirFd);
+			}
+		} catch (err) {
+			// Some filesystems (network mounts, FUSE) reject directory fsync; the file itself is synced.
+			unsyncableSessionDirs.add(dir);
+			logger.warn("Session directory fsync unsupported; syncing the file only", {
+				dir,
+				error: toError(err).message,
+			});
+		}
+	}
+
 	#assertExpectedSize(fpath: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		let actualSize: number | null;
@@ -1082,6 +1127,10 @@ export class FileSessionStorage implements SessionStorage {
 	/** Run a synchronous session mutation under its cross-process lock. */
 	withSessionFileLockSync<T>(sessionPath: string, operation: () => T): T {
 		return withFileLockSync(sessionPath, operation);
+	}
+
+	sessionClaimCount(sessionId: string): number {
+		return sessionLeases.get(sessionId)?.holders ?? 0;
 	}
 
 	/**

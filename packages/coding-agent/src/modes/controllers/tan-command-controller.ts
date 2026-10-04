@@ -149,6 +149,8 @@ export class TanCommandController {
 						const created = await sdk.createAgentSession({
 							cwd,
 							sessionManager: cloneManager,
+							// The parent's tail is still live; the fork already closed its dangling calls.
+							skipInterruptedTurnRepair: true,
 							model,
 							thinkingLevel,
 							systemPrompt,

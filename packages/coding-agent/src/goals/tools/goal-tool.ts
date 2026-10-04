@@ -55,6 +55,8 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
+	/** Changes goal state. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Goal";
 	readonly description = prompt.render(goalDescription);
 	readonly parameters = goalSchema;

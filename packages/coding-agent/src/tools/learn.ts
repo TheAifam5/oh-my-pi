@@ -48,6 +48,8 @@ export type LearnParams = typeof learnSchemaWithScope.infer;
  */
 export class LearnTool implements AgentTool<LearnSchema> {
 	readonly name = "learn";
+	/** Stores a lesson. */
+	readonly replay = "unsafe" as const;
 	/** A global lesson reaches every project's recall, so it needs the same approval as a file write. */
 	readonly approval = (args: unknown) => {
 		const params = args as Partial<LearnParams>;

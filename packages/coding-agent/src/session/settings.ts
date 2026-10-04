@@ -71,6 +71,32 @@ export const cfgPowerSleepPrevention = register({
 	},
 });
 
+export const cfgSessionFsyncUnsafeTools = register({
+	id: "session.fsyncUnsafeTools",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tools",
+		group: "Execution",
+		label: "Fsync Before Unsafe Tools",
+		description:
+			"Force the session file to disk before running a tool that is not declared safe to replay, so the call and its start record survive power loss on platforms where fsync reaches stable storage (macOS fsync does not force a full flush). Adds an fsync per such call; no effect on memory or remote session storage.",
+	},
+});
+
+export const cfgSessionRefuseUnsafeToolsWithoutJournal = register({
+	id: "session.refuseUnsafeToolsWithoutJournal",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tools",
+		group: "Execution",
+		label: "Refuse Unsafe Tools Without Journal",
+		description:
+			"While the session file cannot be written, refuse to run a tool that is not declared safe to replay, so no such call runs without a durable start record. Replay-safe tools, yield, and ask still run. Off: such a tool runs anyway and resume never reports it as not started.",
+	},
+});
+
 export const cfgPrewalkEnabled = register({
 	id: "prewalk.enabled",
 	type: "boolean",

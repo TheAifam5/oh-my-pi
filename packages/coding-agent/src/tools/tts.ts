@@ -177,6 +177,7 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 	label: "Speech Generation",
 	strict: false,
 	approval: "write",
+	replay: "unsafe",
 	description: prompt.render(ttsDescription, {
 		localVoices: KOKORO_VOICES.map(v => (v.id === DEFAULT_TTS_VOICE ? `${v.id} (default)` : v.id)).join(", "),
 		xaiVoices: formatVoiceList(),

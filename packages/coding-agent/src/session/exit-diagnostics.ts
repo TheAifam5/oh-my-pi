@@ -1,9 +1,28 @@
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, ToolReplayClass } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "./session-entries";
+import type { SessionManager } from "./session-manager";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
 export const SESSION_EXIT_CUSTOM_TYPE = "session_exit";
+
+/**
+ * Custom entry types core crash recovery reads as evidence. Extensions must
+ * not write them: a forged marker or exit record would change what resume
+ * reports about an interrupted turn.
+ */
+const RESERVED_RECOVERY_CUSTOM_TYPES: ReadonlySet<string> = new Set([
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
+	SESSION_EXIT_CUSTOM_TYPE,
+]);
+
+/** Throws when an extension tries to append a custom entry type reserved for crash recovery. */
+export function assertExtensionCustomEntryType(customType: string): void {
+	if (RESERVED_RECOVERY_CUSTOM_TYPES.has(customType)) {
+		throw new Error(`Custom entry type "${customType}" is reserved for session crash recovery.`);
+	}
+}
 
 /**
  * Compact projection of tool-call arguments persisted with the start marker.
@@ -16,13 +35,47 @@ export interface ToolArgumentSummary {
 	path?: string;
 }
 
-/** Persisted marker written before a tool implementation starts running. */
+/**
+ * Persisted marker written before a tool implementation starts running.
+ *
+ * When `assistantEntryId` is present, the marker was appended after that
+ * assistant entry and before the tool started. Markers without it come from
+ * writers that did not order the two, or from speculative execution, which
+ * starts before the assistant entry exists and so precedes it on the branch.
+ */
 export interface ToolExecutionStartData {
 	toolCallId: string;
 	toolName: string;
 	args?: ToolArgumentSummary;
 	intent?: string;
 	startedAt: string;
+	/** Replay class resolved from the tool when the call started. */
+	replay?: ToolReplayClass;
+	/** Session entry id of the assistant message that requested the call. */
+	assistantEntryId?: string;
+	/** Written when speculative execution started the call while the model was still streaming. */
+	speculative?: true;
+	/**
+	 * Set when the journal could not prove write-before-execute for this run:
+	 * `"degraded"` after a wait gave up or a journal step failed, `"deferred"`
+	 * on storage that confirms appends later, `"failed"` for a tombstone
+	 * written after journaling threw. Any such marker in a turn makes its
+	 * unmarked calls `"unknown"` instead of `"not_started"`.
+	 */
+	journal?: ToolJournalCondition;
+}
+
+/** Why a start marker cannot vouch for the write-before-execute order of its run. */
+export type ToolJournalCondition = "degraded" | "deferred" | "failed";
+
+/** Session entry ids are short random hex or Snowflake ids; anything else in a marker is ignored. */
+const ENTRY_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+
+/** ISO form of a persisted time string, or `undefined` when it does not parse. */
+function normalizeIsoTime(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length > 64) return undefined;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
 /** Tool call left without a matching toolResult at the end of a branch. */
@@ -33,6 +86,32 @@ export interface PendingToolCallDiagnostic {
 	intent?: string;
 	assistantTimestamp?: number;
 	startedAt?: string;
+	replay?: ToolReplayClass;
+}
+
+/** Details carried by a tool result written on resume for a call the previous process never finished. */
+export interface InterruptedToolResultDetails {
+	__interrupted: true;
+	/**
+	 * `"started"` when a start marker exists for the call. `"not_started"` only
+	 * when the turn was journaled before execution (another call of the same
+	 * turn has a marker naming the assistant entry), which proves an unmarked
+	 * call never ran. `"unknown"` otherwise: sessions written before start
+	 * journaling, or an exit before the turn's first marker.
+	 */
+	execution: "started" | "not_started" | "unknown";
+	resumed: true;
+	startedAt?: string;
+	args?: ToolArgumentSummary;
+	replay?: ToolReplayClass;
+}
+
+/** Records a resume must append to close an interrupted turn, in append order. */
+export interface InterruptedTurnRepair {
+	/** One result per call of the interrupted assistant turn that has no result yet. */
+	toolResults: ToolResultMessage<InterruptedToolResultDetails>[];
+	/** Terminal aborted assistant record; absent when the turn is already closed or no model metadata exists. */
+	abort?: AssistantMessage;
 }
 
 /** Session shutdown marker written during normal and fatal process teardown. */
@@ -70,6 +149,7 @@ function isPendingToolCallDiagnostic(value: unknown): value is PendingToolCallDi
 	if ("intent" in value && typeof value.intent !== "string") return false;
 	if ("assistantTimestamp" in value && typeof value.assistantTimestamp !== "number") return false;
 	if ("startedAt" in value && typeof value.startedAt !== "string") return false;
+	if ("replay" in value && value.replay !== "safe" && value.replay !== "unsafe") return false;
 	return true;
 }
 
@@ -98,25 +178,100 @@ function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
 	};
 }
 
+const INTERRUPTED_TURN_ERROR = "Previous OMP process exited before completing the turn.";
+const CRASHED_TURN_ERROR = "Previous OMP process exited without a shutdown record before completing the turn.";
+const SEPARATED_TURN_ERROR =
+	"This session copy was separated from a live OMP session that still owns the original file; the turn continues there.";
+
+/** Options for {@link planInterruptedTurnRepair}. */
+export interface InterruptedTurnRepairOptions {
+	/**
+	 * The branch is a copy split off a session another live process still
+	 * writes: its turn is not interrupted, only unreachable from here.
+	 */
+	separatedFromLiveSession?: boolean;
+}
+
+function isClosedByFailure(message: AssistantMessage | undefined): boolean {
+	return message?.stopReason === "error" || message?.stopReason === "aborted";
+}
+
+/** True when a yield result ends its run: the loop stops without another model call. */
+export function isTerminalYieldResult(toolName: string, isError: boolean | undefined, details: unknown): boolean {
+	if (toolName !== "yield" || isError) return false;
+	if (!isObject(details)) return true;
+	return !(
+		details.status === "success" &&
+		Array.isArray(details.type) &&
+		details.type.length > 0 &&
+		details.type.every(item => typeof item === "string")
+	);
+}
+
+/** A tool-result tail that ends its turn without a following assistant record. */
+function isSettledToolResultTail(message: ToolResultMessage): boolean {
+	if (isTerminalYieldResult(message.toolName, message.isError, message.details)) return true;
+	// Fork repair closes a live parent's in-flight calls with aborted synthetic results.
+	const details = message.details;
+	return isObject(details) && details.__synthetic === true && details.source === "assistant_stop_aborted";
+}
+
+function interruptedToolResult(
+	call: { id: string; name: string },
+	pending: PendingToolCallDiagnostic,
+	turnJournaled: boolean,
+	separated: boolean,
+	timestamp: number,
+): ToolResultMessage<InterruptedToolResultDetails> {
+	const args = summarizeToolArguments(pending.args);
+	// A separated copy's calls may still start or finish in the live session.
+	const execution: InterruptedToolResultDetails["execution"] = separated
+		? "unknown"
+		: pending.startedAt
+			? "started"
+			: turnJournaled
+				? "not_started"
+				: "unknown";
+	const details: InterruptedToolResultDetails = { __interrupted: true, execution, resumed: true };
+	if (pending.startedAt) details.startedAt = pending.startedAt;
+	if (args) details.args = args;
+	if (pending.replay) details.replay = pending.replay;
+	const callParts = [call.name];
+	appendArgumentSummary(callParts, args);
+	const callLabel = callParts.join(" ");
+	const text = separated
+		? `This session copy was separated from a live OMP session that still owns the original file; this call may still be running there, and its outcome is unknown here. It was not re-run. Call: ${callLabel}.`
+		: execution === "started"
+			? `Previous OMP process exited after this tool started (${pending.startedAt}) and before it returned; its outcome is unknown. It was not re-run. Call: ${callLabel}.`
+			: execution === "not_started"
+				? `Previous OMP process exited before this tool started; it was not executed. Call: ${callLabel}.`
+				: `Previous OMP process exited before this tool returned; whether it started is unknown. It was not re-run. Call: ${callLabel}.`;
+	return {
+		role: "toolResult",
+		toolCallId: call.id,
+		toolName: call.name,
+		content: [{ type: "text", text }],
+		details,
+		isError: true,
+		timestamp,
+	};
+}
+
 /**
- * createInterruptedTurnAbortMessage returns a terminal assistant record when
- * the latest persisted process exit follows a non-terminal conversation tail.
+ * Plans the records that close an interrupted turn at the end of the active
+ * branch. Detection reads the branch itself: an assistant turn with tool calls
+ * lacking results, a tool-result tail, or a user tail, with no settled
+ * assistant after it. A later `session_exit` only refines the outcome: a
+ * normal exit without pending calls marks a graceful stop and nothing is
+ * planned; any other exit, or none at all (crash, SIGKILL, power loss), plans
+ * a repair. Planning on an already repaired branch returns `undefined`.
  */
-export function createInterruptedTurnAbortMessage(
+export function planInterruptedTurnRepair(
 	entries: readonly SessionEntry[],
 	fallbackModel?: AssistantModelMetadata,
-): AssistantMessage | undefined {
-	let exitIndex = -1;
-	let exit: SessionExitData | undefined;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const candidate = readSessionExit(entries[index]!);
-		if (!candidate) continue;
-		exitIndex = index;
-		exit = candidate;
-		break;
-	}
-	if (!exit || (exit.kind === "normal" && !exit.pendingToolCalls?.length)) return undefined;
-
+	options?: InterruptedTurnRepairOptions,
+): InterruptedTurnRepair | undefined {
+	const separated = options?.separatedFromLiveSession === true;
 	let tailIndex = -1;
 	let tail: AgentMessage | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -126,79 +281,150 @@ export function createInterruptedTurnAbortMessage(
 		tail = entry.message;
 		break;
 	}
-	if (!tail || tailIndex > exitIndex) return undefined;
-	if (tail.role === "assistant" && !tail.content.some(isToolCallContent)) return undefined;
+	if (!isObject(tail)) return undefined;
+
+	let exit: SessionExitData | undefined;
+	for (let index = entries.length - 1; index > tailIndex; index--) {
+		exit = readSessionExit(entries[index]!);
+		if (exit) break;
+	}
+	if (exit?.kind === "normal" && !exit.pendingToolCalls?.length) return undefined;
 
 	let previousAssistant: AssistantMessage | undefined;
+	let previousAssistantIndex = -1;
 	for (let index = tailIndex; index >= 0; index--) {
 		const entry = entries[index]!;
-		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		if (entry.type !== "message" || !isObject(entry.message) || entry.message.role !== "assistant") continue;
 		previousAssistant = entry.message;
+		previousAssistantIndex = index;
 		break;
 	}
-	if (
-		tail.role === "toolResult" &&
-		(previousAssistant?.stopReason === "error" || previousAssistant?.stopReason === "aborted")
-	) {
+
+	let needsAbort: boolean;
+	let owner: AssistantMessage | undefined;
+	if (tail.role === "assistant") {
+		// Malformed persisted content means there is nothing reliable to close.
+		if (!Array.isArray(tail.content) || !tail.content.some(isToolCallContent)) return undefined;
+		owner = tail;
+		needsAbort = !isClosedByFailure(tail);
+	} else if (tail.role === "toolResult") {
+		owner = previousAssistant;
+		needsAbort = !isClosedByFailure(owner) && !isSettledToolResultTail(tail);
+	} else if (tail.role === "user" || tail.role === "fileMention") {
+		needsAbort = true;
+	} else {
 		return undefined;
 	}
-	const model = previousAssistant ?? fallbackModel;
-	if (!model) return undefined;
 
-	const recordedAt = Date.parse(exit.recordedAt);
-	return {
-		role: "assistant",
-		content: [],
-		api: model.api,
-		provider: model.provider,
-		model: model.model,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "aborted",
-		errorMessage: "Previous OMP process exited before completing the turn.",
-		timestamp: Number.isFinite(recordedAt) ? recordedAt : Date.now(),
-	};
-}
-
-/** Pairs the last interrupted assistant turn's unresolved calls before resume builds model context. */
-export function createInterruptedToolResults(entries: readonly SessionEntry[]): ToolResultMessage[] {
-	let tail: AgentMessage | undefined;
-	let assistant: AssistantMessage | undefined;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
-		if (entry?.type !== "message") continue;
-		tail ??= entry.message;
-		if (entry.message.role === "assistant") {
-			assistant = entry.message;
-			break;
+	const repairedAt = Date.now();
+	const toolResults: ToolResultMessage<InterruptedToolResultDetails>[] = [];
+	if (owner) {
+		const pending = new Map<string, PendingToolCallDiagnostic>();
+		for (const call of collectPendingToolCalls(entries)) {
+			if (call.toolCallId) pending.set(call.toolCallId, call);
+		}
+		const ownerContent: unknown[] = Array.isArray(owner.content) ? owner.content : [];
+		const calls: { id: string; name: string }[] = [];
+		for (const part of ownerContent) {
+			if (isToolCallContent(part) && typeof part.id === "string" && typeof part.name === "string") {
+				calls.push({ id: part.id, name: part.name });
+			}
+		}
+		const turnJournaled = isTurnJournaled(entries, previousAssistantIndex, new Set(calls.map(call => call.id)));
+		for (const call of calls) {
+			const record = pending.get(call.id);
+			if (record) toolResults.push(interruptedToolResult(call, record, turnJournaled, separated, repairedAt));
 		}
 	}
-	if (!assistant || (tail?.role !== "assistant" && tail?.role !== "toolResult")) return [];
-	const pendingIds = new Set(collectPendingToolCalls(entries).map(call => call.toolCallId));
-	const results: ToolResultMessage[] = [];
-	for (const call of assistant.content) {
-		if (call.type !== "toolCall" || !pendingIds.has(call.id)) continue;
-		results.push({
-			role: "toolResult",
-			toolCallId: call.id,
-			toolName: call.name,
-			content: [
-				{
-					type: "text",
-					text: "Previous OMP process exited before this tool returned; its outcome is unknown.",
-				},
-			],
-			isError: true,
-			timestamp: Date.now(),
-		});
+
+	let abort: AssistantMessage | undefined;
+	const model = previousAssistant ?? fallbackModel;
+	if (needsAbort && model) {
+		const recordedAt = exit ? Date.parse(exit.recordedAt) : Number.NaN;
+		abort = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.model,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "aborted",
+			errorMessage: separated ? SEPARATED_TURN_ERROR : exit ? INTERRUPTED_TURN_ERROR : CRASHED_TURN_ERROR,
+			timestamp: Number.isFinite(recordedAt) ? recordedAt : repairedAt,
+		};
 	}
-	return results;
+	if (toolResults.length === 0 && !abort) return undefined;
+	return abort ? { toolResults, abort } : { toolResults };
+}
+
+/**
+ * True when the turn's markers prove write-before-execute held: at least one
+ * marker for a call of this turn names the assistant entry, and no marker for
+ * a call of this turn reports a degraded journal.
+ */
+function isTurnJournaled(
+	entries: readonly SessionEntry[],
+	assistantIndex: number,
+	callIds: ReadonlySet<string>,
+): boolean {
+	const assistantEntryId = entries[assistantIndex]?.id;
+	if (assistantEntryId === undefined) return false;
+	let vouched = false;
+	for (let index = assistantIndex + 1; index < entries.length; index++) {
+		const marker = readToolExecutionStart(entries[index]!);
+		if (!marker || !callIds.has(marker.toolCallId)) continue;
+		if (marker.journal !== undefined) return false;
+		if (marker.assistantEntryId === assistantEntryId) vouched = true;
+	}
+	return vouched;
+}
+
+/** Session files whose skipped repair was already logged, so each is reported once per process. */
+const heldRepairSkipsLogged = new Set<string>();
+
+/**
+ * Closes an interrupted turn on the session's active branch: appends one
+ * interrupted result per unpaired call, then the terminal aborted assistant
+ * record. Planning and appending run in one synchronous block, so no other
+ * append in this process can interleave; a repeat call finds the repaired
+ * tail and appends nothing. Returns what was appended.
+ *
+ * Another live session in this process may be mid-turn on the same file, so
+ * nothing is appended then. When another process owns the file, the first
+ * append moves this session to a sibling copy; that copy is closed with
+ * wording that says the turn continues in the live session, so the copy never
+ * replays an unpaired tool call to a provider.
+ */
+export function repairInterruptedTurn(
+	sessionManager: SessionManager,
+	fallbackModel?: AssistantModelMetadata,
+): InterruptedTurnRepair | undefined {
+	const branch = sessionManager.getBranch();
+	if (!planInterruptedTurnRepair(branch, fallbackModel)) return undefined;
+	if (sessionManager.isSessionHeldByAnotherManager()) {
+		const sessionFile = sessionManager.getSessionFile();
+		if (sessionFile !== undefined && !heldRepairSkipsLogged.has(sessionFile)) {
+			heldRepairSkipsLogged.add(sessionFile);
+			logger.warn("Interrupted turn left unrepaired: another session manager in this process holds the session", {
+				sessionId: sessionManager.getSessionId(),
+				reason: "undisposed session manager",
+			});
+		}
+		return undefined;
+	}
+	const separatedFromLiveSession = sessionManager.isSessionOwnedElsewhere();
+	const repair = planInterruptedTurnRepair(branch, fallbackModel, { separatedFromLiveSession });
+	if (!repair) return undefined;
+	for (const result of repair.toolResults) sessionManager.appendMessage(result);
+	if (repair.abort) sessionManager.appendMessage(repair.abort);
+	return repair;
 }
 
 function isToolCallContent(value: unknown): value is ToolCallContent {
@@ -236,7 +462,8 @@ function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | u
 	const data = entry.data;
 	if (!isObject(data)) return undefined;
 	if (typeof data.toolCallId !== "string" || typeof data.toolName !== "string") return undefined;
-	const startedAt = typeof data.startedAt === "string" ? data.startedAt : entry.timestamp;
+	// Marker text reaches the model on resume: accept only times that parse, re-emitted as ISO.
+	const startedAt = normalizeIsoTime(data.startedAt) ?? normalizeIsoTime(entry.timestamp) ?? "unknown time";
 	const result: ToolExecutionStartData = {
 		toolCallId: data.toolCallId,
 		toolName: data.toolName,
@@ -248,6 +475,14 @@ function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | u
 		if (args) result.args = args;
 	}
 	if (typeof data.intent === "string") result.intent = data.intent;
+	if (data.replay === "safe" || data.replay === "unsafe") result.replay = data.replay;
+	if (typeof data.assistantEntryId === "string" && ENTRY_ID_PATTERN.test(data.assistantEntryId)) {
+		result.assistantEntryId = data.assistantEntryId;
+	}
+	if (data.speculative === true) result.speculative = true;
+	if (data.journal === "degraded" || data.journal === "deferred" || data.journal === "failed") {
+		result.journal = data.journal;
+	}
 	return result;
 }
 
@@ -276,11 +511,13 @@ function appendAssistantToolCalls(pending: Map<string, PendingToolCallRecord>, m
 function applyToolExecutionStart(pending: Map<string, PendingToolCallRecord>, marker: ToolExecutionStartData): void {
 	const existing = pending.get(marker.toolCallId);
 	if (existing) {
-		existing.startedAt = marker.startedAt;
+		// A speculative start precedes the dispatch marker; keep the earliest.
+		existing.startedAt ??= marker.startedAt;
 		// The assistant message carries the full arguments; the marker only has
 		// the command/path projection. Keep the richer copy when present.
 		existing.args ??= marker.args;
 		if (marker.intent) existing.intent = marker.intent;
+		if (marker.replay) existing.replay = marker.replay;
 		return;
 	}
 	const record: PendingToolCallRecord = {
@@ -291,6 +528,7 @@ function applyToolExecutionStart(pending: Map<string, PendingToolCallRecord>, ma
 		startedAt: marker.startedAt,
 	};
 	if (marker.intent) record.intent = marker.intent;
+	if (marker.replay) record.replay = marker.replay;
 	pending.set(marker.toolCallId, record);
 }
 
@@ -306,13 +544,27 @@ function applyMessageEntry(pending: Map<string, PendingToolCallRecord>, message:
 /** Finds tool calls left pending at the end of a session branch. */
 export function collectPendingToolCalls(entries: readonly SessionEntry[]): PendingToolCallDiagnostic[] {
 	const pending = new Map<string, PendingToolCallRecord>();
+	// Markers for calls no assistant entry has named yet: speculative execution
+	// journals its start while the model is still streaming the call.
+	const early = new Map<string, ToolExecutionStartData>();
 	for (const entry of entries) {
 		if (entry.type === "message") {
+			if (!isObject(entry.message)) continue;
 			applyMessageEntry(pending, entry.message);
+			if (entry.message.role === "assistant") {
+				for (const [toolCallId, marker] of early) {
+					if (pending.has(toolCallId)) applyToolExecutionStart(pending, marker);
+				}
+				early.clear();
+			} else if (entry.message.role === "toolResult") {
+				early.delete(entry.message.toolCallId);
+			}
 			continue;
 		}
 		const marker = readToolExecutionStart(entry);
-		if (marker) applyToolExecutionStart(pending, marker);
+		if (!marker) continue;
+		if (!pending.has(marker.toolCallId)) early.set(marker.toolCallId, marker);
+		applyToolExecutionStart(pending, marker);
 	}
 	return [...pending.values()].map(({ key: _key, ...toolCall }) => toolCall);
 }

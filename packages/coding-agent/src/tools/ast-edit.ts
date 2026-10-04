@@ -150,6 +150,8 @@ type AstEditSchemaInfer = typeof astEditSchema.infer;
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
 	readonly name = "ast_edit";
+	/** Mutates files. */
+	readonly replay = "unsafe" as const;
 	/** Strictest write decision ({@link strictestApproval}) over every path; "write" when none is given. */
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const paths = isRecord(args) ? args.paths : undefined;

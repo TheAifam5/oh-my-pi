@@ -323,6 +323,8 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 
 export class EditTool implements AgentTool<TInput> {
 	readonly name = "edit";
+	/** Mutates files. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Edit";
 	readonly loadMode = "essential";
 	readonly concurrency = "exclusive";

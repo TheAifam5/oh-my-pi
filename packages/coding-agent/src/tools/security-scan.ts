@@ -106,6 +106,8 @@ function textResult(text: string, details: SecurityScanToolDetails): AgentToolRe
 
 export class SecurityScanTool implements AgentTool<typeof securityScanSchema, SecurityScanToolDetails> {
 	readonly name = "security_scan";
+	/** Runs a scan with model calls. */
+	readonly replay = "unsafe" as const;
 	readonly approval: ToolTier = "exec";
 	readonly label = "Security Scan";
 	readonly loadMode = "discoverable";

@@ -206,6 +206,8 @@ const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
 
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
 	readonly name = "advise";
+	/** Consults an advisor model over the network. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Advise";
 	readonly description = adviseDescription;
 	readonly parameters = adviseSchema;

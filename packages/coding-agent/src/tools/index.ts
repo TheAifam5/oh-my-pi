@@ -1,4 +1,10 @@
-import type { AgentOptions, AgentTelemetryConfig, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentOptions,
+	AgentTelemetryConfig,
+	AgentTool,
+	AgentToolContext,
+	ToolReplay,
+} from "@oh-my-pi/pi-agent-core";
 import type { EditStore } from "@oh-my-pi/pi-natives";
 import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -556,6 +562,14 @@ export interface ToolSession {
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;
 
+/** A built-in tool that declares its crash-replay class explicitly. */
+type ReplayClassifiedTool = Tool & { readonly replay: ToolReplay };
+
+/** Factory for a built-in tool; `satisfies` on the registries rejects a built-in that omits `replay`. */
+type ClassifiedToolFactory = (
+	session: ToolSession,
+) => ReplayClassifiedTool | null | Promise<ReplayClassifiedTool | null>;
+
 /**
  * Public callable factory map. External callers may invoke `BUILTIN_TOOLS.read(session)` or
  * `BUILTIN_TOOLS[name](session)` to construct a tool directly.
@@ -591,13 +605,13 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
-};
+} satisfies Record<BuiltinToolName, ClassifiedToolFactory>;
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
 	think: () => new ThinkTool(),
 	yield: s => new YieldTool(s),
 	goal: s => new GoalTool(s),
-};
+} satisfies Record<HiddenToolName, ClassifiedToolFactory>;
 
 export type ToolName = BuiltinToolName;
 

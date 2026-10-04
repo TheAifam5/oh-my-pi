@@ -36,6 +36,7 @@ import {
 	type AsideMessage,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	type BeforeToolExecutionContext,
 	EventLoopKeepalive,
 	type QueuedMessagePreparation,
 	resolveTelemetry,
@@ -43,6 +44,7 @@ import {
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
 	type ThinkingLevel,
 	type ToolChoiceDirective,
+	type ToolReplayClass,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
@@ -202,6 +204,7 @@ import type { SecretObfuscator } from "../secrets/obfuscator";
 import { cfgSecretsEnabled } from "../secrets/settings";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import { flushSharpshooterExtraction } from "../sharpshooter/extract";
+import type { SpeculativeToolStart } from "../speculation/host";
 import { toolReadsSkillUris } from "../system-prompt";
 import {
 	AUTO_THINKING,
@@ -213,7 +216,7 @@ import {
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
-import { resolveApproval } from "../tools/approval";
+import { resolveApproval, resolveToolReplayClass } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import {
@@ -322,7 +325,8 @@ import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
-	createInterruptedTurnAbortMessage,
+	isTerminalYieldResult,
+	repairInterruptedTurn,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -439,6 +443,8 @@ import {
 	cfgExternalThinking,
 	cfgPowerSleepPrevention,
 	cfgPrewalkEnabled,
+	cfgSessionFsyncUnsafeTools,
+	cfgSessionRefuseUnsafeToolsWithoutJournal,
 	cfgProviderAppendOnlyContext,
 	cfgProvidersCacheWarming,
 	cfgProvidersCacheRetention,
@@ -639,6 +645,22 @@ type SetSessionNameWithTrigger = (
 ) => Promise<boolean>;
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
+/**
+ * Refusal to start an unsafe tool while the session file cannot record its
+ * start. The message is model-visible, so it never carries the storage error.
+ */
+class ToolJournalRefusal extends Error {
+	constructor(toolName: string, cause: Error) {
+		super(`Session journal is failing; refusing to start ${toolName} without a durable start record.`, { cause });
+		this.name = "ToolJournalRefusal";
+	}
+}
+
+/** Tools a failing journal never refuses: refusing them would block a subagent's result or the user's answer. */
+const JOURNAL_REFUSAL_EXEMPT_TOOLS: ReadonlySet<string> = new Set(["yield", "ask"]);
+
+/** Upper bound a tool waits for its assistant message and start marker to be journaled before it runs anyway. */
+const TOOL_JOURNAL_WAIT_MS = 2_000;
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
 
 const INTERRUPTED_THINKING_MIN_CHARS = 60;
@@ -881,6 +903,18 @@ export class AgentSession implements SettingsScope {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
+	/** Tool calls whose start marker `#beforeToolExecution` wrote; the start event skips them once. */
+	#hookRecordedToolStarts = new Set<string>();
+	/** Set when a journal wait ran out its budget; later tools in the same run start without waiting. */
+	#toolJournalStalled = false;
+	/** Set once a journal step failed in the current run, so the failure is logged once. */
+	#toolJournalFailureLogged = false;
+	/** Set once a journal step stalled, failed, or threw in the current run; later markers carry `journal: "degraded"`. */
+	#toolJournalDegraded = false;
+	/** Set once the session has shown a failed fsync notice, so it is shown once per session. */
+	#fsyncFailureNoticed = false;
+	/** Persistence keys a tool is waiting on before its assistant message's `message_end` arrived. */
+	#messageEndArrivalWaiters = new Map<string, PromiseWithResolvers<void>>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
 
 	// Custom commands (TypeScript slash commands)
@@ -1971,6 +2005,9 @@ export class AgentSession implements SettingsScope {
 		// time so a block/revision lands before concurrency resolution,
 		// tool_execution_start, and the wrapper's approval gate.
 		this.agent.beforeToolCall = (ctx, signal) => this.#beforeToolCall(ctx, signal);
+		// Write-before-execute: the owning assistant entry and the start marker
+		// are journaled before the tool runs, so a crash leaves honest evidence.
+		this.agent.beforeToolExecution = (ctx, signal) => this.#beforeToolExecution(ctx, signal);
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#todo.syncFromBranch();
@@ -2940,18 +2977,309 @@ export class AgentSession implements SettingsScope {
 		this.#emit({ type: "notice", level, message, source });
 	}
 
-	#recordToolExecutionStart(event: Extract<AgentEvent, { type: "tool_execution_start" }>): void {
+	#toolExecutionStartData(
+		toolCallId: string,
+		toolName: string,
+		args: unknown,
+		intent?: string,
+	): ToolExecutionStartData {
 		const data: ToolExecutionStartData = {
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
+			toolCallId,
+			toolName,
 			startedAt: new Date().toISOString(),
 		};
 		// The assistant message already persists the full arguments; store only
 		// the command/path projection the resume warning renders.
-		const args = summarizeToolArguments(event.args);
-		if (args) data.args = args;
-		if (event.intent) data.intent = event.intent;
+		const summary = summarizeToolArguments(args);
+		if (summary) data.args = summary;
+		if (intent) data.intent = intent;
+		return data;
+	}
+
+	/**
+	 * Fallback start marker for `tool_execution_start` events the
+	 * `beforeToolExecution` hook did not journal: synthetic results for calls
+	 * that never ran and externally emitted (Cursor exec) tool events. Chained
+	 * behind queued message persistence so the marker lands after its
+	 * assistant entry.
+	 */
+	#recordToolExecutionStart(event: Extract<AgentEvent, { type: "tool_execution_start" }>): void {
+		if (this.#hookRecordedToolStarts.delete(event.toolCallId)) return;
+		const data = this.#toolExecutionStartData(event.toolCallId, event.toolName, event.args, event.intent);
+		this.#appendStartMarkerAfterQueuedPersistence(data, this.#promptGeneration);
+	}
+
+	/**
+	 * Journal a speculative start before it happens. The model is still
+	 * streaming the call, so the marker precedes its assistant entry; resume
+	 * pairs it with the call by id. Never throws.
+	 */
+	recordSpeculativeToolStart(start: SpeculativeToolStart): void {
+		if (this.#unsubscribeAgent === undefined) return;
+		try {
+			const { toolCall, tool, args } = start;
+			const data = this.#toolExecutionStartData(toolCall.id, toolCall.name, args, toolCall.intent);
+			data.replay = resolveToolReplayClass(tool, args);
+			data.speculative = true;
+			this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+		} catch (error) {
+			logger.warn("Failed to record speculative tool start", {
+				toolCallId: start.toolCall.id,
+				error: toError(error).message,
+			});
+		}
+	}
+
+	/** Append a start marker once every message persistence queued so far has run. */
+	#appendStartMarkerAfterQueuedPersistence(data: ToolExecutionStartData, promptGeneration: number): void {
+		this.#messageEndPersistenceTail = this.#messageEndPersistenceTail
+			.then(() => {
+				if (this.#promptGeneration !== promptGeneration) return;
+				this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+			})
+			.catch(error => {
+				logger.warn("Failed to record tool start marker", {
+					toolCallId: data.toolCallId,
+					error: toError(error).message,
+				});
+			});
+	}
+
+	/**
+	 * Journals a call before it runs: waits until the owning assistant entry is
+	 * persisted, appends the start marker synchronously (with its replay class,
+	 * the assistant entry id once known, and a `journal` condition whenever
+	 * write-before-execute cannot be vouched for), waits until the store
+	 * confirms it, and, with `session.fsyncUnsafeTools`, forces the session to
+	 * stable storage before an unsafe call. The waits share one
+	 * {@link TOOL_JOURNAL_WAIT_MS} budget and end early on abort; once a wait
+	 * runs out its budget, the rest of the run skips them. Nothing is written
+	 * once the session moved to another transcript.
+	 *
+	 * Journal trouble is logged once per run and the tool runs; markers written
+	 * after it carry a `journal` condition and a best-effort tombstone covers a
+	 * call whose own marker could not vouch, so resume never reports such a call
+	 * as not started. With `session.refuseUnsafeToolsWithoutJournal`, an unsafe
+	 * tool other than `yield` and `ask` is refused instead while the session
+	 * file cannot be written at all.
+	 */
+	async #beforeToolExecution(ctx: BeforeToolExecutionContext, signal?: AbortSignal): Promise<void> {
+		try {
+			await this.#journalToolStart(ctx, signal);
+		} catch (error) {
+			if (error instanceof ToolJournalRefusal) throw error;
+			this.#toolJournalDegraded = true;
+			logger.warn("Tool start journaling failed; running the tool anyway", {
+				toolCallId: ctx.toolCall.id,
+				error: toError(error).message,
+			});
+			this.#writeToolStartTombstone(ctx);
+		}
+	}
+
+	/**
+	 * Best-effort marker for a call whose own marker cannot vouch for the turn,
+	 * so resume never calls it not started. `replay` defaults to `"unsafe"` when
+	 * the class was never computed.
+	 */
+	#writeToolStartTombstone(ctx: BeforeToolExecutionContext, replay: ToolReplayClass = "unsafe"): void {
+		try {
+			this.#hookRecordedToolStarts.add(ctx.toolCall.id);
+			this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+				toolCallId: ctx.toolCall.id,
+				toolName: ctx.toolCall.name,
+				startedAt: new Date().toISOString(),
+				replay,
+				journal: "failed",
+			} satisfies ToolExecutionStartData);
+		} catch (error) {
+			logger.warn("Failed to write tool start tombstone", {
+				toolCallId: ctx.toolCall.id,
+				error: toError(error).message,
+			});
+		}
+	}
+
+	async #journalToolStart(ctx: BeforeToolExecutionContext, signal?: AbortSignal): Promise<void> {
+		// Disconnected from agent events: this run is not journaled by this session.
+		if (this.#unsubscribeAgent === undefined) {
+			this.#toolJournalDegraded = true;
+			return;
+		}
+		const promptGeneration = this.#promptGeneration;
+		// The run started before a session transition: its entries belong to the old transcript.
+		if (promptGeneration !== this.#activeAgentPromptGeneration) {
+			this.#toolJournalDegraded = true;
+			return;
+		}
+		const { assistantMessage, toolCall, tool, args } = ctx;
+		const deadline = Date.now() + TOOL_JOURNAL_WAIT_MS;
+		const persisted = await this.#awaitJournalStep(
+			this.#assistantPersistence(assistantMessage),
+			deadline,
+			signal,
+			"assistant message persistence",
+			toolCall.id,
+		);
+		if (this.#promptGeneration !== promptGeneration) {
+			this.#toolJournalDegraded = true;
+			return;
+		}
+		if (persisted === "aborted") {
+			// The loop skips an aborted call; the tombstone keeps a sibling marker from vouching for it either way.
+			this.#toolJournalDegraded = true;
+			this.#writeToolStartTombstone(ctx);
+			return;
+		}
+		const assistantEntryId = this.#persistedSessionEntryId(assistantMessage);
+		const replay = resolveToolReplayClass(tool, args);
+		const data = this.#toolExecutionStartData(toolCall.id, toolCall.name, args, toolCall.intent);
+		data.replay = replay;
+		if (assistantEntryId) data.assistantEntryId = assistantEntryId;
+		const appliesInBody = this.sessionManager.appendsApplyInBody();
+		if (appliesInBody && this.sessionManager.getPersistenceError()) this.#toolJournalDegraded = true;
+		if (!appliesInBody) data.journal = "deferred";
+		else if (this.#toolJournalDegraded) data.journal = "degraded";
+		// Appended synchronously in every outcome: a marker that lands before its
+		// assistant entry is paired by id on resume and still proves the start.
+		this.#hookRecordedToolStarts.add(toolCall.id);
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+		// Deferred-publish storage never vouches for not-started calls (`journal: "deferred"`), and its
+		// latch can be a transient self-conflict, so only in-body storage counts as failing.
+		const persistenceError = appliesInBody ? this.sessionManager.getPersistenceError() : undefined;
+		if (persistenceError) {
+			if (data.journal === undefined) {
+				// The failure latched on this marker's own append, which therefore cannot vouch for the turn.
+				this.#toolJournalDegraded = true;
+				this.#writeToolStartTombstone(ctx, replay);
+			}
+			if (!this.#toolJournalFailureLogged) {
+				this.#toolJournalFailureLogged = true;
+				logger.warn("Session journal is failing; tools start without a durable start record", {
+					toolCallId: toolCall.id,
+					error: persistenceError.message,
+				});
+			}
+			if (
+				replay === "unsafe" &&
+				!JOURNAL_REFUSAL_EXEMPT_TOOLS.has(tool.name) &&
+				cfgSessionRefuseUnsafeToolsWithoutJournal.get(this.settings)
+			) {
+				logger.warn("Refusing unsafe tool while the session journal is failing", {
+					toolCallId: toolCall.id,
+					toolName: tool.name,
+					error: persistenceError.message,
+				});
+				throw new ToolJournalRefusal(tool.name, persistenceError);
+			}
+		}
+		const confirmed = await this.#awaitJournalStep(
+			this.sessionManager.confirmAppends(),
+			deadline,
+			signal,
+			"session storage confirmation",
+			toolCall.id,
+		);
+		if (confirmed === "aborted" || this.#promptGeneration !== promptGeneration) return;
+		if (replay === "unsafe" && cfgSessionFsyncUnsafeTools.get(this.settings)) {
+			try {
+				this.sessionManager.fsyncSync();
+			} catch (error) {
+				const message = toError(error).message;
+				logger.warn("Session fsync before unsafe tool failed", { toolCallId: toolCall.id, error: message });
+				if (!this.#fsyncFailureNoticed) {
+					this.#fsyncFailureNoticed = true;
+					this.emitNotice("warning", `Session fsync before unsafe tools is failing: ${message}`, "session-fsync");
+				}
+			}
+		}
+	}
+
+	/**
+	 * The assistant message's `message_end` persistence. A tool can reach its
+	 * start before `message_end` is delivered to this session, so a key not yet
+	 * queued resolves once it is queued and then persisted.
+	 */
+	#assistantPersistence(message: AssistantMessage): Promise<void> {
+		const key = sessionMessagePersistenceKey(message);
+		if (key === undefined || this.#persistedSessionEntryId(message) !== undefined) return Promise.resolve();
+		const pending = this.#pendingMessageEndPersistence.get(key);
+		if (pending) return pending;
+		let arrival = this.#messageEndArrivalWaiters.get(key);
+		if (!arrival) {
+			arrival = Promise.withResolvers<void>();
+			this.#messageEndArrivalWaiters.set(key, arrival);
+		}
+		const queued = arrival;
+		return queued.promise.then(() => this.#pendingMessageEndPersistence.get(key));
+	}
+
+	/** Await one journal step until `deadline` (epoch ms) or abort; failures and timeouts are logged, not thrown. */
+	async #awaitJournalStep(
+		step: Promise<unknown>,
+		deadline: number,
+		signal: AbortSignal | undefined,
+		label: string,
+		toolCallId: string,
+	): Promise<"done" | "failed" | "timeout" | "aborted"> {
+		if (signal?.aborted) return "aborted";
+		if (this.#toolJournalStalled) return "timeout";
+		const stop = Promise.withResolvers<"timeout" | "aborted">();
+		const timer = setTimeout(() => stop.resolve("timeout"), Math.max(0, deadline - Date.now()));
+		const onAbort = () => stop.resolve("aborted");
+		signal?.addEventListener("abort", onAbort, { once: true });
+		let failure: unknown;
+		let outcome: "done" | "failed" | "timeout" | "aborted";
+		try {
+			outcome = await Promise.race([
+				step.then(
+					() => "done" as const,
+					error => {
+						failure = error;
+						return "failed" as const;
+					},
+				),
+				stop.promise,
+			]);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+		if (outcome === "timeout" || outcome === "failed") this.#toolJournalDegraded = true;
+		if (outcome === "timeout") {
+			this.#toolJournalStalled = true;
+			logger.warn("Session journal stalled; tools in this run start without waiting for it", {
+				toolCallId,
+				step: label,
+				budgetMs: TOOL_JOURNAL_WAIT_MS,
+			});
+		} else if (outcome === "failed" && !this.#toolJournalFailureLogged) {
+			// A latched disk failure rejects every confirmation; report it once per run.
+			this.#toolJournalFailureLogged = true;
+			logger.warn("Tool starting before its journal step completed", {
+				toolCallId,
+				step: label,
+				error: toError(failure).message,
+			});
+		}
+		return outcome;
+	}
+
+	/** Session entry id holding `message` on the current branch, if it is persisted. */
+	#persistedSessionEntryId(message: AssistantMessage): string | undefined {
+		const stamped = (message as PersistedAssistantMessage)[kPersistedSessionEntryId];
+		if (stamped !== undefined) return stamped;
+		// A structurally identical entry (or the Cursor split's copy) carries no stamp.
+		const key = sessionMessagePersistenceKey(message);
+		if (key === undefined || !this.#ensurePersistedMessageKeys().has(key)) return undefined;
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			if (sessionMessagePersistenceKey(entry.message) !== key) continue;
+			if (sameMessageContent(entry.message, message)) return entry.id;
+		}
+		return undefined;
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
@@ -3183,7 +3511,14 @@ export class AgentSession implements SettingsScope {
 					this.#pendingMessageEndPersistence.delete(key);
 				}
 			});
-		if (key !== undefined) this.#pendingMessageEndPersistence.set(key, pending);
+		if (key !== undefined) {
+			this.#pendingMessageEndPersistence.set(key, pending);
+			const arrival = this.#messageEndArrivalWaiters.get(key);
+			if (arrival) {
+				this.#messageEndArrivalWaiters.delete(key);
+				arrival.resolve();
+			}
+		}
 		this.#messageEndPersistenceTail = pending.catch(() => {});
 		return pending;
 	}
@@ -3506,6 +3841,13 @@ export class AgentSession implements SettingsScope {
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
 			this.#activeAgentPromptGeneration = eventPromptGeneration;
+			this.#hookRecordedToolStarts.clear();
+			this.#toolJournalStalled = false;
+			this.#toolJournalFailureLogged = false;
+			this.#toolJournalDegraded = false;
+			// A waiter whose message_end never arrived belongs to a finished run.
+			for (const arrival of this.#messageEndArrivalWaiters.values()) arrival.resolve();
+			this.#messageEndArrivalWaiters.clear();
 			this.#prunedTerminalFailure = undefined;
 			this.#advisors.onPrimaryAgentStart();
 			this.#emitRunState("running");
@@ -9836,16 +10178,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#isTerminalYieldToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
-		if (event.toolName !== "yield" || event.isError) return false;
-		const details = event.result?.details;
-		if (!details || typeof details !== "object") return true;
-		const record = details as Record<string, unknown>;
-		return !(
-			record.status === "success" &&
-			Array.isArray(record.type) &&
-			record.type.length > 0 &&
-			record.type.every(item => typeof item === "string")
-		);
+		return isTerminalYieldResult(event.toolName, event.isError, event.result?.details);
 	}
 
 	#markTerminalYieldToolCall(toolCallId: string): void {
@@ -10673,6 +11006,12 @@ export class AgentSession implements SettingsScope {
 			onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
 			/** Collab snapshot adoption keeps the guest's process cwd and marks the replica runtime-only. */
 			preserveLocalCwd?: boolean;
+			/**
+			 * Leave an interrupted-looking tail untouched instead of closing it.
+			 * Collab replicas mirror a live host's journal, whose in-flight turn
+			 * only the host may close.
+			 */
+			skipInterruptedTurnRepair?: boolean;
 		},
 	): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
@@ -10856,14 +11195,13 @@ export class AgentSession implements SettingsScope {
 			}
 
 			const model = this.model;
-			if (model) {
-				const interruptedTurnAbort = createInterruptedTurnAbortMessage(this.sessionManager.getBranch(), {
+			if (model && !options?.skipInterruptedTurnRepair) {
+				const interruptedTurnRepair = repairInterruptedTurn(this.sessionManager, {
 					api: model.api,
 					provider: model.provider,
 					model: model.id,
 				});
-				if (interruptedTurnAbort) {
-					this.sessionManager.appendMessage(interruptedTurnAbort);
+				if (interruptedTurnRepair) {
 					sessionContext = this.buildDisplaySessionContext();
 					this.agent.replaceMessages(sessionContext.messages);
 				}

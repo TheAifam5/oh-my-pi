@@ -11,9 +11,8 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	collectPendingToolCalls,
-	createInterruptedToolResults,
-	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
+	planInterruptedTurnRepair,
 	SESSION_EXIT_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
@@ -93,12 +92,18 @@ describe("session exit diagnostics", () => {
 			toolName: "bash",
 			args: { command: "bun run check:ts" },
 		});
-		await Promise.resolve();
+		// The fallback marker is chained behind queued message persistence.
+		await Bun.sleep(0);
 
-		const marker = sessionManager
-			.getEntries()
-			.find(entry => entry.type === "custom" && entry.customType === TOOL_EXECUTION_START_CUSTOM_TYPE);
+		const entries = sessionManager.getEntries();
+		const markerIndex = entries.findIndex(
+			entry => entry.type === "custom" && entry.customType === TOOL_EXECUTION_START_CUSTOM_TYPE,
+		);
+		const marker = entries[markerIndex];
 		if (marker?.type !== "custom") throw new Error("Expected tool execution start marker");
+		const assistantIndex = entries.findIndex(entry => entry.type === "message" && entry.message.role === "assistant");
+		expect(assistantIndex).toBeGreaterThanOrEqual(0);
+		expect(markerIndex).toBeGreaterThan(assistantIndex);
 		expect(marker.data).toMatchObject({
 			toolCallId: "toolu_repro",
 			toolName: "bash",
@@ -298,7 +303,7 @@ describe("session exit diagnostics", () => {
 			recordedAt: "2026-07-11T02:20:08.800Z",
 		});
 
-		const recovered = createInterruptedTurnAbortMessage(sessionManager.getBranch());
+		const recovered = planInterruptedTurnRepair(sessionManager.getBranch())?.abort;
 		expect(recovered).toMatchObject({
 			role: "assistant",
 			content: [],
@@ -310,7 +315,7 @@ describe("session exit diagnostics", () => {
 		expect(recovered?.errorMessage).toContain("process exited");
 
 		sessionManager.appendMessage(recovered!);
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toBeUndefined();
 		expect(
 			sessionManager
 				.buildSessionContext()
@@ -333,7 +338,7 @@ describe("session exit diagnostics", () => {
 			pendingToolCalls: [{ toolCallId: "toolu_repro", toolName: "bash" }],
 		});
 
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toMatchObject({
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toMatchObject({
 			role: "assistant",
 			stopReason: "aborted",
 		});
@@ -350,7 +355,7 @@ describe("session exit diagnostics", () => {
 			pendingToolCalls: "not an array",
 		});
 
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toBeUndefined();
 	});
 
 	it("reconstructs an interrupted assistant tool-call tail", () => {
@@ -363,7 +368,7 @@ describe("session exit diagnostics", () => {
 			recordedAt: "2026-07-11T02:20:08.800Z",
 		});
 
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toMatchObject({
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toMatchObject({
 			role: "assistant",
 			content: [],
 			api: pendingAssistant.api,
@@ -404,9 +409,9 @@ describe("session exit diagnostics", () => {
 		});
 
 		const branch = sessionManager.getBranch();
-		const aborted = createInterruptedTurnAbortMessage(branch);
+		const aborted = planInterruptedTurnRepair(branch)?.abort;
 		expect(aborted).toBeDefined();
-		for (const result of createInterruptedToolResults(branch)) sessionManager.appendMessage(result);
+		for (const result of planInterruptedTurnRepair(branch)?.toolResults ?? []) sessionManager.appendMessage(result);
 		sessionManager.appendMessage(aborted!);
 		const context = sessionManager.buildSessionContext().messages;
 		expect(context).toContainEqual(
@@ -430,7 +435,7 @@ describe("session exit diagnostics", () => {
 		expect(
 			context.filter(message => message.role === "toolResult" && message.toolCallId === "toolu_done"),
 		).toHaveLength(1);
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toBeUndefined();
 	});
 
 	it("reconstructs tool-call content even when stopReason is stop", () => {
@@ -443,7 +448,7 @@ describe("session exit diagnostics", () => {
 			recordedAt: "2026-07-11T02:20:08.800Z",
 		});
 
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toMatchObject({
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toMatchObject({
 			role: "assistant",
 			stopReason: "aborted",
 		});
@@ -467,7 +472,7 @@ describe("session exit diagnostics", () => {
 			recordedAt: "2026-07-11T02:20:08.800Z",
 		});
 
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+		expect(planInterruptedTurnRepair(sessionManager.getBranch())?.abort).toBeUndefined();
 	});
 
 	it("reconstructs a first user-message tail with selected model metadata", () => {
@@ -480,11 +485,11 @@ describe("session exit diagnostics", () => {
 		});
 
 		expect(
-			createInterruptedTurnAbortMessage(sessionManager.getBranch(), {
+			planInterruptedTurnRepair(sessionManager.getBranch(), {
 				api: pendingAssistant.api,
 				provider: pendingAssistant.provider,
 				model: pendingAssistant.model,
-			}),
+			})?.abort,
 		).toMatchObject({
 			role: "assistant",
 			api: pendingAssistant.api,
@@ -494,7 +499,7 @@ describe("session exit diagnostics", () => {
 		});
 	});
 
-	it("does not reconstruct clean, completed, or superseded exits", () => {
+	it("does not reconstruct clean or completed exits, and treats an exit before the tail as a crash", () => {
 		const normalExit = SessionManager.inMemory();
 		normalExit.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
 		normalExit.appendMessage(pendingAssistant);
@@ -527,8 +532,13 @@ describe("session exit diagnostics", () => {
 		});
 		supersededExit.appendMessage({ role: "user", content: "new turn", timestamp: Date.now() });
 
-		expect(createInterruptedTurnAbortMessage(normalExit.getBranch())).toBeUndefined();
-		expect(createInterruptedTurnAbortMessage(completedTurn.getBranch())).toBeUndefined();
-		expect(createInterruptedTurnAbortMessage(supersededExit.getBranch())).toBeUndefined();
+		expect(planInterruptedTurnRepair(normalExit.getBranch())?.abort).toBeUndefined();
+		expect(planInterruptedTurnRepair(completedTurn.getBranch())?.abort).toBeUndefined();
+		// The exit record precedes the new turn, so it says nothing about it: the
+		// user tail without a later record is a crash.
+		expect(planInterruptedTurnRepair(supersededExit.getBranch())?.abort).toMatchObject({
+			stopReason: "aborted",
+			errorMessage: expect.stringContaining("without a shutdown record"),
+		});
 	});
 });

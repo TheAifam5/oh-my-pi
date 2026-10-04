@@ -28,6 +28,7 @@ import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import type { SendUserMessageOptions } from "../../session/agent-session";
+import { assertExtensionCustomEntryType } from "../../session/exit-diagnostics";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { isFilesystemSourcePath } from "../../tools/path-utils";
@@ -305,6 +306,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	appendEntry(customType: string, data?: unknown): void {
+		assertExtensionCustomEntryType(customType);
 		this.runtime.appendEntry(customType, data);
 	}
 

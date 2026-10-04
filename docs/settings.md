@@ -626,6 +626,8 @@ tools:
 | `tools.xdevInlineDevices` | array | `[]` | Dynamic-device name globs to inline in `builtins` mode; ignored in `catalog` mode. |
 | `async.enabled` | boolean | `true` | Enable async bash commands and background task execution. |
 | `async.maxJobs` | number | `100` | Running background-job cap, floored to at least 1; parked/queued jobs do not consume execution slots. |
+| `session.fsyncUnsafeTools` | boolean | `false` | Fsync the session file and its directory before running a tool whose replay class is `unsafe` (any tool that does not declare `replay: "safe"`), so the call and its start marker survive power loss on platforms where fsync reaches stable storage (macOS fsync does not force a full flush). File-backed sessions only; a failed fsync shows a warning and the tool still runs. See [session custom entries](./session.md). |
+| `session.refuseUnsafeToolsWithoutJournal` | boolean | `false` | While the session file cannot be written (a latched write failure on file or memory storage), refuse a tool whose replay class is `unsafe` with an error result instead of running it without a durable start record. Replay-safe tools, `yield`, and `ask` still run. Off: the tool runs, the failure is logged, and resume never reports a call of that turn as not started. See [session custom entries](./session.md). |
 
 Mounting still follows the session's explicit tool allow-list. A session that permits `read` but omits `write` can receive a device-only write transport; this does not grant filesystem writes.
 

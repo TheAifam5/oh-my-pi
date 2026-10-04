@@ -542,6 +542,8 @@ function resolveDisassemblyReference(memoryReference: string | undefined): strin
 
 export class DebugTool implements AgentTool<typeof debugSchema, DebugExecutionDetails> {
 	readonly name = "debug";
+	/** Drives a debugger against a live process. */
+	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawAction = (args as Partial<DebugParams>).action;
 		const action = typeof rawAction === "string" ? rawAction.toLowerCase() : "";

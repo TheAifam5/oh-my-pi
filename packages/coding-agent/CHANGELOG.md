@@ -5,11 +5,19 @@
 ### Fixed
 
 - Fixed follow-up hashline edits being rejected as anchored on lines "never displayed" after an earlier edit shifted those lines, when the replacement carries the anchored content; genuinely stale line numbers are still rejected ([#14254](https://github.com/can1357/oh-my-pi/pull/14254) by [@abilliontokens](https://github.com/abilliontokens)).
+- Resuming a session after a crash or kill now closes the interrupted turn: each unfinished tool call is recorded as started with an unknown outcome, not started, or unknown whether it started, and nothing is re-run
+- Tools now wait up to 2 seconds for the assistant message that requested them to be saved to the session before starting; when saving stalls or fails they still run, and resume reports their outcome as unknown
 
 ### Added
 
 - Added `omp config schema` to print the JSON Schema of `config.yml` (or write it with `--out`) for editor validation and autocomplete; the schema also ships as `omp-config.schema.json` with each GitHub release
 - Added `package` on stdio MCP servers: OMP runs the project's installed npm package, or a runner fetching the pinned version, following the `local-first`, `local-only`, or `fallback-only` policy; defaults come from the new `mcp.packageRunner` (`bunx`), `mcp.packageRuntime` (`bun`), and `mcp.packagePolicy` settings
+- Added the `session.fsyncUnsafeTools` setting to force the session file to disk before running a tool that is not safe to replay
+- Added the `session.refuseUnsafeToolsWithoutJournal` setting to refuse tools that are not safe to replay while the session file cannot be written (`yield` and `ask` still run); off by default
+
+### Changed
+
+- Extension and hook `pi.appendEntry()` now throws for the reserved custom entry types `tool_execution_start` and `session_exit`
 
 ## [18.6.0] - 2026-10-03
 
