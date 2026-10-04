@@ -70,7 +70,7 @@ import {
 	parseModelGroupDefinition,
 	parseModelRoleValue,
 } from "./model-groups";
-import { cfgModelGroups, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import { cfgAllowProjectMeteredPools, cfgModelGroups, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
 import { cfgRetryFallbackChains } from "../session/settings";
 import { cfgShellPath } from "../exec/settings";
 
@@ -491,6 +491,25 @@ function parseModelGroupEntry(
 	}
 }
 
+/** How {@link modelGroupLayerForMerge} treats one layer. */
+interface ModelGroupLayerPolicy {
+	source: ModelGroupLayerSource;
+	/** Whether the project layer may add metered funding and redefine `definedBelow` groups (`allowProjectMeteredPools`). */
+	allowProjectMetered: boolean;
+	/** Group names the global layer, a `--config` overlay, a runtime override, or an overlay parent defines. */
+	definedBelow?: ReadonlySet<string>;
+}
+
+/** The group a parsed model-group entry defines inline; `undefined` for selectors and group references. */
+function definedGroup(
+	section: (typeof MODEL_GROUP_RECORDS)[number]["section"],
+	value: unknown,
+): ModelGroup | undefined {
+	if (section === "modelGroups") return value as ModelGroup;
+	const parsed = value as ParsedModelValue;
+	return parsed.kind === "group" ? parsed.group : undefined;
+}
+
 /** `layer` with `value` at `segments` (`undefined` removes it); records on the path are copied, `layer` never mutated. */
 function withLayerValue(layer: RawSettings, segments: readonly string[], value: unknown): RawSettings {
 	const result: RawSettings = { ...layer };
@@ -514,14 +533,21 @@ function withLayerValue(layer: RawSettings, segments: readonly string[], value: 
  *   tolerant parse rejects is dropped, so the layer below shows through. Legacy selector strings
  *   and lists pass unchanged.
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
- *   dropped (a `null` record silently), and entry `null`s are dropped (a cleared entry falls back
- *   to global).
+ *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
+ *   to global), and `allowProjectMeteredPools` is dropped. Unless `allowProjectMetered`, a
+ *   `modelGroups` entry named in `definedBelow` and an inline group whose funding includes
+ *   `metered` are dropped too.
  *
  * Every change is reported through `warn`. Returns `layer` itself when nothing changes.
  */
-function modelGroupLayerForMerge(layer: RawSettings, source: ModelGroupLayerSource, warn: ModelGroupWarn): RawSettings {
-	const project = source === "project";
+function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPolicy, warn: ModelGroupWarn): RawSettings {
+	const project = policy.source === "project";
+	const restricted = project && !policy.allowProjectMetered;
 	let result = layer;
+	if (project && Object.hasOwn(layer, cfgAllowProjectMeteredPools.id)) {
+		warn(cfgAllowProjectMeteredPools.id, "is read from the global config only; ignored in project settings");
+		result = withLayerValue(result, cfgAllowProjectMeteredPools.segments, undefined);
+	}
 	for (const { segments, section } of MODEL_GROUP_RECORDS) {
 		const record = getByPath(layer, segments);
 		const prefix = segments.join(".");
@@ -553,8 +579,24 @@ function modelGroupLayerForMerge(layer: RawSettings, source: ModelGroupLayerSour
 			}
 			if (value === null || value === undefined) continue;
 			if (section !== "modelGroups" && !isModelGroupForm(value)) continue;
+			if (restricted && section === "modelGroups" && policy.definedBelow?.has(key)) {
+				warn(
+					path,
+					"is defined by the global config, a --config overlay, or a runtime override; project definition ignored (see allowProjectMeteredPools)",
+				);
+				drop(key);
+				continue;
+			}
 			const parsed = parseModelGroupEntry(section, key, value);
 			if (parsed.ok) {
+				if (restricted && definedGroup(section, parsed.value)?.routing?.funding?.includes("metered")) {
+					warn(
+						`${path}.routing.funding.order`,
+						"metered funding may only be configured globally (see allowProjectMeteredPools); project entry ignored",
+					);
+					drop(key);
+					continue;
+				}
 				for (const issue of parsed.warnings) warn(issue.path, issue.message);
 				continue;
 			}
@@ -4587,22 +4629,41 @@ export class Settings {
 
 	/**
 	 * `layers` as they merge: the project layer through {@link projectLayerForMerge}, and every layer
-	 * through {@link modelGroupLayerForMerge}.
+	 * through {@link modelGroupLayerForMerge}, the project one restricted unless
+	 * `allowProjectMeteredPools` allows it.
 	 */
 	#modelGroupLayers(layers: OwnLayers): OwnLayers {
 		const warn =
 			(source: ModelGroupLayerSource): ModelGroupWarn =>
 			(path, message, issues) =>
 				this.#warnModelGroupOnce(source, path, message, issues);
-		const global = modelGroupLayerForMerge(layers.global, "global", warn("global"));
-		const configOverlay = modelGroupLayerForMerge(layers.configOverlay, "overlay", warn("overlay"));
-		const overrides = modelGroupLayerForMerge(layers.overrides, "runtime", warn("runtime"));
+		const unrestricted = (source: ModelGroupLayerSource): ModelGroupLayerPolicy => ({
+			source,
+			allowProjectMetered: true,
+		});
+		const global = modelGroupLayerForMerge(layers.global, unrestricted("global"), warn("global"));
+		const configOverlay = modelGroupLayerForMerge(layers.configOverlay, unrestricted("overlay"), warn("overlay"));
+		const overrides = modelGroupLayerForMerge(layers.overrides, unrestricted("runtime"), warn("runtime"));
+		const definedBelow = new Set<string>(this.#parent ? Object.keys(cfgModelGroups.get(this.#parent)) : []);
+		for (const layer of [global, configOverlay, overrides]) {
+			const groups = getByPath(layer, cfgModelGroups.segments);
+			if (isRecord(groups)) for (const name of Object.keys(groups)) definedBelow.add(name);
+		}
 		const project = modelGroupLayerForMerge(
 			projectLayerForMerge(layers.project, (segments, reason) => this.#warnProjectDrop(segments, reason)),
-			"project",
+			{ source: "project", allowProjectMetered: this.#allowProjectMeteredPools(layers), definedBelow },
 			warn("project"),
 		);
 		return { global, project, configOverlay, overrides };
+	}
+
+	/** `allowProjectMeteredPools` from the runtime, `--config` overlay, or global layer, else the overlay parent's. */
+	#allowProjectMeteredPools(layers: OwnLayers): boolean {
+		for (const layer of [layers.overrides, layers.configOverlay, layers.global]) {
+			const value = getByPath(layer, cfgAllowProjectMeteredPools.segments);
+			if (typeof value === "boolean") return value;
+		}
+		return this.#parent ? cfgAllowProjectMeteredPools.get(this.#parent) : false;
 	}
 
 	/** {@link #modelGroupLayers} of the live layers, computed once per {@link revision}. */

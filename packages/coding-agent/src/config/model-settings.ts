@@ -131,6 +131,17 @@ export const cfgModelGroups = register({
 	validateWrite: raw => assertModelGroupSectionWritable("modelGroups", raw),
 });
 
+/**
+ * Lets project settings add pools whose funding includes `metered` and redefine `modelGroups`
+ * entries that a lower layer defines. Read from the global config, `--config` overlays, and runtime
+ * overrides; a project-layer value is ignored with a warning.
+ */
+export const cfgAllowProjectMeteredPools = register({
+	id: "allowProjectMeteredPools",
+	type: "boolean",
+	default: false,
+});
+
 /** Named model presets; no settings-panel UI — managed by `/modelpreset` and the model hub. */
 export const cfgModelPresets = register({
 	id: "modelPresets",
