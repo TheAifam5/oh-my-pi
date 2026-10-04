@@ -357,7 +357,6 @@ export const cfgDefaultTools = register({
 	validate: validateDefaultTools,
 	merge: mergeDefaultTools,
 	dropInvalidInProject: true,
-	ignoreProjectNulls: true,
 	ui: {
 		tab: "tools",
 		group: "Available Tools",
