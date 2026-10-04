@@ -66,7 +66,7 @@ export async function loadCustomContextFiles(ctx: LoadContext): Promise<LoadResu
 	const seen = new Set<string>();
 
 	for (const name of names) {
-		const loaded = await loadStandaloneContextFiles(ctx, PROVIDER_ID, name);
+		const loaded = await loadStandaloneContextFiles(ctx, PROVIDER_ID, [name]);
 		if (loaded.warnings) warnings.push(...loaded.warnings);
 		for (const item of loaded.items) pushFile(items, seen, item);
 	}

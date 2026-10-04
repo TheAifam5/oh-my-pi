@@ -20,17 +20,22 @@ import {
 	cfgCompactionModelThresholds,
 	cfgCompactionModelThresholdsEnabled,
 	cfgExtendedContext,
+	resolveCompactionSettings,
 } from "./context-settings";
 
-/** The compaction policy in force for `model`: the configured policy with its `compaction.modelThresholds` entry applied. */
+/**
+ * The compaction policy in force for `model`: the configured policy with its `compaction.modelThresholds`
+ * entry applied, then its `compaction.modelOverrides` budgets ({@link resolveCompactionSettings}).
+ */
 export function resolveModelCompactionSettings(
 	scope: ScopeLike,
-	model: { provider: string; id: string } | null | undefined,
+	model: { provider: string; id: string; contextWindow?: number | null } | null | undefined,
 ): CompactionSettings {
 	const thresholds = cfgCompactionModelThresholdsEnabled.get(scope)
 		? cfgCompactionModelThresholds.get(scope)
 		: undefined;
-	return applyModelCompactionThreshold(cfgCompaction.get(scope), thresholds, model);
+	const withThreshold = applyModelCompactionThreshold(cfgCompaction.get(scope), thresholds, model);
+	return resolveCompactionSettings(scope, model ?? undefined, withThreshold);
 }
 
 /** Where auto-compaction triggers for `model` and which setting decides it, for the model hub preview. */

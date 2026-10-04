@@ -285,6 +285,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_switch",
 			emit,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session, sessionManager } = buildSession(tempDir, extensionRunner);
 		sessionManager.appendMessage({ role: "user", content: "current", timestamp: 1 });

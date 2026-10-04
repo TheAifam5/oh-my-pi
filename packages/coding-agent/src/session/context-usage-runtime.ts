@@ -24,7 +24,11 @@ export function getSessionCompactionBoundaries(
 	model?: Model | null,
 ): CompactionBoundaries | null {
 	if (!(contextWindow > 0)) return null;
-	const configured = resolveModelCompactionSettings(settings, model);
+	// The caller's window clamps the per-model overrides, so they agree with the arithmetic below.
+	const configured = resolveModelCompactionSettings(
+		settings,
+		model ? { provider: model.provider, id: model.id, contextWindow } : undefined,
+	);
 	const compaction: CompactionSettings = configured;
 	if (!compaction.enabled || compaction.strategy === "off") return null;
 	const threshold = resolveThresholdTokens(contextWindow, compaction);

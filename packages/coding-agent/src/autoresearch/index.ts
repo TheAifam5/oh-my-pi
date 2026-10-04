@@ -3,7 +3,7 @@ import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
-import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
+import { type ExtensionContext, type ExtensionFactory, isSessionReplacementStart } from "../extensibility/extensions";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import { createDashboardController } from "@oh-my-pi/pi-tui/apps/autoresearch-dashboard";
 import { currentResults, findBaselineMetric, findBaselineRunNumber } from "@oh-my-pi/pi-tui/apps/autoresearch-data";
@@ -244,7 +244,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		},
 	});
 
-	api.on("session_start", (_event, ctx) => rehydrate(ctx));
+	// Replacement starts are already covered by session_switch/session_branch.
+	api.on("session_start", (event, ctx) => (isSessionReplacementStart(event) ? undefined : rehydrate(ctx)));
 	api.on("session_switch", (_event, ctx) => rehydrate(ctx));
 	api.on("session_branch", (_event, ctx) => rehydrate(ctx));
 	api.on("session_tree", (_event, ctx) => rehydrate(ctx));

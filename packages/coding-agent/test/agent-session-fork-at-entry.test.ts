@@ -89,6 +89,7 @@ describe("AgentSession.fork(entryId)", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
+			invalidate: () => {},
 		} as unknown as ExtensionRunner;
 		const { session, forkAt } = await createSeededSession(extensionRunner);
 		const sourceFile = session.sessionFile!;
@@ -128,6 +129,7 @@ describe("AgentSession.fork(entryId)", () => {
 				session!.trackEvalExecution(Promise.withResolvers<void>().promise, userEval).catch(() => undefined);
 				return undefined;
 			},
+			invalidate: () => {},
 		} as unknown as ExtensionRunner;
 		const { session: seeded, forkAt } = await createSeededSession(extensionRunner);
 		const sourceFile = seeded.sessionFile!;
@@ -199,6 +201,7 @@ describe("AgentSession.fork(entryId)", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
+			invalidate: () => {},
 		} as unknown as ExtensionRunner;
 		const { session } = await createSeededSession(extensionRunner);
 		const manager = session.sessionManager;

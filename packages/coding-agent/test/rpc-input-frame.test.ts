@@ -644,7 +644,9 @@ describe("RpcInputDispatcher", () => {
 					// Mirrors the real RPC "prompt" handler: the response is held until
 					// the message is admitted (or settles without ever being admitted).
 					const admitted = Promise.withResolvers<void>();
-					const settled = session.prompt(command.message, { onPromptAdmitted: admitted.resolve }).catch(() => {});
+					const settled = session
+						.prompt(command.message, { onPromptAdmitted: () => admitted.resolve() })
+						.catch(() => {});
 					await Promise.race([admitted.promise, settled]);
 					return { id: command.id, type: "response", command: "prompt", success: true };
 				}

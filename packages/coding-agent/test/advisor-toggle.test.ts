@@ -962,6 +962,7 @@ describe("AgentSession advisor toggle", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-");
 		const branchManager = SessionManager.create(branchDir.path(), branchDir.path());
@@ -1005,6 +1006,7 @@ describe("AgentSession advisor toggle", () => {
 				if (event.type === "session_branch") throw failure;
 				return undefined;
 			},
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-fail-");
 		const branchManager = SessionManager.create(branchDir.path(), branchDir.path());

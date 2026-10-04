@@ -2951,6 +2951,7 @@ const streamAnthropicOnce = (
 					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
 					maxRetries: 0,
 					...(perRequestHeaders ? { headers: perRequestHeaders } : {}),
+					...(options?.transformHeaders ? { transformHeaders: options.transformHeaders } : {}),
 				};
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta

@@ -127,6 +127,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -285,6 +286,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -325,6 +327,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -449,6 +452,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				stopCount++;
 				return Promise.resolve({ continue: true, additionalContext: "Must not restart." });
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		session = new AgentSession({
 			agent,
@@ -491,6 +495,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitSessionStop: vi.fn(() =>
 				Promise.resolve({ continue: true, additionalContext: "Run another advisory pass." }),
 			),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -526,6 +531,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					stopCount <= 10 ? { decision: "block" as const, reason: "Run another pass." } : undefined,
 				);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -559,6 +565,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				stopCount++;
 				return Promise.resolve(stopCount === 1 ? { decision: "block" as const } : undefined);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -588,6 +595,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -617,6 +625,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -653,6 +662,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -694,6 +704,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -770,6 +781,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn().mockReturnValue(false),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -1522,6 +1534,7 @@ describe("AgentSession TTSR resume gate", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_start"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		const sessionManager = SessionManager.inMemory();
@@ -1624,6 +1637,7 @@ describe("AgentSession TTSR resume gate", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "turn_start"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		const sessionManager = SessionManager.inMemory();

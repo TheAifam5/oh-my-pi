@@ -35,6 +35,7 @@ import { isFilesystemSourcePath } from "../../tools/path-utils";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
 import { resolveExtensionDirectory } from "./directory-resolution";
+import { applyPiToolMetadata } from "./tool-metadata";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 
@@ -48,6 +49,7 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
+	MarkdownTransformer,
 	MessageRenderer,
 	PreparedExtension,
 	ProviderConfig,
@@ -208,15 +210,25 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		}
 	}
 
-	on<F extends HandlerFn>(event: string, handler: F): void {
-		const list = this.extension.handlers.get(event) ?? [];
-		list.push(handler);
-		this.extension.handlers.set(event, list);
+	on<F extends HandlerFn>(event: string, handler: F): () => void {
+		// Each registration gets its own identity so registering one function twice
+		// unsubscribes independently. Lists are replaced, never mutated, so a dispatch
+		// already iterating a list is unaffected by handlers added or removed mid-run.
+		const registered: HandlerFn = (...args) => handler(...args);
+		const handlers = this.extension.handlers;
+		handlers.set(event, [...(handlers.get(event) ?? []), registered]);
+		return () => {
+			const current = handlers.get(event);
+			if (!current?.includes(registered)) return;
+			const remaining = current.filter(entry => entry !== registered);
+			if (remaining.length === 0) handlers.delete(event);
+			else handlers.set(event, remaining);
+		};
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		const registered = {
-			definition: tool,
+			definition: applyPiToolMetadata(tool),
 			extensionPath: this.extension.path,
 			sourceInfo: extensionToolSourceInfo(tool, this.extension.resolvedPath),
 		};
@@ -273,6 +285,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void {
 		this.extension.assistantThinkingRenderers.push(renderer);
+	}
+
+	registerMarkdownTransformer(transformer: MarkdownTransformer): void {
+		this.extension.markdownTransformer = transformer;
 	}
 
 	registerComposerShape(definition: ComposerShapeDefinition): void {

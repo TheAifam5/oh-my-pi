@@ -1168,6 +1168,8 @@ export class SessionMaintenance {
 			onCommitted?.();
 		};
 		let methodAttempted = false;
+		// Reported by `session_compact_failed` when the hook-supplied compaction fails to commit.
+		let compactionFromExtension = false;
 		// No-op rejections (too small / already compacted) make no history change
 		// in this pass, so an interrupted or inherited turn resumes on them like on
 		// a commit; a hook cancel or summarizer failure does not resume.
@@ -1327,6 +1329,7 @@ export class SessionMaintenance {
 				if (result?.compaction) {
 					hookCompaction = result.compaction;
 					fromExtension = true;
+					compactionFromExtension = true;
 				}
 			}
 
@@ -1597,6 +1600,17 @@ export class SessionMaintenance {
 					compactionAbortController,
 					markCommitted,
 				);
+			}
+			if (!rejectedAsNoOp) {
+				const aborted = compactionAbortController.signal.aborted || error instanceof CompactionCancelledError;
+				await this.#host.extensionRunner?.emit({
+					type: "session_compact_failed",
+					reason: "manual",
+					aborted,
+					...(aborted ? {} : { errorMessage: err.message }),
+					willRetry: false,
+					fromExtension: compactionFromExtension,
+				});
 			}
 			options?.onError?.(err);
 			throw error;

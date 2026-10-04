@@ -2053,6 +2053,7 @@ describe("AgentSession retry delay cap", () => {
 			emitBeforeAgentStart: async () => undefined,
 			hasHandlers: () => false,
 			emitSessionStop: async () => undefined,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

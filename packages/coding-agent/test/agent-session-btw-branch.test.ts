@@ -191,6 +191,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
 			emit,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -223,6 +224,7 @@ describe("AgentSession.branchFromBtw", () => {
 				await hookRelease.promise;
 				return undefined;
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -263,6 +265,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
 			emit: vi.fn(async () => ({ skipConversationRestore: true })),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -389,6 +392,7 @@ describe("AgentSession.branchFromBtw", () => {
 				await hookRelease.promise;
 				return undefined;
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });

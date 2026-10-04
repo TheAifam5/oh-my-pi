@@ -519,7 +519,7 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"steer", "follow_up"}:
             queue_name = "steering" if command_type == "steer" else "followUp"
             queued_messages[queue_name].append(command["message"])
-            respond(request_id, command_type, {})
+            respond(request_id, command_type, {"disposition": "queued"})
             print(json.dumps({"type": "queue_update", "steering": queued_messages["steering"], "followUp": queued_messages["followUp"]}), flush=True)
         elif command_type == "remove_queued_message":
             items = queued_messages.get(command.get("queue"))
@@ -532,6 +532,11 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, command_type, {"removed": removed})
             if removed:
                 print(json.dumps({"type": "queue_update", "steering": queued_messages["steering"], "followUp": queued_messages["followUp"]}), flush=True)
+        elif command_type == "clear_queue":
+            cleared = {"steering": list(queued_messages["steering"]), "followUp": list(queued_messages["followUp"])}
+            queued_messages["steering"].clear()
+            queued_messages["followUp"].clear()
+            respond(request_id, command_type, cleared)
         elif command_type == "promote_queued_message":
             promoted = command["message"] in queued_messages["followUp"]
             if promoted:
@@ -570,9 +575,9 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"prompt", "abort_and_prompt"}:
             message = command["message"]
             if message == "/local":
-                respond(request_id, command_type, {"agentInvoked": False})
+                respond(request_id, command_type, {"agentInvoked": False, "disposition": "handled"})
                 continue
-            respond(request_id, command_type, {})
+            respond(request_id, command_type, {"disposition": "started"})
             pending_prompt_id = request_id
             if message == "after stale run":
                 # A terminal agent_end and prompt_result left over from an
@@ -1259,6 +1264,37 @@ class RpcClientTests(unittest.TestCase):
             self.assertIs(client.remove_queued_message("missing", "followUp").removed, False)
             self.assertEqual(client.get_state().queued_message_count, 1)
             self.assertIs(client.remove_queued_message("keep", "followUp").removed, True)
+
+    def test_clear_queue_returns_and_removes_queued_text(self) -> None:
+        with self.make_client() as client:
+            self.assertEqual(client.steer("now").disposition, "queued")
+            self.assertEqual(client.follow_up("later").disposition, "queued")
+
+            cleared = client.clear_queue()
+
+            self.assertEqual(cleared.steering, ("now",))
+            self.assertEqual(cleared.follow_up, ("later",))
+            self.assertEqual(client.get_state().queued_message_count, 0)
+            self.assertEqual(client.clear_queue().follow_up, ())
+
+    def test_prompt_with_disposition_reports_handled_and_started(self) -> None:
+        with self.make_client() as client:
+            self.assertEqual(client.prompt_with_disposition("/local").disposition, "handled")
+            submission = client.prompt_with_disposition("hello")
+            self.assertEqual(submission.disposition, "started")
+            self.assertTrue(submission.id)
+
+    def test_dispositions_are_none_from_servers_that_omit_them(self) -> None:
+        server = FAKE_SERVER.replace(
+            'respond(request_id, command_type, {"disposition": "queued"})',
+            "respond(request_id, command_type, {})",
+        ).replace(
+            'respond(request_id, command_type, {"agentInvoked": False, "disposition": "handled"})',
+            'respond(request_id, command_type, {"agentInvoked": False})',
+        )
+        with self.make_client(server) as client:
+            self.assertIsNone(client.steer("now").disposition)
+            self.assertIsNone(client.prompt_with_disposition("/local").disposition)
 
     def test_queue_update_event_matches_get_state_and_removal_invariant(self) -> None:
         updates: list[QueueUpdateEvent] = []

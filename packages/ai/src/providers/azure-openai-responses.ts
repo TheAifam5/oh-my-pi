@@ -175,6 +175,7 @@ const streamAzureOpenAIResponsesOnce = (
 						// the first-event watchdog aborts `requestSignal`, so retries
 						// cannot extend the caller's deadline.
 						onSseEvent: rawSseObserver,
+						transformHeaders: options?.transformHeaders,
 					});
 					openaiStream = handle.events;
 					break;

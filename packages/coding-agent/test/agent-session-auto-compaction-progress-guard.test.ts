@@ -93,6 +93,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			initialize: () => {},
 			onError: () => {},
 			hasHandlers: (type: string) => compactHookEnabled && type === "session_before_compact",
+			invalidate: () => {},
 			emit: async (event: {
 				type: string;
 				preparation?: CompactionPreparation;

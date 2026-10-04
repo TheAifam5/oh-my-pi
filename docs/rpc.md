@@ -130,6 +130,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "remove_queued_message", message: string, queue: "steering" | "followUp" }`
 - `{ id?, type: "promote_queued_message", message: string }`
+- `{ id?, type: "clear_queue" }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "abort_and_restore_queue" }`
@@ -326,6 +327,14 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 }
 ```
 
+`data.disposition` reports what happened to the submitted prompt at admission:
+
+- `"handled"`: an extension `input` handler, or a builtin, extension, or custom slash command, consumed the prompt. A builtin that schedules a turn (such as `/retry`) also sets `data.agentInvoked: true`.
+- `"queued"`: the prompt was queued into a live run (`streamingBehavior`).
+- `"started"`: the prompt was accepted to start a run. A prompt that settles without ever being admitted (superseded before dispatch, dropped by an `abort`, or failing first) also reports `"started"`; its `prompt_result` reports how it ended.
+
+The disposition describes admission only, not completion, and not independent work an extension command starts. Only the builtin-command response carries `data.agentInvoked`; check `data.agentInvoked === false`, not the presence of `data`, for local completion.
+
 `data.agentInvoked: false` is the completion signal for builtin slash commands that finish synchronously without starting an agent turn; no `prompt_result` follows. Every other accepted `prompt` (and every `abort_and_prompt`) is completed by one `prompt_result` frame carrying the command `id`, once its local outcome or agent yield is known. Background work need not have settled:
 
 ```json
@@ -426,6 +435,21 @@ Before aborting, the server withdraws every user-authored steering and follow-up
 `data.steering` and `data.followUp` list the withdrawn messages oldest first, as `{ text, images? }` with `text` being the queue-chip text, so a client can put them back in its editor. The command otherwise behaves like `abort`: it stops goal continuation, cancels input received before it that is not yet admitted (that input is dropped, not returned), and responds after the abort completes. Older runtimes reject this command. The TypeScript client exposes `abortAndRestoreQueue(): Promise<{ steering, followUp }>`.
 
 The response always succeeds, even when the withdrawn input is too large for one response under the negotiated protocol (1 MiB per frame on v1, 64 MiB reassembled on v2). Instead of failing with a transport-limit error, which would lose the already-withdrawn input, the server first omits every entry's `images` and sets `data.imagesDropped: true`, keeping all texts. If the texts alone still do not fit, it returns only the oldest entries that fit (steering first, then follow-ups) and sets `data.truncated: true`; entries after the last one listed are gone. Neither flag is present when the full result fits.
+
+### `steer` and `follow_up` payloads
+
+A successful `steer` or `follow_up` response carries `data.disposition`. `"queued"` means the message was placed on its queue; it does not guarantee the message stays queued, since it may be delivered, removed, or cleared later. `"handled"` means an extension `input` handler consumed the message, or left it empty, so nothing was queued. A message superseded before dispatch (by `abort_and_prompt`, a session change, or shutdown) is answered without `data.disposition`. The TypeScript client's `steer()` and `followUp()` resolve this value (`undefined` from servers that predate it), and `promptWithDisposition(message, images?, streamingBehavior?)` resolves `{ id, disposition }` for a `prompt`. The Python client's `steer()` and `follow_up()` return a `QueuedInputAck` whose `disposition` carries it (`None` from servers that predate it), and `prompt_with_disposition()` returns a `PromptSubmission` with `id` and `disposition`.
+
+### `clear_queue` payload
+
+Removes every queued user-authored steering and follow-up message and returns their queued text:
+
+```json
+{"id":"req_4","type":"clear_queue"}
+{"id":"req_4","type":"response","command":"clear_queue","success":true,"data":{"steering":["Change direction"],"followUp":["Summarize when finished"]}}
+```
+
+Agent-authored queued entries (advisor cards, hidden goal or plan notices, IRC and extension asides) stay queued, matching the TUI's dequeue shortcut. User-authored entries are every queued user message on the session, whoever submitted it: the RPC client's own `prompt`, `steer`, and `follow_up` messages, and messages an extension queued with `sendUserMessage`. An RPC session has one command channel and one client, so no other client's messages are queued there. Attached images are removed with their messages but are not returned. The change is reported through `queue_update`. To restore queued input to a client editor on interrupt, use `abort_and_restore_queue`; a plain `abort` continues any queued messages still in the session. The TypeScript client exposes `clearQueue(): Promise<{ steering: string[]; followUp: string[] }>`. The Python client exposes `clear_queue() -> ClearedQueue` with `steering` and `follow_up` tuples.
 
 ### `get_state` payload
 

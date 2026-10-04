@@ -29,6 +29,7 @@ import {
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
 	type ExtensionWidgetOptions,
+	type WorkingIndicatorOptions,
 	getExtensionUISelectOptionLabel,
 	timedOutAskDialogResult,
 } from "../../extensibility/extensions";
@@ -48,7 +49,7 @@ import {
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
-import { type AgentSession, SessionBusyError } from "../../session/agent-session";
+import { type AgentSession, type PromptAdmission, SessionBusyError } from "../../session/agent-session";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
@@ -103,6 +104,7 @@ import type {
 	RpcHostUriRequest,
 	RpcHostUriResult,
 	RpcOpenSessionResult,
+	RpcPromptDisposition,
 	RpcRemoveQueuedMessageResult,
 	RpcResponse,
 	RpcSessionState,
@@ -248,7 +250,7 @@ export type RpcSessionChangeResult =
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
 export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
-export type RpcSkillCommandResult = { agentInvoked: true };
+export type RpcSkillCommandResult = { agentInvoked: true; disposition?: RpcPromptDisposition };
 
 export interface RpcSkillInvocation extends SkillPromptInput {
 	skill: Skill;
@@ -281,7 +283,7 @@ export async function runRpcSkillCommand(
 	invocation: RpcSkillInvocation,
 	streamingBehavior: "steer" | "followUp" = "steer",
 	prebuilt?: BuiltSkillPromptMessage,
-	onPromptAdmitted?: () => void,
+	onPromptAdmitted?: (admission: PromptAdmission) => void,
 	images?: ImageContent[],
 ): Promise<boolean> {
 	const built = prebuilt ?? (await buildSkillPromptMessage(invocation.skill, invocation, "user"));
@@ -331,7 +333,7 @@ export async function dispatchRpcSkillPrompt(input: {
 	if (input.isCurrent && !input.isCurrent()) return "cancelled";
 	// A failure before admission still resolves this wait (without rejecting this
 	// call) — reportPromptResult already routed it to onError and a failed prompt_result.
-	await watchAndReportPromptResult({
+	const admission = await watchAndReportPromptResult({
 		ticket: input.ticket,
 		startPrompt: onPromptAdmitted =>
 			runRpcSkillCommand(
@@ -346,7 +348,7 @@ export async function dispatchRpcSkillPrompt(input: {
 		onError: input.onError,
 		extensionUserMessageTracker: input.extensionUserMessageTracker,
 	});
-	return { agentInvoked: true };
+	return { agentInvoked: true, disposition: admission ?? "started" };
 }
 
 export async function tryRunRpcSkillCommand(
@@ -1510,6 +1512,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// Not supported in RPC mode
 		}
 
+		setWorkingVisible(_visible: boolean): void {
+			// Not supported in RPC mode
+		}
+
+		setWorkingIndicator(_options?: WorkingIndicatorOptions): void {
+			// Not supported in RPC mode
+		}
+
+		setHiddenThinkingLabel(_label?: string): void {
+			// Not supported in RPC mode
+		}
+
 		setWidget(key: string, content: unknown, options?: ExtensionWidgetOptions): void {
 			// Only support string arrays in RPC mode - factory functions are ignored
 			if (content === undefined || Array.isArray(content)) {
@@ -1760,7 +1774,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 	const inputGate = new RpcUserInputGate();
 	type OrderedUserInput = Extract<RpcCommand, { type: "prompt" | "steer" | "follow_up" | "abort_and_prompt" }>;
-	type OrderedInputOutcome = "local" | "cancelled" | "admitted" | "builtin-agent";
+	/** `"local"` was consumed before admission; a {@link PromptAdmission} value says how the input was admitted. */
+	type OrderedInputOutcome = "local" | "cancelled" | "builtin-agent" | PromptAdmission;
 	const dispatchOrderedUserInput = (
 		command: OrderedUserInput,
 		ticket: RpcPromptTicket | undefined,
@@ -1784,11 +1799,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
 				await session.steer(text, images);
-				return "admitted";
+				return "queued";
 			}
 			if (command.type === "follow_up") {
 				await session.followUp(text, images);
-				return "admitted";
+				return "queued";
 			}
 			if (command.type === "prompt") {
 				if (!ticket) return "cancelled";
@@ -1804,7 +1819,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					isCurrent,
 				});
 				if (skillResult === "cancelled") return "cancelled";
-				if (skillResult) return "admitted";
+				if (skillResult) return skillResult.disposition ?? "started";
 				const builtinAbort = new AbortController();
 				builtinCommandAborts.add(builtinAbort);
 				let backgroundedBuiltin = false;
@@ -1862,7 +1877,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				}
 			}
 			if (!isCurrent() || !ticket) return "cancelled";
-			await watchAndReportPromptResult({
+			const admission = await watchAndReportPromptResult({
 				ticket,
 				startPrompt: onPromptAdmitted =>
 					session.prompt(text, {
@@ -1874,7 +1889,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				onError: onPromptError(command.id, command.type),
 				extensionUserMessageTracker,
 			});
-			return "admitted";
+			return admission ?? "started";
 		});
 	// Abort controllers for builtin commands whose work outlives the prompt
 	// response (e.g. the `/mcp reauth` browser wait, dispatched through
@@ -1912,14 +1927,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					const outcome = await dispatchOrderedUserInput(command, ticket);
 					if (outcome === "local") {
 						promptResults.discard(ticket);
-						return success(id, "prompt", { agentInvoked: false });
+						return success(id, "prompt", { agentInvoked: false, disposition: "handled" });
 					}
-					if (outcome === "builtin-agent") return success(id, "prompt", { agentInvoked: true });
+					if (outcome === "builtin-agent") {
+						return success(id, "prompt", { agentInvoked: true, disposition: "handled" });
+					}
+					// A prompt that settles without admission (superseded, dropped by an abort, or
+					// failed first) reports "started": it was accepted, and its prompt_result says how it ended.
 					if (outcome === "cancelled") {
 						promptResults.settle(ticket);
-						return success(id, "prompt");
+						return success(id, "prompt", { disposition: "started" });
 					}
-					return success(id, "prompt");
+					return success(id, "prompt", { disposition: outcome });
 				} catch (promptSetupError) {
 					promptResults.discard(ticket);
 					throw promptSetupError;
@@ -1928,8 +1947,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "steer":
 			case "follow_up": {
-				await dispatchOrderedUserInput(command, undefined);
-				return success(id, command.type);
+				const outcome = await dispatchOrderedUserInput(command, undefined);
+				if (outcome === "cancelled") return success(id, command.type);
+				return success(id, command.type, { disposition: outcome === "local" ? "handled" : "queued" });
+			}
+
+			case "clear_queue": {
+				const cleared = session.clearQueue();
+				return success(id, "clear_queue", {
+					steering: cleared.steering.map(message => message.text),
+					followUp: cleared.followUp.map(message => message.text),
+				});
 			}
 
 			case "remove_queued_message": {

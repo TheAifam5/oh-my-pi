@@ -1,4 +1,4 @@
-import { combine, register } from "../config/registry";
+import { combine, describeSettingValue, register } from "../config/registry";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgBashEnabled } from "../exec/settings";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
@@ -289,6 +289,83 @@ export const cfgReadToolResultPreview = register({
 // ────────────────────────────────────────────────────────────────────────
 // Tools
 // ────────────────────────────────────────────────────────────────────────
+
+/** One `defaultTools` entry: `op` is `"+"` (add), `"-"` (remove), or `undefined` for a plain name. */
+export interface DefaultToolsEntry {
+	op: "+" | "-" | undefined;
+	name: string;
+}
+
+/**
+ * Parses one `defaultTools` entry, ignoring surrounding whitespace. `undefined` when the entry is
+ * not a string holding a non-empty name without inner whitespace.
+ */
+export function parseDefaultToolsEntry(entry: unknown): DefaultToolsEntry | undefined {
+	if (typeof entry !== "string") return undefined;
+	const trimmed = entry.trim();
+	const op = trimmed.startsWith("+") ? "+" : trimmed.startsWith("-") ? "-" : undefined;
+	const name = op ? trimmed.slice(1) : trimmed;
+	return /^\S+$/.test(name) ? { op, name } : undefined;
+}
+
+/**
+ * Whether a higher layer's `defaultTools` list replaces the list accumulated below it rather than
+ * extending it: true unless the list is non-empty and holds only `+name`/`-name` entries.
+ */
+export function defaultToolsListReplaces(list: readonly unknown[]): boolean {
+	return list.length === 0 || !list.every(entry => parseDefaultToolsEntry(entry)?.op !== undefined);
+}
+
+/** Most entries one `defaultTools` list accepts. */
+const MAX_DEFAULT_TOOLS_ENTRIES = 256;
+/** Longest `defaultTools` entry accepted, in characters. */
+const MAX_DEFAULT_TOOLS_ENTRY_LENGTH = 128;
+
+function validateDefaultTools(raw: unknown): void {
+	if (raw === undefined || raw === null) return;
+	if (!Array.isArray(raw)) throw new Error("Invalid defaultTools: expected a list of tool names.");
+	if (raw.length > MAX_DEFAULT_TOOLS_ENTRIES) {
+		throw new Error(`Invalid defaultTools: ${raw.length} entries exceed the limit of ${MAX_DEFAULT_TOOLS_ENTRIES}.`);
+	}
+	for (const entry of raw) {
+		if (typeof entry === "string" && entry.length > MAX_DEFAULT_TOOLS_ENTRY_LENGTH) {
+			throw new Error(
+				`Invalid defaultTools entry ${describeSettingValue(entry)}: longer than ${MAX_DEFAULT_TOOLS_ENTRY_LENGTH} characters.`,
+			);
+		}
+		if (!parseDefaultToolsEntry(entry)) {
+			throw new Error(
+				`Invalid defaultTools entry ${describeSettingValue(entry)}: expected a tool name, "+name" to add one, or "-name" to remove one.`,
+			);
+		}
+	}
+}
+
+// A higher layer's list of only +name/-name entries extends the lower layer's list, so the entries
+// apply in layer order; any other value replaces it.
+function mergeDefaultTools(lower: unknown, upper: unknown): unknown {
+	if (!Array.isArray(lower) || !Array.isArray(upper)) return upper;
+	return defaultToolsListReplaces(upper) ? upper : [...lower, ...upper];
+}
+
+// Startup tool selection for the main session, read through `resolveDefaultToolSelection`
+// (tools/default-tools.ts).
+export const cfgDefaultTools = register({
+	id: "defaultTools",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+	validate: validateDefaultTools,
+	merge: mergeDefaultTools,
+	dropInvalidInProject: true,
+	ignoreProjectNulls: true,
+	ui: {
+		tab: "tools",
+		group: "Available Tools",
+		label: "Default Tools",
+		description:
+			"Tools the main session starts with. Plain names replace the built-in defaults; '+name' adds and '-name' removes a tool. A list of only '+name'/'-name' entries changes the selection inherited from lower settings layers; a project list can only narrow it. Unset starts every enabled tool.",
+	},
+});
 
 // Tool approval policies
 export const cfgToolsApproval = register({

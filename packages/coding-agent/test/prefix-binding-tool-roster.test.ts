@@ -120,6 +120,7 @@ function newSession(
 			? ({
 					emitBeforeAgentStart: async () => ({ systemPrompt: options.beforeAgentStartSystemPrompt }),
 					emit: async () => undefined,
+					invalidate: vi.fn(),
 				} as unknown as ExtensionRunner)
 			: undefined,
 		rebuildSystemPrompt: async toolNames => ({

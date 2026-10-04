@@ -6,6 +6,8 @@ export interface ChatTranscriptDisplayPreferences {
 	cacheMissMarker: boolean;
 	showTokenUsage: boolean;
 	showTurnTime: boolean;
+	/** Label for collapsed (hidden) thinking blocks; undefined uses the built-in label. */
+	hiddenThinkingLabel: string | undefined;
 }
 
 /** Current transcript display preferences. */
@@ -16,6 +18,7 @@ export const chatTranscriptDisplayPreferences: ChatTranscriptDisplayPreferences 
 	cacheMissMarker: false,
 	showTokenUsage: false,
 	showTurnTime: false,
+	hiddenThinkingLabel: undefined,
 };
 
 /** Apply host display preferences without pulling settings into the renderer. */

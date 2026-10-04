@@ -225,7 +225,7 @@ describe("dispatchRpcSkillPrompt", () => {
 				],
 				async promptCustomMessage(_message, options) {
 					promptCustomMessageCalls += 1;
-					options?.onPromptAdmitted?.();
+					options?.onPromptAdmitted?.("queued");
 					await dispatchGate.promise;
 					return true;
 				},
@@ -240,7 +240,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		// rest of the dispatch pipeline: with the gate still closed, awaiting the
 		// pipeline (usage preflight, compaction, provider calls) would hang this
 		// call forever — it returns once admitted regardless.
-		expect(result).toEqual({ agentInvoked: true });
+		expect(result).toEqual({ agentInvoked: true, disposition: "queued" });
 
 		dispatchGate.resolve();
 		await settleUntil(() => promptCustomMessageCalls === 1);
@@ -267,7 +267,7 @@ describe("dispatchRpcSkillPrompt", () => {
 				async promptCustomMessage(_message, options) {
 					promptCustomMessageCalled.resolve();
 					await admissionGate.promise;
-					options?.onPromptAdmitted?.();
+					options?.onPromptAdmitted?.("queued");
 					return true;
 				},
 			},
@@ -289,7 +289,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		expect(settled).toBe(false);
 
 		admissionGate.resolve();
-		expect(await resultPromise).toEqual({ agentInvoked: true });
+		expect(await resultPromise).toEqual({ agentInvoked: true, disposition: "queued" });
 
 		await removeWithRetries(dir);
 	});
@@ -401,7 +401,7 @@ describe("dispatchRpcSkillPrompt", () => {
 			extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
 		});
 
-		expect(result).toEqual({ agentInvoked: true });
+		expect(result).toEqual({ agentInvoked: true, disposition: "started" });
 		await settleUntil(() => frames.length === 1);
 		expect(frames).toEqual([
 			{ type: "prompt_result", id: "cmd-5", agentInvoked: false, status: "completed", sessionSettled: true },
@@ -434,7 +434,7 @@ describe("dispatchRpcSkillPrompt", () => {
 					],
 					async promptCustomMessage(nextMessage, options) {
 						message = nextMessage;
-						options?.onPromptAdmitted?.();
+						options?.onPromptAdmitted?.("started");
 						return true;
 					},
 				},
@@ -445,7 +445,7 @@ describe("dispatchRpcSkillPrompt", () => {
 				images: [image],
 			});
 
-			expect(result).toEqual({ agentInvoked: true });
+			expect(result).toEqual({ agentInvoked: true, disposition: "started" });
 			expect(Array.isArray(message?.content)).toBe(true);
 			expect(message?.content).toEqual([{ type: "text", text: expect.stringContaining("Body.") }, image]);
 		} finally {

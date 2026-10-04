@@ -45,8 +45,18 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		result: "PromptAck",
 		completion: "prompt_result",
 	},
-	{ name: "steer", doc: "Queue a steering message.", params: { message: "string", "images?": IMAGES } },
-	{ name: "follow_up", doc: "Queue a follow-up message.", params: { message: "string", "images?": IMAGES } },
+	{
+		name: "steer",
+		doc: "Queue a steering message.",
+		params: { message: "string", "images?": IMAGES },
+		result: "QueuedInputAck",
+	},
+	{
+		name: "follow_up",
+		doc: "Queue a follow-up message.",
+		params: { message: "string", "images?": IMAGES },
+		result: "QueuedInputAck",
+	},
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
@@ -58,6 +68,11 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		doc: "Move one queued follow-up to the end of the steering queue.",
 		params: { message: "string" },
 		result: "PromoteQueuedMessageResult",
+	},
+	{
+		name: "clear_queue",
+		doc: "Remove every queued user-authored steering and follow-up message and return their text.",
+		result: "ClearedQueue",
 	},
 	{ name: "abort", doc: "Abort the current run." },
 	{

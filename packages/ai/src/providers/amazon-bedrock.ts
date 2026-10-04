@@ -47,6 +47,7 @@ import {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
 import { armPreResponseTimeout, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
+import { applyHeadersTransform } from "../utils/provider-headers";
 import { toolWireSchema } from "../utils/schema/wire";
 import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
@@ -222,13 +223,26 @@ async function sendBedrockRequest(
 	// `Content-Type` beside the fixed `content-type` leaves TWO object keys, which
 	// SigV4 signs as one value while fetch joins both into a single comma-joined
 	// wire header, so AWS validates different bytes than were signed.
+	// `transformHeaders` sees that merge before the filter, so a transform cannot
+	// set signer-owned or reserved names either.
 	const callerHeaders: Record<string, string> = {};
-	for (const source of [model.headers, options.headers]) {
-		for (const [name, value] of Object.entries(source ?? {})) {
-			const field = name.toLowerCase();
-			if (SIGNER_OWNED_HEADERS.has(field) || BEDROCK_RESERVED_HEADERS.has(field)) continue;
-			callerHeaders[field] = value;
-		}
+	const configuredHeaders: Record<string, string> = { ...model.headers, ...options.headers };
+	const mergedCallerHeaders = await applyHeadersTransform(
+		configuredHeaders,
+		options.transformHeaders,
+		signal,
+		() => new AIError.AbortError(),
+	);
+	const configuredValues = new Map<string, string>();
+	for (const [name, value] of Object.entries(configuredHeaders)) {
+		configuredValues.set(name.toLowerCase(), value);
+	}
+	for (const [name, value] of Object.entries(mergedCallerHeaders)) {
+		const field = name.toLowerCase();
+		if (SIGNER_OWNED_HEADERS.has(field) || BEDROCK_RESERVED_HEADERS.has(field)) continue;
+		// A transform may pass configured `x-amz-*` headers through but not add or change one.
+		if (field.startsWith("x-amz-") && configuredValues.get(field) !== value) continue;
+		callerHeaders[field] = value;
 	}
 	// SigV4 never signs `user-agent` (UNSIGNABLE in aws-sigv4.ts), so this default
 	// cannot break the signature. Without it Bun's fetch sends `Bun/<version>`,

@@ -32,7 +32,9 @@ import userAppendPromptTemplate from "./prompts/system/user-append.md" with { ty
 import { normalizeConcurrencyLimit } from "./task/parallel";
 import type { ActiveRepoContext } from "@oh-my-pi/pi-tui/status-line/host";
 import { XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
+import { sanitizeNoticeLine } from "./utils/notice-text";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 import { combine } from "./config/registry";
@@ -349,6 +351,29 @@ export function dedupeContainedContextFiles(
 export async function loadProjectContextFiles(
 	options: LoadContextFilesOptions = {},
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
+	return (await loadProjectContextFilesWithOverrides(options)).files;
+}
+
+/** File name of the per-directory context override. */
+const CONTEXT_OVERRIDE_FILE_NAME = "AGENTS.override.md";
+
+/** An `AGENTS.override.md` that took the place of other context files in its own directory. */
+export interface ContextFileOverride {
+	/** Absolute path of the loaded override. */
+	path: string;
+	/** Absolute paths of the files it replaced, in provider priority order. */
+	replaced: string[];
+}
+
+/**
+ * {@link loadProjectContextFiles}, plus every loaded `AGENTS.override.md` that replaced a context
+ * file of the same scope in its own directory (`AGENTS.md`, `CLAUDE.md`, or the user-level
+ * `AGENTS.md`). An override that replaced nothing is not listed.
+ */
+export async function loadProjectContextFilesWithOverrides(options: LoadContextFilesOptions = {}): Promise<{
+	files: Array<{ path: string; content: string; depth?: number }>;
+	overrides: ContextFileOverride[];
+}> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
 	const result = await loadCapability(contextFileCapability.id, {
@@ -379,7 +404,34 @@ export async function loadProjectContextFiles(
 		return depthB - depthA;
 	});
 
-	return dedupeContainedContextFiles(files);
+	const overrides: ContextFileOverride[] = [];
+	for (const item of result.items as ContextFile[]) {
+		if (path.basename(item.path) !== CONTEXT_OVERRIDE_FILE_NAME) continue;
+		const key = contextFileCapability.key(item);
+		const dir = path.dirname(item.path);
+		const replaced = (result.all as Array<ContextFile & { _shadowed?: boolean }>)
+			.filter(
+				other =>
+					other._shadowed === true &&
+					other.path !== item.path &&
+					path.dirname(other.path) === dir &&
+					contextFileCapability.key(other) === key,
+			)
+			.map(other => other.path);
+		if (replaced.length > 0) overrides.push({ path: item.path, replaced });
+	}
+
+	return { files: dedupeContainedContextFiles(files), overrides };
+}
+
+/**
+ * The warning shown for one {@link ContextFileOverride} on one line: the override's path with the
+ * home directory shortened, and the names of the files it replaced, both through
+ * {@link sanitizeNoticeLine}.
+ */
+export function formatContextFileOverrideNotice(override: ContextFileOverride): string {
+	const names = [...new Set(override.replaced.map(file => sanitizeNoticeLine(path.basename(file))))];
+	return `${sanitizeNoticeLine(shortenPath(override.path))} replaces ${names.join(" and ")} in its directory.`;
 }
 
 /**

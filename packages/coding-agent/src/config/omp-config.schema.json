@@ -1773,6 +1773,11 @@
           "type": "number",
           "default": 20000
         },
+        "modelOverrides": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
         "autoContinue": {
           "type": "boolean",
           "default": true
@@ -2579,6 +2584,11 @@
           "default": false
         }
       }
+    },
+    "defaultTools": {
+      "description": "Tools the main session starts with. Plain names replace the built-in defaults; '+name' adds and '-name' removes a tool. A list of only '+name'/'-name' entries changes the selection inherited from lower settings layers; a project list can only narrow it. Unset starts every enabled tool.",
+      "type": "array",
+      "default": []
     },
     "todo": {
       "type": "object",

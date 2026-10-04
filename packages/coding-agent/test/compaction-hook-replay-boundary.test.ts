@@ -79,6 +79,7 @@ describe("hook-provided compaction replay boundary", () => {
 				};
 			},
 			emitBeforeAgentStart: async () => undefined,
+			invalidate: () => {},
 		};
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in anthropic model to exist");

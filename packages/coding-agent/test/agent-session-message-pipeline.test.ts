@@ -1941,6 +1941,7 @@ describe("AgentSession message pipeline", () => {
 			extensionRunner: {
 				hasHandlers: () => true,
 				emit: extensionEmit,
+				invalidate: () => {},
 			} as never,
 		});
 		sessions.push(session);

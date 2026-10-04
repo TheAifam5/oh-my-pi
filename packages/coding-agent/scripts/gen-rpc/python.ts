@@ -601,7 +601,15 @@ class PythonEmitter {
 				statement: `data = ${call}\n        return None if data is None else ${decoder}(data, ${pyString(command.name)})`,
 			};
 		}
-		return { returns: command.result, statement: `return ${decoder}(${call}, ${pyString(command.name)})` };
+		const envelope = this.#def(command.result);
+		if (envelope.kind !== "object" || envelope.fields.some(field => field.required)) {
+			return { returns: command.result, statement: `return ${decoder}(${call}, ${pyString(command.name)})` };
+		}
+		// Servers omit `data` for results whose fields are all optional (e.g. the `steer` ack).
+		return {
+			returns: command.result,
+			statement: `data = ${call}\n        return ${decoder}({} if data is None else data, ${pyString(command.name)})`,
+		};
 	}
 
 	#listenerMethod(frameType: string, className: string, doc: string | undefined): string {

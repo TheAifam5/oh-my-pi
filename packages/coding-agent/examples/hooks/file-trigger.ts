@@ -8,10 +8,13 @@
  *   echo "Run the tests" > /tmp/agent-trigger.txt
  */
 import * as fs from "node:fs";
+import { isSessionReplacementStart } from "@oh-my-pi/pi-coding-agent";
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function (pi: HookAPI) {
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		// session_start also fires after /new, resume, and fork; watch the file once.
+		if (isSessionReplacementStart(event)) return;
 		const triggerFile = "/tmp/agent-trigger.txt";
 
 		fs.watch(triggerFile, async () => {

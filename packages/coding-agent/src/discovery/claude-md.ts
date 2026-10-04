@@ -18,7 +18,7 @@ const DISPLAY_NAME = "CLAUDE.md";
  * (see {@link loadStandaloneContextFiles}).
  */
 export async function loadClaudeMd(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
-	return loadStandaloneContextFiles(ctx, PROVIDER_ID, "CLAUDE.md");
+	return loadStandaloneContextFiles(ctx, PROVIDER_ID, ["CLAUDE.md"]);
 }
 
 registerProvider(contextFileCapability.id, {

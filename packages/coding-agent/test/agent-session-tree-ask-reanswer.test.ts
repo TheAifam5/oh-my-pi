@@ -412,6 +412,7 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 				}
 				return undefined;
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		const ctx = await createTestSession({ inMemory: true, extensionRunner });
