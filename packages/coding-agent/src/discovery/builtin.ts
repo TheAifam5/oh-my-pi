@@ -4,7 +4,14 @@
  * Primary provider for OMP native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { getAgentDir, logger, normalizePathForComparison, parseFrontmatter, tryParseJson } from "@oh-my-pi/pi-utils";
+import {
+	getAgentDir,
+	isRecord,
+	logger,
+	normalizePathForComparison,
+	parseFrontmatter,
+	tryParseJson,
+} from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { getManagedSkillsDir, MANAGED_SKILLS_PROVIDER_ID } from "../autolearn/managed-skills";
 import { registerProvider } from "../capability";
@@ -23,6 +30,8 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
+import { parsePackageLaunchConfig } from "../mcp/package-launch";
+import type { MCPPackageLaunch } from "../mcp/types";
 import { expandTilde } from "../tools/path-utils";
 import {
 	discoverRuleFromMarkdown,
@@ -179,6 +188,16 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				);
 			}
 
+			let packageLaunch: MCPPackageLaunch | undefined;
+			// Read from the unexpanded config: only the spec's argv fields take `${VAR}` expansion.
+			const rawServer = data.mcpServers[serverName];
+			const rawPackage = isRecord(rawServer) ? rawServer.package : undefined;
+			if (rawPackage != null) {
+				const { spec, problem } = parsePackageLaunchConfig(rawPackage);
+				if (problem) logger.warn(`MCP server "${serverName}": invalid package (${problem}), ignoring`);
+				else packageLaunch = spec;
+			}
+
 			result.push({
 				name: serverName,
 				enabled,
@@ -186,6 +205,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				requestIdFormat,
 				instructions,
 				command: serverConfig.command as string | undefined,
+				package: packageLaunch,
 				args: serverConfig.args as string[] | undefined,
 				env: serverConfig.env as Record<string, string> | undefined,
 				cwd: serverConfig.cwd as string | undefined,

@@ -9,6 +9,7 @@
 ### Added
 
 - Added `omp config schema` to print the JSON Schema of `config.yml` (or write it with `--out`) for editor validation and autocomplete; the schema also ships as `omp-config.schema.json` with each GitHub release
+- Added `package` on stdio MCP servers: OMP runs the project's installed npm package, or a runner fetching the pinned version, following the `local-first`, `local-only`, or `fallback-only` policy; defaults come from the new `mcp.packageRunner` (`bunx`), `mcp.packageRuntime` (`bun`), and `mcp.packagePolicy` settings
 
 ## [18.6.0] - 2026-10-03
 

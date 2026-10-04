@@ -125,9 +125,10 @@ Remote HTTP and SSE transports do not impose an additional socket-idle timeout. 
 
 Direct runtime configs and the config writer default to `stdio` when `type` is omitted. Discovery infers `http` for a URL-only entry and `stdio` for a command entry; use an explicit `type` for portable, schema-valid configuration.
 
-Required:
+Required, exactly one of:
 
 - `command: string`
+- `package: object` (see [npm package launch](#npm-package-launch-package))
 
 Optional:
 
@@ -156,6 +157,46 @@ Example:
 ```
 
 This follows the official Filesystem MCP server package (`@modelcontextprotocol/server-filesystem`).
+
+#### npm package launch (`package`)
+
+Set `package` instead of `command` to run the npm package installed in the current project when there is one, and a package runner otherwise:
+
+```json
+{
+  "mcpServers": {
+    "lint": {
+      "type": "stdio",
+      "package": { "name": "@scope/lint-mcp", "bin": "lint-mcp", "version": "^1.2", "policy": "local-first" },
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name` | required | npm package name, optionally scoped |
+| `bin` | package name without its scope | entry of the package's `bin` map to run; applies only to an installed package (the runner receives `name@version` and runs the package's default binary) |
+| `version` | `"latest"` | registry tag, version, or range given to the runner |
+| `policy` | `mcp.packagePolicy` (`local-first`) | `local-first` runs the installed package, else the runner; `local-only` fails without an installed package; `fallback-only` always uses the runner |
+| `runner` | `mcp.packageRunner` (`["bunx"]`) | argv prefix that receives `name@version` |
+| `runtime` | `mcp.packageRuntime` (`["bun"]`) | argv prefix that receives the installed bin entry's real path |
+
+OMP resolves the spec each time it connects the server, including `/mcp test` and reconnects:
+
+- It looks for `node_modules/<name>` in the server's working directory (`cwd`, else the project directory) and its ancestors, up to the nearest `.git`, `pnpm-workspace.yaml`, `aube-workspace.yaml`, or `package.json` with `workspaces`, never at or above your home directory. Without such a root it stops at the nearest `package.json`.
+- An installed package runs as `runtime <bin entry> args...`. Its `package.json` must name the package and declare `bin` as a relative path whose real path stays inside the package directory.
+- Otherwise the server runs as `runner <name>@<version> args...`, unless `policy` is `local-only`.
+- A `node_modules/.bin/<bin>` shim without its package fails the connection instead of falling back.
+
+A launch that cannot be resolved fails that server's connection. The reason is reported like any other MCP connection failure: in the interactive startup MCP status message, in print mode's stderr warning, by `/mcp test <name>`, and in the log; `/mcp list` shows the server as disconnected. Set the defaults once in your user `config.yml`, for example `mcp: { packageRunner: ["npx", "-y"], packageRuntime: ["node"] }` to use npm and Node instead of Bun. The SDK helpers `discoverMCPServers()` and `createMCPManager()` have no settings instance and use the built-in defaults; call `manager.setPackageLaunchDefaults(() => mcpPackageLaunchDefaults(settings))` on a manager you construct to apply settings. A project's settings files cannot change `mcp.packageRunner`, `mcp.packageRuntime`, or `mcp.packagePolicy`: values set there are ignored in favor of your user config or the defaults. `package` is OMP-specific: native config and standalone `mcp.json`/`.mcp.json` parse it; imported tool configs and Agent Plugins ignore it. Discovery-time `${VAR}` expansion applies only to `runner` and `runtime`; `name`, `bin`, `version`, and `policy` are used literally.
+
+Trust boundaries:
+
+- `local-first` and `local-only` run code from the project's `node_modules`, found by walking up from the server's working directory. In a checkout you do not trust, set `policy: "fallback-only"` on the entry (or `mcp.packagePolicy: fallback-only` in your user config) so OMP never executes the project's installed copy.
+- The runner (`bunx`, `npx`) runs in the server's working directory and reads that directory's package-manager config (`bunfig.toml`, `.npmrc`), including the registry it downloads from.
+- The bin entry's path is checked when OMP resolves the launch, not again at spawn; swapping it in between requires write access to the project's `node_modules`, which already allows replacing the package itself.
 
 ### `http` transport
 
@@ -481,7 +522,7 @@ After editing, use:
 
 From `validateServerConfig()` in `packages/coding-agent/src/mcp/config.ts`:
 
-- `stdio` requires `command`
+- `stdio` requires `command` or a valid `package`, not both
 - `http` and `sse` require `url`
 - a server cannot set both `command` and `url`
 - unknown `type` values are rejected
@@ -518,7 +559,7 @@ Within OMP native config, project `.omp/mcp.json` precedes `.omp/.mcp.json`, the
 
 ### `Server "name": stdio server requires "command" field`
 
-For a remote config passed directly to the writer/client, set `type: "http"`. Discovered URL-only entries infer HTTP; an explicitly stdio entry still needs a command.
+For a remote config passed directly to the writer/client, set `type: "http"`. Discovered URL-only entries infer HTTP; an explicitly stdio entry still needs a command or a `package`.
 
 ### `Server "name": both "command" and "url" are set`
 

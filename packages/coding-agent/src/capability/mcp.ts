@@ -5,7 +5,7 @@
  * All providers translate their native format to this shape.
  */
 
-import type { MCPRequestIdFormat } from "../mcp/types";
+import type { MCPPackageLaunch, MCPRequestIdFormat } from "../mcp/types";
 import { defineCapability } from ".";
 import type { SourceMeta } from "./types";
 
@@ -25,6 +25,8 @@ export interface MCPServer {
 	instructions?: boolean;
 	/** Command to run (for stdio transport) */
 	command?: string;
+	/** npm package launch spec (stdio transport); replaces `command` */
+	package?: MCPPackageLaunch;
 	/** Command arguments */
 	args?: string[];
 	/** Environment variables */
@@ -80,8 +82,8 @@ export function isSameMCPConnection(left: MCPServer, right: MCPServer): boolean 
 	// equivalent to leaving the option unset, not a distinct connection.
 	if ((left.requestIdFormat ?? "number") !== (right.requestIdFormat ?? "number")) return false;
 
-	const leftTransport = left.transport ?? (left.command ? "stdio" : left.url ? "http" : "stdio");
-	const rightTransport = right.transport ?? (right.command ? "stdio" : right.url ? "http" : "stdio");
+	const leftTransport = left.transport ?? (left.command || left.package ? "stdio" : left.url ? "http" : "stdio");
+	const rightTransport = right.transport ?? (right.command || right.package ? "stdio" : right.url ? "http" : "stdio");
 	if (leftTransport !== rightTransport) return false;
 
 	if (leftTransport === "stdio") {
@@ -95,6 +97,7 @@ export function isSameMCPConnection(left: MCPServer, right: MCPServer): boolean 
 				: [...(server.envLiteralKeys ?? [])].sort();
 		return (
 			left.command === right.command &&
+			Bun.deepEquals(left.package, right.package) &&
 			Bun.deepEquals(left.args, right.args) &&
 			Bun.deepEquals(left.env, right.env) &&
 			Bun.deepEquals(literalKeysOf(left), literalKeysOf(right)) &&
@@ -114,11 +117,13 @@ export const mcpCapability = defineCapability<MCPServer>({
 	toExtensionId: server => `mcp:${server.name}`,
 	validate: server => {
 		if (!server.name) return "Missing server name";
-		if (!server.command && !server.url) return "Must have command or url";
+		if (!server.command && !server.package && !server.url) return "Must have command, package, or url";
+		if (server.command && server.package) return "Must not have both command and package";
+		if (server.package && server.url) return "Must not have both package and url";
 
 		// Validate transport-endpoint pairing
-		if (server.transport === "stdio" && !server.command) {
-			return "stdio transport requires command field";
+		if (server.transport === "stdio" && !server.command && !server.package) {
+			return "stdio transport requires command or package field";
 		}
 		if ((server.transport === "http" || server.transport === "sse") && !server.url) {
 			return "http/sse transport requires url field";

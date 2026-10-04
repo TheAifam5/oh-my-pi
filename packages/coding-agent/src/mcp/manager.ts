@@ -4,6 +4,7 @@
  * Discovers, connects to, and manages MCP servers.
  * Handles tool loading and lifecycle.
  */
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import type { TSchema } from "@oh-my-pi/pi-ai";
@@ -40,6 +41,7 @@ import {
 	refreshStoredManagedMcpOAuthCredential,
 } from "./oauth-credentials";
 import type { MCPStoredOAuthCredential } from "./oauth-flow";
+import { DEFAULT_MCP_PACKAGE_LAUNCH, type MCPPackageLaunchDefaults, resolvePackageLaunch } from "./package-launch";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
 
@@ -286,6 +288,7 @@ export class MCPManager {
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	#discoverOptions: MCPDiscoverOptions | undefined;
+	#packageLaunchDefaults: () => MCPPackageLaunchDefaults = () => DEFAULT_MCP_PACKAGE_LAUNCH;
 	#browserFilterMutationTail: Promise<void> = Promise.resolve();
 	/** Settles when the latest {@link MCPManager.discoverAndConnect} call does; reconciles wait on it. */
 	#discoveryInFlight: Promise<unknown> = Promise.resolve();
@@ -515,6 +518,11 @@ export class MCPManager {
 	 */
 	setAuthStorage(authStorage: AuthStorage): void {
 		this.#authStorage = authStorage;
+	}
+
+	/** Set the source of the runner, runtime, and policy that `package` launch specs fall back to; read on every connect. */
+	setPackageLaunchDefaults(read: () => MCPPackageLaunchDefaults): void {
+		this.#packageLaunchDefaults = read;
 	}
 
 	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
@@ -1180,7 +1188,8 @@ export class MCPManager {
 	}
 
 	/**
-	 * Resolve auth and shell-command substitutions in config before connecting.
+	 * Resolve package launches, auth, and shell-command substitutions in config before connecting.
+	 * Rejects with `MCPPackageLaunchError` when a `package` spec cannot be launched.
 	 * Pass `oauth: false` to skip OAuth credential injection (used by reauth's
 	 * unauthenticated probe, which must observe the server's bare 401).
 	 */
@@ -1826,7 +1835,7 @@ export class MCPManager {
 	}
 
 	/**
-	 * Resolve OAuth credentials and shell commands in config.
+	 * Resolve package launches, OAuth credentials, and shell commands in config.
 	 * `oauth: false` skips credential injection (reauth's unauthenticated probe);
 	 * `forceRefresh` bypasses the expiry buffer (401/403 auth-error hook).
 	 */
@@ -1835,6 +1844,16 @@ export class MCPManager {
 		opts?: { forceRefresh?: boolean; oauth?: boolean },
 	): Promise<MCPServerConfig> {
 		let resolved: MCPServerConfig = { ...config };
+		if (resolved.type !== "http" && resolved.type !== "sse" && resolved.package) {
+			resolved = await resolvePackageLaunch(
+				{ ...resolved, package: resolved.package },
+				{
+					cwd: path.resolve(this.cwd, resolved.cwd ?? "."),
+					home: os.homedir(),
+					defaults: this.#packageLaunchDefaults(),
+				},
+			);
+		}
 
 		const auth = config.auth;
 		const lookup: MCPOAuthCredentialLookup | undefined =
@@ -1922,7 +1941,8 @@ export class MCPManager {
 
 /**
  * Create an MCP manager and discover servers.
- * Convenience function for quick setup.
+ * Convenience function for quick setup; `package` launch specs use the built-in defaults, not the
+ * `mcp.package*` settings.
  */
 export async function createMCPManager(
 	cwd: string,

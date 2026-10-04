@@ -102,10 +102,39 @@ interface MCPServerConfigBase {
 	};
 }
 
+/** How a {@link MCPPackageLaunch} chooses between the project's installed package and the runner. */
+export type MCPPackagePolicy = "local-first" | "local-only" | "fallback-only";
+
+/**
+ * npm package launch spec for a stdio server, replacing `command`.
+ *
+ * Before connecting, OMP looks for the package in `node_modules` from the server's working
+ * directory up to the nearest Git or workspace root. An installed package runs as
+ * `runtime <bin entry> args...`; otherwise `runner <name>@<version> args...`, as `policy` allows.
+ * OMP-specific: only native config and standalone `mcp.json` parse it.
+ */
+export interface MCPPackageLaunch {
+	/** npm package name, optionally scoped. */
+	name: string;
+	/** Name of the package's `bin` entry (default: the package name without its scope). */
+	bin?: string;
+	/** Registry tag, version, or range passed to the runner (default: `"latest"`). */
+	version?: string;
+	/** Default: the `mcp.packagePolicy` setting. */
+	policy?: MCPPackagePolicy;
+	/** Argv prefix that receives `name@version` (default: the `mcp.packageRunner` setting). */
+	runner?: string[];
+	/** Argv prefix that receives the installed bin entry's real path (default: the `mcp.packageRuntime` setting). */
+	runtime?: string[];
+}
+
 /** Stdio server configuration */
 export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	type?: "stdio"; // Default if not specified
-	command: string;
+	/** Executable to spawn; required unless `package` supplies it. */
+	command?: string;
+	/** Launch an npm package instead of `command`; resolved to a concrete `command` before connecting. */
+	package?: MCPPackageLaunch;
 	args?: string[];
 	env?: Record<string, string>;
 	/**
