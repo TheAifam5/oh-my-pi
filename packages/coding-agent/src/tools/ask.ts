@@ -543,6 +543,8 @@ type AskParams = AskToolInput;
  */
 export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly name = "ask";
+	/** Prompts the user; a replay would ask again. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "read" as const;
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";

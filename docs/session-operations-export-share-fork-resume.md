@@ -481,17 +481,19 @@ understands the flag.
    rebuilds it from its transcript, the turn goes on as below, and the parent
    receives the result as the job's ordinary `async-result`, so a parent waiting on
    that job finds it again.
-2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
-   cut off without a `session_exit` record (a crash, SIGKILL or power loss records
-   none) is first closed the way exit recovery closes one whose exit was recorded:
-   unfinished tool calls get "outcome unknown" results and an interrupted-turn
-   abort ends it. That turn is then retried as `/retry` does: a batch whose every
-   call was cut off runs again; otherwise the model answers from where the
-   transcript stops.
+2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A
+   `--restore` launch skips startup interrupted-turn repair, so the turn is
+   closed here by the same repair resume uses (`repairInterruptedTurn`, with the
+   exit assumed): unfinished tool calls get interrupted results and an aborted
+   assistant record ends the turn. A turn startup repair already closed, with or
+   without a recorded exit, is taken as it is. That turn is then retried as
+   `/retry` does: a batch whose every call was cut off runs again; otherwise the
+   model answers from where the transcript stops.
 
 Nothing is continued when the last turn finished, failed, or the user interrupted
-it, or when a normal exit was recorded after it (the user quit with it
-interrupted). `--restore` is interactive only, takes no prompt, and cannot be
+it, when a normal exit was recorded after it (the user quit with it
+interrupted), or when the session is a copy separated from a live session that
+still runs the turn. `--restore` is interactive only, takes no prompt, and cannot be
 combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
 `/restart` drops it like the other one-shot selectors.
 
@@ -533,7 +535,7 @@ falls back to spawning the replacement with inherited terminal streams.
 5. `sessionManager.setSessionFile(sessionPath)`, update provider-cache/session ids and memory keys, build the display context, resolve the recorded model, and rehydrate checkpoint state. When no recorded model can be restored for a different file, the switch fails here with `Could not restore model <provider/id>` (see below).
 6. Emit `session_switch` with `reason: "resume"`.
 7. Replace agent messages, reset advisor state, and synchronize todos. Close cached provider sessions for a different file, or for a same-file reload whose replay messages changed.
-8. Apply the resolved (or explicitly requested) model. If the loaded branch ended with an interrupted turn, append its synthetic abort message and rebuild context.
+8. Apply the resolved (or explicitly requested) model. If the loaded branch ended with an interrupted turn, append interrupted results for its unfinished tool calls and its synthetic abort message (see [Custom entries](session.md)), then rebuild context.
 9. Restore configured/effective thinking and per-family service tiers, falling back to current settings when the target branch has no corresponding entries.
 10. For a different transcript, reset memory context; for any conversation rewrite, clear session-scoped tool state.
 11. Reconnect agent events, run the optional session-switch reconciler (interactive mode uses it to re-enter persisted modes such as plan), and best-effort refresh the workspace-root system-prompt block. Reconciler/prompt-refresh errors are logged rather than rolling back the committed switch.

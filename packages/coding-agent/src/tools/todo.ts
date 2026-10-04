@@ -712,6 +712,8 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 	readonly name = "todo";
 	readonly approval = "read" as const;
+	/** Applies list operations; re-running after a crash may apply them twice. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Todo";
 	readonly summary = "Write a structured todo list to track progress within a session";
 	readonly description: string;

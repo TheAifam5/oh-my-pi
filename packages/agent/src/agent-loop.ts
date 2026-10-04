@@ -3276,6 +3276,7 @@ async function executeToolCalls(
 		transformToolCallArguments,
 		resolveFallbackTool,
 		suggestFallbackToolNames,
+		beforeToolExecution,
 		afterToolCall,
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
@@ -3363,6 +3364,10 @@ async function executeToolCalls(
 		};
 	});
 
+	// Interruptible calls awaiting `beforeToolExecution`. A background completion
+	// waits until they start: a started `wait` returns the finished job's result,
+	// while a call skipped before it starts reports a skip instead.
+	let interruptibleCallsInHook = 0;
 	const checkAsideInterrupts = async (): Promise<void> => {
 		// Asides only fire once: an interrupt already recorded on interruptState
 		// must not re-abort, and (unlike steering) never re-consumes a queue.
@@ -3377,9 +3382,15 @@ async function executeToolCalls(
 		let source: AsideInterruptSource | undefined;
 		if (hasIrcInterrupts && (await hasIrcInterrupts())) source = "irc";
 		else if (!interruptState.triggered && hasQueuedAsides && (await hasQueuedAsides())) source = "aside";
-		else if (!interruptState.triggered && hasBackgroundCompletions && (await hasBackgroundCompletions()))
+		else if (
+			!interruptState.triggered &&
+			interruptibleCallsInHook === 0 &&
+			hasBackgroundCompletions &&
+			(await hasBackgroundCompletions())
+		)
 			source = "background";
-		if (!source) return;
+		// Rechecked after the await: a hook may have begun while the peek ran.
+		if (!source || (source === "background" && interruptibleCallsInHook > 0)) return;
 		if (!interruptState.triggered) {
 			interruptState.triggered = true;
 			interruptState.source = source;
@@ -3531,6 +3542,33 @@ async function executeToolCalls(
 			return;
 		}
 		const effectiveArgs = record.args;
+		// Calls that fail before reaching the tool (unknown tool, blocked, failed
+		// preparation) never run, so the hook is not asked to journal them.
+		const willExecute =
+			tool !== undefined &&
+			!record.blocked &&
+			record.prepareError === undefined &&
+			record.transformError === undefined;
+		if (beforeToolExecution && willExecute && !record.signal.aborted) {
+			if (record.interruptible) interruptibleCallsInHook++;
+			try {
+				await beforeToolExecution(
+					{ assistantMessage, toolCall, tool, args: effectiveArgs as Record<string, unknown> },
+					record.signal,
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				emitToolResult(record, { content: [{ type: "text", text: message }], details: {} }, true);
+				return;
+			} finally {
+				if (record.interruptible) interruptibleCallsInHook--;
+			}
+			// Steering queued during the wait preempts an interruptible call like the check above.
+			if (interruptState.triggered && record.interruptible) {
+				record.skipped = true;
+				return;
+			}
+		}
 		if (record.signal.aborted) {
 			record.skipped = true;
 			recordSkippedTool(telemetry, {

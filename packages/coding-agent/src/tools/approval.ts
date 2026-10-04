@@ -10,7 +10,7 @@ import { isRecord, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import approvalFolderTemplate from "../prompts/tools/approval-folder.md" with { type: "text" };
-import type { AgentTool, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, ToolApprovalDecision, ToolReplayClass, ToolTier } from "@oh-my-pi/pi-agent-core";
 import * as path from "node:path";
 import type { Settings } from "../config/settings";
 import { normalizeToLF } from "../edit/normalize";
@@ -304,6 +304,38 @@ function getToolDecision(
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
 	return getToolDecision(tool, args).tier;
+}
+
+/**
+ * Resolve whether re-running a call after a crash is harmless from the tool's
+ * own `replay` declaration. A missing tool, a missing declaration, an
+ * unrecognized value, or a declaration function that throws resolves to
+ * unsafe: a tool is replay-safe only when it says so.
+ */
+export function resolveToolReplayClass(tool: object | undefined, args: unknown): ToolReplayClass {
+	const replay: unknown = tool && "replay" in tool ? tool.replay : undefined;
+	if (replay === undefined) return "unsafe";
+	try {
+		const resolved = typeof replay === "function" ? replay(args) : replay;
+		return resolved === "safe" ? "safe" : "unsafe";
+	} catch {
+		return "unsafe";
+	}
+}
+
+function containsUrlTarget(value: unknown, depth: number): boolean {
+	if (typeof value === "string") return value.includes("://");
+	if (depth === 0 || typeof value !== "object" || value === null) return false;
+	return Object.values(value).some(entry => containsUrlTarget(entry, depth - 1));
+}
+
+/**
+ * Replay class for tools that only read local files: safe unless an argument
+ * names a URL target (`scheme://`), which may reach the network or an
+ * internal device with its own effects.
+ */
+export function localReadReplay(args: unknown): ToolReplayClass {
+	return containsUrlTarget(args, 2) ? "unsafe" : "safe";
 }
 
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {

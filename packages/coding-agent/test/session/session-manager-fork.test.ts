@@ -5,9 +5,8 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { isSyntheticToolResultMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	collectPendingToolCalls,
-	createInterruptedToolResults,
-	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
+	planInterruptedTurnRepair,
 	SESSION_EXIT_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -719,12 +718,14 @@ describe("SessionManager.forkFrom", () => {
 		if (!result || result.message.role !== "toolResult") throw new Error("expected an unknown tool result");
 		expect(result.message.toolCallId).toBe("toolu_live");
 		expect(result.message.isError).toBe(true);
-		expect(result.message).not.toHaveProperty("details");
+		expect(result.message.details).toMatchObject({ __interrupted: true, execution: "unknown", separated: true });
 		expect(
 			result.message.content.some(
-				block => block.type === "text" && block.text.includes("may still be running this tool"),
+				block => block.type === "text" && block.text.includes("may still be running there"),
 			),
 		).toBe(true);
+		// Startup repair of the fork leaves the parent's in-flight turn alone: no abort, no second result.
+		expect(planInterruptedTurnRepair(repairedEntries)).toBeUndefined();
 	});
 
 	it("leaves an exited source's interrupted tail to resume recovery", async () => {
@@ -777,8 +778,9 @@ describe("SessionManager.forkFrom", () => {
 		const branch = forked.getBranch();
 		expect(collectPendingToolCalls(branch).map(call => call.toolCallId)).toEqual(["toolu_crashed"]);
 		expect(describePendingToolCalls(branch)).toContain("toolu_crashed");
-		expect(createInterruptedTurnAbortMessage(branch)?.stopReason).toBe("aborted");
-		const [result] = createInterruptedToolResults(branch);
+		const repair = planInterruptedTurnRepair(branch);
+		expect(repair?.abort?.stopReason).toBe("aborted");
+		const [result] = repair?.toolResults ?? [];
 		expect(result?.toolCallId).toBe("toolu_crashed");
 		expect(
 			result?.content.some(block => block.type === "text" && block.text.includes("Previous OMP process exited")),
@@ -847,12 +849,18 @@ describe("SessionManager.forkFrom", () => {
 			throw new Error("expected a synthetic tool result for the truncated call");
 		}
 		expect(result.message.toolCallId).toBe("toolu_truncated");
-		expect(result.message.details).toMatchObject({ source: "assistant_stop_length", executed: false });
+		expect(result.message.details).toMatchObject({
+			source: "assistant_stop_length",
+			executed: false,
+			separated: true,
+		});
 		expect(
 			result.message.content.some(
 				block => block.type === "text" && block.text.includes("truncated and unsafe to run"),
 			),
 		).toBe(true);
+		// The parent's loop goes on after the guard; the fork's startup repair appends no abort.
+		expect(planInterruptedTurnRepair(branch)).toBeUndefined();
 		const startedSourceFile = path.join(sessionDir, "started-source.jsonl");
 		const startedHeader = { ...header, id: "length-started-parent" };
 		const startMarker = {
@@ -889,10 +897,14 @@ describe("SessionManager.forkFrom", () => {
 			throw new Error("expected the started length-stopped call to be paired");
 		}
 		expect(isSyntheticToolResultMessage(startedResult.message)).toBe(false);
-		expect(startedResult.message).not.toHaveProperty("details");
+		expect(startedResult.message.details).toMatchObject({
+			__interrupted: true,
+			execution: "unknown",
+			separated: true,
+		});
 		expect(
 			startedResult.message.content.some(
-				block => block.type === "text" && block.text.includes("may still be running this tool"),
+				block => block.type === "text" && block.text.includes("may still be running there"),
 			),
 		).toBe(true);
 	});
@@ -992,10 +1004,10 @@ describe("SessionManager.forkFrom", () => {
 		if (result?.type !== "message" || result.message.role !== "toolResult") {
 			throw new Error("expected the active branch's unknown tool result");
 		}
-		expect(result.message).not.toHaveProperty("details");
+		expect(result.message.details).toMatchObject({ execution: "unknown", separated: true });
 		expect(
 			result.message.content.some(
-				block => block.type === "text" && block.text.includes("may still be running this tool"),
+				block => block.type === "text" && block.text.includes("may still be running there"),
 			),
 		).toBe(true);
 		expect(

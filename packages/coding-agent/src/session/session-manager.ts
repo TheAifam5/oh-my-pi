@@ -41,7 +41,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
-import { createInterruptedToolResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
+import { planForkedTurnResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import {
 	type BuildSessionContextOptions,
@@ -1125,6 +1125,39 @@ export class SessionManager {
 		this.#claimSession();
 		const claim = this.#sessionClaim;
 		return claim !== undefined && claim.sessionId === this.#sessionId && claim.release === undefined;
+	}
+
+	/**
+	 * Whether another live process owns this session. Claims the session for
+	 * this process when it is free, as the first write would.
+	 */
+	isSessionOwnedElsewhere(): boolean {
+		return this.#sessionOwnedElsewhere();
+	}
+
+	/**
+	 * Whether another session manager in this process holds this session.
+	 * In-process managers share one ownership lease, so they never move off a
+	 * shared session; this is the only signal that another live session in
+	 * this process may be mid-turn on it.
+	 */
+	isSessionHeldByAnotherManager(): boolean {
+		const sessionId = this.#sessionId;
+		if (this.#released || !this.#persist || !this.#sessionFile || !this.#storage.sessionClaimCount) return false;
+		this.#claimSession();
+		const claim = this.#sessionClaim;
+		if (claim?.sessionId !== sessionId || claim.release === undefined) return false;
+		return this.#storage.sessionClaimCount(sessionId) > 1;
+	}
+
+	/** The latched persistence failure, if writes to the session file are currently failing. */
+	getPersistenceError(): Error | undefined {
+		return this.#diskFailure;
+	}
+
+	/** Whether an appended entry reaches the backing store before the append returns (file, memory). */
+	appendsApplyInBody(): boolean {
+		return !this.#storage.defersSyncPublish;
 	}
 
 	/**
@@ -2850,6 +2883,35 @@ export class SessionManager {
 	}
 
 	/**
+	 * Synchronously flush the session, then force the file to stable storage.
+	 * Returns `false` without syncing when nothing is on disk yet or the backend
+	 * cannot fsync (memory and indexed backends); throws on flush or fsync
+	 * failure.
+	 */
+	fsyncSync(): boolean {
+		this.flushSync();
+		const sessionFile = this.#sessionFile;
+		if (!this.#persist || !sessionFile || !this.#storage.fsyncSync) return false;
+		if (!this.#storage.existsSync(sessionFile)) return false;
+		this.#storage.fsyncSync(sessionFile);
+		return true;
+	}
+
+	/**
+	 * Resolve once every entry appended so far is confirmed by the backing
+	 * store. Immediate on backends that apply appends in-body (file, memory);
+	 * deferred-publish backends wait for the writes queued for the session
+	 * file. Rejects when one of them failed or a disk failure is latched.
+	 */
+	async confirmAppends(): Promise<void> {
+		const sessionFile = this.#sessionFile;
+		if (!this.#storage.defersSyncPublish || !this.#persist || !sessionFile) return;
+		if (this.#storage.confirmWrites) await this.#storage.confirmWrites(sessionFile);
+		else await this.#storage.drain();
+		if (this.#diskFailure) throw this.#diskFailure;
+	}
+
+	/**
 	 * Drop only session files that this manager saw materialized for a draft and
 	 * that still contain no durable conversation or extension state. Explicit
 	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
@@ -4163,9 +4225,16 @@ export class SessionManager {
 	/**
 	 * Pair unresolved calls on the fork's active branch with diagnostic results.
 	 *
-	 * Forks can be taken while the source parent is still running. A result that
-	 * arrives later is only present in that parent's history, so the child must
-	 * preserve an unknown outcome instead of asserting the tool never ran.
+	 * A fork of a *live* parent is taken while the parent may be mid-turn: its
+	 * last assistant turn emitted a tool call whose `toolResult` is delivered
+	 * only to the parent. Resume repair ({@link repairInterruptedTurn}) would
+	 * describe that call as interrupted by a process exit, which is false for a
+	 * live parent. Left unpaired, the clone renders the parent's in-flight call
+	 * as its own pending work and replays an orphan `tool_use` into the model.
+	 * {@link planForkedTurnResults} pairs each such call with an outcome-unknown
+	 * result marked `separated` (a truncated call of a `length` stop without a
+	 * start marker keeps the never-executed length guard), which resume repair
+	 * treats as a settled tail.
 	 *
 	 * A source whose process exit follows its last message is no longer running;
 	 * it keeps the resume recovery instead: startup warns about the pending
@@ -4177,7 +4246,7 @@ export class SessionManager {
 	static #repairForkedInterruptedTail(history: SessionEntry[], branch: readonly SessionEntry[]): void {
 		const leaf = branch.at(-1);
 		if (!leaf || sessionExitFollowsLastMessage(branch)) return;
-		const results = createInterruptedToolResults(branch, "fork");
+		const results = planForkedTurnResults(branch);
 		if (results.length === 0) return;
 		const usedIds = new Set(history.map(entry => entry.id));
 		let parentId = leaf.id;

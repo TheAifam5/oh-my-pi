@@ -78,6 +78,8 @@ function requireArg(value: string | undefined, name: string, action: IdaAction):
 /** IDA Pro tool: lifecycle, structured edits, and Python `exec` against process-wide shared IDBs. */
 export class IdaTool implements AgentTool<typeof idaSchema, IdaToolDetails> {
 	readonly name = "ida";
+	/** Drives an external IDA session. */
+	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const action = stringArg(args, "action");
 		if (action === "list") return "read";

@@ -2282,6 +2282,8 @@ export async function runRootCommand(
 		sessionOptions.tuiTranscript = isInteractive;
 		sessionOptions.autoTitle = isInteractive;
 		sessionOptions.settings = settingsInstance;
+		// `--restore` closes the interrupted turn itself, with the exit assumed, before retrying it.
+		if (parsedArgs.restore) sessionOptions.skipInterruptedTurnRepair = true;
 		sessionOptions.onPrewalkWarning = warning => {
 			if (isInteractive) notifs.push({ kind: "warn", message: warning });
 			else process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);

@@ -64,6 +64,8 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	/** Goal ops touch only session state: `get` reads it; the rest change the goal, so `always-ask` still prompts. */
 	readonly approval = (args: unknown): ToolTier =>
 		args !== null && typeof args === "object" && "op" in args && args.op === "get" ? "read" : "write";
+	/** Changes goal state. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Goal";
 	readonly description = prompt.render(goalDescription);
 	readonly parameters = goalSchema;

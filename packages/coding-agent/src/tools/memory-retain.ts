@@ -41,6 +41,8 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 	/** A global item reaches every project's recall, so it needs the same approval as a file write. */
 	readonly approval = (args: unknown) =>
 		(args as Partial<MemoryRetainParams>).items?.some(item => item.scope === "global") ? "write" : "read";
+	/** Stores memory items: re-running after a crash would store them twice. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Retain";
 	get description(): string {
 		return prompt.render(retainDescription, { globalScope: isGlobalMemoryScopeAvailable(this.session.settings) });

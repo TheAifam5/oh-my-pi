@@ -188,6 +188,8 @@ export class TanCommandController {
 								extensionRoots: () => parentExtensionRoots,
 								localProtocolOptions,
 								parentMnemopiSessionState,
+								// The parent's tail is still live; the fork already closed its dangling calls.
+								skipInterruptedTurnRepair: true,
 							});
 							clone = created.session;
 							await clone.setActiveToolPresentation(toolNames, mountedToolNames);

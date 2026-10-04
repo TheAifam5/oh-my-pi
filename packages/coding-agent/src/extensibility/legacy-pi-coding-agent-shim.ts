@@ -65,6 +65,7 @@ import {
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { SessionEntry } from "../session/session-entries";
 import type { Tool, ToolSession } from "../tools";
+import { localReadReplay, resolveToolReplayClass } from "../tools/approval";
 import { BashTool } from "../tools/bash";
 import { GlobTool } from "../tools/glob";
 import { GrepTool } from "../tools/grep";
@@ -479,6 +480,7 @@ export function createReadToolDefinition(cwd: string, options?: ReadToolOptions)
 		parameters: legacyReadSchema,
 		approval: "read",
 		approvalCacheTargets: params => tool.approvalCacheTargets?.({ path: stringField(params, "path") ?? "" }),
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, options, themeArg) => {
 			const theme = renderTheme(options, themeArg);
 			const readPath = stringField(params, "path") ?? "";
@@ -524,6 +526,7 @@ export function createBashToolDefinition(cwd: string, options?: BashToolOptions)
 		description: tool.description,
 		parameters: legacyBashSchema,
 		approval: "exec",
+		replay: "unsafe",
 		...(shellEnv ? { shellEnv } : {}),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
@@ -586,6 +589,7 @@ export function createGrepToolDefinition(cwd: string, options?: GrepToolOptions)
 		parameters: legacyGrepSchema,
 		approval: "read",
 		approvalCacheTargets: params => tool.approvalCacheTargets?.({ path: stringField(params, "path") ?? "." }),
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			const pattern = stringField(params, "pattern") ?? "";
@@ -648,6 +652,7 @@ export function createFindToolDefinition(cwd: string, options?: FindToolOptions)
 			tool.approvalCacheTargets?.({
 				path: piJoinPath(stringField(params, "path") ?? ".", stringField(params, "pattern") ?? "*"),
 			}),
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			const pattern = stringField(params, "pattern") ?? "";
@@ -706,6 +711,7 @@ export function createLsToolDefinition(cwd: string, options?: LsToolOptions): To
 		// Listing a directory reads it, so it needs the grant a `read` of that directory would.
 		approvalCacheTargets: params =>
 			createRegistryTool(cwd, "read").approvalCacheTargets?.({ path: stringField(params, "path") ?? "." }),
+		replay: localReadReplay,
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			return new Text(`${themedTitle(theme, "ls")} ${themedMuted(theme, stringField(params, "path") ?? ".")}`, 0, 0);

@@ -173,6 +173,7 @@ function abortedToolCallTail(messages: readonly AgentMessage[]): boolean {
  * whose anchor assistant turn completed with runnable arguments
  * (`toolUse`/`stop`) — optionally followed by an aborted boundary with no tool
  * calls of its own (a live Esc; a restored session has already dropped it).
+ * Eval state snapshots inside the batch are skipped and stripped with it.
  * Stripping from the returned index leaves that assistant as the transcript
  * tail, which `Agent.continue()` resumes by re-executing the calls. A
  * partially successful batch never qualifies: re-running a completed call
@@ -189,8 +190,13 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 		end -= 1;
 	}
 	let start = end;
-	while (start > 0 && messages[start - 1].role === "toolResult") start--;
-	if (start === end) return undefined;
+	let resultCount = 0;
+	// An eval snapshot persisted before resume repair appended the results can sit inside the batch.
+	while (start > 0 && (messages[start - 1].role === "toolResult" || isEvalStateContext(messages[start - 1]))) {
+		start--;
+		if (messages[start].role === "toolResult") resultCount++;
+	}
+	if (resultCount === 0) return undefined;
 	const anchor = messages[start - 1];
 	if (anchor?.role !== "assistant") return undefined;
 	if (anchor.stopReason !== "toolUse" && anchor.stopReason !== "stop") return undefined;
@@ -198,12 +204,11 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	for (const block of anchor.content) {
 		if (block.type === "toolCall") callIds.add(block.id);
 	}
-	if (end - start !== callIds.size) return undefined;
+	if (resultCount !== callIds.size) return undefined;
 	for (let i = start; i < end; i++) {
 		const result = messages[i];
-		if (result.role !== "toolResult" || result.isError !== true || !callIds.has(result.toolCallId)) {
-			return undefined;
-		}
+		if (result.role !== "toolResult") continue;
+		if (result.isError !== true || !callIds.has(result.toolCallId)) return undefined;
 	}
 	return start;
 }

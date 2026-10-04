@@ -181,6 +181,8 @@ export class CompressProtocol {
 			description: rewriteDescription.trim(),
 			parameters: rewriteSchema,
 			approval: "read",
+			// Records compressor state; a replay would record it again.
+			replay: "unsafe",
 			strict: true,
 			execute: async (_toolCallId, rawParams) => {
 				const params = rewriteSchema(rawParams);
@@ -207,6 +209,8 @@ export class CompressProtocol {
 			description: approveDescription.trim(),
 			parameters: approveSchema,
 			approval: "read",
+			// Records compressor state; a replay would record it again.
+			replay: "unsafe",
 			strict: true,
 			execute: async (_toolCallId, rawParams) => {
 				const params = approveSchema(rawParams);

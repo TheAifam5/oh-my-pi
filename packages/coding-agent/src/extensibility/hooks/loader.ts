@@ -10,6 +10,7 @@ import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import { assertExtensionCustomEntryType } from "../../session/exit-diagnostics";
 import type { CustomMessagePayload } from "../../session/messages";
 import * as typebox from "../legacy-typebox";
 import { resolvePath, withHostGuard } from "../utils";
@@ -106,6 +107,7 @@ async function createHookAPI(
 			sendMessageHandler(message, options);
 		},
 		appendEntry<T = unknown>(customType: string, data?: T): void {
+			assertExtensionCustomEntryType(customType);
 			if (!appendEntryHandler) {
 				throw new Error("appendEntry handler not initialized");
 			}

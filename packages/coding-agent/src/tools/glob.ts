@@ -11,7 +11,7 @@ import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import type { ToolSession } from ".";
-import { resolveToolTier } from "./approval";
+import { localReadReplay, resolveToolTier } from "./approval";
 import { isFindEnabled } from "./jfind";
 import { applyListLimit } from "@oh-my-pi/pi-tui/tools/list-limit";
 import {
@@ -118,6 +118,8 @@ interface NativePreparedTarget {
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly name = "glob";
+	/** Lists local files only. */
+	readonly replay = localReadReplay;
 	readonly approval = searchPathTier;
 	/**
 	 * `always-ask-cached` keys: the folders and files this glob searches, so a

@@ -496,7 +496,11 @@ export class CollabGuestLink {
 
 		// Resume through AgentSession without adopting the host's cwd. The replica
 		// keeps its model: #applyHostState mirrors the host's, which runs inference.
-		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true, keepModel: true });
+		const switched = await this.#ctx.session.switchSession(replicaPath, {
+			preserveLocalCwd: true,
+			keepModel: true,
+			skipInterruptedTurnRepair: true,
+		});
 		if (switched === false) {
 			throw new Error("Collab replica activation was cancelled");
 		}

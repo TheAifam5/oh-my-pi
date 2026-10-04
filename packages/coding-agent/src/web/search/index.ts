@@ -389,6 +389,8 @@ let registryDescription: string | undefined;
  */
 export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchResultDetails> {
 	readonly name = "web_search";
+	/** Reaches the network. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "read" as const;
 	readonly label = "Web Search";
 	readonly parameters = webSearchSchema;

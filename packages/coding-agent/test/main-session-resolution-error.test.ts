@@ -288,10 +288,15 @@ describe("createSessionManager — missing session (#2084)", () => {
 					throw new Error("expected the unknown tool result");
 				}
 				expect(resultEntry.message.isError).toBe(true);
-				expect(resultEntry.message).not.toHaveProperty("details");
+				expect(resultEntry.message.details).toMatchObject({
+					__interrupted: true,
+					execution: "unknown",
+					separated: true,
+					startedAt: timestamp,
+				});
 				expect(
 					resultEntry.message.content.some(
-						block => block.type === "text" && block.text.includes("may still be running this tool"),
+						block => block.type === "text" && block.text.includes("may still be running there"),
 					),
 				).toBe(true);
 
@@ -310,7 +315,7 @@ describe("createSessionManager — missing session (#2084)", () => {
 					throw new Error("expected the unknown result to be persisted");
 				}
 				expect(persistedResult.message.isError).toBe(true);
-				expect(persistedResult.message).not.toHaveProperty("details");
+				expect(persistedResult.message.details).toMatchObject({ execution: "unknown", separated: true });
 			} finally {
 				vi.restoreAllMocks();
 				await fsp.rm(cwd, { recursive: true, force: true });

@@ -135,6 +135,8 @@ function buildBinaryFileReadResult(
 
 export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails> {
 	readonly name = "github";
+	/** Calls GitHub and can change remote state. */
+	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawOp = (args as Partial<GithubInput>).op;
 		const op = typeof rawOp === "string" ? rawOp : "";

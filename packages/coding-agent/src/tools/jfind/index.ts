@@ -15,7 +15,7 @@ import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../../judgment";
 import findDescription from "../../prompts/tools/find.md" with { type: "text" };
 import type { ToolSession } from "..";
-import { resolveToolTier } from "../approval";
+import { localReadReplay, resolveToolTier } from "../approval";
 import {
 	formatPathRelativeToCwd,
 	normalizePathLikeInput,
@@ -59,6 +59,8 @@ export function isFindEnabled(session: ToolSession): boolean {
 /** Semantic search tool: describe a behavior, get files and line ranges that implement it. */
 export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 	readonly name = "find";
+	/** Finds local files only. */
+	readonly replay = localReadReplay;
 	readonly approval = searchPathTier;
 	/** `always-ask-cached` keys: the tree (or file) it searches, as `grep` reports one. */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {

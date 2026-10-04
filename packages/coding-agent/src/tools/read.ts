@@ -13,6 +13,7 @@ import type {
 	ToolSpeculationCommitContext,
 	ToolSpeculationDiscardContext,
 	ToolSpeculationExecutionContext,
+	ToolReplayClass,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import { completeSimple, type ImageContent, type TextContent } from "@oh-my-pi/pi-ai";
@@ -83,6 +84,7 @@ import {
 	scanConflictLines,
 	scanFileForConflicts,
 } from "./conflict-detect";
+import { localReadReplay } from "./approval";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
 import { approvalDirectoryKey } from "./approval-cache";
 import { approvalTargetKey, approvalTargetNamesFile, isApprovalPublicUrl } from "./approval-targets";
@@ -1024,6 +1026,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// subfolder's contents.
 		if (path.isAbsolute(key) && !approvalTargetNamesFile(key)) return [approvalDirectoryKey(key)];
 		return [key];
+	};
+	/** Plain local reads are safe to repeat; URL targets and conversions that execute (PDF rendering) are not. */
+	readonly replay = (args: unknown): ToolReplayClass => {
+		if (localReadReplay(args) !== "safe" || this.approval(args) !== "read") return "unsafe";
+		const readPath = args && typeof args === "object" && "path" in args ? String(args.path ?? "") : "";
+		return parseReadUrlTarget(readPath) === null ? "safe" : "unsafe";
 	};
 	readonly label = "Read";
 	readonly loadMode = "essential";

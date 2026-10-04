@@ -10,8 +10,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
-	createInterruptedToolResults,
-	createInterruptedTurnAbortMessage,
+	CRASHED_TURN_ERROR,
+	planInterruptedTurnRepair,
+	repairInterruptedTurn,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -61,10 +62,9 @@ function probeTool(executed: string[]): AgentTool {
 function closedByExitRecovery(persisted: Message[]): Message[] {
 	const manager = SessionManager.inMemory();
 	for (const message of persisted) manager.appendMessage(message);
-	const branch = manager.getBranch();
-	const abort = createInterruptedTurnAbortMessage(branch, undefined, { assumeExit: true });
-	if (!abort) throw new Error("Expected an unfinished turn to close");
-	return [...persisted, ...createInterruptedToolResults(branch), abort];
+	const repair = planInterruptedTurnRepair(manager.getBranch(), undefined, { assumeExit: true });
+	if (!repair?.abort) throw new Error("Expected an unfinished turn to close");
+	return [...persisted, ...repair.toolResults, repair.abort];
 }
 
 describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
@@ -149,6 +149,44 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
 	});
 
+	it("goes on with a crash-cut turn that startup repair already closed without an exit record", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const { session, mock } = reopen(
+			model,
+			[
+				{ role: "user", content: "run the probe", timestamp: Date.now() },
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+					stopReason: "toolUse",
+				}),
+			],
+			[probeTool(executed)],
+			[{ content: ["done after restore"], stopReason: "stop" }],
+		);
+		// A resume without --restore (or a revived subagent) closes the crash tail at startup.
+		const startup = repairInterruptedTurn(session.sessionManager);
+		expect(startup?.abort?.errorMessage).toBe(CRASHED_TURN_ERROR);
+		session.agent.replaceMessages(session.sessionManager.buildSessionContext().messages);
+		const entriesBeforeRestore = session.sessionManager.getEntries().length;
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual(["again"]);
+		expect(mock.calls.length).toBe(1);
+		// The restore appended no second repair before retrying.
+		const repairedEntries = session.sessionManager
+			.getEntries()
+			.slice(entriesBeforeRestore)
+			.filter(
+				entry =>
+					entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "aborted",
+			);
+		expect(repairedEntries).toEqual([]);
+	});
+
 	it("goes on with a turn exit recovery closed when the eval state snapshot follows it (#16195)", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -202,6 +240,116 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		expect(mock.calls.length).toBe(1);
 		const last = session.agent.state.messages.at(-1);
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
+	});
+
+	it("replays a crash-cut call when --restore skipped startup repair and the eval state snapshot already follows the tail", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const evalToolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			getEvalSessionId: () => "restore-eval-state-unrepaired",
+		};
+		const { session, mock } = reopen(
+			model,
+			[
+				{ role: "user", content: "eval something", timestamp: Date.now() },
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_eval", name: "eval", arguments: { code: "1" } }],
+					stopReason: "toolUse",
+				}),
+				{
+					role: "toolResult",
+					toolCallId: "call_eval",
+					toolName: "eval",
+					content: [{ type: "text", text: "1" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				assistant(model, { content: [{ type: "text", text: "evaluated" }] }),
+				{ role: "user", content: "run the probe", timestamp: Date.now() },
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+					stopReason: "toolUse",
+				}),
+			],
+			[probeTool(executed)],
+			[{ content: ["done after restore"], stopReason: "stop" }],
+			evalToolSession,
+		);
+		const tail = session.sessionManager.getBranch().at(-1);
+		expect(tail?.type === "custom_message" && tail.customType).toBe("eval-state-context");
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual(["again"]);
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("does not replay a partly completed batch when an eval state snapshot sits inside it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const evalToolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			getEvalSessionId: () => "restore-eval-state-partial",
+		};
+		const { session, mock } = reopen(
+			model,
+			[
+				{ role: "user", content: "eval something", timestamp: Date.now() },
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_eval", name: "eval", arguments: { code: "1" } }],
+					stopReason: "toolUse",
+				}),
+				{
+					role: "toolResult",
+					toolCallId: "call_eval",
+					toolName: "eval",
+					content: [{ type: "text", text: "1" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				assistant(model, { content: [{ type: "text", text: "evaluated" }] }),
+				{ role: "user", content: "run both probes", timestamp: Date.now() },
+				assistant(model, {
+					content: [
+						{ type: "toolCall", id: "call_done", name: "probe", arguments: { value: "done" } },
+						{ type: "toolCall", id: "call_cut", name: "probe", arguments: { value: "cut" } },
+					],
+					stopReason: "toolUse",
+				}),
+				{
+					role: "toolResult",
+					toolCallId: "call_done",
+					toolName: "probe",
+					content: [{ type: "text", text: "ok:done" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			],
+			[probeTool(executed)],
+			[{ content: ["answered from the transcript"], stopReason: "stop" }],
+			evalToolSession,
+		);
+		const tail = session.sessionManager.getBranch().at(-1);
+		expect(tail?.type === "custom_message" && tail.customType).toBe("eval-state-context");
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		// Re-running the batch would repeat the completed call; the model answers instead.
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
 	});
 
 	it("leaves a turn the user interrupted, and one that finished, as they are", async () => {
