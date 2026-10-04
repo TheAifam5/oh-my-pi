@@ -10,9 +10,10 @@ import {
 	updateMCPServer,
 } from "../../mcp/config-writer";
 import { MCPManager } from "../../mcp/manager";
+import { mcpPackageLaunchDefaults } from "../../mcp/settings";
 import { getSmitheryApiKey } from "../../mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../mcp/smithery-registry";
-import type { MCPServerConfig, MCPServerConnection } from "../../mcp/types";
+import type { MCPServerConfig, MCPServerConnection, MCPStdioServerConfig } from "../../mcp/types";
 import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, usage } from "./parse";
@@ -210,6 +211,7 @@ async function withPreparedMcpConnection<T>(
 		// Without this, `/mcp test|resources|prompts` silently fails for any
 		// server saved by the TUI/reauth path.
 		manager.setAuthStorage(runtime.session.modelRegistry.authStorage);
+		manager.setPackageLaunchDefaults(() => mcpPackageLaunchDefaults(runtime.settings));
 		const resolvedConfig = await manager.prepareConfig(config);
 		connection = await connectToServer(name, resolvedConfig);
 		return await fn(connection);
@@ -404,7 +406,8 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 							}
 						}
 					} else {
-						location = (config as { command: string }).command;
+						const stdio = config as MCPStdioServerConfig;
+						location = stdio.package ? `package:${stdio.package.name}` : stdio.command;
 					}
 					return `${name} | ${type} | ${enabled} | ${location ?? "(unknown)"} [${scope}]`;
 				})

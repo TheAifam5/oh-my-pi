@@ -25,7 +25,7 @@ import { ReadTool, splitImageQuestionTarget } from "../tools/read";
 import { renderError } from "../tools/tool-errors";
 
 import { cfgDisabledExtensions, cfgExtensions, cfgSkills } from "../extensibility/settings";
-import { cfgMcpEnableProjectConfig } from "../mcp/settings";
+import { cfgMcpEnableProjectConfig, mcpPackageLaunchDefaults } from "../mcp/settings";
 
 export interface ReadCommandArgs {
 	path: string;
@@ -93,6 +93,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 				filterBrowser: false,
 				cacheStorage: settings.getStorage(),
 				authStorage,
+				packageLaunch: () => mcpPackageLaunchDefaults(settings),
 			});
 			mcpManager = result.manager;
 			session.mcpManager = mcpManager;

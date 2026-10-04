@@ -10,7 +10,8 @@ import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { readMCPConfigFile } from "./config-writer";
-import type { MCPConfigFile, MCPServerConfig } from "./types";
+import { validatePackageLaunch } from "./package-launch";
+import type { MCPConfigFile, MCPServerConfig, MCPStdioServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -39,7 +40,7 @@ export interface LoadMCPConfigsResult {
  */
 function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	// Determine transport type
-	const transport = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
+	const transport = server.transport ?? (server.command || server.package ? "stdio" : server.url ? "http" : "stdio");
 	const shared = {
 		enabled: server.enabled,
 		timeout: server.timeout,
@@ -53,8 +54,9 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 		const config: MCPServerConfig = {
 			...shared,
 			type: "stdio" as const,
-			command: server.command ?? "",
 		};
+		if (server.package) config.package = server.package;
+		else config.command = server.command ?? "";
 		if (server.args) config.args = server.args;
 		if (server.env) config.env = server.env;
 		if (server.envPolicy) config.envPolicy = server.envPolicy;
@@ -338,17 +340,26 @@ export function validateServerConfig(name: string, config: MCPServerConfig): str
 
 	// Check for conflicting transport fields
 	const hasCommand = "command" in config && config.command;
+	const hasPackage = "package" in config && config.package;
 	const hasUrl = "url" in config && (config as { url?: string }).url;
-	if (hasCommand && hasUrl) {
+	if ((hasCommand || hasPackage) && hasUrl) {
+		const field = hasCommand ? "command" : "package";
 		errors.push(
-			`Server "${name}": both "command" and "url" are set - server should be either stdio (command) OR http/sse (url), not both`,
+			`Server "${name}": both "${field}" and "url" are set - server should be either stdio (${field}) OR http/sse (url), not both`,
 		);
 	}
 
 	if (serverType === "stdio") {
-		const stdioConfig = config as { command?: string };
-		if (!stdioConfig.command) {
+		const stdioConfig = config as MCPStdioServerConfig;
+		if (stdioConfig.command && stdioConfig.package) {
+			errors.push(
+				`Server "${name}": both "command" and "package" are set - a stdio server launches one or the other`,
+			);
+		} else if (!stdioConfig.command && !stdioConfig.package) {
 			errors.push(`Server "${name}": stdio server requires "command" field`);
+		} else if (stdioConfig.package) {
+			const problem = validatePackageLaunch(stdioConfig.package);
+			if (problem) errors.push(`Server "${name}": package ${problem}`);
 		}
 	} else if (serverType === "http" || serverType === "sse") {
 		const httpConfig = config as { url?: string };
@@ -417,8 +428,11 @@ export function isBrowserMCPServer(name: string, config: MCPServerConfig): boole
 
 	// Check by command/args for stdio servers
 	if (!config.type || config.type === "stdio") {
-		const stdioConfig = config as { command?: string; args?: string[] };
+		const stdioConfig = config as MCPStdioServerConfig;
 		if (stdioConfig.command && BROWSER_MCP_PKG_PATTERN.test(stdioConfig.command)) {
+			return true;
+		}
+		if (stdioConfig.package && BROWSER_MCP_PKG_PATTERN.test(stdioConfig.package.name)) {
 			return true;
 		}
 		if (stdioConfig.args?.some(arg => BROWSER_MCP_PKG_PATTERN.test(arg))) {

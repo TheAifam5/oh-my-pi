@@ -332,12 +332,15 @@ export async function resolveStdioSpawnCommand(
 	config: MCPStdioServerConfig,
 	options: ResolveStdioSpawnOptions,
 ): Promise<StdioSpawnCommand> {
+	const command = config.command;
+	// A `package` launch spec is resolved to a concrete command by `MCPManager.prepareConfig`.
+	if (!command) throw new Error("MCP stdio server has no command to spawn");
 	const args = config.args ?? [];
-	if (options.platform !== "win32") return { cmd: [config.command, ...args], detached: options.platform !== "darwin" };
+	if (options.platform !== "win32") return { cmd: [command, ...args], detached: options.platform !== "darwin" };
 
 	const windowsHide = options.hostHasInheritableConsole === undefined ? true : !options.hostHasInheritableConsole;
-	const resolved = await resolveWindowsCommandPath(config.command, options.cwd, options.env);
-	const resolvedCommand = resolved ?? config.command;
+	const resolved = await resolveWindowsCommandPath(command, options.cwd, options.env);
+	const resolvedCommand = resolved ?? command;
 	const npmShimCommand = await resolveWindowsNpmShimCommand(resolvedCommand, args, options.cwd, windowsHide);
 	if (npmShimCommand) return npmShimCommand;
 
@@ -351,12 +354,8 @@ export async function resolveStdioSpawnCommand(
 	// A path-qualified command with no file behind it (bare or with a PATHEXT extension) can only fail
 	// inside cmd.exe, whose "not recognized" stderr surfaces as an opaque early stdout EOF. Spawn it
 	// directly so the launch fails with ENOENT naming the missing path, as it does on POSIX.
-	if (
-		resolved === null &&
-		hasPathSegment(config.command) &&
-		!(await fileExists(path.resolve(options.cwd, config.command)))
-	) {
-		return { cmd: [config.command, ...args], windowsHide, detached };
+	if (resolved === null && hasPathSegment(command) && !(await fileExists(path.resolve(options.cwd, command)))) {
+		return { cmd: [command, ...args], windowsHide, detached };
 	}
 	const needsCmdExe = resolved === null || isWindowsBatchCommand(resolvedCommand);
 	if (!needsCmdExe) return { cmd: [resolvedCommand, ...args], windowsHide, detached };

@@ -75,7 +75,7 @@ import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import type { InteractiveModeContext } from "../types";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
 
-import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
+import { cfgMcpEnableProjectConfig, mcpPackageLaunchDefaults } from "../../mcp/settings";
 
 const MCP_MANUAL_INPUT_PROVIDER_ID = "mcp";
 const MCP_MANUAL_LOGIN_TIP = "Headless? Paste the redirect URL or code with /login <value>.";
@@ -1148,6 +1148,7 @@ export class MCPCommandController {
 		} else {
 			const tempManager = new MCPManager(getProjectDir());
 			tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
+			tempManager.setPackageLaunchDefaults(() => mcpPackageLaunchDefaults(this.ctx.settings));
 			resolvedConfig = await tempManager.prepareConfig(config, options);
 		}
 
@@ -1740,6 +1741,7 @@ export class MCPCommandController {
 			} else {
 				const tempManager = new MCPManager(getProjectDir());
 				tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
+				tempManager.setPackageLaunchDefaults(() => mcpPackageLaunchDefaults(this.ctx.settings));
 				resolvedConfig = await tempManager.prepareConfig(config);
 			}
 

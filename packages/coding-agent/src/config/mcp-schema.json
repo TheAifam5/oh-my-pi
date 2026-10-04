@@ -109,6 +109,57 @@
       },
       "description": "Explicit OAuth client settings for servers that need them during /mcp reauth or initial connect."
     },
+    "argvPrefix": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      },
+      "prefixItems": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^-]"
+        }
+      ]
+    },
+    "packageLaunch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "description": "Launch an npm package instead of `command`: the project's installed copy runs as `runtime <bin entry> args...`, otherwise `runner <name>@<version> args...`, as `policy` allows. OMP-specific: supported by native config and standalone mcp.json/.mcp.json.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$",
+          "description": "npm package name, optionally scoped."
+        },
+        "bin": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "Name of the package's bin entry (default: the package name without its scope)."
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\s/@:]([^\\n\\r/@:]*[^\\s/@:])?$",
+          "description": "Registry tag, version, or range passed to the runner (default: \"latest\")."
+        },
+        "policy": {
+          "type": "string",
+          "enum": ["local-first", "local-only", "fallback-only"],
+          "description": "local-first runs the installed package, else the runner; local-only fails without an installed package; fallback-only always uses the runner (default: the mcp.packagePolicy setting)."
+        },
+        "runner": {
+          "$ref": "#/$defs/argvPrefix",
+          "description": "Argv prefix that receives name@version (default: the mcp.packageRunner setting, [\"bunx\"])."
+        },
+        "runtime": {
+          "$ref": "#/$defs/argvPrefix",
+          "description": "Argv prefix that receives the installed bin entry's real path (default: the mcp.packageRuntime setting, [\"bun\"])."
+        }
+      }
+    },
     "serverBase": {
       "type": "object",
       "properties": {
@@ -147,7 +198,7 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["command"],
+          "oneOf": [{ "required": ["command"] }, { "required": ["package"] }],
           "properties": {
             "enabled": {},
             "timeout": {},
@@ -164,6 +215,9 @@
               "type": "string",
               "minLength": 1,
               "description": "Executable to spawn."
+            },
+            "package": {
+              "$ref": "#/$defs/packageLaunch"
             },
             "args": {
               "type": "array",

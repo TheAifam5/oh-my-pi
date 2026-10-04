@@ -8,6 +8,7 @@ import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
 import { type MCPLoadResult, MCPManager } from "./manager";
+import type { MCPPackageLaunchDefaults } from "./package-launch";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import { MCPToolCache } from "./tool-cache";
 
@@ -37,6 +38,8 @@ export interface MCPToolsLoadOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
+	/** Source of the runner, runtime, and policy for `package` launch specs (default: the built-in setting defaults) */
+	packageLaunch?: () => MCPPackageLaunchDefaults;
 	/** SQLite storage for MCP tool cache (null disables cache) */
 	cacheStorage?: AgentStorage | null;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
@@ -66,6 +69,9 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 	const manager = new MCPManager(cwd, toolCache);
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);
+	}
+	if (options?.packageLaunch) {
+		manager.setPackageLaunchDefaults(options.packageLaunch);
 	}
 
 	let result: MCPLoadResult;

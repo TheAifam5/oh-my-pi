@@ -374,6 +374,7 @@ import {
 	cfgMcpNotificationDebounceMs,
 	cfgMcpNotifications,
 	cfgMcpStartupTimeoutMs,
+	mcpPackageLaunchDefaults,
 } from "./mcp/settings";
 import { cfgPlanEnabled } from "./plan-mode/settings";
 import { cfgSecretsEnabled } from "./secrets/settings";
@@ -1256,7 +1257,8 @@ export async function discoverCustomTSCommands(cwd?: string, agentDir?: string):
 
 /**
  * Discover MCP servers from .mcp.json files.
- * Returns the manager and loaded tools.
+ * Returns the manager and loaded tools. `package` launch specs use the built-in defaults, not the
+ * `mcp.package*` settings.
  */
 export async function discoverMCPServers(cwd?: string): Promise<MCPToolsLoadResult> {
 	const resolvedCwd = cwd ?? getProjectDir();
@@ -2500,6 +2502,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const cacheStorage = settings.getStorage();
 				mcpManager = new MCPManager(cwd, cacheStorage ? new MCPToolCache(cacheStorage) : null);
 				mcpManager.setAuthStorage(authStorage);
+				mcpManager.setPackageLaunchDefaults(() => mcpPackageLaunchDefaults(settings));
 				toolSession.mcpManager = mcpManager;
 
 				if (cfgMcpNotifications.get(settings)) {
@@ -2540,6 +2543,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...mcpDiscoverOptions,
 					cacheStorage: settings.getStorage(),
 					authStorage,
+					packageLaunch: () => mcpPackageLaunchDefaults(settings),
 				});
 				mcpManager = mcpResult.manager;
 				toolSession.mcpManager = mcpManager;

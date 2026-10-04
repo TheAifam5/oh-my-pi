@@ -3726,6 +3726,28 @@
           "description": "Debounce window in milliseconds for MCP resource updates before injecting them into the conversation",
           "type": "number",
           "default": 500
+        },
+        "packageRunner": {
+          "type": "array",
+          "default": [
+            "bunx"
+          ]
+        },
+        "packageRuntime": {
+          "type": "array",
+          "default": [
+            "bun"
+          ]
+        },
+        "packagePolicy": {
+          "description": "Default launch policy for stdio MCP servers configured with a package",
+          "type": "string",
+          "enum": [
+            "local-first",
+            "local-only",
+            "fallback-only"
+          ],
+          "default": "local-first"
         }
       }
     },

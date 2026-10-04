@@ -27,7 +27,7 @@ This document describes how MCP servers are discovered, connected, exposed as to
 
 Both paths:
 
-- pass `authStorage`, cache storage, `mcp.startupTimeoutMs`, and `mcp.enableProjectConfig`; browser-MCP filtering requires `browser.enabled`, registered and active Eval, and an unrestricted session,
+- pass `authStorage`, cache storage, `mcp.startupTimeoutMs`, `mcp.enableProjectConfig`, and the `mcp.packageRunner`/`mcp.packageRuntime`/`mcp.packagePolicy` launch defaults; browser-MCP filtering requires `browser.enabled`, registered and active Eval, and an unrestricted session,
 - always set `filterExa: true`,
 - log per-server load/connect errors,
 - store the manager in `toolSession.mcpManager` and the session result.
