@@ -91,6 +91,7 @@ describe("AgentSession subscriber event order", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_start"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		const settings = Settings.isolated({

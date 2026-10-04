@@ -18,6 +18,7 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import { classifyDifficulty } from "../auto-thinking/classifier";
 import type { ModelRegistry } from "../config/model-registry";
+import type { ModelSelectSource } from "../extensibility/extensions/types";
 import {
 	filterAvailableModelsByEnabledPatterns,
 	formatModelStringWithRouting,
@@ -61,7 +62,13 @@ export interface ModelControlsHost {
 	promptGeneration(): number;
 	resolveActiveEditMode(): EditMode;
 	syncAfterModelChange(previousEditMode: EditMode): Promise<void>;
-	setModelWithProviderSessionReset(model: Model, selection?: "explicit" | "automatic"): Promise<void>;
+	setModelWithProviderSessionReset(
+		model: Model,
+		source?: ModelSelectSource,
+		selection?: "explicit" | "automatic",
+	): Promise<void>;
+	/** Observes an effective thinking-level change; `previousLevel` is the level before it. */
+	onThinkingLevelSelected?(level: ThinkingLevel, previousLevel: ThinkingLevel): void;
 	clearActiveRetryFallback(): void;
 	clearInheritedProviderPromptCacheKey(): void;
 	magicKeywordEnabled(keyword: MagicKeywordId): boolean;
@@ -286,7 +293,7 @@ export class ModelControls {
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(targetModel, selection);
+		await this.#host.setModelWithProviderSessionReset(targetModel, undefined, selection);
 		this.#host.sessionManager.appendModelChange(
 			`${targetModel.provider}/${targetModel.id}`,
 			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
@@ -446,7 +453,7 @@ export class ModelControls {
 		// Apply model
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(next.model));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(next.model);
+		await this.#host.setModelWithProviderSessionReset(next.model, "cycle");
 		this.#host.sessionManager.appendModelChange(`${next.model.provider}/${next.model.id}`);
 		this.#host.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
 
@@ -477,7 +484,7 @@ export class ModelControls {
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(nextModel));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(nextModel);
+		await this.#host.setModelWithProviderSessionReset(nextModel, "cycle");
 		this.#host.sessionManager.appendModelChange(`${nextModel.provider}/${nextModel.id}`);
 		this.#host.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
 		// Re-apply the current thinking level (or auto) for the newly selected model
@@ -536,6 +543,7 @@ export class ModelControls {
 			if (isChanging) {
 				this.#host.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
 				this.#host.emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
+				this.#notifyThinkingLevelSelected(provisional, previousLevel);
 			}
 			return;
 		}
@@ -551,6 +559,7 @@ export class ModelControls {
 		// auto resolved to medium, then the user pins medium): otherwise the latest
 		// session entry keeps `configured: "auto"` and resume re-enables auto.
 		const isChanging = wasAuto || effectiveLevel !== this.#thinkingLevel;
+		const previousLevel = this.#thinkingLevel;
 
 		this.#thinkingLevel = effectiveLevel;
 		this.#applyThinkingLevelToAgent(effectiveLevel);
@@ -562,7 +571,13 @@ export class ModelControls {
 				cfgDefaultThinkingLevel.set(this.#host.settings, effectiveLevel);
 			}
 			this.#host.emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
+			this.#notifyThinkingLevelSelected(effectiveLevel, previousLevel);
 		}
+	}
+
+	#notifyThinkingLevelSelected(level: ThinkingLevel | undefined, previousLevel: ThinkingLevel | undefined): void {
+		if (level === previousLevel) return;
+		this.#host.onThinkingLevelSelected?.(level ?? ThinkingLevel.Off, previousLevel ?? ThinkingLevel.Off);
 	}
 
 	/**
@@ -672,6 +687,7 @@ export class ModelControls {
 		);
 		if (effort === undefined) return;
 		const shouldPersistResolution = this.#thinkingLevel !== effort;
+		const previousLevel = this.#thinkingLevel;
 		this.#autoResolvedLevel = effort;
 		this.#thinkingLevel = effort;
 		this.#applyThinkingLevelToAgent(effort);
@@ -684,6 +700,7 @@ export class ModelControls {
 			configured: AUTO_THINKING,
 			resolved: effort,
 		});
+		this.#notifyThinkingLevelSelected(effort, previousLevel);
 	}
 
 	/**

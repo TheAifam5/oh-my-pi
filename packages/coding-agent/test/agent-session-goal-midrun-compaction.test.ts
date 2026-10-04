@@ -248,6 +248,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 					await releaseMessageEnd.promise;
 				}
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session } = await createHarness(
 			{ "compaction.thresholdTokens": 100_000 },
@@ -429,6 +430,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 					throw new Error("intentional message_end failure");
 				}
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session, sessionManager } = await createHarness(
 			{ "compaction.thresholdTokens": 100_000 },
@@ -468,6 +470,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 				(event.message.details as { nested: { state: string } }).nested.state = "mutated";
 				mutationApplied.resolve();
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		let modelCall = 0;
 		const { session, observedContexts } = await createHarness(
@@ -546,6 +549,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 					await releaseMessageEnd.promise;
 				}
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session, sessionManager, observedContexts } = await createHarness({}, { extensionRunner });
 		const compactSpy = mockCompaction("MID-RUN-COMPACTED-WITH-PENDING-HOOK");
@@ -611,6 +615,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 					await releaseContextMessageEnd.promise;
 				}
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		// Disable background speculation: the soft method would otherwise defer
 		// this threshold crossing to a background run and the assertions below
@@ -726,6 +731,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 					await releaseHandler.promise;
 				}
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session, observedContexts } = await createHarness(
 			{ "compaction.methodOrder": methodOrder },

@@ -176,8 +176,8 @@ Provider API keys are resolved separately (stored auth, OAuth, `models.yml`, env
 Layers are combined with a deep merge:
 
 - **Objects are deep-merged** — keys present only in a lower layer are kept; keys present in a higher layer override.
-- **Scalars and arrays are replaced wholesale** by the higher-precedence layer. A higher layer's array does not append to a lower layer's array.
-- **A configured `null` counts as unset at read time**, so the schema default (or a fallback env var) applies rather than a lower-layer value. Project `modelRoles` entries are an exception: cleared/null project roles fall back to global roles.
+- **Scalars and arrays are replaced wholesale** by the higher-precedence layer. A higher layer's array does not append to a lower layer's array. `defaultTools` is the exception: a higher layer's list of only `+name`/`-name` entries changes the lower layer's selection (see [Default tool selection](#default-tool-selection)).
+- **A configured `null` counts as unset at read time**, so the schema default (or a fallback env var) applies rather than a lower-layer value. Project `modelRoles` entries are an exception: cleared/null project roles fall back to global roles. A project `null` for `defaultTools` or `compaction.modelOverrides`, and project `null` entries and fields of `compaction.modelOverrides`, are ignored, so lower layers apply.
 - **Named model presets are resolved whole**, not deep-merged across layers. A project preset of the same name replaces the global preset. Runtime/overlay `null` entries can hide a lower-layer preset.
 
 Use nested YAML mappings for dotted setting paths:
@@ -633,6 +633,30 @@ tools:
 | `session.fsyncUnsafeTools` | boolean | `false` | Fsync the session file and its directory before running a tool whose replay class is `unsafe` (any tool that does not declare `replay: "safe"`), so the call and its start marker survive power loss on platforms where fsync reaches stable storage (macOS fsync does not force a full flush). File-backed sessions only; a failed fsync shows a warning and the tool still runs. See [session custom entries](./session.md). |
 | `session.refuseUnsafeToolsWithoutJournal` | boolean | `false` | While the session file cannot be written (a latched write failure on file or memory storage), refuse a tool whose replay class is `unsafe` with an error result instead of running it without a durable start record. Replay-safe tools, `yield`, and `ask` still run. Off: the tool runs, the failure is logged, and resume never reports a call of that turn as not started. See [session custom entries](./session.md). |
 
+#### Default tool selection
+
+`defaultTools` (array, unset by default) changes which tools the main session starts with. Unset, every tool its `*.enabled` gate allows starts active.
+
+```yaml
+# ~/.omp/agent/config.yml
+defaultTools: [read, grep, edit, write]
+```
+
+```yaml
+# <repo>/.omp/config.yml — layers on the user list: drops grep
+defaultTools: ["-grep"]
+```
+
+- **Plain names** replace the built-in tools of the default selection; `[]` disables every built-in tool. Extension, custom, and MCP tools stay unless a `-name` removes them. The protected built-ins `ask`, `resolve`, `yield`, `manage_skill`, `learn`, `context_notes`, and `new_context` also stay; only a `-name` outside the project layer removes them.
+- **`+name` and `-name`** add or remove one tool. In one list, plain names form the selection first, then the `+name`/`-name` entries apply in order. Entries are trimmed, so `" +bash"` equals `"+bash"`. Outside the project layer, `+name` can activate a registered tool that starts inactive (`defaultInactive`).
+- **Layering.** A list of only `+name`/`-name` entries is appended to the list from the lower layers (global, then project, then a `--config` overlay or runtime override), so its entries apply after theirs; a list with a plain name, or `[]`, replaces it.
+- **The project layer only narrows.** A project's `.omp` settings can remove tools, but never select a tool the other layers leave out: a user `-name` or a user list of plain names wins over every project entry, and project entries never activate a tool that starts inactive. A project `-name` cannot remove a protected built-in. When the project layer removes tools the other layers select, a warning names them: in the interactive header (or on stderr outside interactive mode) at startup, and as one notice per session when a later change removes a different set. A project `defaultTools: null` is ignored rather than clearing the user's list. A malformed project `defaultTools` value is ignored with one warning, so the lower layers apply; a malformed value in any other layer stops settings from loading.
+- **Limits.** One list holds at most 256 entries of at most 128 characters each; a longer list or entry is malformed.
+- **Policy still applies.** `defaultTools` selects among registered tools only: a tool its `*.enabled` setting disables is not registered, and names that match no registered tool are ignored. A plain name or `+name` never selects a tool that `tools.approval` sets to `deny`, or a hidden internal tool outside the default selection; `-name` can still remove either.
+- **Live changes** enable tools that a change outside the project layer newly selects, including the tools a cleared setting brings back, as long as the project layer does not remove them. They never disable tools. A project-layer change (an edited project file, or a session moving to another directory) never enables a tool. A tool turned off since the previous change, by you or by its `*.enabled` setting, stays off, as does a built-in whose `*.enabled` setting is off.
+- **Scope.** `--tools`, `--no-tools`, an SDK `toolNames` list, restricted sessions, and subagents keep their own selection and ignore `defaultTools`. `--tools` does not accept `+name` or `-name`. MCP tools that connect after startup are not affected.
+- **Approval is separate.** Selecting a tool does not approve its calls: `tools.approvalMode` and `tools.approval` still decide every call at execution time.
+
 Mounting still follows the session's explicit tool allow-list. A session that permits `read` but omits `write` can receive a device-only write transport; this does not grant filesystem writes.
 
 Individual built-in tools and Eval preludes are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `ratchet.enabled` (default `false`; the `ratchet(flow)` eval/hillclimb prelude, which `/ratchet` turns on for the current session only), `archive.enabled` (default `true`; the read-only `archive` eval prelude over prompt history, recent projects, past sessions, and recaps), `astEdit.enabled`, `astGrep.enabled`, `find.enabled` (`auto`/`on`/`off`; `auto` enables `find` only when the `judge` role resolves to a native TypeSafe jev model), and `web_search.enabled`. Image questions use `read <image>?q=<question>` and honor `images.questionTimeoutMs`.
@@ -789,6 +813,7 @@ memory:
 | `task.agentCompactionThresholdOverrides` | record | `{}` | Exact-name task/eval agent → compaction trigger: a positive token count (`90000`) or a percentage string (`"80%"`). See below. |
 | `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
 | `compaction.keepRecentTokens` | number  | `20000`                                  | Recent-history token budget for summary compaction.                                                                                                                                                                                                           |
+| `compaction.modelOverrides`   | record  | `{}`                                     | Per-model `reserveTokens` and `keepRecentTokens`, keyed by exact `provider/modelId`. See below. |
 | `compaction.autoContinue`     | boolean | `true`                                   | Continue automatically after compaction.                                                                                                                                                                                                  |
 | `memory.backend`              | enum    | `off`                                    | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys.                                                                                                                  |
 | `autolearn.enabled`           | boolean | `false`       | Experimental: enable standing lesson-capture guidance and `manage_skill` (plus `learn` when a memory backend is active). Managed skills live under `<agent dir>/managed-skills`. |
@@ -796,6 +821,18 @@ memory:
 | `autolearn.minToolCalls`      | number  | `5`           | Minimum completed tool calls in a primary turn before automatic capture is eligible.                                                                                                                                                                               |
 
 A positive `compaction.thresholdTokens` wins over `thresholdPercent` and is clamped below the context window. Otherwise, a positive percentage is clamped to 1–99%; non-positive percentages use the reserve-based threshold.
+
+Per-model compaction budgets. This raises the reserve for one large-window model and leaves every other model on the ordinary settings:
+
+```yaml
+compaction:
+  keepRecentTokens: 20000
+  modelOverrides:
+    some-provider/big-model:
+      reserveTokens: 400000
+```
+
+On a 1M-token window that override triggers compaction above 600K tokens and keeps the ordinary 20,000 recent tokens. Keys are exact, case-sensitive `provider/modelId` values, including any slashes in the model id. Each of `reserveTokens` and `keepRecentTokens` resolves independently: the matching entry, then the ordinary `compaction.*` value, then the built-in default (the unset `reserveTokens` default keeps its proportional small-window behavior). Values must be non-negative integers; an entry must be an object holding only those two fields, and the map holds at most 256 entries. A malformed value is rejected when settings load, except in the project layer, where it is ignored with one warning so the lower layers apply. A value above the model's context window is clamped to the window (a reserve equal to the window then uses the proportional reserve described above). A `null` entry or field clears a value inherited from a lower settings layer, except in the project layer, where `null` entries and fields are ignored. Global and project objects deep-merge per entry and field before lookup, so a project entry changes only the fields it sets. The resolved budgets apply to automatic threshold checks, manual `/compact`, overflow recovery, the status-line threshold, and advisor-context compaction for the advisor's own model; `compaction.enabled` and the other `compaction.*` keys stay global. Budgets are resolved at each check from the active model and the current settings, so a model switch or a settings change applies to every later check, including later steps of a compaction already running.
 
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 
@@ -1046,7 +1083,7 @@ Selected migrations applied whenever raw settings are loaded (global, project, o
 
 ### A global array disappeared in a project
 
-Arrays replace; they do not append. If a project sets `disabledProviders`, `enabledModels`, `cycleOrder`, `extensions`, or any other array, include the **complete** desired value in the project layer — the global array is fully replaced.
+Arrays replace; they do not append (`defaultTools` lists of only `+name`/`-name` entries are the exception). If a project sets `disabledProviders`, `enabledModels`, `cycleOrder`, `extensions`, or any other array, include the **complete** desired value in the project layer — the global array is fully replaced.
 
 ### A provider is still available after editing config
 

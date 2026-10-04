@@ -13,6 +13,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionCustomOptions,
 	ExtensionError,
+	ExtensionRunner,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
@@ -30,6 +31,8 @@ import {
 	AskDialogComponent,
 	normalizeDialogQuestions,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import { setChatTranscriptDisplayPreferences } from "@oh-my-pi/pi-tui/chat/display-preferences";
+import { setChatMarkdownTransform } from "@oh-my-pi/pi-tui/chat/markdown-transform";
 import { installExtensionComposerShape } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import { EditorTopGap } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
 import { boundPromptTitle, HookEditorComponent, type HookEditorOptions } from "@oh-my-pi/pi-tui/overlays/hook-editor";
@@ -43,6 +46,8 @@ import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 
 const MAX_WIDGET_LINES = 10;
+/** Columns transcript Markdown loses to the message gutter and padding. */
+const MARKDOWN_GUTTER_COLUMNS = 2;
 
 /**
  * Footer hint for a guest-rendered ask selector. The guest's selector handles
@@ -113,6 +118,12 @@ export class ExtensionUiController {
 		this.ctx.syncComposerShape();
 	}
 
+	/** Clear the process-wide transcript state extensions installed (Markdown transform, hidden-thinking label). */
+	disposeExtensionDisplay(): void {
+		setChatMarkdownTransform(undefined);
+		setChatTranscriptDisplayPreferences({ hiddenThinkingLabel: undefined });
+	}
+
 	/** Remove extension-owned composer styles from the process registries. */
 	disposeComposerShapes(): void {
 		for (const dispose of this.#composerShapeDisposers.splice(0)) dispose();
@@ -133,6 +144,9 @@ export class ExtensionUiController {
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setHookStatus(key, text),
 			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
+			setWorkingVisible: visible => this.ctx.setWorkingVisible(visible),
+			setWorkingIndicator: options => this.ctx.setWorkingIndicator(options),
+			setHiddenThinkingLabel: label => this.ctx.setHiddenThinkingLabel(label),
 			setWidget: (key, content, options) => this.setHookWidget(key, content, options),
 			setTitle: title => setExtensionTerminalTitle(title),
 			custom: (factory, options) => this.showHookCustom(factory, options),
@@ -318,6 +332,7 @@ export class ExtensionUiController {
 		};
 
 		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		this.#resetExtensionDisplay(extensionRunner);
 
 		// Subscribe to extension errors
 		extensionRunner.onError((error: ExtensionError) => {
@@ -327,6 +342,7 @@ export class ExtensionUiController {
 		// Emit session_start event
 		await extensionRunner.emit({
 			type: "session_start",
+			reason: "startup",
 		});
 	}
 
@@ -406,6 +422,28 @@ export class ExtensionUiController {
 		for (const widget of widgets.values()) {
 			container.addChild(widget);
 		}
+	}
+
+	/**
+	 * Start a runner generation with default extension display state: the working
+	 * row and hidden-thinking label return to their defaults, and transcript
+	 * Markdown routes through this runner's transformers. Components read the
+	 * transform when they render, so live and rebuilt messages both pass through
+	 * it; stored session text is untouched. The transform is installed even with
+	 * no transformer so an extension resumed later takes effect.
+	 */
+	#resetExtensionDisplay(extensionRunner: ExtensionRunner): void {
+		this.ctx.setWorkingVisible(true);
+		this.ctx.setWorkingIndicator(undefined);
+		this.ctx.setHiddenThinkingLabel(undefined);
+		setChatMarkdownTransform((markdown, context) =>
+			extensionRunner.hasMarkdownTransformers()
+				? extensionRunner.transformMarkdown(markdown, {
+						...context,
+						availableWidth: Math.max(1, this.ctx.ui.terminal.columns - MARKDOWN_GUTTER_COLUMNS),
+					})
+				: markdown,
+		);
 	}
 
 	initializeHookRunner(uiContext: ExtensionUIContext, _hasUI: boolean): void {
@@ -542,6 +580,7 @@ export class ExtensionUiController {
 		};
 
 		extensionRunner.initialize(actions, contextActions, commandActions, uiContext, "tui");
+		this.#resetExtensionDisplay(extensionRunner);
 		this.#syncExtensionComposerShapes();
 	}
 

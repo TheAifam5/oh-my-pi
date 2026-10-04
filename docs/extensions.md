@@ -115,9 +115,9 @@ export default function (pi: ExtensionAPI) {
 
 Core methods:
 
-- `on(event, handler)`
+- `on(event, handler)` — returns an unsubscribe function
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
-- `registerMessageRenderer`, `registerAssistantThinkingRenderer`
+- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerMarkdownTransformer`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
@@ -132,9 +132,27 @@ Core methods:
 
 `ExtensionAPI` methods retain their extension binding when destructured or passed as callbacks.
 
+`on()` returns a function that removes that one registration; registering the
+same function twice yields two independent registrations. Handlers added or
+removed while an event is being dispatched take effect from the next dispatch of
+that event, never the current one.
+
+```ts
+const off = pi.on("turn_end", event => {
+	if (event.turnIndex >= 3) off();
+});
+```
+
+`ExtensionFactory` may return `void`, a `Promise<void>`, or a `() => void`; the
+return value is ignored, so a concise arrow such as `pi => pi.on("input", handler)`
+type-checks.
+
 `setLabel(label)` sets the extension's display label. It is not a session-entry
 labeling action. `getAllTools()` returns tool schemas and source metadata, while
-`getActiveTools()` returns enabled names.
+`getActiveTools()` returns enabled names. Each `getAllTools()` entry also carries the
+Pi-compatible `exposure` (the declared value, else `"hidden"` for hidden tools,
+`"deferred"` for discoverable tools, and `"direct"` otherwise) plus the tool's
+`namespace` and `annotations` when declared.
 
 `getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
 
@@ -273,7 +291,10 @@ ACP clients can defer agent-initiated turns, in which case requests that would
 start one are retained as hidden next-turn messages.
 
 `pi.sendUserMessage(content, { deliverAs })` submits text/images without slash-command
-or prompt-template expansion. Omit `deliverAs` to start a prompt when idle;
+or prompt-template expansion. Pass `expandPromptTemplates: true` to treat the text as if
+the user typed it: a leading `/` dispatches extension and custom commands, and skill
+commands and prompt templates expand; `deliverAs` then picks the queue used while
+streaming (default `"steer"`). Omit `deliverAs` to start a prompt when idle;
 while streaming, omission queues a steer. Explicit `"steer"` or `"followUp"`
 queues the prompt even when idle instead of starting a turn directly. `"aside"`
 injects at the next step boundary while a run is live and starts a turn when
@@ -387,10 +408,14 @@ Command handlers additionally get:
 - `newSession(...)`
 - `switchSession(...)`
 - `branch(entryId)`
+- `fork(entryId, { position? })` — Pi-compatible alias of `branch`. OMP branches before the entry, so `position` may be omitted or `"before"`; `"at"` rejects
 - `navigateTree(targetId, { summarize })`
 - `reload()`
+- `getSystemPromptOptions()` — frozen snapshot of the options the current base system prompt was built from: `cwd`, `selectedTools`, optional `directToolNames`, `customPrompt`, `systemPromptTemplate`, `appendSystemPrompt`, plus `additionalWorkspaceRoots`, `contextFiles`, `skills` (`name`, `description`, `filePath`), and `rules`. Field names follow Pi's `BuildSystemPromptOptions` where OMP has an equivalent; Pi's `toolSnippets`, `toolGuidelines`, `promptGuidelines`, and `sections` do not exist in OMP. A host-supplied fixed system prompt leaves only `cwd` and `selectedTools` set, and before the first prompt build the snapshot holds only `cwd` with empty lists. The snapshot is sensitive: it carries context-file contents and the custom and appended prompt text. Read-only: changing the prompt still goes through `before_agent_start`
 
 Use command context for session-control flows; these methods are intentionally separated from general event handlers.
+
+`newSession()`, `switchSession()`, `branch()`/`fork()`, and `reload()` keep the same session object and extension runner, so a context captured before them keeps working afterwards (unlike Pi, where these replace the runtime). A context becomes stale only when its session is disposed (shutdown, or a subagent session finishing). After that, the session-touching methods of both handler and command contexts — `isIdle()`, `abort()`, `hasPendingMessages()`, `shutdown()`, `getContextUsage()`, `compact()`, `getSystemPrompt()`, `getAsyncJobSnapshot()`, `runEphemeralTurn()`, and every command-context method above — throw (or reject with) `ExtensionStaleContextError`, as do `invokeTool()`, `setInterval()`, and `setTimeout()`. `clearTimer()`, `ui`, `memory`, `models`, and plain properties such as `cwd`, `model`, and `sessionManager` are not guarded. The error is thrown only after `session_shutdown` handlers have run, so shutdown handlers keep a working context, and even when teardown itself fails.
 
 ## Event surface (current names and behavior)
 
@@ -398,12 +423,38 @@ Canonical event unions and payload types are in `types.ts`.
 
 ### Session lifecycle
 
-- `session_start`
+- `session_start` — `{ reason, previousSessionFile? }`
+- `session_info_changed` — `{ name }` after the session display name changes
 - `session_before_switch` / `session_switch`
-- `session_before_branch` / `session_branch`
-- `session_before_compact` / `session.compacting` / `session_compact`
+- `session_before_branch` / `session_before_fork` / `session_branch`
+- `session_before_compact` / `session.compacting` / `session_compact` / `session_compact_failed`
 - `session_before_tree` / `session_tree`
 - `session_shutdown`
+
+`session_start.reason` is `"startup"` when the runtime initializes. After the
+active session is replaced it fires again: `"new"` and `"resume"` after the
+matching `session_switch`, and `"fork"` after `session_switch` with reason
+`"fork"` and after `session_branch`. `previousSessionFile` is set for those
+replacements when the previous session was persisted. OMP has no extension
+runtime reload, so `"reload"` is part of the type but not emitted. Earlier
+releases fired `session_start` only at startup, so a handler registered for both
+`session_start` and `session_switch`/`session_branch` now runs twice per
+replacement; skip replacement starts with `isSessionReplacementStart(event)`.
+
+`session_before_fork` fires right after `session_before_branch` with
+`{ entryId, position }`: `"before"` for `branch()`/`fork()` (the entry's text
+returns to the editor) and `"at"` for branching a `/btw` answer. Either event
+returning `cancel: true` cancels the branch.
+
+`session_compact_failed` fires after a manual or automatic compaction fails or
+is aborted: `{ reason, aborted, errorMessage?, willRetry, fromExtension }`.
+`reason` is `"manual"` for `/compact` and `ctx.compact()`; automatic passes
+report the `auto_compaction_start` reason (`"threshold"`, `"overflow"`,
+`"idle"`, `"incomplete"`) and fire after `auto_compaction_end`. A cancel from
+`session_before_compact` reports `aborted: true`. Benign skips (nothing to
+compact, already compacted, `skipped` auto passes) do not fire it.
+`fromExtension` is set for a manual pass whose failing compaction came from a
+`session_before_compact` handler; automatic passes report `false`.
 
 `session.compacting` receives `{ sessionId, messages }` and can return
 `{ context?: string[]; prompt?: string; preserveData?: Record<string, unknown> }`
@@ -415,6 +466,7 @@ Cancelable pre-events:
 
 - `session_before_switch` → `{ cancel?: boolean }`
 - `session_before_branch` → `{ cancel?: boolean; skipConversationRestore?: boolean }`
+- `session_before_fork` → `{ cancel?: boolean; skipConversationRestore?: boolean }`
 - `session_before_compact` → `{ cancel?: boolean; compaction?: CompactionResult }`
 - `session_before_tree` → `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }`
 
@@ -425,9 +477,14 @@ Cancelable pre-events:
 - `input`
 - `before_agent_start`
 - `before_provider_request` — receives `{ payload }`; return the replacement payload itself (not `{ payload }`). Handlers chain. Provider transports must invoke `onPayload`; `devin-agent` does not.
+- `before_provider_headers` — receives `{ headers }`, the assembled request headers for one provider HTTP request, just before it is sent. Mutate `event.headers` in place; later handlers see earlier handlers' edits and the return value is ignored. Set a header to `null` to delete it (names match case-insensitively). The map **includes credential headers such as `Authorization` and `X-Api-Key`**: treat it as secret, never log or persist it. Each handler edits its own copy, adopted once the handler returns or throws (a throwing handler's edits before the throw are kept). A timed-out handler's edits are discarded, and once the request is aborted the remaining handlers are skipped, so a hung handler never edits headers that were already sent and an abort is not held up for the handler timeout. Failures are reported through `onError`. After handlers run, CR/LF is stripped; entries whose name is not an HTTP token of at most 256 characters, whose value is not visible ASCII of at most 8192 characters, or that come after the first 128 headers are dropped, and changes to connection-level headers (`host`, `content-length`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `proxy-connection`, `proxy-authorization`, `te`, `trailer`, `upgrade`) are reverted. Each dropped name (never its value, truncated to 64 characters) is reported once per extension through `onError`, up to 256 reports per session. It fires once per provider HTTP request, so a provider-internal retry with a rebuilt request fires it again, while transport-level retries resend the same headers. Covered transports: `openai-completions`, `openai-responses`, `azure-openai-responses`, `anthropic-messages`, and `bedrock-converse-stream`. On Bedrock the map holds only the caller and model headers before SigV4 signing (no credentials), and signer-owned or framing headers (`host`, `x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`, `authorization`, `content-type`, `accept`, `content-length`) set by a handler are dropped, as is any `x-amz-*` header a handler adds or changes. Other transports do not emit it: Codex Responses (SSE and WebSocket), Google/Gemini CLI/Vertex/Antigravity, Cursor, Devin, Ollama, custom provider transports, the pi-native proxy transport, and the GitLab Duo, Factory Droid, and OpenAI-to-Anthropic shim wrappers (they forward selected options to a covered transport without `transformHeaders`). When a handler is registered and a request goes to an API that does not run it, OMP logs one warning per API and session. Handlers' `ctx.model` is the session's current model, which may differ from the request's model for side, handoff, and advisor requests. It covers main-loop requests, ephemeral side turns (`/btw`, `runEphemeralTurn`), handoff, and advisor requests; compaction, branch-summary, and other session-maintenance requests and auto-learn capture requests do not emit it. Extensions, including project-local ones that OMP loads without a trust prompt, run with the same access to credentials as OMP itself; only load extensions whose code you trust.
 - `after_provider_response` — notification before response-body consumption: `{ status, headers, requestId?, metadata? }`. Provider request/response handlers receive the model used for that request in `ctx.model`.
+- `provider_stream_event` — `{ provider, api, model, data }` for each raw provider stream frame before OMP normalizes it. `data` is the frame's `data:` field parsed as JSON, or the raw string when it is not JSON. The `[DONE]` sentinel, comment/keepalive frames, outbound Codex WebSocket frames, and unparseable WebSocket messages are not delivered. Observe-only and lossy: frames are queued and delivered in arrival order by one consumer that awaits each frame's handlers before the next, so handlers cannot alter or delay the stream. When handlers fall behind, the queue keeps the newest 256 frames (and at most 4 Mi characters of `data`) and drops older queued frames, logging one warning per overflow episode. Failures are reported through `onError`; a hung handler times out once per frame it holds up, not once per dropped frame. Nothing is parsed while no handler is subscribed. Emitted by transports that report raw SSE frames: OpenAI Completions/Responses/Azure Responses, Anthropic Messages (reconstructed from decoded events for injected SDK clients), Google (`google-shared`), Gemini CLI, Codex (HTTP SSE and inbound WebSocket messages), GitLab Duo, Factory Droid, and the OpenAI-to-Anthropic shim, plus providers delegating to them. Bedrock (AWS event stream), Cursor, Devin, and Ollama do not emit it, nor does Codex remote compaction (its frames carry no model).
 - `context` — receives conversation messages and may return `{ messages }`; replacements chain without rewriting persisted history
+- `context_with_system` — fired before each main-agent provider request, after every `context` handler ran and the transcript was converted for the provider. `messages[0]` is a `{ role: "system", content, toolsAdded }` message carrying the request's system prompt and tool declarations; the rest is the provider transcript. Return `{ messages }` to replace it; the result is sent as returned for this request only, so handlers own the prompt and tools (the session's active tools are unchanged). Keep the system message at index 0: dropping it sends no system prompt and no tools and is reported through `onError`, and a system message anywhere else is reported and dropped because providers take one system prompt. `toolsAdded` is the complete tool list for the request: removing a tool hides it from the model for that request, an omitted or empty `toolsAdded` sends no tools, and the session's active tools are unchanged either way. With a handler registered, every request deep-copies its transcript for the handlers (the cost grows with the context size); when the transcript cannot be copied, the request is sent unchanged and the failure is reported. Only main agent-loop requests emit it; advisor and auto-learn capture requests do not.
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
+- `agent_before_settle` — `{ outcome, entries, continue }`, the final actionable boundary of a run: it fires once after OMP's own continuations (retries, compaction recovery, todo and plan reminders, `session_stop`) declined to continue, and never when the session already scheduled a continuation. `outcome` is `"completed"`, `"aborted"`, or `"error"`. Handlers chain: each sees the drafts and decision so far, a returned `entries` replaces the draft list (return `[...event.entries, draft]` to add one), and the last boolean `continue` wins. Drafts are append-only: `{ type: "custom", customType, data? }` persists a session entry the model never sees, and `{ type: "custom_message", customType, content, display, details? }` persists a custom message that joins the model context (`display: true` also paints it in the transcript). Upstream Pi's `context_edit` and `compaction` drafts and its `context` preview are not supported; a draft of another type, an empty, overlong (over 128 characters), or crash-recovery-reserved (`tool_execution_start`, `session_exit`) `customType`, more than 16 drafts, `data` or `details` that are not JSON-serializable or exceed 256 KiB of JSON, text over 256 Ki characters, or a malformed content part or image over 20 MiB is reported through `onError` and discards every draft and the continuation. Drafts are committed as one unit before the run settles, also when it was aborted, but never into a session that was replaced meanwhile; when the commit fails (for example a session write error) no draft is committed in a persisted session, the failure is reported, and the run does not continue. `{ continue: true }` requests one more model request: it runs only when the committed context can run (its tail is not an assistant message) and the run was not aborted; otherwise it is reported as a continuation without runnable model context. Queued steering and follow-up messages continue through the normal queue drain; while a user interrupt holds queued follow-ups for the user, a continuation is declined with an `onError` report instead of consuming them. Guard the condition: an unconditional continuation that adds context loops.
+- `agent_settled` — notification after a run settled terminally: no automatic retry, compaction, or queued continuation will run. `prompt()` does not wait for it. Turn-starting sends made from a handler while notifications are running (`sendMessage` with `triggerTurn` or `deliverAs: "aside"`, `sendUserMessage`) start after every `agent_settled` handler finished; when the session is disposed first, those sends are rejected and reported through the host's send-error path. SDK code calling `session.sendUserMessage()` or `session.sendCustomMessage()` from an `agent_settled` handler must not await it inside the handler: the send waits for every handler, including the one awaiting it.
 - `session_stop` — main-session stop hook, awaited before settle. Advisory `{ continue: true, additionalContext }` requests are capped at 8 continuations. Explicit `{ decision: "block", reason }` refusals take precedence over advisory requests, do not consume that allowance, and remain blocking until the hook allows completion or the operator interrupts. A refusal without a reason receives a diagnostic continuation rather than permission to finish. This event never fires for task/subagent sessions and defers until agent-owned background jobs are fully idle (`#hasPendingAsyncWake` in `session/agent-session.ts`).
 - `cache_warming_decision` — fired before each prompt-cache warming refresh with the warmer's economics (`warmCost`, `missCost`, `continuationProbability`, `action`). Return `{ action: "warm" | "stop" }` to override; the last handler returning an action wins, handler failures or answers slower than 2 seconds leave the warmer's decision standing, and a `"stop"` override ends warming until the next real request. Only the main agent loop warms; task/subagent sessions never fire this. The refresh itself replays the real request through the same provider path, so `before_provider_request` and `after_provider_response` fire for it too; a replacement payload must stay byte-identical to the real one for the refresh to hit the cache.
 - `turn_start` / `turn_end`
@@ -489,10 +546,22 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 
 ### Tool lifecycle
 
-- `tool_call` (pre-exec, may block, revise the tool's execution `input`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
+- `tool_call` (pre-exec, may block (optionally with `terminate`), revise the tool's execution `input`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
 - `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
+
+A blocking `tool_call` result may set `terminate: true`. When every call in a
+model tool batch is blocked with `terminate`, the blocked results are recorded and
+are not sent back for another model turn, so the tool-driven continuation ends.
+Steering, aside, and follow-up messages that are already queued still start their
+own turn. A batch with any non-terminating call continues normally.
+
+```ts
+pi.on("tool_call", event =>
+	event.toolName === "submit_answer" ? { block: true, reason: "Answer recorded", terminate: true } : undefined,
+);
+```
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
 
@@ -510,6 +579,14 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 - `todo_reminder`
 - `goal_updated`
 - `credential_disabled`
+
+### Model and UI prompt signals
+
+- `model_select` — `{ model, previousModel, source }` after the active model changes. `source` is `"cycle"` for model cycling, `"restore"` when resuming a session restores its model, and `"set"` otherwise (explicit selection, role switches, retry fallback)
+- `thinking_level_select` — `{ level, previousLevel }` after the effective thinking level changes, including `auto` resolving to a different level; an unset level reports `"off"`
+- `ui_prompt_start` / `ui_prompt_end` — `{ reason: "ui_prompt", kind, title? }` around every blocking `ctx.ui` prompt (`kind`: `"select"`, `"confirm"`, `"input"`, `"editor"`, `"custom"`, or OMP's `"askDialog"`). The end event always follows its start, whether the prompt was answered, cancelled, aborted, or threw. Delivery is queued in order and does not delay the prompt. Prompts opened by OMP's own tools (for example `ask`) are not extension prompts and do not fire these events
+
+`model_select` and `thinking_level_select` are delivered without delaying the change itself.
 
 ### MCP notifications
 
@@ -663,6 +740,12 @@ Additional `ToolDefinition` fields include:
 - `deferrable`, `readsSkillUris`, `strict`.
 - `approval`: defaults to `"exec"`; accepts a tier, a decision object, or a function of the arguments.
 - `mcpServerName`, `mcpToolName`, `legacyName`, `sourcePath`: discovery, approval, and provenance metadata.
+- Pi-compatible orchestration fields, mapped onto the fields above at registration:
+  - `exposure`: `"direct"` and `"model-only"` set `loadMode: "essential"`, `"codemode"` and `"deferred"` set `loadMode: "discoverable"`, and `"hidden"` sets `hidden: true`. OMP has no `ctx.executeTool`, so `"model-only"` behaves like `"direct"` and `"codemode"` like `"deferred"`.
+  - `defaultActive`: the inverse of `defaultInactive`.
+  - `executionMode`: `"sequential"` runs the call alone (`concurrency: "exclusive"`), `"parallel"` alongside other calls (`"shared"`).
+  - `namespace` (`{ name, description?, instructions? }`) and `annotations` (MCP-style `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`): informational, reported by `getAllTools()`. Annotations are unverified hints from the tool's author and never change the approval tier, which comes from `approval` and the user's `tools.approval` policy keyed by the tool name.
+  - Registration throws when a Pi field contradicts the OMP field it maps onto (for example `exposure: "hidden"` with `hidden: false`, `exposure: "direct"` with `loadMode: "discoverable"`, or `defaultActive: true` with `defaultInactive: true`), or when a value is malformed.
 - `shellEnv`: environment values for the interactive user-shell surface.
 - `renderCall`, `renderResult`: TUI components.
 - `describeCall`, `describeResult`: semantic tool views for TSP terminals.
@@ -805,6 +888,18 @@ before and performs no extra syscalls.
 
 `ctx.ui` implements the `ExtensionUIContext` interface. Support differs by mode.
 
+SDK hosts that supply their own `ExtensionUIContext` must implement
+`setWorkingVisible`, `setWorkingIndicator`, and `setHiddenThinkingLabel` (no-ops are
+fine). When a host object lacks them at runtime, extensions calling them get no-ops.
+
+Extension-supplied indicator frames and the hidden-thinking label are rendered on
+one line: tabs become spaces, line breaks become a space, and each is truncated to
+40 columns. ANSI styling is kept. The working-row settings and the label persist
+across session replacement (`/new`, resume, fork, handoff) and subagent focus
+changes. They return to their defaults when the extension runner is initialized
+and when the interactive UI shuts down; the Markdown transform is also removed on
+shutdown. A hidden working row is not rendered and does not animate.
+
 ### Interactive mode (`extension-ui-controller.ts`)
 
 Supported:
@@ -813,6 +908,8 @@ Supported:
 - input editing: `setEditorText`, `getEditorText`, `pasteToEditor`, `editor`
 - autocomplete stacking: `addAutocompleteProvider(factory)` wraps the built-in editor provider (factories apply in registration order and re-apply on every slash-command refresh)
 - terminal title and working message (`setTitle`, `setWorkingMessage`)
+- working row: `setWorkingVisible(false)` removes the row without reserving space; `setWorkingIndicator({ frames })` replaces the interrupt-key glyph with custom frames rendered verbatim (`frames: []` hides it, no argument restores the default). `intervalMs` is accepted but frames advance at the built-in cadence. Both settings survive loader recreation
+- `setHiddenThinkingLabel(label?)` replaces the label shown for collapsed thinking (the hidden-thinking pulse and the folded "Thought for …" head); no argument restores the default
 - notifications/status/editor text/terminal input/custom overlays
 - theme listing/loading by name (`setTheme` supports string names)
 - tools expanded toggle
@@ -844,7 +941,7 @@ Unsupported/no-op in RPC implementation:
 - `custom`; optional `askDialog` is absent
 - `getEditorText` returns `""`
 - `setFooter`, `setHeader`, `setEditorComponent`, `addAutocompleteProvider`
-- `setWorkingMessage`
+- `setWorkingMessage`, `setWorkingVisible`, `setWorkingIndicator`, `setHiddenThinkingLabel`
 - theme switching/loading (`setTheme` returns failure)
 - tool expansion controls are inert
 
@@ -859,7 +956,7 @@ ACP installs an elicitation-bridged UI context (`createAcpExtensionUiContext` in
 `select`/`confirm`/`input`/`editor` and optional `askDialog` round-trip as ACP form
 elicitations; defaults are returned when the client lacks `elicitation.form`.
 The non-elicitation surface (widgets, editor control, theming, terminal input,
-autocomplete stacking) is inert; `notify` logs a debug notification.
+autocomplete stacking, working row and hidden-thinking label) is inert; `notify` logs a debug notification.
 
 ## Session and state patterns
 
@@ -1051,6 +1148,26 @@ pi.registerAssistantThinkingRenderer((context, theme) => {
 ```
 
 Used by interactive rendering to add display-only supplemental UI below each visible assistant thinking block. The renderer receives the already-visible thinking text, content/thinking indexes, theme, and a `requestRender()` callback for async renderers. All registered renderers that return a component are appended in registration order. Renderers must not mutate messages; the original thinking block remains the provider/session source of truth.
+
+## Markdown transformer
+
+```ts
+pi.registerMarkdownTransformer((markdown, { messageType, isStreaming, availableWidth }) =>
+	markdown.replaceAll(":tada:", "🎉"),
+);
+```
+
+Transforms the Markdown of user messages, assistant text, and assistant thinking
+(`messageType`: `"user"`, `"assistant"`, `"assistant-thinking"`) before the
+interactive transcript renders it. It is display-only: stored session text,
+provider context, exports, and other consumers keep the original. It applies to
+live streaming and to rebuilt transcripts. Each extension has one transformer (a
+later call replaces it); transformers from all extensions chain in load order,
+each receiving the previous output. `availableWidth` is the terminal width minus
+the transcript gutter. A transformer that throws or returns a non-string is
+skipped and reported once through the extension error channel. Output goes
+through the normal Markdown renderer. Other modes do not render Markdown and
+ignore transformers.
 
 ## Tool call/result renderer
 

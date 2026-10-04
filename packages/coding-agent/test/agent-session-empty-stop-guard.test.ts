@@ -461,6 +461,7 @@ describe("AgentSession empty stop guard", () => {
 				await releaseMessageEnd.promise;
 				return undefined;
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const { session } = await createHarness(
 			[emptyStop(), emptyStop(), emptyStop(), emptyStop()],

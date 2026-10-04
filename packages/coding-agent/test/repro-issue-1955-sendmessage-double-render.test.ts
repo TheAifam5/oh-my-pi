@@ -15,6 +15,7 @@ import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { buildSessionContext, type SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CustomMessageEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { Container } from "@oh-my-pi/pi-tui";
+import { setChatMarkdownTransform } from "@oh-my-pi/pi-tui/chat/markdown-transform";
 
 /**
  * Issue #1955: `sendMessage` with `display: true` renders twice during
@@ -45,6 +46,8 @@ afterAll(() => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	// The controller installs a process-wide Markdown transform bound to the fake runner.
+	setChatMarkdownTransform(undefined);
 });
 
 function makeCustomEntry(id: number, text: string, parentId: string | null): CustomMessageEntry {
@@ -113,6 +116,9 @@ function createHarness(): Harness {
 		chatContainer: new Container(),
 		pendingMessagesContainer: new Container(),
 		updatePendingMessagesDisplay: vi.fn(),
+		setWorkingVisible: vi.fn(),
+		setWorkingIndicator: vi.fn(),
+		setHiddenThinkingLabel: vi.fn(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		transcriptMessageComponents: new WeakMap(),

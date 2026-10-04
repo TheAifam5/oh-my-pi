@@ -158,6 +158,38 @@ describe("RPC queued-message editing", () => {
 		}
 	}, 30_000);
 
+	test("clear_queue returns and removes queued user text and inputs report their disposition", async () => {
+		await client.start();
+		expect(await client.followUp("summarize later")).toBe("queued");
+
+		expect(await client.clearQueue()).toEqual({ steering: [], followUp: ["summarize later"] });
+		expect((await client.getState()).queuedMessages).toEqual({ steering: [], followUp: [] });
+		expect(await client.clearQueue()).toEqual({ steering: [], followUp: [] });
+
+		const agentStarted = Promise.withResolvers<void>();
+		const unsubscribe = client.onEvent(event => {
+			if (event.type === "agent_start") agentStarted.resolve();
+		});
+		const results: RpcPromptResultFrame[] = [];
+		const bothReported = Promise.withResolvers<void>();
+		const unsubscribeResults = client.onPromptResult(result => {
+			results.push(result);
+			if (results.length === 2) bothReported.resolve();
+		});
+		try {
+			expect((await client.promptWithDisposition("start a long turn")).disposition).toBe("started");
+			await withTimeout(agentStarted.promise, 10_000, "First turn never started streaming");
+			expect((await client.promptWithDisposition("after this", undefined, "followUp")).disposition).toBe("queued");
+			expect(await client.steer("also this")).toBe("queued");
+			await withTimeout(bothReported.promise, 10_000, "Prompts never reported their results");
+		} finally {
+			unsubscribeResults();
+			unsubscribe();
+		}
+		const messages = await client.getMessages();
+		expect(messages.some(message => JSON.stringify(message).includes("summarize later"))).toBe(false);
+	}, 30_000);
+
 	test("rejects malformed promotion, preserves missing targets, and promotes without duplicate delivery", async () => {
 		await client.start();
 		await client.followUp("queued request");

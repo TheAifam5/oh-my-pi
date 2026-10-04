@@ -143,6 +143,7 @@ describe("AgentSession plan-mode compaction hook contract (issue #4359)", () => 
 			// AgentSession.#promptWithMessage always awaits this before agent_start
 			// when an extensionRunner is present; the shim mirrors the no-op path.
 			emitBeforeAgentStart: async () => undefined,
+			invalidate: () => {},
 		};
 		const session = new AgentSession({
 			agent,

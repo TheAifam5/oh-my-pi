@@ -22,6 +22,7 @@ The native provider is the recommended format for new projects. It reads from yo
 | File                                          | Scope   | Behavior                                                                                                                                                                                                                                             |
 | --------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `~/.omp/agent/AGENTS.md`                      | User    | User-level context for every session unless the `native` provider is disabled.                                                                                                                                                                       |
+| `~/.omp/agent/AGENTS.override.md`             | User    | Replaces `~/.omp/agent/AGENTS.md` when non-empty. See [Per-directory overrides](#per-directory-overrides-agentsoverridemd).                                                                                                                          |
 | `<nearest-non-empty-ancestor>/.omp/AGENTS.md` | Project | Project context, but only when `AGENTS.md` exists in the **nearest non-empty `.omp/` directory** found while walking from cwd toward the repository root. OMP does not continue to a farther `.omp/` directory when the nearest one lacks this file. |
 | `~/.omp/agent/RULES.md`                       | User    | User-level sticky rule content. Loaded as an always-apply rule, not as a context file.                                                                                                                                                               |
 | `<nearest-non-empty-ancestor>/.omp/RULES.md`  | Project | Project sticky content, but only when `RULES.md` exists in the same nearest non-empty `.omp/` directory selected by the walk.                                                                                                                        |
@@ -52,6 +53,19 @@ Starting a session in `repo/packages/api`:
 
 Put broad, durable project background in `AGENTS.md`. Reserve `RULES.md` for short, hard requirements that must stay visible across long conversations.
 
+### Per-directory overrides (`AGENTS.override.md`)
+
+An `AGENTS.override.md` replaces the context file of its own directory without changing any other directory. Use it for a local variant of a directory's instructions, for example one kept out of version control.
+
+- **Standalone files.** While walking from cwd toward the repository root, a non-empty `AGENTS.override.md` in a directory replaces the standalone `AGENTS.md` and `CLAUDE.md` in that same directory. Ancestor and descendant directories keep their own files, and the user-level file is unaffected.
+- **User agent directory.** A non-empty `~/.omp/agent/AGENTS.override.md` replaces `~/.omp/agent/AGENTS.md`. It does not suppress project context files.
+- **Shadowing still applies.** The override takes the place of the standalone `AGENTS.md` (`agents-md` provider, priority 10). A higher-priority file at the same depth, such as `.omp/AGENTS.md` or `.github/copilot-instructions.md`, still shadows it.
+- **Empty files contribute nothing.** An `AGENTS.override.md` without visible content does not claim its directory (or the user agent directory), so `AGENTS.md` (or `CLAUDE.md`) loads as usual. Content counts as invisible when it holds only whitespace, control and format characters (zero-width spaces and joiners, byte order marks, bidirectional controls), private-use or unassigned code points, other default-ignorable code points, or the braille blank (U+2800).
+- **Replacement is reported.** When an override replaces an `AGENTS.md` or `CLAUDE.md` at startup, a warning names the override and the files it replaced (in the interactive header, or on stderr outside interactive mode).
+- **Disabling.** `context-file:project:AGENTS.override.md` (or `context-file:user:AGENTS.override.md`) in `disabledExtensions` drops the override, and the file it replaced loads in its place.
+
+Project `.omp/` directories do not read an `AGENTS.override.md`; `.omp/AGENTS.md` is already the project's own file.
+
 ## Other supported context conventions
 
 `omp` also discovers the context and rule files of other agent tools so existing projects keep working without migration.
@@ -75,7 +89,7 @@ enabledProviders:
 | `opencode`  | `.config/opencode/AGENTS.md`                | User           | User file `~/.config/opencode/AGENTS.md` only.                                                                                                                                                                                                                                                                                                               |
 | `github`    | `.github/copilot-instructions.md`           | User + project | Project file `<cwd>/.github/copilot-instructions.md` only (no ancestor walk-up), plus a user-global `~/.copilot/copilot-instructions.md` (relocate with `COPILOT_HOME`). `AGENTS.md` candidates from `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` are also considered at user scope, where normal one-user-file deduplication applies.                                 |
 | `agents`    | `.agent/AGENTS.md`, `.agents/AGENTS.md`     | User + project | User files from `~/.agent/` and `~/.agents/`; project files discovered while walking up from the current directory to the repository root.                                                                                                                                                                                                                   |
-| `agents-md` | `AGENTS.md`                                 | Project        | Standalone (non-config-directory) `AGENTS.md` files, discovered by walking up from the current directory to the repository root and, when that repository is nested under the user's home directory, through enclosing workspace directories up to but not including the home directory. With no repository root, discovery uses the home directory as the boundary for sessions under home and includes that boundary file. Files whose parent directory name starts with `.` are ignored — those belong to a config-directory provider instead.                                                                   |
+| `agents-md` | `AGENTS.md`, `AGENTS.override.md`           | Project        | Standalone (non-config-directory) `AGENTS.md` files (a non-empty `AGENTS.override.md` in the same directory replaces it), discovered by walking up from the current directory to the repository root and, when that repository is nested under the user's home directory, through enclosing workspace directories up to but not including the home directory. With no repository root, discovery uses the home directory as the boundary for sessions under home and includes that boundary file. Files whose parent directory name starts with `.` are ignored — those belong to a config-directory provider instead.                                                                   |
 | `claude-md` | `CLAUDE.md`                                 | Project        | Standalone (non-config-directory) `CLAUDE.md` files, discovered by walking up from the current directory to the repository root and, when that repository is nested under the user's home directory, through enclosing workspace directories up to but not including the home directory. With no repository root, discovery uses the home directory as the boundary for sessions under home and includes that boundary file. Files whose parent directory name starts with `.` are ignored — those belong to a config-directory provider instead. |
 | `github`    | `.github/instructions/**/*.instructions.md` | Project rules  | GitHub Copilot / VS Code instruction files become rules. `applyTo: '*'`, `applyTo: '**'`, or `applyTo: '**/*'` is injected as always-apply content; other `applyTo` globs are listed in the rulebook with a generated description when needed and are readable as `rule://<name>`. Missing `applyTo` also produces a rulebook entry and a discovery warning. |
 
@@ -251,6 +265,7 @@ Context-file ids have the form `context-file:<level>:<basename>`, where `<level>
 | `context-file:user:CLAUDE.md`       | The user-level `CLAUDE.md`, while Claude's MCP servers, commands, skills, hooks, tools, and settings keep loading. |
 | `context-file:project:AGENTS.md`    | **Every** project-level `AGENTS.md`, at each directory depth the walk reaches — the id carries no depth. |
 | `context-file:user:AGENTS.md`       | Every user-level file named `AGENTS.md`, whichever provider supplied it.       |
+| `context-file:project:AGENTS.override.md` | Every project-level `AGENTS.override.md`; the `AGENTS.md` or `CLAUDE.md` each one replaced loads instead. |
 
 The match is on level and file name only, so one entry covers every provider that contributes a file of that name at that level, and a project entry cannot be narrowed to a single depth. When you need per-directory control, use a project `.omp/config.yml` in the subtree that should differ, or the path-scoped `disabledProviders` form above.
 
@@ -281,6 +296,8 @@ Browse the ids interactively with `/extensions`, which lists every discovered co
 ### The wrong file wins
 
 At one user scope or project depth, the higher-priority provider shadows the others (native > claude > agents/codex > gemini > opencode > github > agents-md > claude-md). To force deterministic behavior, move your guidance into `.omp/AGENTS.md` (native always wins) or disable the competing discovery provider.
+
+A standalone `AGENTS.md` or `CLAUDE.md` that never loads may be replaced by a non-empty `AGENTS.override.md` in the same directory. Check for one, or disable `context-file:project:AGENTS.override.md`.
 
 ### User context disappeared
 

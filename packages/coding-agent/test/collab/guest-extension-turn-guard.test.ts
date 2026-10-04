@@ -99,6 +99,9 @@ describe("collab guest extension turn guard", () => {
 			showStatus: (message: string) => statuses.push(message),
 			showError: (message: string) => errors.push(message),
 			syncComposerShape: () => {},
+			setWorkingVisible: () => {},
+			setWorkingIndicator: () => {},
+			setHiddenThinkingLabel: () => {},
 		} as unknown as InteractiveModeContext;
 		new ExtensionUiController(ctx).initializeHookRunner({} as ExtensionUIContext, false);
 

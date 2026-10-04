@@ -557,6 +557,9 @@ export function createAcpExtensionUiContext(
 		onTerminalInput: () => () => {},
 		setStatus: () => {},
 		setWorkingMessage: () => {},
+		setWorkingVisible: () => {},
+		setWorkingIndicator: () => {},
+		setHiddenThinkingLabel: () => {},
 		setWidget: () => {},
 		setFooter: () => {},
 		setHeader: () => {},
@@ -2641,7 +2644,7 @@ export class AcpAgent implements Agent {
 			uiContext,
 			"rpc",
 		);
-		await extensionRunner.emit({ type: "session_start" });
+		await extensionRunner.emit({ type: "session_start", reason: "startup" });
 		record.extensionsConfigured = true;
 	}
 

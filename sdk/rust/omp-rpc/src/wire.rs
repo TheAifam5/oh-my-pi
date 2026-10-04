@@ -2652,6 +2652,47 @@ impl QueuedMessageQueue {
 	}
 }
 
+/// How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptDisposition {
+	#[serde(rename = "handled")]
+	Handled,
+	#[serde(rename = "queued")]
+	Queued,
+	#[serde(rename = "started")]
+	Started,
+}
+
+impl PromptDisposition {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Handled => "handled",
+			Self::Queued => "queued",
+			Self::Started => "started",
+		}
+	}
+}
+
+/// How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueuedInputDisposition {
+	#[serde(rename = "handled")]
+	Handled,
+	#[serde(rename = "queued")]
+	Queued,
+}
+
+impl QueuedInputDisposition {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Handled => "handled",
+			Self::Queued => "queued",
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CacheWarmingMode {
 	#[serde(rename = "off")]
@@ -3220,6 +3261,21 @@ pub struct AbortAndRestoreQueueResult {
 	pub truncated: Option<bool>,
 }
 
+/// `steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedInputAck {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub disposition: Option<QueuedInputDisposition>,
+}
+
+/// Text of the user-authored queued messages `clear_queue` removed, in queue order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearedQueue {
+	pub steering: Vec<String>,
+	#[serde(rename = "followUp")]
+	pub follow_up: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchMessage {
 	#[serde(rename = "entryId")]
@@ -3466,11 +3522,13 @@ pub struct HandoffResult {
 	pub saved_path: Option<String>,
 }
 
-/// `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows.
+/// `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptAck {
 	#[serde(rename = "agentInvoked", default, skip_serializing_if = "Option::is_none")]
 	pub agent_invoked: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub disposition: Option<PromptDisposition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -5904,11 +5962,10 @@ pub struct SteerCommand {
 impl Command for SteerCommand {
 	const NAME: &'static str = "steer";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = ();
+	type Output = QueuedInputAck;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		let _ = data;
-		Ok(())
+		serde_json::from_value::<QueuedInputAck>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 
@@ -5924,11 +5981,10 @@ pub struct FollowUpCommand {
 impl Command for FollowUpCommand {
 	const NAME: &'static str = "follow_up";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = ();
+	type Output = QueuedInputAck;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		let _ = data;
-		Ok(())
+		serde_json::from_value::<QueuedInputAck>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 
@@ -5962,6 +6018,20 @@ impl Command for PromoteQueuedMessageCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<PromoteQueuedMessageResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Remove every queued user-authored steering and follow-up message and return their text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ClearQueueCommand {}
+
+impl Command for ClearQueueCommand {
+	const NAME: &'static str = "clear_queue";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ClearedQueue;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<ClearedQueue>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

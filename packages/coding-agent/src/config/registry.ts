@@ -23,9 +23,24 @@
  * Declaration order is significant: the settings panel lists a tab's settings in registration order
  * (sections follow `TAB_GROUPS`), and `config/all-settings.ts` imports every domain in that order.
  */
-import { logger, parseFlag } from "@oh-my-pi/pi-utils";
+import { logger, parseFlag, truncate } from "@oh-my-pi/pi-utils";
 import type { AnyUiMetadata, SubmenuOption, UiBase } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import type { SettingProvenance, Settings } from "./settings";
+
+/** Longest string a `validate` error echoes from a configured value, in characters before quoting. */
+const MAX_ECHOED_SETTING_VALUE_LENGTH = 80;
+
+/**
+ * `value` as `validate` errors and warnings echo it: a string is truncated to
+ * {@link MAX_ECHOED_SETTING_VALUE_LENGTH} characters and JSON-quoted, so control characters stay
+ * escaped on one line; numbers, booleans, and `null` print as is; lists and objects print as their
+ * kind only.
+ */
+export function describeSettingValue(value: unknown): string {
+	if (typeof value === "string") return JSON.stringify(truncate(value, MAX_ECHOED_SETTING_VALUE_LENGTH));
+	if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
+	return Array.isArray(value) ? "a list" : `a ${typeof value}`;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Definitions
@@ -115,6 +130,25 @@ interface DefinitionBase {
 	 * `set`/`override` — e.g. flooring request limits. May throw like `validate`.
 	 */
 	normalize?: (value: unknown) => unknown;
+	/**
+	 * Combines a layer's configured value (`upper`) with the value accumulated from the layers below
+	 * it (`lower`), replacing the default whole-value replacement for this setting. Applied once per
+	 * configuring layer in precedence order (overlay parent, global, project, `--config` overlay,
+	 * runtime override); a layer that leaves the setting unset is skipped, and the lowest configured
+	 * value is taken as is. Must be pure. Settings without it keep plain deep-merge semantics.
+	 */
+	merge?: (lower: unknown, upper: unknown) => unknown;
+	/**
+	 * When true, a project-layer value that fails `validate` is dropped from that layer with one
+	 * warning, so lower layers show through; other layers still fail the load.
+	 */
+	dropInvalidInProject?: boolean;
+	/**
+	 * When true, a project-layer `null` value, the `null` entries of a project-layer record value,
+	 * and the `null` fields of its object entries are dropped before the project layer merges, so a
+	 * repository cannot clear what lower layers configure. Other layers' `null` values still clear.
+	 */
+	ignoreProjectNulls?: boolean;
 }
 
 export interface BooleanDefinition extends DefinitionBase {

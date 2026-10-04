@@ -75,6 +75,7 @@ describe("AgentSession user shortcut hooks", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash");
 
@@ -114,6 +115,7 @@ describe("AgentSession user shortcut hooks", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_python"),
 			emitUserPython,
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const executePythonSpy = vi.spyOn(pythonExecutor, "executePython");
 
@@ -141,6 +143,7 @@ describe("AgentSession user shortcut hooks", () => {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash" || eventType === "user_python"),
 			emitUserBash: vi.fn().mockResolvedValue({}),
 			emitUserPython: vi.fn().mockResolvedValue(undefined),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
 			output: "bash fallback",

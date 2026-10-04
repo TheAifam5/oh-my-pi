@@ -84,6 +84,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			extensionRunner: {
 				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
 				emit: async () => undefined,
+				invalidate: vi.fn(),
 			} as unknown as ExtensionRunner,
 			rebuildSystemPrompt: async () => ({ systemPrompt: [REBUILT_BASE] }),
 		});

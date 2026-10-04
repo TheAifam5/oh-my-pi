@@ -267,7 +267,7 @@ describe("persisted subagent revival", () => {
 
 		expect(initialize).toHaveBeenCalledTimes(1);
 		expect(onError).toHaveBeenCalledTimes(1);
-		expect(emit).toHaveBeenCalledWith({ type: "session_start" });
+		expect(emit).toHaveBeenCalledWith({ type: "session_start", reason: "startup" });
 	});
 
 	it("loads only extensions allowed by the live owner's root policy", async () => {
@@ -1268,6 +1268,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 				initialize: () => {},
 				onError: () => () => {},
 				hasHandlers: () => false,
+				invalidate: () => {},
 				emit: async (event: { type: string }) => {
 					if (event.type === "session_start") hooks.sessionStart?.();
 				},

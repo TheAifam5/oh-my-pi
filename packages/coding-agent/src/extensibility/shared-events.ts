@@ -26,9 +26,35 @@ import type { TodoItem } from "@oh-my-pi/pi-tui/tools/todo";
 // Session Events
 // ============================================================================
 
-/** Fired on initial session load */
+/** Why a `session_start` fired. */
+export type SessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
+
+/**
+ * Fired when the session runtime starts and again after the active session is
+ * replaced: after `session_switch` (`new`, `resume`, `fork`) and after
+ * `session_branch` (`fork`). `startup` fires once when the runtime initializes.
+ */
 export interface SessionStartEvent {
 	type: "session_start";
+	/** Always set by OMP; optional so hosts emitting the reason-less shape stay valid (treated as `startup`). */
+	reason?: SessionStartReason;
+	/** Previously active session file. Present for `new`, `resume`, and `fork` when it was persisted. */
+	previousSessionFile?: string;
+}
+
+/**
+ * Whether a `session_start` reports a replaced session (`new`, `resume`, `fork`),
+ * which `session_switch` / `session_branch` also report.
+ */
+export function isSessionReplacementStart(event: SessionStartEvent): boolean {
+	return event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+}
+
+/** Fired after the session display name changes. */
+export interface SessionInfoChangedEvent {
+	type: "session_info_changed";
+	/** Current normalized session name; undefined when no name is set. */
+	name: string | undefined;
 }
 
 /** Fired before switching to another session (can be cancelled) */
@@ -66,6 +92,21 @@ export interface SessionBeforeBranchEvent {
 	entryId: string;
 }
 
+/**
+ * Fired before branching a session from an entry, right after
+ * `session_before_branch` (can be cancelled). Either event's `cancel` cancels the branch.
+ */
+export interface SessionBeforeForkEvent {
+	type: "session_before_fork";
+	/** ID of the entry the new session is created from. */
+	entryId: string;
+	/**
+	 * `"before"` branches before the entry (its text returns to the editor);
+	 * `"at"` keeps the entry and branches after it.
+	 */
+	position: "before" | "at";
+}
+
 /** Fired after branching a session */
 export interface SessionBranchEvent {
 	type: "session_branch";
@@ -98,6 +139,23 @@ export interface SessionCompactEvent {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	/** Whether the compaction entry was provided by an extension/hook */
+	fromExtension: boolean;
+}
+
+/** What triggered a compaction pass. */
+export type SessionCompactReason = "manual" | "threshold" | "overflow" | "idle" | "incomplete";
+
+/** Fired after a manual or automatic compaction fails or is aborted. Not fired for benign skips. */
+export interface SessionCompactFailedEvent {
+	type: "session_compact_failed";
+	reason: SessionCompactReason;
+	/** Error text when compaction failed for a reason other than an abort. */
+	errorMessage?: string;
+	/** True when compaction was cancelled or aborted. */
+	aborted: boolean;
+	/** True when the interrupted turn would have been retried after this compaction. */
+	willRetry: boolean;
+	/** True when the failing compaction content came from a `session_before_compact` handler. */
 	fromExtension: boolean;
 }
 
@@ -164,13 +222,16 @@ export interface GoalUpdatedEvent {
 
 export type SessionEvent =
 	| SessionStartEvent
+	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionSwitchEvent
 	| SessionBeforeBranchEvent
+	| SessionBeforeForkEvent
 	| SessionBranchEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactingEvent
 	| SessionCompactEvent
+	| SessionCompactFailedEvent
 	| SessionStopEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
@@ -328,6 +389,13 @@ export interface ToolCallEventResult {
 	/** Reason for blocking (returned to LLM as error) */
 	reason?: string;
 	/**
+	 * Honored only with `block`. When every call in a model tool batch is blocked
+	 * with `terminate`, the blocked results are recorded and not sent back for
+	 * another model turn. Steering, aside, and follow-up messages already queued
+	 * still start their own turn. A batch with any other call continues.
+	 */
+	terminate?: boolean;
+	/**
 	 * Replacement input the tool executes with, instead of the original arguments. Ignored when
 	 * `block` is true. This is the raw execution input passed to the tool's `execute` (the handler
 	 * owns its correctness) — not the normalized `event.input` view, which may carry derived
@@ -461,6 +529,14 @@ export interface SessionBeforeBranchResult {
 	 * - `skipConversationRestore: true` → branch happens, but messages stay as-is
 	 * - neither → branch happens AND messages rewind to branch point (default)
 	 */
+	skipConversationRestore?: boolean;
+}
+
+/** Return type for `session_before_fork` handlers */
+export interface SessionBeforeForkResult {
+	/** If true, cancel the branch. */
+	cancel?: boolean;
+	/** Same as {@link SessionBeforeBranchResult.skipConversationRestore}. */
 	skipConversationRestore?: boolean;
 }
 

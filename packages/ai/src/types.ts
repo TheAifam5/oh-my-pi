@@ -414,6 +414,19 @@ export interface ProviderResponseMetadata {
 	metadata?: Record<string, unknown>;
 }
 
+/** Request headers a {@link ProviderHeadersTransform} returns; a `null` value deletes the header. */
+export type ProviderHeaders = Record<string, string | null>;
+
+/**
+ * Transform over a provider request's assembled headers; see `StreamOptions.transformHeaders`.
+ * Returning `undefined` leaves the original headers untouched. `signal` is the request's abort
+ * signal; once it aborts the request rejects without waiting for the transform.
+ */
+export type ProviderHeadersTransform = (
+	headers: ProviderHeaders,
+	signal?: AbortSignal,
+) => ProviderHeaders | undefined | Promise<ProviderHeaders | undefined>;
+
 export interface RawSseEvent {
 	event: string | null;
 	data: string;
@@ -646,6 +659,24 @@ export interface StreamOptions {
 	 * let observers alter stream contents.
 	 */
 	onSseEvent?: (event: RawSseEvent, model?: Model<Api>) => void;
+	/**
+	 * Optional transform over the fully assembled request headers, including
+	 * credential headers such as `Authorization`, run once per provider HTTP
+	 * request before it is sent. A `null` value deletes that header; returning
+	 * `undefined` sends the original headers unchanged. Afterwards CR/LF is
+	 * stripped, entries with an invalid name or value are dropped, and
+	 * connection-level headers (`host`, `content-length`, `transfer-encoding`,
+	 * `connection`, ...; see `RESERVED_PROVIDER_HEADERS`) keep their original
+	 * value. Providers also drop headers they own (Bedrock SigV4 and framing
+	 * headers, and any `x-amz-*` header the transform adds or changes).
+	 *
+	 * Honored by: `openai-completions`, `openai-responses`,
+	 * `azure-openai-responses`, `anthropic-messages`, and
+	 * `bedrock-converse-stream` (pre-signing caller headers only, no
+	 * credentials); see `PROVIDER_HEADER_TRANSFORM_APIS`. Other transports
+	 * ignore it.
+	 */
+	transformHeaders?: ProviderHeadersTransform;
 	/**
 	 * Optional override for the first-event watchdog in milliseconds. Built-in
 	 * providers apply this budget twice when they can: once to the underlying

@@ -1928,6 +1928,49 @@ func (v *QueuedMessageQueue) UnmarshalJSON(data []byte) error {
 	return unknownValue("QueuedMessageQueue", s)
 }
 
+// How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion.
+type PromptDisposition string
+
+const (
+	PromptDispositionHandled PromptDisposition = "handled"
+	PromptDispositionQueued  PromptDisposition = "queued"
+	PromptDispositionStarted PromptDisposition = "started"
+)
+
+func (v *PromptDisposition) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "PromptDisposition")
+	if err != nil {
+		return err
+	}
+	switch value := PromptDisposition(s); value {
+	case PromptDispositionHandled, PromptDispositionQueued, PromptDispositionStarted:
+		*v = value
+		return nil
+	}
+	return unknownValue("PromptDisposition", s)
+}
+
+// How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue.
+type QueuedInputDisposition string
+
+const (
+	QueuedInputDispositionHandled QueuedInputDisposition = "handled"
+	QueuedInputDispositionQueued  QueuedInputDisposition = "queued"
+)
+
+func (v *QueuedInputDisposition) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "QueuedInputDisposition")
+	if err != nil {
+		return err
+	}
+	switch value := QueuedInputDisposition(s); value {
+	case QueuedInputDispositionHandled, QueuedInputDispositionQueued:
+		*v = value
+		return nil
+	}
+	return unknownValue("QueuedInputDisposition", s)
+}
+
 type CacheWarmingMode string
 
 const (
@@ -2851,6 +2894,48 @@ func (v *AbortAndRestoreQueueResult) decodeFrom(raw map[string]json.RawMessage) 
 	return nil
 }
 
+// `steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`.
+type QueuedInputAck struct {
+	Disposition *QueuedInputDisposition `json:"disposition,omitempty"`
+}
+
+func (v *QueuedInputAck) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QueuedInputAck", v.decodeFrom)
+}
+
+func (v *QueuedInputAck) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QueuedInputAck
+	d := fieldDecoder{raw: raw, owner: "QueuedInputAck"}
+	d.optional("disposition", &out.Disposition)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+// Text of the user-authored queued messages `clear_queue` removed, in queue order.
+type ClearedQueue struct {
+	Steering []string `json:"steering"`
+	FollowUp []string `json:"followUp"`
+}
+
+func (v *ClearedQueue) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ClearedQueue", v.decodeFrom)
+}
+
+func (v *ClearedQueue) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ClearedQueue
+	d := fieldDecoder{raw: raw, owner: "ClearedQueue"}
+	d.required("steering", &out.Steering)
+	d.required("followUp", &out.FollowUp)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type BranchMessage struct {
 	EntryID string `json:"entryId"`
 	Text    string `json:"text"`
@@ -3385,9 +3470,10 @@ func (v *HandoffResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
-// `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows.
+// `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`.
 type PromptAck struct {
-	AgentInvoked *bool `json:"agentInvoked,omitempty"`
+	AgentInvoked *bool              `json:"agentInvoked,omitempty"`
+	Disposition  *PromptDisposition `json:"disposition,omitempty"`
 }
 
 func (v *PromptAck) UnmarshalJSON(data []byte) error {
@@ -3398,6 +3484,7 @@ func (v *PromptAck) decodeFrom(raw map[string]json.RawMessage) error {
 	var out PromptAck
 	d := fieldDecoder{raw: raw, owner: "PromptAck"}
 	d.optional("agentInvoked", &out.AgentInvoked)
+	d.optional("disposition", &out.Disposition)
 	if d.err != nil {
 		return d.err
 	}
@@ -7367,8 +7454,10 @@ type SteerCommand struct {
 }
 
 // Steer sends "steer": Queue a steering message.
-func (c Commands) Steer(ctx context.Context, p SteerCommand) error {
-	return c.call(ctx, "steer", p, 0, nil)
+func (c Commands) Steer(ctx context.Context, p SteerCommand) (QueuedInputAck, error) {
+	var out QueuedInputAck
+	err := c.call(ctx, "steer", p, 0, &out)
+	return out, err
 }
 
 // FollowUpCommand holds the parameters of "follow_up".
@@ -7379,8 +7468,10 @@ type FollowUpCommand struct {
 }
 
 // FollowUp sends "follow_up": Queue a follow-up message.
-func (c Commands) FollowUp(ctx context.Context, p FollowUpCommand) error {
-	return c.call(ctx, "follow_up", p, 0, nil)
+func (c Commands) FollowUp(ctx context.Context, p FollowUpCommand) (QueuedInputAck, error) {
+	var out QueuedInputAck
+	err := c.call(ctx, "follow_up", p, 0, &out)
+	return out, err
 }
 
 // RemoveQueuedMessageCommand holds the parameters of "remove_queued_message".
@@ -7405,6 +7496,13 @@ type PromoteQueuedMessageCommand struct {
 func (c Commands) PromoteQueuedMessage(ctx context.Context, p PromoteQueuedMessageCommand) (PromoteQueuedMessageResult, error) {
 	var out PromoteQueuedMessageResult
 	err := c.call(ctx, "promote_queued_message", p, 0, &out)
+	return out, err
+}
+
+// ClearQueue sends "clear_queue": Remove every queued user-authored steering and follow-up message and return their text.
+func (c Commands) ClearQueue(ctx context.Context) (ClearedQueue, error) {
+	var out ClearedQueue
+	err := c.call(ctx, "clear_queue", nil, 0, &out)
 	return out, err
 }
 

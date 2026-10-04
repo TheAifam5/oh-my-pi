@@ -46,6 +46,7 @@ export interface SessionProviderBoundaryHost {
 	onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
+	transformHeaders?: SimpleStreamOptions["transformHeaders"];
 	/** Current secret obfuscator; swapped when `secrets.enabled` turns on mid-session. */
 	obfuscator(): SecretObfuscator | undefined;
 }
@@ -204,6 +205,7 @@ export class SessionProviderBoundary {
 		const sessionOnResponse = this.#host.onResponse;
 		const sessionMetadata = this.#host.agent.metadataForProvider(provider);
 		const sessionOnSseEvent = this.#host.onSseEvent;
+		const sessionTransformHeaders = this.#host.transformHeaders;
 		const openrouterRoutingPreset =
 			provider === "openrouter" ? cfgProvidersOpenrouterVariant.get(this.#host.settings) : "default";
 		const openrouterVariant =
@@ -258,6 +260,16 @@ export class SessionProviderBoundary {
 					else await requestOnResponse(response, model);
 				}
 			};
+		}
+
+		if (sessionTransformHeaders) {
+			const requestTransformHeaders = options.transformHeaders;
+			preparedOptions.transformHeaders = requestTransformHeaders
+				? async (headers, signal) => {
+						const sessionHeaders = await sessionTransformHeaders(headers, signal);
+						return (await requestTransformHeaders(sessionHeaders ?? headers, signal)) ?? sessionHeaders;
+					}
+				: sessionTransformHeaders;
 		}
 
 		if (sessionOnSseEvent) {

@@ -1,8 +1,10 @@
-import { combine, register, type SettingValueOf } from "../config/registry";
+import { combine, describeSettingValue, register, type ScopeLike, type SettingValueOf } from "../config/registry";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { COMPACTION_METHOD_CHOICES, DEFAULT_COMPACTION_METHOD_ORDER } from "./compaction-methods";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 
 const EMPTY_STRING_ARRAY: string[] = [];
+const EMPTY_COMPACTION_MODEL_OVERRIDES: Readonly<Record<string, CompactionModelOverride | null>> = {};
 
 export const cfgWorkspaceAdditionalDirectories = register({
 	id: "workspace.additionalDirectories",
@@ -205,6 +207,68 @@ export const cfgCompactionKeepRecentTokens = register({
 	default: 20000,
 });
 
+/** One `compaction.modelOverrides` entry; an omitted or `null` field falls back to the ordinary setting. */
+export interface CompactionModelOverride {
+	reserveTokens?: number | null;
+	keepRecentTokens?: number | null;
+}
+
+const COMPACTION_MODEL_OVERRIDE_FIELDS: readonly (keyof CompactionModelOverride)[] = [
+	"reserveTokens",
+	"keepRecentTokens",
+];
+
+/** Most entries `compaction.modelOverrides` accepts. */
+const MAX_COMPACTION_MODEL_OVERRIDES = 256;
+
+function validateCompactionModelOverrides(raw: unknown): void {
+	if (raw === undefined || raw === null) return;
+	if (!isRecord(raw)) {
+		throw new Error(
+			`Invalid compaction.modelOverrides: expected a map of "provider/modelId" to token settings, got ${describeSettingValue(raw)}.`,
+		);
+	}
+	const keys = Object.keys(raw);
+	if (keys.length > MAX_COMPACTION_MODEL_OVERRIDES) {
+		throw new Error(
+			`Invalid compaction.modelOverrides: ${keys.length} entries exceed the limit of ${MAX_COMPACTION_MODEL_OVERRIDES}.`,
+		);
+	}
+	for (const key of keys) {
+		const entry = raw[key];
+		if (entry === null) continue;
+		const where = `compaction.modelOverrides[${describeSettingValue(key)}]`;
+		if (!isRecord(entry)) {
+			throw new Error(`Invalid ${where}: expected an object with reserveTokens and/or keepRecentTokens.`);
+		}
+		for (const [field, value] of Object.entries(entry)) {
+			if (!(COMPACTION_MODEL_OVERRIDE_FIELDS as readonly string[]).includes(field)) {
+				throw new Error(
+					`Invalid ${where}[${describeSettingValue(field)}]: only reserveTokens and keepRecentTokens can be set per model.`,
+				);
+			}
+			if (value !== null && !(Number.isSafeInteger(value) && (value as number) >= 0)) {
+				throw new Error(
+					`Invalid ${where}.${field}: expected a non-negative integer, got ${describeSettingValue(value)}.`,
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Per-model `reserveTokens`/`keepRecentTokens`, keyed by the exact, case-sensitive
+ * `provider/modelId` of the model being compacted. Read through {@link resolveCompactionSettings}.
+ */
+export const cfgCompactionModelOverrides = register({
+	id: "compaction.modelOverrides",
+	type: "record",
+	default: EMPTY_COMPACTION_MODEL_OVERRIDES,
+	validate: validateCompactionModelOverrides,
+	dropInvalidInProject: true,
+	ignoreProjectNulls: true,
+});
+
 export const cfgCompactionAutoContinue = register({ id: "compaction.autoContinue", type: "boolean", default: true });
 
 export const cfgCompactionRemoteEndpoint = register({
@@ -325,6 +389,38 @@ export const cfgCompaction = combine({
 
 /** Configured compaction policy ({@link cfgCompaction}). */
 export type CompactionSettings = SettingValueOf<typeof cfgCompaction>;
+
+/**
+ * The compaction policy for compacting `model`: {@link cfgCompaction} with `reserveTokens` and
+ * `keepRecentTokens` taken from the `compaction.modelOverrides` entry whose key equals
+ * `provider/modelId` exactly. Each field falls back independently to the ordinary setting when the
+ * entry omits it or holds anything but a non-negative safe integer. When `model.contextWindow` is a
+ * positive finite number, an override above it is clamped to the window. Every other field is the
+ * ordinary setting. Without a model or a matching entry the ordinary snapshot is returned unchanged;
+ * with a matching entry each call returns a new object.
+ */
+export function resolveCompactionSettings(
+	scope: ScopeLike,
+	model: { provider: string; id: string; contextWindow?: number | null } | undefined,
+): CompactionSettings {
+	const base = cfgCompaction.get(scope);
+	if (!model) return base;
+	const key = `${model.provider}/${model.id}`;
+	const entry = cfgCompactionModelOverrides.get(scope)[key];
+	if (!entry) return base;
+	const window = model.contextWindow;
+	const limit = typeof window === "number" && Number.isFinite(window) && window > 0 ? Math.floor(window) : undefined;
+	const clamp = (value: unknown): number | undefined => {
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return undefined;
+		return limit === undefined ? value : Math.min(value, limit);
+	};
+	const resolved: CompactionSettings = { ...base };
+	const reserveTokens = clamp(entry.reserveTokens);
+	if (reserveTokens !== undefined) resolved.reserveTokens = reserveTokens;
+	const keepRecentTokens = clamp(entry.keepRecentTokens);
+	if (keepRecentTokens !== undefined) resolved.keepRecentTokens = keepRecentTokens;
+	return resolved;
+}
 
 // Experimental: snapcompact inline imaging (transient, per-request; never persisted)
 export const cfgSnapcompactSystemPrompt = register({

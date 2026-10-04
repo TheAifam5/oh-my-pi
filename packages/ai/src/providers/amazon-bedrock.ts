@@ -45,6 +45,7 @@ import {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
 import { armPreResponseTimeout, getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
+import { applyHeadersTransform } from "../utils/provider-headers";
 import { toolWireSchema } from "../utils/schema/wire";
 import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
@@ -526,14 +527,26 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			const callerHeaders: Record<string, string> = {};
 			// `model.headers` first, `options.headers` second: `StreamOptions.headers` is
 			// documented (types.ts:431-435) as merged ON TOP of model-defined headers.
-			// Both pass the same filter, so a config-authored `Host`/`Content-Type`
-			// cannot desync the signature either.
-			for (const source of [model.headers, options?.headers]) {
-				for (const [name, value] of Object.entries(source ?? {})) {
-					const field = name.toLowerCase();
-					if (SIGNER_OWNED_HEADERS.has(field) || BEDROCK_RESERVED_HEADERS.has(field)) continue;
-					callerHeaders[field] = value;
-				}
+			// `transformHeaders` sees that merge before the filter, so a transform cannot
+			// set signer-owned or reserved names either, and neither can a
+			// config-authored `Host`/`Content-Type`.
+			const configuredHeaders: Record<string, string> = { ...model.headers, ...options?.headers };
+			const mergedCallerHeaders = await applyHeadersTransform(
+				configuredHeaders,
+				options?.transformHeaders,
+				options?.signal,
+				() => new AIError.AbortError(),
+			);
+			const configuredValues = new Map<string, string>();
+			for (const [name, value] of Object.entries(configuredHeaders)) {
+				configuredValues.set(name.toLowerCase(), value);
+			}
+			for (const [name, value] of Object.entries(mergedCallerHeaders)) {
+				const field = name.toLowerCase();
+				if (SIGNER_OWNED_HEADERS.has(field) || BEDROCK_RESERVED_HEADERS.has(field)) continue;
+				// A transform may pass configured `x-amz-*` headers through but not add or change one.
+				if (field.startsWith("x-amz-") && configuredValues.get(field) !== value) continue;
+				callerHeaders[field] = value;
 			}
 			// SigV4 never signs `user-agent` (UNSIGNABLE in aws-sigv4.ts:42-58), so this
 			// default cannot break the signature. Without it Bun's fetch sends

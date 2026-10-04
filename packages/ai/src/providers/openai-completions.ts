@@ -939,6 +939,7 @@ const streamOpenAICompletionsOnce = (
 						// bounds every attempt and backoff sleep — retries cannot
 						// extend the deadline.
 						onSseEvent: rawSseObserver,
+						transformHeaders: options?.transformHeaders,
 						onDoneSentinel: () => {
 							sawDoneSentinel = true;
 						},

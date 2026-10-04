@@ -82,6 +82,18 @@ _QUEUED_MESSAGE_QUEUE_VALUES: Final[frozenset[str]] = frozenset({"steering", "fo
 _decode_queued_message_queue = cast("Decoder[QueuedMessageQueue]", literal(_QUEUED_MESSAGE_QUEUE_VALUES))
 
 
+PromptDisposition: TypeAlias = Literal["handled", "queued", "started"]
+"""How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion."""
+_PROMPT_DISPOSITION_VALUES: Final[frozenset[str]] = frozenset({"handled", "queued", "started"})
+_decode_prompt_disposition = cast("Decoder[PromptDisposition]", literal(_PROMPT_DISPOSITION_VALUES))
+
+
+QueuedInputDisposition: TypeAlias = Literal["handled", "queued"]
+"""How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue."""
+_QUEUED_INPUT_DISPOSITION_VALUES: Final[frozenset[str]] = frozenset({"handled", "queued"})
+_decode_queued_input_disposition = cast("Decoder[QueuedInputDisposition]", literal(_QUEUED_INPUT_DISPOSITION_VALUES))
+
+
 CacheWarmingMode: TypeAlias = Literal["off", "streaming", "idle"]
 _CACHE_WARMING_MODE_VALUES: Final[frozenset[str]] = frozenset({"off", "streaming", "idle"})
 _decode_cache_warming_mode = cast("Decoder[CacheWarmingMode]", literal(_CACHE_WARMING_MODE_VALUES))
@@ -766,6 +778,19 @@ class AbortAndRestoreQueueResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class QueuedInputAck:
+    """`steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`."""
+    disposition: QueuedInputDisposition | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ClearedQueue:
+    """Text of the user-authored queued messages `clear_queue` removed, in queue order."""
+    steering: tuple[str, ...]
+    follow_up: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class BranchMessage:
     entry_id: str
     text: str
@@ -936,8 +961,9 @@ class HandoffResult:
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class PromptAck:
-    """`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows."""
+    """`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`."""
     agent_invoked: bool | None = None
+    disposition: PromptDisposition | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2050,6 +2076,21 @@ def parse_abort_and_restore_queue_result(value: object, path: str = "AbortAndRes
     )
 
 
+def parse_queued_input_ack(value: object, path: str = "QueuedInputAck") -> QueuedInputAck:
+    payload = expect_object(value, path)
+    return QueuedInputAck(
+        disposition=optional(payload, "disposition", _decode_queued_input_disposition, path),
+    )
+
+
+def parse_cleared_queue(value: object, path: str = "ClearedQueue") -> ClearedQueue:
+    payload = expect_object(value, path)
+    return ClearedQueue(
+        steering=required(payload, "steering", array(decode_str), path),
+        follow_up=required(payload, "followUp", array(decode_str), path),
+    )
+
+
 def parse_branch_message(value: object, path: str = "BranchMessage") -> BranchMessage:
     payload = expect_object(value, path)
     return BranchMessage(
@@ -2249,6 +2290,7 @@ def parse_prompt_ack(value: object, path: str = "PromptAck") -> PromptAck:
     payload = expect_object(value, path)
     return PromptAck(
         agent_invoked=optional(payload, "agentInvoked", decode_bool, path),
+        disposition=optional(payload, "disposition", _decode_prompt_disposition, path),
     )
 
 
@@ -3111,21 +3153,23 @@ class WireClient:
     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         raise NotImplementedError
 
-    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> QueuedInputAck:
         """Queue a steering message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
-        self._command("steer", params)
+        data = self._command("steer", params)
+        return parse_queued_input_ack({} if data is None else data, "steer")
 
-    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None) -> QueuedInputAck:
         """Queue a follow-up message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
-        self._command("follow_up", params)
+        data = self._command("follow_up", params)
+        return parse_queued_input_ack({} if data is None else data, "follow_up")
 
     def remove_queued_message(self, message: str, queue: QueuedMessageQueue) -> RemoveQueuedMessageResult:
         """Remove one pending queued message by its queue-chip text."""
@@ -3139,6 +3183,11 @@ class WireClient:
         params: dict[str, object] = {}
         params["message"] = message
         return parse_promote_queued_message_result(self._command("promote_queued_message", params), "promote_queued_message")
+
+    def clear_queue(self) -> ClearedQueue:
+        """Remove every queued user-authored steering and follow-up message and return their text."""
+        params: dict[str, object] = {}
+        return parse_cleared_queue(self._command("clear_queue", params), "clear_queue")
 
     def abort(self) -> None:
         """Abort the current run."""
@@ -3463,7 +3512,8 @@ class WireClient:
         params: dict[str, object] = {}
         params["providerId"] = provider_id
         params["credentialId"] = credential_id
-        return parse_logout_result(self._command("logout", params), "logout")
+        data = self._command("logout", params)
+        return parse_logout_result({} if data is None else data, "logout")
 
     def predict_word(self, text: str, cursor: int) -> str | None:
         """Ghost-text suffix for the prose word ending at `cursor` (a UTF-16 offset); null when none applies."""
@@ -3757,6 +3807,7 @@ __all__ = [
     "CacheWarmingStartEvent",
     "CancelUiRequest",
     "CancellationResult",
+    "ClearedQueue",
     "CommandOutputEvent",
     "CompactionResult",
     "CompactionSummaryMessage",
@@ -3817,12 +3868,15 @@ __all__ = [
     "OpenUrlUiRequest",
     "PromoteQueuedMessageResult",
     "PromptAck",
+    "PromptDisposition",
     "PromptError",
     "PromptResultEvent",
     "PromptStatus",
     "PythonExecutionMessage",
     "QueueMode",
     "QueueUpdateEvent",
+    "QueuedInputAck",
+    "QueuedInputDisposition",
     "QueuedMessageQueue",
     "QueuedMessagesState",
     "ReadyEvent",
@@ -3941,6 +3995,7 @@ __all__ = [
     "parse_cache_warming_start_event",
     "parse_cancel_ui_request",
     "parse_cancellation_result",
+    "parse_cleared_queue",
     "parse_command_output_event",
     "parse_compaction_result",
     "parse_compaction_summary_message",
@@ -3995,6 +4050,7 @@ __all__ = [
     "parse_prompt_result_event",
     "parse_python_execution_message",
     "parse_queue_update_event",
+    "parse_queued_input_ack",
     "parse_queued_messages_state",
     "parse_ready_event",
     "parse_redacted_thinking_content",

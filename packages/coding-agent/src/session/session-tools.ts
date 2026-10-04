@@ -11,7 +11,14 @@ import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
-import type { ExtensionRunner, SourceInfo, ToolInfo } from "../extensibility/extensions";
+import type {
+	ExtensionRunner,
+	SourceInfo,
+	ToolAnnotations,
+	ToolInfo,
+	ToolNamespace,
+} from "../extensibility/extensions";
+import { toolExposureOf } from "../extensibility/extensions/tool-metadata";
 import { type EvalPreludeDefinition, evalPreludeSummary } from "../eval/preludes";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
@@ -751,7 +758,16 @@ export class SessionTools {
 				scope: "temporary",
 				origin: "top-level",
 			};
-			return { name, description: tool.description, parameters: tool.parameters, sourceInfo };
+			const { namespace, annotations } = tool as { namespace?: ToolNamespace; annotations?: ToolAnnotations };
+			return {
+				name,
+				description: tool.description,
+				parameters: tool.parameters,
+				exposure: toolExposureOf(tool),
+				...(namespace !== undefined ? { namespace } : {}),
+				...(annotations !== undefined ? { annotations } : {}),
+				sourceInfo,
+			};
 		});
 	}
 

@@ -35,7 +35,7 @@
 				"name": "steer",
 				"doc": "Queue a steering message.",
 				"params": "SteerParams",
-				"result": null,
+				"result": "QueuedInputAck",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -46,7 +46,7 @@
 				"name": "follow_up",
 				"doc": "Queue a follow-up message.",
 				"params": "FollowUpParams",
-				"result": null,
+				"result": "QueuedInputAck",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -69,6 +69,17 @@
 				"doc": "Move one queued follow-up to the end of the steering queue.",
 				"params": "PromoteQueuedMessageParams",
 				"result": "PromoteQueuedMessageResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "clear_queue",
+				"doc": "Remove every queued user-authored steering and follow-up message and return their text.",
+				"params": null,
+				"result": "ClearedQueue",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -2172,6 +2183,23 @@
 			],
 			"type": "string"
 		},
+		"PromptDisposition": {
+			"enum": [
+				"handled",
+				"queued",
+				"started"
+			],
+			"type": "string",
+			"description": "How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion."
+		},
+		"QueuedInputDisposition": {
+			"enum": [
+				"handled",
+				"queued"
+			],
+			"type": "string",
+			"description": "How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue."
+		},
 		"CacheWarmingMode": {
 			"enum": [
 				"off",
@@ -2915,6 +2943,37 @@
 			],
 			"description": "User-authored queued input withdrawn before the abort, oldest first."
 		},
+		"QueuedInputAck": {
+			"type": "object",
+			"properties": {
+				"disposition": {
+					"$ref": "#/$defs/QueuedInputDisposition"
+				}
+			},
+			"description": "`steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`."
+		},
+		"ClearedQueue": {
+			"type": "object",
+			"properties": {
+				"steering": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"followUp": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"steering",
+				"followUp"
+			],
+			"description": "Text of the user-authored queued messages `clear_queue` removed, in queue order."
+		},
 		"BranchMessage": {
 			"type": "object",
 			"properties": {
@@ -3450,9 +3509,12 @@
 			"properties": {
 				"agentInvoked": {
 					"type": "boolean"
+				},
+				"disposition": {
+					"$ref": "#/$defs/PromptDisposition"
 				}
 			},
-			"description": "`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows."
+			"description": "`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`."
 		},
 		"AutoCompactionReason": {
 			"enum": [

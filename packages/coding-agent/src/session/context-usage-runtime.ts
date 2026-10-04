@@ -15,10 +15,10 @@ import { resolveSpeculationLeadTokens } from "./speculation-lead";
 
 import { cfgSkillful } from "./settings";
 import {
-	cfgCompaction,
 	cfgSnapcompactShape,
 	cfgSnapcompactSystemPrompt,
 	cfgSnapcompactToolResults,
+	resolveCompactionSettings,
 } from "./context-settings";
 
 /** Resolve session policy before handing pure boundary arithmetic to the UI. */
@@ -28,7 +28,11 @@ export function getSessionCompactionBoundaries(
 	model?: Model | null,
 ): CompactionBoundaries | null {
 	if (!(contextWindow > 0)) return null;
-	const configured = cfgCompaction.get(settings);
+	// The caller's window clamps the per-model overrides, so they agree with the arithmetic below.
+	const configured = resolveCompactionSettings(
+		settings,
+		model ? { provider: model.provider, id: model.id, contextWindow } : undefined,
+	);
 	const compaction: CompactionSettings = configured;
 	if (!compaction.enabled || compaction.strategy === "off") return null;
 	const threshold = resolveThresholdTokens(contextWindow, compaction);
@@ -60,7 +64,7 @@ export function computeSessionContextBreakdown(
 		}
 	}
 	return computeContextBreakdown(session, {
-		compaction: cfgCompaction.get(session.settings),
+		compaction: resolveCompactionSettings(session.settings, session.model),
 		sourceRevision: session.settings.revision,
 		skillful: cfgSkillful.get(session.settings),
 		snapcompact,

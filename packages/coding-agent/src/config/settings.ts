@@ -44,6 +44,7 @@ import {
 	type AnySetting,
 	all as allSettings,
 	bindEffects,
+	describeSettingValue,
 	inheritWarnings,
 	lookup as lookupSetting,
 	resetRegistryForTest,
@@ -282,10 +283,14 @@ function assertKnownSettingPaths(layer: RawSettings, prefix = ""): void {
 	}
 }
 
-/** `project` as it merges over the global layer: `null` (cleared) model roles fall back to global. */
+/**
+ * `project` as it merges over the global layer: `null` (cleared) model roles fall back to global,
+ * and `ignoreProjectNulls` settings lose their `null` entries and entry fields.
+ */
 function projectLayerForMerge(project: RawSettings): RawSettings {
-	const projectRoles = getByPath(project, ["modelRoles"]);
-	if (!isRecord(projectRoles)) return project;
+	const result = projectLayerWithoutIgnoredNulls(project);
+	const projectRoles = getByPath(result, ["modelRoles"]);
+	if (!isRecord(projectRoles)) return result;
 
 	let filteredRoles: Record<string, unknown> | undefined;
 	for (const role in projectRoles) {
@@ -293,7 +298,81 @@ function projectLayerForMerge(project: RawSettings): RawSettings {
 		filteredRoles ??= { ...projectRoles };
 		delete filteredRoles[role];
 	}
-	return filteredRoles ? { ...project, modelRoles: filteredRoles } : project;
+	return filteredRoles ? { ...result, modelRoles: filteredRoles } : result;
+}
+
+/**
+ * `record` without `null` entries and without `null` fields of its object entries; itself when it
+ * has none. Copies are built with `Object.fromEntries`, so a `__proto__` key stays an own entry.
+ */
+function withoutNullEntries(record: Record<string, unknown>): Record<string, unknown> {
+	const hasNull = Object.values(record).some(
+		entry => entry === null || (isRecord(entry) && Object.values(entry).includes(null)),
+	);
+	if (!hasNull) return record;
+	return Object.fromEntries(
+		Object.entries(record).flatMap(([key, entry]): [string, unknown][] => {
+			if (entry === null) return [];
+			if (!isRecord(entry)) return [[key, entry]];
+			return [[key, Object.fromEntries(Object.entries(entry).filter(([, value]) => value !== null))]];
+		}),
+	);
+}
+
+/**
+ * `project` without the `null` values of every `ignoreProjectNulls` setting: a whole-value `null`
+ * is removed, and a record value goes through {@link withoutNullEntries}. Itself when nothing changes.
+ */
+function projectLayerWithoutIgnoredNulls(project: RawSettings): RawSettings {
+	let result = project;
+	for (const setting of allSettings()) {
+		if (!setting.definition.ignoreProjectNulls) continue;
+		const value = getByPath(result, setting.segments);
+		if (value === null) {
+			if (result === project) result = { ...project };
+			deleteByPath(result, setting.segments);
+			continue;
+		}
+		if (!isRecord(value)) continue;
+		const filtered = withoutNullEntries(value);
+		if (filtered === value) continue;
+		if (result === project) result = structuredClone(project);
+		setByPath(result, setting.segments, filtered);
+	}
+	return result;
+}
+
+/**
+ * Re-derives every setting that declares a `merge` hook in `merged` from `layers` (lowest precedence
+ * first): the lowest configured value is taken as is, and each higher configured value is combined
+ * with it through the hook. `merged` is returned unchanged when no hook setting is configured;
+ * otherwise the records on the written path are copied, since a merged view may share them with a layer.
+ */
+function applyMergeHooks(merged: RawSettings, layers: readonly RawSettings[]): RawSettings {
+	let result = merged;
+	for (const setting of allSettings()) {
+		const merge = setting.definition.merge;
+		if (!merge) continue;
+		let value: unknown;
+		let configured = false;
+		for (const layer of layers) {
+			const layerValue = getByPath(layer, setting.segments);
+			if (layerValue === undefined) continue;
+			value = configured ? merge(value, layerValue) : layerValue;
+			configured = true;
+		}
+		if (!configured) continue;
+		if (result === merged) result = { ...merged };
+		let container = result;
+		for (const segment of setting.segments.slice(0, -1)) {
+			const next = container[segment];
+			const copy: RawSettings = isRecord(next) ? { ...next } : {};
+			container[segment] = copy;
+			container = copy;
+		}
+		container[setting.segments[setting.segments.length - 1]] = value;
+	}
+	return result;
 }
 
 /** One instance's own layers, lowest precedence first. */
@@ -609,6 +688,13 @@ export class Settings {
 	/** Monotonic revision of merged layers and cwd-scoped resolution. */
 	#revision = 0;
 	/**
+	 * Last `#projectLayerForMerge` result, keyed by the layer objects, {@link revision}, and the
+	 * overlay parent's revision. Layers change in place only before a rebuild bumps the revision.
+	 */
+	#preparedProject:
+		| { layers: OwnLayers; revision: number; parentRevision: number | undefined; project: RawSettings }
+		| undefined;
+	/**
 	 * Registry-owned memo of handle and derivation values for this instance, indexed by
 	 * `Derived.slot` and validated against {@link revision}; see `config/registry.ts`.
 	 */
@@ -813,6 +899,16 @@ export class Settings {
 
 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */
 	#applyParentChange(setting: AnySetting): void {
+		if (setting.definition.merge) {
+			// A merge hook combines the child's own value with the parent's, so the child's effective
+			// value can change even when its own layers configure the setting. A view another read
+			// already re-merged has lost the previous value, so it notifies unconditionally.
+			const stale = this.#parent !== undefined && this.#parent.revision !== this.#syncedParentRevision;
+			const before = getByPath(this.#merged, setting.segments);
+			this.#syncParent();
+			if (!stale || !Bun.deepEquals(before, getByPath(this.#merged, setting.segments))) this.#notifyChange(setting);
+			return;
+		}
 		this.#syncParent();
 		const own = getByPath(this.#mergeOwnLayers(this.#ownLayers()), setting.segments);
 		if (own !== undefined && (typeof own !== "object" || own === null || Array.isArray(own))) return;
@@ -884,9 +980,29 @@ export class Settings {
 		const segments = setting.segments;
 		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
 		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
-		if (getByPath(projectLayerForMerge(this.#project), segments) !== undefined) return "project";
+		if (getByPath(this.#projectLayerForMerge(this.#ownLayers()), segments) !== undefined) return "project";
 		if (getByPath(this.#global, segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
+	}
+
+	/**
+	 * Every layer's own configured value of `setting`, lowest precedence first: an overlay parent's
+	 * layers, then global, project, `--config` overlay, and runtime override. Layers that leave the
+	 * setting unset are omitted; a configured `null` is included.
+	 */
+	getLayerValues(setting: AnySetting): { source: SettingProvenance; value: unknown }[] {
+		const values = this.#parent?.getLayerValues(setting) ?? [];
+		const layers: [SettingProvenance, RawSettings][] = [
+			["global", this.#global],
+			["project", this.#projectLayerForMerge(this.#ownLayers())],
+			["overlay", this.#configOverlay],
+			["runtime", this.#overrides],
+		];
+		for (const [source, layer] of layers) {
+			const value = getByPath(layer, setting.segments);
+			if (value !== undefined) values.push({ source, value });
+		}
+		return values;
 	}
 
 	/**
@@ -2447,12 +2563,42 @@ export class Settings {
 			merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
 		}
 		return {
-			settings: this.#migrateRawSettings(merged, quarantineInvalid),
+			settings: this.#dropInvalidProjectValues(this.#migrateRawSettings(merged, quarantineInvalid)),
 			fileSettings: structuredClone(nativeProject),
 			shellPathSource,
 			sourcePaths,
 			warningsSeen,
 		};
+	}
+
+	/**
+	 * `layer` without the values of `dropInvalidInProject` settings that fail `validate`, so a
+	 * repository cannot stop settings from loading through them. Warns once per dropped value.
+	 */
+	#dropInvalidProjectValues(layer: RawSettings): RawSettings {
+		let result = layer;
+		for (const setting of allSettings()) {
+			if (!setting.definition.dropInvalidInProject) continue;
+			const warnKey = `project:${setting.id}`;
+			const value = getByPath(result, setting.segments);
+			try {
+				if (value !== undefined) setting.definition.validate?.(value);
+				this.warnState.invalid.delete(warnKey);
+				continue;
+			} catch (error) {
+				const warned = this.warnState.invalid;
+				if (!warned.has(warnKey) || !Bun.deepEquals(warned.get(warnKey), value)) {
+					warned.set(warnKey, value);
+					logger.warn("Settings: ignoring invalid project value", {
+						setting: setting.id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			if (result === layer) result = { ...layer };
+			deleteByPath(result, setting.segments);
+		}
+		return result;
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
@@ -3885,14 +4031,86 @@ export class Settings {
 
 	/** `layers` (global, project, `--config` overlay, runtime) merged in precedence order. */
 	#mergeOwnLayers(layers: OwnLayers): RawSettings {
-		let merged = this.#deepMerge(this.#deepMerge({}, layers.global), projectLayerForMerge(layers.project));
+		return this.#mergeOwnLayersWith(layers, this.#projectLayerForMerge(layers));
+	}
+
+	/** {@link mergeOwnLayers} with `project` standing in for the prepared project layer. */
+	#mergeOwnLayersWith(layers: OwnLayers, project: RawSettings): RawSettings {
+		let merged = this.#deepMerge(this.#deepMerge({}, layers.global), project);
 		merged = this.#deepMerge(merged, layers.configOverlay);
-		return this.#deepMerge(merged, layers.overrides);
+		merged = this.#deepMerge(merged, layers.overrides);
+		return applyMergeHooks(merged, [layers.global, project, layers.configOverlay, layers.overrides]);
+	}
+
+	/**
+	 * The project layer of `layers` as it merges ({@link projectLayerForMerge}), without the value of
+	 * a `dropInvalidInProject` setting whose merged value fails `validate` only because of it: when
+	 * the merge without that value passes, the value is dropped with one warning. When the other
+	 * layers fail on their own, the project value stays and the failure surfaces as usual.
+	 */
+	#projectLayerForMerge(layers: OwnLayers): RawSettings {
+		const parentRevision = this.#parent?.revision;
+		const cached = this.#preparedProject;
+		if (
+			cached &&
+			cached.revision === this.#revision &&
+			cached.parentRevision === parentRevision &&
+			cached.layers.global === layers.global &&
+			cached.layers.project === layers.project &&
+			cached.layers.configOverlay === layers.configOverlay &&
+			cached.layers.overrides === layers.overrides
+		) {
+			return cached.project;
+		}
+		const project = this.#prepareProjectLayer(layers);
+		this.#preparedProject = { layers, revision: this.#revision, parentRevision, project };
+		return project;
+	}
+
+	/** The uncached body of `#projectLayerForMerge`. */
+	#prepareProjectLayer(layers: OwnLayers): RawSettings {
+		let project = projectLayerForMerge(layers.project);
+		for (const setting of allSettings()) {
+			const validate = setting.definition.validate;
+			if (!setting.definition.dropInvalidInProject || !validate) continue;
+			const value = getByPath(project, setting.segments);
+			if (value === undefined) continue;
+			const warnKey = `project-merged:${setting.id}`;
+			const mergedValue = (candidate: RawSettings): unknown =>
+				getByPath(this.#mergeOverParent(this.#mergeOwnLayersWith(layers, candidate)), setting.segments);
+			let error: unknown;
+			try {
+				validate(mergedValue(project));
+				this.warnState.invalid.delete(warnKey);
+				continue;
+			} catch (caught) {
+				error = caught;
+			}
+			const without = { ...project };
+			deleteByPath(without, setting.segments);
+			try {
+				validate(mergedValue(without));
+			} catch {
+				continue;
+			}
+			const warned = this.warnState.invalid;
+			if (!warned.has(warnKey) || !Bun.deepEquals(warned.get(warnKey), value)) {
+				warned.set(warnKey, value);
+				logger.warn("Settings: ignoring project value that makes the merged value invalid", {
+					setting: setting.id,
+					error: error instanceof Error ? error.message : describeSettingValue(error),
+				});
+			}
+			project = without;
+		}
+		return project;
 	}
 
 	/** `own` merged over an overlay parent's current view (itself for a root instance). */
 	#mergeOverParent(own: RawSettings): RawSettings {
-		return this.#parent ? this.#deepMerge(this.#parent.#mergedView(), own) : own;
+		if (!this.#parent) return own;
+		const parent = this.#parent.#mergedView();
+		return applyMergeHooks(this.#deepMerge(parent, own), [parent, own]);
 	}
 
 	/**

@@ -39,6 +39,7 @@ import {
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
+	isInvisibleContent,
 	loadFilesFromDir,
 	parseRequestIdFormat,
 	SOURCE_PATHS,
@@ -947,15 +948,19 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(getAgentDir(), "AGENTS.md");
-	const userContent = await readFile(userPath);
-	if (userContent) {
-		items.push({
-			path: userPath,
-			content: userContent,
-			level: "user",
-			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
-		});
+	// AGENTS.override.md is listed first so it claims the user scope over AGENTS.md;
+	// disabling it, or leaving it without visible content, lets AGENTS.md take the scope back.
+	for (const fileName of ["AGENTS.override.md", "AGENTS.md"]) {
+		const userPath = path.join(getAgentDir(), fileName);
+		const userContent = await readFile(userPath);
+		if (userContent && (fileName === "AGENTS.md" || !isInvisibleContent(userContent))) {
+			items.push({
+				path: userPath,
+				content: userContent,
+				level: "user",
+				_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+			});
+		}
 	}
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);

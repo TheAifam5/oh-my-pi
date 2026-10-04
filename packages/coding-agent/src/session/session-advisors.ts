@@ -125,7 +125,7 @@ import {
 	cfgAdvisorReviewMode,
 	cfgAdvisorSyncBacklog,
 } from "../advisor/settings";
-import { cfgCompaction, cfgContextPromotionEnabled } from "./context-settings";
+import { cfgContextPromotionEnabled, resolveCompactionSettings } from "./context-settings";
 import { cfgRetry, cfgTierAdvisor } from "./settings";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
@@ -467,6 +467,7 @@ export interface SessionAdvisorsHost {
 	onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
+	transformHeaders?: SimpleStreamOptions["transformHeaders"];
 	isDisposed(): boolean;
 	abortInProgress(): boolean;
 	allowAgentInitiatedTurns(): boolean;
@@ -1433,6 +1434,7 @@ export class SessionAdvisors {
 				onPayload: this.#host.onPayload,
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
+				transformHeaders: this.#host.transformHeaders,
 				transformProviderContext: this.#transformProviderContext,
 				intentTracing: false,
 				transformAssistantMessage: message => {
@@ -2306,7 +2308,7 @@ export class SessionAdvisors {
 		}
 		const incomingTokens = agent.tokenizer.countMessage(incoming);
 
-		const configuredCompaction = cfgCompaction.get(this.#host.settings);
+		const configuredCompaction = resolveCompactionSettings(this.#host.settings, agent.state.model);
 		const methods = resolveCompactionMethodOrder(configuredCompaction.methodOrder);
 		if (!configuredCompaction.enabled || methods.length === 0) {
 			return false;

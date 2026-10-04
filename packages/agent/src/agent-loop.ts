@@ -1252,6 +1252,7 @@ async function runLoopBody(
 		// between the tool_use blocks and their results would break the
 		// provider's pairing invariant.
 		const resumeTail = unpairedToolCallTail(currentContext.messages);
+		let skipFirstModelTurn = false;
 		if (resumeTail) {
 			stream.push({ type: "turn_start" });
 			emitInputMessages(stream, messagesToEmit);
@@ -1278,7 +1279,7 @@ async function runLoopBody(
 				executionResult.additionalContext,
 			);
 			await emitTurnEnd(stream, currentContext, resumeTail, executionResult.toolResults, config, signal, {
-				willContinue: !isDeadlineExceeded(config.deadline),
+				willContinue: !executionResult.terminate && !isDeadlineExceeded(config.deadline),
 				...(resumeContextMessage ? { additionalMessages: [resumeContextMessage] } : {}),
 			});
 			turnOpen = false;
@@ -1288,11 +1289,15 @@ async function runLoopBody(
 				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 				return;
 			}
+			// A terminating batch ends tool-driven continuation: skip the model turn and
+			// go straight to the stop boundary, which still delivers queued messages.
+			skipFirstModelTurn = executionResult.terminate === true;
 		}
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
 		while (true) {
-			let hasMoreToolCalls = true;
+			let hasMoreToolCalls = !skipFirstModelTurn;
+			skipFirstModelTurn = false;
 
 			// Inner loop: process tool calls and steering messages
 			while (hasMoreToolCalls || pendingMessages.length > 0) {
@@ -1662,6 +1667,9 @@ async function runLoopBody(
 						executionResult.additionalContext,
 					);
 					if (injectedContext) additionalMessages.push(injectedContext);
+					// Every call was blocked by a hook that asked to terminate: stop the
+					// tool-driven continuation. Queued steering below still starts a turn.
+					if (executionResult.terminate) hasMoreToolCalls = false;
 				} else if (toolCalls.length > 0) {
 					SpeculativeOperationCoordinator.discardForMessage(
 						message,
@@ -2793,6 +2801,8 @@ interface PreparedToolCall {
 	validationErrorMessage?: string;
 	blocked?: boolean;
 	blockReason?: string;
+	/** The blocking hook asked to end the run once the batch settles. */
+	terminate?: boolean;
 	prepareError?: unknown;
 }
 
@@ -3090,6 +3100,7 @@ async function prepareToolCallDispatch(
 		if (beforeResult?.block) {
 			entry.blocked = true;
 			entry.blockReason = beforeResult.reason;
+			if (beforeResult.terminate === true) entry.terminate = true;
 			continue;
 		}
 		if (isNonBlankContext(beforeResult?.additionalContext)) {
@@ -3198,7 +3209,7 @@ async function executeToolCalls(
 	// Steering the provider took off the queue during the response that emitted
 	// this batch; it injects at this batch's boundary like queued steering.
 	liveSteering: readonly AgentMessage[],
-): Promise<{ toolResults: ToolResultMessage[]; additionalContext?: string }> {
+): Promise<{ toolResults: ToolResultMessage[]; additionalContext?: string; terminate?: boolean }> {
 	const tools = currentContext.tools;
 	const {
 		hasSteeringMessages,
@@ -3290,6 +3301,7 @@ async function executeToolCalls(
 			validationErrorMessage: prepared.validationErrorMessage,
 			blocked: prepared.blocked === true,
 			blockReason: prepared.blockReason,
+			terminate: prepared.terminate === true,
 			prepareError: prepared.prepareError,
 			preparedContext: prepared.additionalContext,
 			reportedContext: [] as string[],
@@ -3851,9 +3863,14 @@ async function executeToolCalls(
 				record.toolResultMessage?.isError ? undefined : record.preparedContext,
 			]),
 	);
+	// Every call must be a finalized block that asked to terminate; one ordinary
+	// or skipped call keeps the run going.
+	const terminate =
+		records.length > 0 && records.every(record => record.blocked && record.terminate && !record.skipped);
 	return {
 		toolResults: emittedToolResults,
 		...(additionalContext !== undefined ? { additionalContext } : {}),
+		...(terminate ? { terminate } : {}),
 	};
 }
 

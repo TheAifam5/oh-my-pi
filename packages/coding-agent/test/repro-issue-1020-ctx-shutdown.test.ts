@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type {
 	ExtensionActions,
 	ExtensionCommandContextActions,
@@ -8,6 +8,7 @@ import type {
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { setChatMarkdownTransform } from "@oh-my-pi/pi-tui/chat/markdown-transform";
 
 async function createHost(initializeUi: boolean) {
 	let actions: ExtensionContextActions | undefined;
@@ -37,6 +38,9 @@ async function createHost(initializeUi: boolean) {
 	const host = Object.assign(Object.create(InteractiveMode.prototype), {
 		shutdownRequested: false,
 		syncComposerShape() {},
+		setWorkingVisible() {},
+		setWorkingIndicator() {},
+		setHiddenThinkingLabel() {},
 		session: {
 			extensionRunner: runner,
 			get isStreaming() {
@@ -86,6 +90,11 @@ async function flushShutdown() {
 }
 
 describe("interactive extension shutdown", () => {
+	afterEach(() => {
+		// The controller installs a process-wide Markdown transform bound to the fake runner.
+		setChatMarkdownTransform(undefined);
+	});
+
 	test("an idle background request closes the initialized host without terminal input", async () => {
 		const { actions, state, errors } = await createHost(true);
 		actions.shutdown();

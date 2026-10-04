@@ -23,6 +23,7 @@ from ._wire import (
     ExtensionUiRequest,
     ImageContent,
     MessageEndEvent,
+    PromptDisposition,
     PromptResultEvent,
     ReadyEvent,
     RpcAgentEvent,
@@ -36,6 +37,7 @@ from ._wire import (
     WireClient,
     parse_agent_message,
     parse_notification,
+    parse_prompt_ack,
     parse_todo_phase,
 )
 from ._wire_runtime import (
@@ -359,6 +361,17 @@ class HostToolCompletedEvent:
     tool_name: str
     tool_call_id: str
 
+
+
+@dataclass(slots=True, frozen=True)
+class PromptSubmission:
+    """An accepted prompt: its request id and how the server admitted it.
+
+    `disposition` is `None` from servers that do not report one.
+    """
+
+    id: str
+    disposition: PromptDisposition | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1079,15 +1092,34 @@ class RpcClient(WireClient):
 
         The prompt's `prompt_result` (see `on_prompt_result`) carries the same id.
         """
+        return self.prompt_with_disposition(
+            message, images=images, streaming_behavior=streaming_behavior
+        ).id
+
+    def prompt_with_disposition(
+        self,
+        message: str,
+        *,
+        images: Sequence[ImageContent] | None = None,
+        streaming_behavior: StreamingBehavior | None = None,
+    ) -> PromptSubmission:
+        """Like `prompt`, and also return how the server admitted the prompt.
+
+        The disposition is `"started"` for a new turn, `"queued"` for a message
+        queued during a run, `"handled"` for a command handled without a turn,
+        and `None` from servers that do not report one.
+        """
         request_id = self._next_request_id()
-        self._submit_prompt(
+        data = self._submit_prompt_data(
             "prompt",
             request_id,
             message=message,
             images=cast(JsonValue, list(images)) if images is not None else None,
             streamingBehavior=streaming_behavior,
         )
-        return request_id
+        return PromptSubmission(
+            id=request_id, disposition=parse_prompt_ack(data, "prompt").disposition
+        )
 
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
@@ -1230,6 +1262,14 @@ class RpcClient(WireClient):
         Returns False when the server handled it locally (`agentInvoked: false`),
         in which case no `prompt_result` follows.
         """
+        return self._submit_prompt_data(command_type, request_id, **payload).get(
+            "agentInvoked"
+        ) is not False
+
+    def _submit_prompt_data(
+        self, command_type: str, request_id: str, **payload: JsonValue
+    ) -> JsonObject:
+        """`_submit_prompt` returning the response data."""
         # Registered before sending: the result may arrive before the response
         # has been handed back to this thread.
         with self._event_condition:
@@ -1242,8 +1282,7 @@ class RpcClient(WireClient):
             raise
         if data.get("agentInvoked") is False:
             self._settle_prompt(request_id)
-            return False
-        return True
+        return data
 
     def _settle_prompt(self, request_id: str) -> None:
         with self._event_condition:

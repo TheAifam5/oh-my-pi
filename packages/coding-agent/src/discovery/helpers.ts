@@ -700,6 +700,16 @@ function isWithin(parent: string, child: string): boolean {
 }
 
 /**
+ * Whether `content` renders as nothing: only whitespace, control and format characters (zero-width
+ * spaces and joiners, byte order marks, bidirectional controls), private-use, unassigned, and lone
+ * surrogate code points, other default-ignorable code points, and the braille blank. Such a file
+ * cannot override another one.
+ */
+export function isInvisibleContent(content: string): boolean {
+	return /^[\s\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Default_Ignorable_Code_Point}\u2800]*$/u.test(content);
+}
+
+/**
  * Load standalone context files (e.g. AGENTS.md, CLAUDE.md) by walking up from
  * cwd. Shared across providers whose files live in project root rather than
  * config directories (which their own providers handle).
@@ -709,11 +719,16 @@ function isWithin(parent: string, child: string): boolean {
  * home directory's own copy as project context. A repository rooted at the
  * home directory itself is not "nested below" it, so the home-level file
  * remains project context.
+ *
+ * `fileNames` lists the candidates in precedence order. Every non-empty
+ * candidate in a directory is returned at that directory's depth, highest
+ * precedence first, so depth deduplication keeps the first one and disabling
+ * it lets the next candidate take the scope.
  */
 export async function loadStandaloneContextFiles(
 	ctx: LoadContext,
 	providerId: string,
-	fileName: string,
+	fileNames: readonly string[],
 ): Promise<LoadResult<ContextFile>> {
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
@@ -733,29 +748,26 @@ export async function loadStandaloneContextFiles(
 	while (true) {
 		const atBoundary = samePath(current, boundary);
 		const atHome = excludeHome && samePath(current, home);
-		if (!(atHome || (atBoundary && !includeBoundary))) {
-			const candidate = path.join(current, fileName);
-			const content = await readFile(candidate);
+		const baseName = current.split(path.sep).pop() ?? "";
+		if (!(atHome || (atBoundary && !includeBoundary)) && !baseName.startsWith(".")) {
+			const calculatedDepth = calculateDepth(cwd, current, path.sep);
+			for (const [index, fileName] of fileNames.entries()) {
+				const candidate = path.join(current, fileName);
+				const content = await readFile(candidate);
 
-			// Empty files contribute nothing and must not claim the depth scope:
-			// at a priority tie, an empty first-registered file would shadow a
-			// non-empty sibling (e.g. an empty AGENTS.md shadowing CLAUDE.md).
-			if (content !== null && content !== "") {
-				const parent = path.dirname(candidate);
-				const baseName = parent.split(path.sep).pop() ?? "";
-
-				if (!baseName.startsWith(".")) {
-					const fileDir = path.dirname(candidate);
-					const calculatedDepth = calculateDepth(cwd, fileDir, path.sep);
-
-					items.push({
-						path: candidate,
-						content,
-						level: "project",
-						depth: calculatedDepth,
-						_source: createSourceMeta(providerId, candidate, "project"),
-					});
-				}
+				// Empty files contribute nothing and must not claim the depth scope:
+				// at a priority tie, an empty first-registered file would shadow a
+				// non-empty sibling (e.g. an empty AGENTS.md shadowing CLAUDE.md).
+				if (content === null || content === "") continue;
+				// A candidate that replaces a later one (an override) needs visible content to do so.
+				if (index < fileNames.length - 1 && isInvisibleContent(content)) continue;
+				items.push({
+					path: candidate,
+					content,
+					level: "project",
+					depth: calculatedDepth,
+					_source: createSourceMeta(providerId, candidate, "project"),
+				});
 			}
 		}
 		if (atBoundary) break;

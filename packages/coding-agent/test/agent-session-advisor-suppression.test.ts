@@ -65,6 +65,7 @@ interface AdvisorTestExtensionRunner {
 	hasHandlers(eventType: string): boolean;
 	emitBeforeAgentStart(): Promise<undefined>;
 	emit(event: { type: string; message?: AgentMessage }): Promise<void>;
+	invalidate(): void;
 }
 
 describe("AgentSession advisor auto-resume suppression", () => {
@@ -341,6 +342,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const extensionRunner: AdvisorTestExtensionRunner = {
 			hasHandlers: eventType => eventType === "message_end",
 			emitBeforeAgentStart: async () => undefined,
+			invalidate: () => {},
 			emit: async event => {
 				if (event.type !== "message_end" || !event.message || !isAdvisorCard(event.message)) return;
 				hookStarted.resolve();
@@ -379,6 +381,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const extensionRunner: AdvisorTestExtensionRunner = {
 			hasHandlers: eventType => eventType === "message_start",
 			emitBeforeAgentStart: async () => undefined,
+			invalidate: () => {},
 			emit: async event => {
 				if (event.type !== "message_start" || !event.message || !isAdvisorCard(event.message)) return;
 				hookStarted.resolve();

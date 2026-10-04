@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -148,9 +149,11 @@ import type {
 	ExtensionCommandContext,
 	ExtensionRunner,
 	ExtensionUIContext,
+	ModelSelectSource,
 	PreparedExtension,
 	SessionBeforeBranchResult,
 	SessionBeforeSwitchResult,
+	SessionCompactReason,
 	SessionBeforeTreeResult,
 	SessionStopEventResult,
 	ToolInfo,
@@ -160,7 +163,12 @@ import { emitSessionShutdownEvent, TOP_LEVEL_AGENT } from "../extensibility/exte
 import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
-import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type {
+	AgentActivityOutcome,
+	CompactOptions,
+	ContextUsage,
+	SessionBoundaryDraft,
+} from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -276,6 +284,7 @@ import type {
 	HandoffResult,
 	ModelCycleResult,
 	Prewalk,
+	PromptAdmission,
 	PromptOptions,
 	ResetSessionContextResult,
 	ResolvedRoleModel,
@@ -581,6 +590,9 @@ const noOpUIContext: ExtensionUIContext = {
 	onTerminalInput: () => () => {},
 	setStatus: () => {},
 	setWorkingMessage: () => {},
+	setWorkingVisible: () => {},
+	setWorkingIndicator: () => {},
+	setHiddenThinkingLabel: () => {},
 	setWidget: () => {},
 	setTitle: () => {},
 	custom: async () => undefined as never,
@@ -953,6 +965,8 @@ export class AgentSession implements SettingsScope {
 	 */
 	#fallbackExtensionTimers: ManagedTimers | undefined = undefined;
 	#turnIndex = 0;
+	/** Trigger of the auto-compaction pass in flight, reported by `session_compact_failed`. */
+	#autoCompactionReason: SessionCompactReason | undefined;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
 	/** Tool calls whose start marker `#beforeToolExecution` wrote; the start event skips them once. */
@@ -1004,6 +1018,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	#lazyContextRefreshed = new Set<string>();
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
+	#transformHeaders: SimpleStreamOptions["transformHeaders"] | undefined;
 	#sideStreamFn: StreamFn;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
@@ -1085,6 +1100,12 @@ export class AgentSession implements SettingsScope {
 	#promptSequence = 0;
 	#skippedPostTurnSpeculationCompletion: Promise<void> | undefined;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	/** Overlapping `agent_settled` notifications in progress. */
+	#agentSettledDepth = 0;
+	/** Set while `agent_settled` handlers run, so only their sends are deferred. */
+	#agentSettledHandlerScope = new AsyncLocalStorage<true>();
+	/** Turn-starting extension sends held until `agent_settled` handlers finish; rejected on dispose. */
+	#deferredSettledActions: Array<{ run: () => Promise<void>; cancel: (error: Error) => void }> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
@@ -1527,7 +1548,7 @@ export class AgentSession implements SettingsScope {
 			this.#canAutoContinueForFollowUp() &&
 			this.agent.hasQueuedMessages();
 		const ircContinuation = canDrain && !this.#isDisposed && !this.#planModeState?.enabled && this.#irc.hasPending();
-		this.#emit(queuedContinuation || ircContinuation ? { ...pending, isTerminal: false } : pending);
+		this.#publishAgentEnd(queuedContinuation || ircContinuation ? { ...pending, isTerminal: false } : pending);
 	}
 
 	/**
@@ -1717,10 +1738,20 @@ export class AgentSession implements SettingsScope {
 			promptGeneration: () => this.#promptGeneration,
 			resolveActiveEditMode: () => this.#tools.resolveActiveEditMode(),
 			syncAfterModelChange: previousEditMode => this.#tools.syncAfterModelChange(previousEditMode),
-			setModelWithProviderSessionReset: async (model, selection = "explicit") => {
-				await this.#setModelWithProviderSessionReset(model);
+			setModelWithProviderSessionReset: async (model, source, selection = "explicit") => {
+				await this.#setModelWithProviderSessionReset(model, source);
 				// Only a completed explicit selection, including same-model reselection, takes ownership.
 				if (selection === "explicit") this.#prewalk.releaseHandoff();
+			},
+			onThinkingLevelSelected: (level, previousLevel) => {
+				if (!this.#extensionRunner?.hasHandlers("thinking_level_select")) return;
+				this.#extensionRunner
+					.emit({ type: "thinking_level_select", level, previousLevel })
+					.catch((error: unknown) => {
+						logger.warn("thinking_level_select emit failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
 			},
 			clearActiveRetryFallback: () => this.#recovery.clearActiveRetryFallback(),
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
@@ -1864,6 +1895,7 @@ export class AgentSession implements SettingsScope {
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#sideStreamFn = config.sideStreamFn ?? streamSimple;
 		this.#onPayload = config.onPayload;
+		this.#transformHeaders = config.transformHeaders;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
 		// outer await on `#onResponse` (provider-response.ts) tolerates a sync void return,
@@ -1888,10 +1920,12 @@ export class AgentSession implements SettingsScope {
 		this.#onSseEvent = configuredOnSseEvent
 			? (event, model) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
+					this.#extensionRunner?.emitProviderStreamEvent(event, model);
 					configuredOnSseEvent(event, model);
 				}
 			: (event, model) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
+					this.#extensionRunner?.emitProviderStreamEvent(event, model);
 				};
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
@@ -2072,6 +2106,7 @@ export class AgentSession implements SettingsScope {
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
+			transformHeaders: this.#transformHeaders,
 			obfuscator: () => this.#obfuscator,
 		};
 		this.#providerBoundary = new SessionProviderBoundary(providerBoundaryHost);
@@ -2185,6 +2220,7 @@ export class AgentSession implements SettingsScope {
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
+			transformHeaders: this.#transformHeaders,
 			isDisposed: () => this.#isDisposed,
 			abortInProgress: () => this.#abortInProgress,
 			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
@@ -3550,7 +3586,7 @@ export class AgentSession implements SettingsScope {
 		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
 			this.#pendingAgentEndEmit = event;
 		} else {
-			this.#emit(event);
+			this.#publishAgentEnd(event);
 		}
 		const extensionEmit = this.#emitExtensionEvent(event);
 		if (options.detachExtensions) {
@@ -4423,14 +4459,20 @@ export class AgentSession implements SettingsScope {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
-			const emitAgentEndNotification = (options?: AgentEndSettleOptions) =>
-				this.#settleAgentEnd(event, activeMessages, options);
 			await this.#goalRuntime.onAgentEnd({ currentUsage: () => this.#goalUsage() });
 			const fallbackAssistant = settledMessages.findLast(
 				(message): message is AssistantMessage => message.role === "assistant",
 			);
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			// Every terminal route passes through here, so `agent_before_settle` runs exactly once
+			// per run after the built-in continuations declined.
+			const emitAgentEndNotification = async (options?: AgentEndSettleOptions) =>
+				this.#settleAgentEnd(
+					event,
+					activeMessages,
+					options?.willContinue ? options : await this.#runBeforeSettleBoundary(msg),
+				);
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				logger.debug("agent_end maintenance routing", {
@@ -5208,7 +5250,11 @@ export class AgentSession implements SettingsScope {
 		}
 		if (callResult?.block) {
 			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
-			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
+			return {
+				block: true,
+				reason: callResult.reason || "Tool execution was blocked by an extension",
+				...(callResult.terminate === true ? { terminate: true } : {}),
+			};
 		}
 		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
 		// view, not the execution params — a revision cannot map back onto them.
@@ -5298,6 +5344,171 @@ export class AgentSession implements SettingsScope {
 		});
 	}
 
+	/**
+	 * Run `agent_before_settle` for a run about to settle terminally and commit its drafts.
+	 * Returns settle options that keep the run going when a handler requested a continuation
+	 * the committed context can run. An aborted or superseded run never continues; a request
+	 * without runnable context, or one that would consume messages the user's interrupt is
+	 * holding, is reported as an extension error and the run settles.
+	 */
+	async #runBeforeSettleBoundary(message: AssistantMessage | undefined): Promise<AgentEndSettleOptions | undefined> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("agent_before_settle") || this.#isDisposed) return undefined;
+		const generation = this.#promptGeneration;
+		const sessionGeneration = this.#sessionGeneration;
+		const outcome: AgentActivityOutcome =
+			message?.stopReason === "aborted" ? "aborted" : message?.stopReason === "error" ? "error" : "completed";
+		const result = await runner.emitAgentBeforeSettle(outcome);
+		// Drafts belong to this session: commit them after an abort, never into a replaced session.
+		if (this.#isDisposed || (await this.#sessionGenerationChanged(sessionGeneration))) return undefined;
+		const reportInvalid = (error: string) =>
+			runner.emitError({ extensionPath: "<agent_before_settle>", event: "agent_before_settle", error });
+		const committed = await this.#commitBoundaryDrafts(result.entries, reportInvalid);
+		if (
+			!committed ||
+			!result.continue ||
+			outcome === "aborted" ||
+			this.#abortInProgress ||
+			this.#isDisposed ||
+			this.#promptGeneration !== generation ||
+			this.#activeAgentPromptGeneration !== this.#promptGeneration
+		) {
+			return undefined;
+		}
+		if (this.agent.hasQueuedMessages()) {
+			// The settle drain continues with the queue; after a user interrupt it holds
+			// follow-ups for the user, and the continuation must not consume them.
+			if (!this.#canAutoContinueForFollowUp() && this.agent.peekSteeringQueue().length === 0) {
+				reportInvalid(
+					"agent_before_settle continuation declined: queued follow-up messages are held for the user after an interrupt",
+				);
+			}
+			return undefined;
+		}
+		if (this.agent.state.messages.at(-1)?.role === "assistant" || this.agent.state.messages.length === 0) {
+			reportInvalid("agent_before_settle requested continuation without runnable model context");
+			return undefined;
+		}
+		this.#scheduleAgentContinue({ source: "agent-before-settle", generation });
+		return { willContinue: true };
+	}
+
+	/**
+	 * Commit boundary drafts as one unit: custom entries go to the session, custom messages to
+	 * the session and the agent context. Every message is normalized before the first write and
+	 * the session appends publish atomically, so a failure leaves no draft committed (an
+	 * in-memory session cannot roll back an append that throws midway). Returns whether the
+	 * drafts were committed; a failure is reported through `report`.
+	 */
+	async #commitBoundaryDrafts(
+		drafts: readonly SessionBoundaryDraft[],
+		report: (error: string) => void,
+	): Promise<boolean> {
+		if (drafts.length === 0) return true;
+		const prepared: Array<{ draft: SessionBoundaryDraft; message?: CustomMessage }> = [];
+		try {
+			for (const draft of drafts) {
+				if (draft.type === "custom") {
+					prepared.push({ draft });
+					continue;
+				}
+				const payload = normalizeCustomMessagePayload({
+					customType: draft.customType,
+					content: draft.content,
+					display: draft.display,
+					details: draft.details,
+				});
+				const message = await this.#normalizeAgentMessageImages({
+					role: "custom",
+					customType: payload.customType,
+					content: payload.content,
+					display: payload.display,
+					details: payload.details,
+					attribution: payload.attribution,
+					timestamp: Date.now(),
+				} satisfies CustomMessage);
+				prepared.push({ draft, message });
+			}
+			await this.sessionManager.appendEntriesAtomically(() => {
+				for (const { draft, message } of prepared) {
+					if (!message) {
+						this.sessionManager.appendCustomEntry(draft.customType, (draft as { data?: unknown }).data);
+						continue;
+					}
+					this.sessionManager.appendCustomMessageEntry(
+						message.customType,
+						message.content,
+						message.display,
+						message.details,
+						message.attribution,
+					);
+				}
+			});
+		} catch (error) {
+			report(`agent_before_settle entries were not committed: ${toError(error).message}`);
+			return false;
+		}
+		for (const { message } of prepared) {
+			if (!message) continue;
+			this.agent.appendMessage(message);
+			if (message.display) {
+				await this.#emitSessionEvent({ type: "message_start", message }, { detachExtensions: true });
+				await this.#emitSessionEvent({ type: "message_end", message }, { detachExtensions: true });
+			}
+		}
+		return true;
+	}
+
+	/** Publish a public `agent_end`; a terminal one also notifies `agent_settled` handlers. */
+	#publishAgentEnd(event: AgentSessionEvent): void {
+		this.#emit(event);
+		if (event.type !== "agent_end" || event.isTerminal === false) return;
+		void this.#emitAgentSettled().catch(error => {
+			logger.warn("agent_settled notification failed", { error: toError(error).message });
+		});
+	}
+
+	/**
+	 * Notify `agent_settled` handlers. Turn-starting sends made while handlers run are
+	 * deferred until every handler of every overlapping notification has finished.
+	 */
+	async #emitAgentSettled(): Promise<void> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("agent_settled") || this.#isDisposed) return;
+		this.#agentSettledDepth++;
+		try {
+			await this.#agentSettledHandlerScope.run(true, () => runner.emit({ type: "agent_settled" }));
+		} catch (error) {
+			logger.warn("agent_settled extension notification failed", { error: toError(error).message });
+		} finally {
+			this.#agentSettledDepth--;
+		}
+		if (this.#agentSettledDepth > 0) return;
+		const deferred = this.#deferredSettledActions.splice(0);
+		for (const action of deferred) {
+			if (this.#isDisposed) {
+				action.cancel(new Error("Session disposed before the deferred send ran"));
+				continue;
+			}
+			await action.run();
+		}
+	}
+
+	/** True for calls made from an `agent_settled` handler while a notification is still running. */
+	#isInAgentSettledHandler(): boolean {
+		return this.#agentSettledDepth > 0 && this.#agentSettledHandlerScope.getStore() === true;
+	}
+
+	/** Hold a turn-starting send until `agent_settled` handlers finish; settles with the send's own outcome. */
+	#deferPastAgentSettled<T>(send: () => Promise<T>): Promise<T> {
+		const deferred = Promise.withResolvers<T>();
+		this.#deferredSettledActions.push({
+			run: () => send().then(deferred.resolve, deferred.reject),
+			cancel: deferred.reject,
+		});
+		return deferred.promise;
+	}
+
 	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
@@ -5361,6 +5572,15 @@ export class AgentSession implements SettingsScope {
 		return true;
 	}
 
+	/** Emit `session_start` after the active session was replaced (new, resume, fork, or branch). */
+	async #emitSessionStart(reason: "new" | "resume" | "fork", previousSessionFile: string | undefined): Promise<void> {
+		await this.#extensionRunner?.emit({
+			type: "session_start",
+			reason,
+			...(previousSessionFile !== undefined ? { previousSessionFile } : {}),
+		});
+	}
+
 	/** Emit extension events based on session events */
 	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.#extensionRunner) return;
@@ -5369,7 +5589,12 @@ export class AgentSession implements SettingsScope {
 			await this.#extensionRunner.emit({ type: "agent_start" });
 			return;
 		}
+		if (event.type === "auto_compaction_start") this.#autoCompactionReason = event.reason;
 
+		if (event.type === "auto_compaction_end") {
+			await this.#emitAutoCompactionEnd(event);
+			return;
+		}
 		if (!this.#extensionRunner.hasHandlers(event.type)) return;
 		if (event.type === "agent_end") {
 			// `agent_end` extension notification is emitted from the settled
@@ -5381,6 +5606,35 @@ export class AgentSession implements SettingsScope {
 		if (!mapped) return;
 		if (event.type === "turn_end") this.#turnIndex++;
 		await this.#extensionRunner.emit(mapped);
+	}
+
+	/**
+	 * Forward `auto_compaction_end`, followed by `session_compact_failed` when the
+	 * pass failed or was aborted. A benign skip is not a failure.
+	 */
+	async #emitAutoCompactionEnd(event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>): Promise<void> {
+		const runner = this.#extensionRunner;
+		if (!runner) return;
+		const reason = this.#autoCompactionReason ?? "threshold";
+		this.#autoCompactionReason = undefined;
+		await runner.emit({
+			type: "auto_compaction_end",
+			action: event.action,
+			result: event.result,
+			aborted: event.aborted,
+			willRetry: event.willRetry,
+			errorMessage: event.errorMessage,
+			skipped: event.skipped,
+		});
+		if (event.skipped || !(event.aborted || event.errorMessage !== undefined)) return;
+		await runner.emit({
+			type: "session_compact_failed",
+			reason,
+			aborted: event.aborted,
+			...(event.aborted || event.errorMessage === undefined ? {} : { errorMessage: event.errorMessage }),
+			willRetry: event.willRetry,
+			fromExtension: false,
+		});
 	}
 
 	/**
@@ -5757,7 +6011,10 @@ export class AgentSession implements SettingsScope {
 	 */
 	#disposeCall?: Promise<void>;
 	dispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
-		if (!this.#disposeCall) this.#disposeCall = this.#doDispose(options);
+		// Contexts handed to extensions refer to a dead session once teardown ends, even a
+		// failed one; invalidating after `session_shutdown` keeps shutdown handlers working.
+		if (!this.#disposeCall)
+			this.#disposeCall = this.#doDispose(options).finally(() => this.#extensionRunner?.invalidate());
 		return this.#disposeCall;
 	}
 
@@ -5888,6 +6145,9 @@ export class AgentSession implements SettingsScope {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		for (const action of this.#deferredSettledActions.splice(0)) {
+			action.cancel(new Error("Session disposed before the deferred send ran"));
+		}
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the
 		// closing session writer.
@@ -7521,7 +7781,11 @@ export class AgentSession implements SettingsScope {
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
-				const handled = await this.#tryExecuteExtensionCommand(text, options?.onPromptAdmitted);
+				const onPromptAdmitted = options?.onPromptAdmitted;
+				const handled = await this.#tryExecuteExtensionCommand(
+					text,
+					onPromptAdmitted && (() => onPromptAdmitted("handled")),
+				);
 				if (handled) {
 					return false;
 				}
@@ -7530,6 +7794,7 @@ export class AgentSession implements SettingsScope {
 				const customResult = await this.#tryExecuteCustomCommand(text);
 				if (customResult !== null) {
 					if (customResult === "") {
+						options?.onPromptAdmitted?.("handled");
 						return false;
 					}
 					text = customResult;
@@ -8057,7 +8322,7 @@ export class AgentSession implements SettingsScope {
 		const setupAbort = new AbortController();
 		this.#promptSetupAbortController = setupAbort;
 		try {
-			options?.onPromptAdmitted?.();
+			options?.onPromptAdmitted?.("started");
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
@@ -8339,6 +8604,16 @@ export class AgentSession implements SettingsScope {
 				void this.dispose().finally(() => process.exit(0));
 			},
 			getContextUsage: () => this.getContextUsage(),
+			// No runner means no prompt-build snapshot; report what the session itself knows.
+			getSystemPromptOptions: () =>
+				Object.freeze({
+					cwd: this.sessionManager.getCwd(),
+					selectedTools: Object.freeze(this.getActiveToolNames()),
+					additionalWorkspaceRoots: Object.freeze([...this.sessionManager.getAdditionalDirectories()]),
+					contextFiles: Object.freeze([]),
+					skills: Object.freeze([]),
+					rules: Object.freeze([]),
+				}),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
@@ -8352,6 +8627,13 @@ export class AgentSession implements SettingsScope {
 				return { cancelled: false };
 			},
 			branch: async entryId => {
+				const result = await this.branch(entryId);
+				return { cancelled: result.cancelled };
+			},
+			fork: async (entryId, options) => {
+				if (options?.position === "at") {
+					throw new Error('fork position "at" is not supported; OMP branches before the entry');
+				}
 				const result = await this.branch(entryId);
 				return { cancelled: result.cancelled };
 			},
@@ -8558,7 +8840,7 @@ export class AgentSession implements SettingsScope {
 				descriptionNotice?: CustomMessage;
 			};
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
-			onPromptAdmitted?: () => void;
+			onPromptAdmitted?: (admission: PromptAdmission) => void;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
@@ -8612,7 +8894,7 @@ export class AgentSession implements SettingsScope {
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			records.push(userMessage);
 			this.#irc.queueAside(records);
-			options?.onPromptAdmitted?.();
+			options?.onPromptAdmitted?.("queued");
 			// The awaits above (image normalization / vision description) can span the run's
 			// settle, so the run may already be idle by the time the record lands in the aside
 			// queue with no loop left to drain it. Resuming here is a no-op while streaming and
@@ -8648,7 +8930,7 @@ export class AgentSession implements SettingsScope {
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			this.agent.steer(userMessage);
 		}
-		options?.onPromptAdmitted?.();
+		options?.onPromptAdmitted?.("queued");
 		this.#scheduleIdleQueueDrain();
 		return true;
 	}
@@ -8851,7 +9133,7 @@ export class AgentSession implements SettingsScope {
 			/** Hidden notices published immediately before this message, in the same synchronous group. */
 			prependMessages?: readonly CustomMessage[];
 			/** Called synchronously once the message is pushed onto its queue. See {@link PromptOptions.onPromptAdmitted}. */
-			onPromptAdmitted?: () => void;
+			onPromptAdmitted?: (admission: PromptAdmission) => void;
 		},
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
@@ -8894,7 +9176,7 @@ export class AgentSession implements SettingsScope {
 				...(descriptionNotice ? [descriptionNotice] : []),
 				normalizedAppMessage,
 			]);
-			onPromptAdmitted?.();
+			onPromptAdmitted?.("queued");
 			// The image-normalization await above can span the run's settle, so the run may
 			// already be idle by the time the record lands in the aside queue with no loop
 			// left to drain it. Resuming here is a no-op while streaming and wakes/folds
@@ -8913,7 +9195,7 @@ export class AgentSession implements SettingsScope {
 			if (descriptionNotice) this.agent.steer(descriptionNotice);
 			this.agent.steer(normalizedAppMessage);
 		}
-		onPromptAdmitted?.();
+		onPromptAdmitted?.("queued");
 		this.#scheduleIdleQueueDrain();
 	}
 
@@ -8942,6 +9224,13 @@ export class AgentSession implements SettingsScope {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		if (
+			this.#isInAgentSettledHandler() &&
+			!this.isStreaming &&
+			(options?.triggerTurn === true || options?.deliverAs === "aside")
+		) {
+			return this.#deferPastAgentSettled(() => this.sendCustomMessage(message, options));
+		}
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
 	}
 
@@ -9131,6 +9420,9 @@ export class AgentSession implements SettingsScope {
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageOptions,
 	): Promise<void> {
+		if (this.#isInAgentSettledHandler() && !this.isStreaming) {
+			return this.#deferPastAgentSettled(() => this.sendUserMessage(content, options));
+		}
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -9149,6 +9441,16 @@ export class AgentSession implements SettingsScope {
 			}
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
+		}
+
+		if (options?.expandPromptTemplates === true) {
+			await this.prompt(text, {
+				attribution: options.attribution,
+				expandPromptTemplates: true,
+				images,
+				streamingBehavior: options.deliverAs ?? "steer",
+			});
+			return;
 		}
 
 		let deliveredAsAside = false;
@@ -10128,6 +10430,7 @@ export class AgentSession implements SettingsScope {
 					reason: "new",
 					previousSessionFile,
 				});
+				await this.#emitSessionStart("new", previousSessionFile);
 			}
 
 			return true;
@@ -10250,6 +10553,7 @@ export class AgentSession implements SettingsScope {
 					reason: "fork",
 					previousSessionFile,
 				});
+				await this.#emitSessionStart("fork", previousSessionFile);
 			}
 
 			return true;
@@ -10928,7 +11232,7 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
+	async #setModelWithProviderSessionReset(model: Model, source: ModelSelectSource = "set"): Promise<void> {
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
 		if (currentModel) {
@@ -10953,6 +11257,17 @@ export class AgentSession implements SettingsScope {
 		// retry-fallback on the error path.
 		if (isChanging) {
 			this.#emit({ type: "model_changed" });
+			// Detached for the same reason as `model_changed`: no extension delivery
+			// await inside a model switch.
+			if (this.#extensionRunner?.hasHandlers("model_select")) {
+				this.#extensionRunner
+					.emit({ type: "model_select", model, previousModel: currentModel, source })
+					.catch((error: unknown) => {
+						logger.warn("model_select emit failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			}
 		}
 
 		await this.#reconcileModelDependentState(currentModel, model);
@@ -11716,6 +12031,7 @@ export class AgentSession implements SettingsScope {
 					reason: "resume",
 					previousSessionFile,
 				});
+				await this.#emitSessionStart("resume", previousSessionFile);
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
@@ -11738,7 +12054,7 @@ export class AgentSession implements SettingsScope {
 							currentModel.id !== targetModel.id ||
 							currentModel.api !== targetModel.api));
 				if (shouldResetProviderState) {
-					await this.#setModelWithProviderSessionReset(targetModel);
+					await this.#setModelWithProviderSessionReset(targetModel, explicitModel ? "set" : "restore");
 				} else {
 					this.agent.setModel(targetModel);
 				}
@@ -11988,7 +12304,7 @@ export class AgentSession implements SettingsScope {
 	 * null), emitting `session_before_branch`/`session_branch` with `reason` for `entryId`.
 	 * `copyArtifacts` goes to {@link SessionManager.createBranchedSession}; `requireIdleFor`
 	 * refuses with {@link SessionBusyError} naming that action unless the session is idle.
-	 * @returns false when a `session_before_branch` hook cancelled
+	 * @returns false when a `session_before_branch` or `session_before_fork` hook cancelled
 	 */
 	async #branchIntoNewSession(
 		reason: "branch" | "fork",
@@ -12014,6 +12330,19 @@ export class AgentSession implements SettingsScope {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 			// A turn or user command may have started while the hook awaited.
+			if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
+		}
+		if (this.#extensionRunner?.hasHandlers("session_before_fork")) {
+			const result = await this.#extensionRunner.emit({
+				type: "session_before_fork",
+				entryId,
+				// A branch drops the entry back to the editor; an entry fork keeps it.
+				position: reason === "branch" ? "before" : "at",
+			});
+			if (result?.cancel) {
+				return false;
+			}
+			skipConversationRestore ||= result?.skipConversationRestore ?? false;
 			if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		}
 
@@ -12079,6 +12408,7 @@ export class AgentSession implements SettingsScope {
 					reason,
 					previousSessionFile,
 				});
+				await this.#emitSessionStart("fork", previousSessionFile);
 			}
 
 			if (!skipConversationRestore) {
@@ -12125,6 +12455,16 @@ export class AgentSession implements SettingsScope {
 				entryId: leafId,
 			})) as SessionBeforeBranchResult | undefined;
 
+			if (result?.cancel) {
+				return { cancelled: true, sessionFile: previousSessionFile };
+			}
+		}
+		if (this.#extensionRunner?.hasHandlers("session_before_fork")) {
+			const result = await this.#extensionRunner.emit({
+				type: "session_before_fork",
+				entryId: leafId,
+				position: "at",
+			});
 			if (result?.cancel) {
 				return { cancelled: true, sessionFile: previousSessionFile };
 			}
@@ -12199,6 +12539,7 @@ export class AgentSession implements SettingsScope {
 					reason: "btw",
 					previousSessionFile,
 				});
+				await this.#emitSessionStart("fork", previousSessionFile);
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);

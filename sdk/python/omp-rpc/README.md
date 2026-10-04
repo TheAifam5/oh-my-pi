@@ -244,6 +244,15 @@ means no matching follow-up was still queued. Never fall back to `steer()`,
 which would enqueue a duplicate. Unsupported servers raise `RpcCommandError`,
 and missing or non-boolean `promoted` values raise `ValueError`.
 
+`clear_queue()` removes every queued user-authored steering and follow-up
+message and returns their text as a `ClearedQueue` (`steering` and `follow_up`
+tuples), for example to restore it to an editor before `abort()`. `steer()` and
+`follow_up()` return a `QueuedInputAck` whose `disposition` is `"queued"`,
+`"handled"` when an extension `input` handler consumed the message, or `None`
+from servers that do not report one, and `prompt_with_disposition()` returns a
+`PromptSubmission` whose `disposition` is `"started"`, `"queued"`, `"handled"`,
+or `None`.
+
 ## Goal Mode
 
 `goal(op, ...)` drives the same goal lifecycle as the interactive `/goal`

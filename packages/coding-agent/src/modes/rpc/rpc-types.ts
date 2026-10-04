@@ -42,6 +42,7 @@ export type RpcCommand =
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "remove_queued_message"; message: string; queue: "steering" | "followUp" }
 	| { id?: string; type: "promote_queued_message"; message: string }
+	| { id?: string; type: "clear_queue" }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort_and_restore_queue" }
@@ -361,6 +362,26 @@ export interface RpcSubagentMessagesResult {
 	messages: AgentMessage[];
 }
 
+/**
+ * What happened to a submitted `prompt`: `"handled"` was consumed locally (an `input`
+ * handler, or an extension, custom, or builtin command) without starting or joining a run, `"queued"` was queued
+ * during a run, and `"started"` was accepted to start a run. It describes admission
+ * only, not completion.
+ */
+export type RpcPromptDisposition = "handled" | "queued" | "started";
+
+/**
+ * What happened to a submitted `steer` or `follow_up`: `"queued"` was placed on its queue,
+ * `"handled"` was consumed by an `input` handler (or left empty by one) and never queued.
+ */
+export type RpcQueuedInputDisposition = "handled" | "queued";
+
+/** User-authored messages removed by `clear_queue`, as their queued text. */
+export interface RpcClearedQueue {
+	steering: string[];
+	followUp: string[];
+}
+
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
@@ -377,9 +398,28 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
-	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "prompt";
+			success: true;
+			data?: { agentInvoked?: boolean; disposition?: RpcPromptDisposition };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "steer";
+			success: true;
+			data?: { disposition: RpcQueuedInputDisposition };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "follow_up";
+			success: true;
+			data?: { disposition: RpcQueuedInputDisposition };
+	  }
+	| { id?: string; type: "response"; command: "clear_queue"; success: true; data: RpcClearedQueue }
 	| {
 			id?: string;
 			type: "response";

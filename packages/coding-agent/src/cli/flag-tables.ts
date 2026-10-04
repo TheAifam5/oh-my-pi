@@ -192,12 +192,17 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.models = value.split(",").map(s => s.trim());
 	},
 	"--tools": (result, value, deps) => {
-		const names = deps.normalizeToolNames(
-			value
-				.split(",")
-				.map(s => s.trim())
-				.filter(Boolean),
-		);
+		const entries = value
+			.split(",")
+			.map(s => s.trim())
+			.filter(Boolean);
+		const modifiers = entries.filter(entry => entry.startsWith("+") || entry.startsWith("-"));
+		if (modifiers.length > 0) {
+			result.invalidFlagValues.push(
+				`Invalid --tools value: ${modifiers.map(entry => JSON.stringify(entry)).join(", ")}. --tools takes plain tool names; use the defaultTools setting for +name/-name changes.`,
+			);
+		}
+		const names = deps.normalizeToolNames(entries.filter(entry => !modifiers.includes(entry)));
 		// Validation runs after session tool discovery. At this point extension,
 		// custom, plugin-manifest, and MCP tools are not all known yet.
 		result.tools = names;

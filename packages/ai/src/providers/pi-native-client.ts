@@ -46,6 +46,7 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"onPayload",
 	"onResponse",
 	"onSseEvent",
+	"transformHeaders",
 	"execHandlers",
 	"cursorExecHandlers",
 	"cursorOnToolResult",

@@ -1697,6 +1697,7 @@ describe("AgentSession retry fallback", () => {
 				await session.setModelTemporary(setupTarget, undefined, { ephemeral: true });
 				return undefined;
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 		session = new AgentSession({
 			agent,
@@ -3773,6 +3774,7 @@ describe("AgentSession retry fallback", () => {
 				sessionStopLastAssistantMessages.push(event.last_assistant_message);
 				return Promise.resolve(undefined);
 			}),
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

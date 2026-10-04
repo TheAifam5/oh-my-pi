@@ -2401,6 +2401,7 @@ export async function runRootCommand(
 				session,
 				setToolUIContext,
 				modelFallbackMessage,
+				startupWarnings,
 				lspServers,
 				mcpManager,
 				startBackgroundModelDiscovery,
@@ -2476,6 +2477,11 @@ export async function runRootCommand(
 
 			if (modelFallbackMessage) {
 				notifs.push({ kind: "warn", message: modelFallbackMessage });
+			}
+			// Interactive mode shows these in the header through `session.configWarnings`.
+			if (!isInteractive) {
+				for (const warning of startupWarnings ?? [])
+					process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
 			}
 
 			const modelRegistryError = modelRegistry.getError();

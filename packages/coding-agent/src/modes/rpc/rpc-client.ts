@@ -39,9 +39,12 @@ import type {
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcClearedQueue,
 	RpcLiveFrame,
 	RpcOpenSessionResult,
+	RpcPromptDisposition,
 	RpcPromptResultFrame,
+	RpcQueuedInputDisposition,
 	RpcRemoveQueuedMessageResult,
 	RpcResponse,
 	RpcSessionSettledFrame,
@@ -703,17 +706,44 @@ export class RpcClient {
 	}
 
 	/**
-	 * Queue a steering message to interrupt the agent mid-run.
+	 * Like {@link prompt}, and also resolves the server's `disposition` for the prompt
+	 * (`undefined` from servers that predate it).
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+	async promptWithDisposition(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<{ id: string; disposition: RpcPromptDisposition | undefined }> {
+		const response = await this.#send({ type: "prompt", message, images, streamingBehavior });
+		const data = this.#getData<{ disposition?: RpcPromptDisposition } | undefined>(response);
+		return { id: response.id ?? "", disposition: data?.disposition };
+	}
+
+	/**
+	 * Queue a steering message to interrupt the agent mid-run.
+	 * Resolves the server's `disposition`; servers that predate it resolve `undefined`.
+	 */
+	async steer(message: string, images?: ImageContent[]): Promise<RpcQueuedInputDisposition | undefined> {
+		const response = await this.#send({ type: "steer", message, images });
+		return this.#dispositionOf(response);
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
+	 * Resolves the server's `disposition`; servers that predate it resolve `undefined`.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[]): Promise<RpcQueuedInputDisposition | undefined> {
+		const response = await this.#send({ type: "follow_up", message, images });
+		return this.#dispositionOf(response);
+	}
+
+	/**
+	 * Remove every queued user-authored steering and follow-up message and return their text,
+	 * for example to restore it to an editor before `abort()`.
+	 */
+	async clearQueue(): Promise<RpcClearedQueue> {
+		const response = await this.#send({ type: "clear_queue" });
+		return this.#getData(response);
 	}
 
 	/**
@@ -1669,6 +1699,12 @@ export class RpcClient {
 		} catch (err) {
 			failed(err);
 		}
+	}
+
+	/** `data.disposition` of a successful steer/follow-up response; failures keep resolving as before. */
+	#dispositionOf(response: RpcResponse): RpcQueuedInputDisposition | undefined {
+		if (!response.success || (response.command !== "steer" && response.command !== "follow_up")) return undefined;
+		return response.data?.disposition;
 	}
 
 	#getData<T>(response: RpcResponse): T {

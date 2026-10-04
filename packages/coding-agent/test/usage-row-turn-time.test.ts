@@ -478,7 +478,7 @@ describe("AgentSession synthetic follow-up marking", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
 			modelRegistry,
-			extensionRunner: {} as unknown as ExtensionRunner,
+			extensionRunner: { invalidate: () => {} } as unknown as ExtensionRunner,
 		});
 		try {
 			// The approved-plan execution path queues the hidden directive this way
@@ -521,6 +521,7 @@ describe("AgentSession synthetic follow-up marking", () => {
 				emitBeforeAgentStart: vi.fn(async () => undefined),
 				hasHandlers: vi.fn(() => false),
 				emitSessionStop: vi.fn(async () => undefined),
+				invalidate: vi.fn(),
 			} as unknown as ExtensionRunner,
 		});
 		const submittedAt = Date.now();

@@ -20,8 +20,9 @@ import { OpenAIHttpError } from "../error";
 
 export { OpenAIHttpError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, ProviderHeadersTransform } from "../types";
 import type { CapturedHttpErrorResponse } from "./http-inspector";
+import { applyHeadersTransform } from "./provider-headers";
 
 /**
  * Total attempts (initial + retries). Parity with the removed SDK clients'
@@ -78,6 +79,8 @@ export interface OpenAIStreamRequestInit {
 	onSseEvent?: SseEventObserver;
 	/** Called when the stream ends on the OpenAI `[DONE]` sentinel; independent of {@link onSseEvent}. */
 	onDoneSentinel?: () => void;
+	/** Applied once to the final header map (including `Content-Type`/`Accept`); retries resend the result. */
+	transformHeaders?: ProviderHeadersTransform;
 }
 
 export interface OpenAIStreamHandle<TEvent> {
@@ -96,9 +99,16 @@ export interface OpenAIStreamHandle<TEvent> {
  * watchdog timers and abort-reason bookkeeping.
  */
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
+	const headers = await applyHeadersTransform(
+		{ "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
+		init.transformHeaders,
+		init.signal,
+		// Same error `fetchWithRetry` throws for an aborted request.
+		() => new Error("Request was aborted"),
+	);
 	const response = await fetchWithRetry(init.url, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
+		headers,
 		body: JSON.stringify(init.body),
 		signal: init.signal,
 		fetch: init.fetch,

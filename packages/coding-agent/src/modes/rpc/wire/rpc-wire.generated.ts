@@ -374,6 +374,12 @@ export type StreamingBehavior = "steer" | "followUp";
 
 export type QueuedMessageQueue = "steering" | "followUp";
 
+/** How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion. */
+export type PromptDisposition = "handled" | "queued" | "started";
+
+/** How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue. */
+export type QueuedInputDisposition = "handled" | "queued";
+
 export type CacheWarmingMode = "off" | "streaming" | "idle";
 
 /** `set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`. */
@@ -597,6 +603,17 @@ export interface AbortAndRestoreQueueResult {
 	truncated?: boolean;
 }
 
+/** `steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`. */
+export interface QueuedInputAck {
+	disposition?: QueuedInputDisposition;
+}
+
+/** Text of the user-authored queued messages `clear_queue` removed, in queue order. */
+export interface ClearedQueue {
+	steering: string[];
+	followUp: string[];
+}
+
 export interface BranchMessage {
 	entryId: string;
 	text: string;
@@ -751,9 +768,10 @@ export interface HandoffResult {
 	savedPath?: string;
 }
 
-/** `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. */
+/** `agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`. */
 export interface PromptAck {
 	agentInvoked?: boolean;
+	disposition?: PromptDisposition;
 }
 
 export type AutoCompactionReason = "threshold" | "overflow" | "idle" | "incomplete";
@@ -1783,10 +1801,11 @@ export interface GetBtwHistoryResult {
 export interface RpcWireCommands {
 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
 	prompt: { params: PromptParams; result: PromptAck };
-	steer: { params: SteerParams; result: undefined };
-	follow_up: { params: FollowUpParams; result: undefined };
+	steer: { params: SteerParams; result: QueuedInputAck };
+	follow_up: { params: FollowUpParams; result: QueuedInputAck };
 	remove_queued_message: { params: RemoveQueuedMessageParams; result: RemoveQueuedMessageResult };
 	promote_queued_message: { params: PromoteQueuedMessageParams; result: PromoteQueuedMessageResult };
+	clear_queue: { params: undefined; result: ClearedQueue };
 	abort: { params: undefined; result: undefined };
 	abort_and_prompt: { params: AbortAndPromptParams; result: undefined };
 	abort_and_restore_queue: { params: undefined; result: AbortAndRestoreQueueResult };

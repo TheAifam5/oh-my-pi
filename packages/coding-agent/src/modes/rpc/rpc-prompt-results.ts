@@ -12,7 +12,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { stripRawHttpRequestDiagnostics } from "@oh-my-pi/pi-ai/utils/http-inspector";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, PromptAdmission } from "../../session/agent-session";
 import { isRpcSessionSettled, type RpcScheduledTurnProbe, type RpcSettleSession } from "./rpc-session-settle";
 import type { RpcPromptError, RpcPromptResultFrame, RpcPromptStatus } from "./rpc-types";
 
@@ -301,18 +301,19 @@ export function reportPromptResult(input: {
  *
  * `startPrompt` receives an admission callback to forward as
  * `PromptOptions.onPromptAdmitted`. The returned promise resolves once the
- * prompt is admitted, or once it settles without ever being admitted; it never
- * rejects, since a failure is already routed to `onError` and the failed
- * `prompt_result`. Await it to acknowledge the command only after admission.
+ * prompt is admitted, with the admission kind, or with `undefined` once it
+ * settles without ever being admitted; it never rejects, since a failure is
+ * already routed to `onError` and the failed `prompt_result`. Await it to
+ * acknowledge the command only after admission.
  */
 export function watchAndReportPromptResult(input: {
 	ticket: RpcPromptTicket;
-	startPrompt: (onPromptAdmitted: () => void) => Promise<boolean>;
+	startPrompt: (onPromptAdmitted: (admission: PromptAdmission) => void) => Promise<boolean>;
 	results: RpcPromptResults;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
-}): Promise<void> {
-	const admitted = Promise.withResolvers<void>();
+}): Promise<PromptAdmission | undefined> {
+	const admitted = Promise.withResolvers<PromptAdmission | undefined>();
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(() => input.startPrompt(admitted.resolve));
 	reportPromptResult({
 		ticket: input.ticket,
@@ -322,7 +323,7 @@ export function watchAndReportPromptResult(input: {
 		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
 		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 	});
-	const settled = () => admitted.resolve();
+	const settled = () => admitted.resolve(undefined);
 	void trackedPrompt.prompt.then(settled, settled);
 	return admitted.promise;
 }

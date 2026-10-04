@@ -30,6 +30,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { PROVIDER_HEADER_TRANSFORM_APIS } from "@oh-my-pi/pi-ai/utils/provider-headers";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { $env } from "@oh-my-pi/pi-utils/env";
@@ -112,9 +113,11 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 	ExtensionRunner,
+	type ExtensionSystemPromptOptions,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
 	extensionToolSourceInfo,
+	isSessionReplacementStart,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -224,8 +227,11 @@ import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
 	cfgSystemPromptInputs,
+	type ContextFileOverride,
 	composeAppendPrompt,
+	formatContextFileOverrideNotice,
 	loadProjectContextFiles as loadContextFilesInternal,
+	loadProjectContextFilesWithOverrides,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
 import type { AgentDefinition } from "./task/types";
@@ -280,6 +286,13 @@ import {
 import { resolveYieldReportText } from "./tools/yield";
 import { createBrowserPrelude } from "./tools/browser";
 import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
+import {
+	createDefaultToolsPolicy,
+	type DefaultToolsCandidate,
+	type DefaultToolsPolicy,
+	formatProjectRemovedToolsNotice,
+	resolveDefaultToolLayers,
+} from "./tools/default-tools";
 import { createComputerPrelude } from "./tools/computer";
 import { createRatchetPrelude } from "./ratchet/prelude-definition";
 import { createArchivePrelude } from "./archive/prelude-definition";
@@ -306,6 +319,8 @@ import {
 	cfgArchiveEnabled,
 	cfgAsyncMaxJobs,
 	cfgComputerEnabled,
+	cfgDefaultTools,
+	cfgToolsApproval,
 	cfgRatchetEnabled,
 	cfgGenerateImageEnabled,
 	cfgSecurityEnabled,
@@ -913,6 +928,11 @@ export interface CreateAgentSessionResult {
 	mcpManager?: MCPManager;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
+	/**
+	 * Settings and context-file warnings found while creating the session, one sanitized line each
+	 * (tabs expanded, home directory shortened). Also held in `session.configWarnings`.
+	 */
+	startupWarnings?: string[];
 	/** LSP servers detected for startup; warmup may continue in the background */
 	lspServers?: LspStartupServerInfo[];
 	/** Start cache-aware online runtime model discovery after the first UI paint. */
@@ -1292,6 +1312,58 @@ export interface BuildSystemPromptOptions {
 	evalPreludes?: readonly Pick<EvalPreludeDefinition, "name" | "guidance">[];
 }
 
+/** Inputs behind one base system prompt build, as {@link snapshotSystemPromptOptions} reads them. */
+interface SystemPromptSnapshotInput {
+	cwd: string;
+	toolNames: readonly string[];
+	directToolNames?: readonly string[];
+	resolvedCustomPrompt?: string;
+	systemPromptTemplate?: string;
+	resolvedAppendSystemPrompt?: string;
+	additionalWorkspaceRoots?: readonly string[];
+	contextFiles?: readonly { path: string; content: string; depth?: number }[];
+	skills?: readonly Skill[];
+	rules?: readonly { name: string; description?: string; path: string }[];
+}
+
+/** Freeze the extension-visible subset of system-prompt build options; see {@link ExtensionSystemPromptOptions}. */
+function snapshotSystemPromptOptions(options: SystemPromptSnapshotInput): ExtensionSystemPromptOptions {
+	return Object.freeze({
+		cwd: options.cwd,
+		selectedTools: Object.freeze([...options.toolNames]),
+		...(options.directToolNames ? { directToolNames: Object.freeze([...options.directToolNames]) } : {}),
+		...(options.resolvedCustomPrompt !== undefined ? { customPrompt: options.resolvedCustomPrompt } : {}),
+		...(options.systemPromptTemplate !== undefined ? { systemPromptTemplate: options.systemPromptTemplate } : {}),
+		...(options.resolvedAppendSystemPrompt !== undefined
+			? { appendSystemPrompt: options.resolvedAppendSystemPrompt }
+			: {}),
+		additionalWorkspaceRoots: Object.freeze([...(options.additionalWorkspaceRoots ?? [])]),
+		contextFiles: Object.freeze(
+			(options.contextFiles ?? []).map(file =>
+				Object.freeze({
+					path: file.path,
+					content: file.content,
+					...(file.depth !== undefined ? { depth: file.depth } : {}),
+				}),
+			),
+		),
+		skills: Object.freeze(
+			(options.skills ?? []).map(skill =>
+				Object.freeze({ name: skill.name, description: skill.description, filePath: skill.filePath }),
+			),
+		),
+		rules: Object.freeze(
+			(options.rules ?? []).map(rule =>
+				Object.freeze({
+					name: rule.name,
+					path: rule.path,
+					...(rule.description !== undefined ? { description: rule.description } : {}),
+				}),
+			),
+		),
+	});
+}
+
 /**
  * Build the default provider-facing system prompt blocks.
  *
@@ -1437,9 +1509,11 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
 			}
 		};
 
-		api.on("session_start", async (_event, ctx) =>
-			runOnSession({ reason: "start", previousSessionFile: undefined }, ctx),
-		);
+		// Replacement starts are reported through session_switch/session_branch below.
+		api.on("session_start", async (event, ctx) => {
+			if (isSessionReplacementStart(event)) return;
+			await runOnSession({ reason: "start", previousSessionFile: undefined }, ctx);
+		});
 		api.on("session_switch", async (event, ctx) =>
 			runOnSession({ reason: "switch", previousSessionFile: event.previousSessionFile }, ctx),
 		);
@@ -1803,9 +1877,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
 	// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
 	// session-context build, tool creation, MCP discovery, and extension discovery.
+	// Overrides found by startup discovery; reported once, through the session's config warnings.
+	let contextFileOverrides: ContextFileOverride[] = [];
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		: logger.time("discoverContextFiles", async () => {
+				const discovered = await loadProjectContextFilesWithOverrides({ cwd });
+				contextFileOverrides = discovered.overrides;
+				return discovered.files;
+			});
 	contextFilesPromise.catch(() => {});
 	const resolveRepoContext = async (repoCwd: string) => {
 		try {
@@ -3731,6 +3811,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: resolveTelemetry(options.telemetry, providerSessionId),
 			),
 		});
+		// Options behind the latest base system prompt, read by extension
+		// `ctx.getSystemPromptOptions()`.
+		// Built on first read so rebuilds nobody inspects copy nothing.
+		let systemPromptOptionsSnapshot: (() => ExtensionSystemPromptOptions) | undefined;
+		const deferSnapshot = (input: SystemPromptSnapshotInput) => {
+			let built: ExtensionSystemPromptOptions | undefined;
+			return () => (built ??= snapshotSystemPromptOptions(input));
+		};
+		extensionRunner.setSystemPromptOptionsProvider(
+			() =>
+				systemPromptOptionsSnapshot?.() ??
+				snapshotSystemPromptOptions({ cwd: sessionManager.getCwd(), toolNames: [] }),
+		);
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
@@ -3800,6 +3893,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.
 			if (options.systemPrompt !== undefined && typeof options.systemPrompt !== "function") {
+				systemPromptOptionsSnapshot = deferSnapshot({ cwd: promptCwd, toolNames: [...toolNames] });
 				return {
 					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
 				};
@@ -3898,6 +3992,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? { mode: "compact", toolNames: [...toolNames, ...mountedPromptToolNames] }
 					: { mode: "full" },
 			);
+			systemPromptOptionsSnapshot = deferSnapshot({
+				cwd: promptCwd,
+				toolNames: [...toolNames],
+				directToolNames: rebuildOptions?.directToolNames,
+				resolvedCustomPrompt: options.customSystemPrompt,
+				systemPromptTemplate: options.systemPromptTemplate,
+				resolvedAppendSystemPrompt: appendPrompt,
+				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
+				contextFiles,
+				skills: cfgSkillful.get(settings) ? (session?.skills ?? skills) : [],
+				rules: rulebookRules,
+			});
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
@@ -4030,6 +4136,39 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (toolRegistry.has(name) && !initialToolNames.includes(name)) {
 				initialToolNames.push(name);
 			}
+		}
+
+		// `defaultTools` reshapes the main session's default selection. Explicit tool lists,
+		// restricted sessions, and subagents own their selection. Plain names replace only
+		// built-in tools; protected built-ins, extension, custom, and MCP tools stay unless
+		// a `-name` removes them. Names outside the registry are ignored.
+		const appliesDefaultTools = options.toolNames === undefined && !restrictToolNames && !isSubagentSession;
+		const defaultToolsBaseline = [...initialToolNames];
+		// Registered tools that start inactive, read by the live `defaultTools` listener; runtime
+		// extension registrations below keep it current.
+		const defaultInactiveRegistryToolNames = new Set(
+			toolNamesFromRegistry.filter(name => toolRegistry.get(name)?.defaultInactive === true),
+		);
+		// An entry never overrides policy: a tool an approval policy denies stays off whichever
+		// settings layer names it.
+		const defaultToolsPolicy = (lookup: (name: string) => DefaultToolsCandidate | undefined): DefaultToolsPolicy =>
+			createDefaultToolsPolicy({
+				baseline: defaultToolsBaseline,
+				isBuiltIn: name => builtInRegistryToolNames.has(name),
+				lookup,
+				isDenied: name =>
+					name === "goal" ||
+					(cfgToolsApproval.get(settings) as Readonly<Record<string, unknown>>)[name] === "deny",
+			});
+		const startupDefaultTools = appliesDefaultTools
+			? resolveDefaultToolLayers(
+					settings,
+					defaultToolsBaseline,
+					defaultToolsPolicy(name => toolRegistry.get(name)),
+				)
+			: undefined;
+		if (startupDefaultTools) {
+			initialToolNames = startupDefaultTools.selection.filter(name => toolRegistry.has(name) && name !== "goal");
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
@@ -4201,12 +4340,34 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				normalizePromptPath(sessionManager.getCwd()),
 			);
 		};
+		// Main-agent requests only; advisors and capture agents keep the plain provider transform.
+		const transformMainProviderContext = async (context: Context, transformModel: Model): Promise<Context> =>
+			transformProviderContext(await extensionRunner.emitContextWithSystem(context, transformModel), transformModel);
+		// APIs already warned about for ignoring `before_provider_headers` handlers.
+		const headerHookUnsupportedApis = new Set<string>();
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
+			if (
+				model &&
+				!PROVIDER_HEADER_TRANSFORM_APIS.has(model.api) &&
+				!headerHookUnsupportedApis.has(model.api) &&
+				extensionRunner.hasHandlers("before_provider_headers")
+			) {
+				headerHookUnsupportedApis.add(model.api);
+				logger.warn("before_provider_headers handlers do not run for this provider API", {
+					api: model.api,
+					provider: model.provider,
+				});
+			}
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model, signal) => {
 			await extensionRunner.emitAfterProviderResponse(response, model, signal);
 		};
+		// Returning `undefined` without subscribers sends the provider's headers untouched.
+		const transformHeaders: SimpleStreamOptions["transformHeaders"] = (headers, signal) =>
+			extensionRunner.hasHandlers("before_provider_headers")
+				? extensionRunner.emitBeforeProviderHeaders(headers, undefined, signal)
+				: undefined;
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);
@@ -4333,11 +4494,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,
+			transformHeaders,
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,
 			transformContext,
-			transformProviderContext,
+			transformProviderContext: transformMainProviderContext,
 			steeringMode: cfgSteeringMode.get(settings),
 			followUpMode: cfgFollowUpMode.get(settings),
 			interruptMode: cfgInterruptMode.get(settings),
@@ -4606,6 +4768,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			transformProviderContext,
 			onPayload,
 			onResponse,
+			transformHeaders,
 			sideStreamFn: settingsAwareStreamFn,
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
@@ -4671,6 +4834,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// after a reset (#13370). The tools snapshot into THIS store, not the
 		// AgentSession's own lazy field.
 		session.registerSessionChangeCallback(() => toolSession.editStore?.clear());
+		const startupWarnings: string[] = [];
+		// The interactive header renders `configWarnings`, which, unlike a notice, exists before
+		// any subscriber does; non-interactive callers report `startupWarnings` themselves.
+		const startupProjectRemovedTools = (startupDefaultTools?.projectRemoved ?? []).filter(name =>
+			toolRegistry.has(name),
+		);
+		if (startupProjectRemovedTools.length > 0) {
+			logger.warn("Project defaultTools removed tools", { tools: startupProjectRemovedTools });
+			startupWarnings.push(formatProjectRemovedToolsNotice(startupProjectRemovedTools));
+		}
+		for (const override of contextFileOverrides) {
+			logger.warn("Context file override replaced files", { override: override.path, replaced: override.replaced });
+			startupWarnings.push(formatContextFileOverrideNotice(override));
+		}
+		session.configWarnings.push(...startupWarnings);
 		if (ownedSkillDescriptionStore) {
 			// Let in-flight compressions land before releasing the file.
 			session.addDisposer(
@@ -4725,6 +4903,92 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			};
 			cfgSessionToolGates.listen(session, () => reconcileGatedTools());
+			// A changed `defaultTools` enables tools the user layers newly select; it never disables
+			// tools. A project-layer change never enables a tool (the project layer only narrows, and
+			// it can change mid-session through a file watch or a cwd change). A tool turned off since
+			// the previous run, by the user or a tool gate, stays off, as does a built-in its gate
+			// now disallows. Runs never overlap: a change during a run schedules one more run, which
+			// resolves the latest value, so rapid changes cannot drop additions. A cleared setting
+			// selects the baseline again.
+			if (appliesDefaultTools) {
+				let defaultToolsRun: Promise<void> | undefined;
+				let defaultToolsRerun = false;
+				let previousUserSelection = new Set(startupDefaultTools?.userSelection ?? defaultToolsBaseline);
+				let previousProjectRemoved = startupProjectRemovedTools.join("\n");
+				let projectRemovedNoticeShown = false;
+				// Enabled tools as of the previous run; a tool that left the set since then was turned off.
+				let lastEnabled = new Set(session.getEnabledToolNames());
+				const turnedOff = new Set<string>();
+				// One registry mutation: the enabled-set snapshot and the apply see no interleaved tool change.
+				const applyDefaultTools = (): Promise<void> =>
+					session.runToolRegistryMutation(async () => {
+						const enabled = session.getEnabledToolNames();
+						for (const name of lastEnabled) if (!enabled.includes(name)) turnedOff.add(name);
+						for (const name of enabled) turnedOff.delete(name);
+						const resolved = resolveDefaultToolLayers(
+							settings,
+							defaultToolsBaseline,
+							defaultToolsPolicy(name => {
+								const tool = session.getToolByName(name);
+								return (
+									tool && { hidden: tool.hidden, defaultInactive: defaultInactiveRegistryToolNames.has(name) }
+								);
+							}),
+						);
+						const selection = resolved?.selection ?? defaultToolsBaseline;
+						const userSelection = resolved?.userSelection ?? defaultToolsBaseline;
+						const projectRemoved = (resolved?.projectRemoved ?? []).filter(name => session.getToolByName(name));
+						const previousUser = previousUserSelection;
+						previousUserSelection = new Set(userSelection);
+						if (projectRemoved.length > 0 && projectRemoved.join("\n") !== previousProjectRemoved) {
+							logger.warn("Project defaultTools removed tools", { tools: projectRemoved });
+							// One live notice per session: repeated project edits would otherwise repeat it.
+							if (!projectRemovedNoticeShown) {
+								projectRemovedNoticeShown = true;
+								session.emitNotice("warning", formatProjectRemovedToolsNotice(projectRemoved), "defaultTools");
+							}
+						}
+						previousProjectRemoved = projectRemoved.join("\n");
+						const plan = await resolveBuiltinToolPlan(toolSession, options.toolNames);
+						const added = selection.filter(
+							name =>
+								!previousUser.has(name) &&
+								!enabled.includes(name) &&
+								!turnedOff.has(name) &&
+								session.getToolByName(name) !== undefined &&
+								(!builtInRegistryToolNames.has(name) || plan.isAllowed(name)),
+						);
+						try {
+							if (added.length > 0) await session.setActiveToolsByName([...enabled, ...added]);
+						} catch (error) {
+							session.emitNotice("error", `Failed to apply defaultTools: ${error}`);
+						} finally {
+							lastEnabled = new Set(session.getEnabledToolNames());
+						}
+					});
+				cfgDefaultTools.listen(session, () => {
+					if (defaultToolsRun) {
+						defaultToolsRerun = true;
+						return;
+					}
+					defaultToolsRun = (async () => {
+						try {
+							do {
+								defaultToolsRerun = false;
+								// A failed run must not drop a rerun queued meanwhile, which resolves the newer value.
+								try {
+									await applyDefaultTools();
+								} catch (error) {
+									logger.warn("Failed to apply defaultTools", { error: String(error) });
+								}
+							} while (defaultToolsRerun);
+						} finally {
+							// Cleared in the same tick as the last rerun check, so no change slips between.
+							defaultToolsRun = undefined;
+						}
+					})();
+				});
+			}
 			// `find.enabled: auto` follows the judge role; a role change only touches
 			// the prompt when it actually adds or removes `find`.
 			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
@@ -4777,6 +5041,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const mounted = session.getMountedXdevToolNames();
 				const wasBuiltIn = builtInRegistryToolNames.has(name);
 				toolRegistry.set(name, liveTool);
+				if (registered.definition.defaultInactive) defaultInactiveRegistryToolNames.add(name);
+				else defaultInactiveRegistryToolNames.delete(name);
 				builtInRegistryToolNames.delete(name);
 				session.setToolBuiltIn(name, false);
 				session.setExtensionMCPTool(name, liveTool);
@@ -5326,6 +5592,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			setToolUIContext,
 			mcpManager,
 			modelFallbackMessage,
+			startupWarnings,
 			lspServers,
 			startBackgroundModelDiscovery: startRuntimeDiscovery,
 			eventBus,

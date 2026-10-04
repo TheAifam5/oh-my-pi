@@ -293,6 +293,8 @@ export interface AgentSessionConfig {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	/** Raw SSE hook used by the active session request path. */
 	onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	/** Provider request header transform used by session side requests and advisors. */
+	transformHeaders?: SimpleStreamOptions["transformHeaders"];
 	/** Per-session raw SSE diagnostic buffer. */
 	rawSseDebugBuffer?: RawSseDebugBuffer;
 	/** Current session message-to-LLM conversion pipeline. */
@@ -423,9 +425,18 @@ export interface PromptOptions {
 	 * is routed to an extension command, before its handler runs. Admission is
 	 * not proof that a model call will occur. A prompt dropped, cancelled, or
 	 * failed before admission still only settles through the returned promise.
+	 * The argument reports which of those admissions happened.
 	 */
-	onPromptAdmitted?: () => void;
+	onPromptAdmitted?: (admission: PromptAdmission) => void;
 }
+
+/**
+ * How a submitted prompt was admitted: `"started"` began an idle turn,
+ * `"queued"` went onto a steer, follow-up, or aside queue during a run, and
+ * `"handled"` was routed to an extension command. Admission does not guarantee
+ * a model call or that a queued message stays queued.
+ */
+export type PromptAdmission = "started" | "queued" | "handled";
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
  *  before it reached the agent (an abort or usage preflight denial raced turn
@@ -459,6 +470,12 @@ export interface SendUserMessageOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/**
+	 * Dispatch a leading `/` to extension or custom commands and expand skill
+	 * commands and prompt templates, as if the user typed the text (default: false).
+	 * `deliverAs` then selects the queue used while streaming.
+	 */
+	expandPromptTemplates?: boolean;
 }
 
 /** Result from a handoff operation. */

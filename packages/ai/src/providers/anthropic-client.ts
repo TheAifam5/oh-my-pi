@@ -26,7 +26,8 @@ import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeout
 
 export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, ProviderHeadersTransform } from "../types";
+import { applyHeadersTransform } from "../utils/provider-headers";
 import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
@@ -51,6 +52,8 @@ export interface AnthropicRequestOptions {
 	maxRetryDelayMs?: number;
 	/** Per-request headers merged after client defaults. */
 	headers?: Record<string, string>;
+	/** Applied once to the final header map, credentials included; retries resend the result. */
+	transformHeaders?: ProviderHeadersTransform;
 }
 
 /**
@@ -247,7 +250,12 @@ export class AnthropicHttpClient {
 		const maxRetries = Math.max(0, options?.maxRetries ?? opts.maxRetries ?? DEFAULT_MAX_RETRIES);
 		const maxRetryDelayMs = options?.maxRetryDelayMs ?? opts.maxRetryDelayMs ?? 60_000;
 		const url = `${opts.baseURL ?? "https://api.anthropic.com"}${path}`;
-		const headers = this.#buildHeaders(options?.headers);
+		const headers = await applyHeadersTransform(
+			this.#buildHeaders(options?.headers),
+			options?.transformHeaders,
+			callerSignal,
+			createAbortError,
+		);
 		const body = params === undefined ? undefined : JSON.stringify(params);
 
 		for (let attempt = 0; ; attempt++) {

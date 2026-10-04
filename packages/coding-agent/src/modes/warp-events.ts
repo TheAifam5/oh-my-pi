@@ -3,7 +3,11 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { writeTerminalSequence } from "@oh-my-pi/pi-tui/terminal";
 import { isInsideTmux, wrapTmuxPassthrough } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions/types";
+import {
+	type ExtensionContext,
+	type ExtensionFactory,
+	isSessionReplacementStart,
+} from "../extensibility/extensions/types";
 import { isSilentAbort, isUserInterruptAbort, SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 
 const WARP_CLI_AGENT_PROTOCOL_VERSION = 1;
@@ -174,7 +178,10 @@ export function createWarpEventBridgeExtension(): ExtensionFactory {
 			emitter?.emit({ event: "session_start" });
 		};
 
-		api.on("session_start", rebuildEmitter);
+		// Replacement starts are already covered by session_switch/session_branch.
+		api.on("session_start", (event, ctx) => {
+			if (!isSessionReplacementStart(event)) rebuildEmitter(event, ctx);
+		});
 		api.on("session_switch", rebuildEmitter);
 		api.on("session_branch", rebuildEmitter);
 

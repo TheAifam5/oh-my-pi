@@ -13,10 +13,14 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	AssistantMessage,
+	Context,
 	CredentialDisabledEvent,
 	ImageContent,
+	Message,
 	Model,
+	ProviderHeaders,
 	ProviderResponseMetadata,
+	RawSseEvent,
 	TextContent,
 } from "@oh-my-pi/pi-ai";
 import {
@@ -25,6 +29,12 @@ import {
 	markPerCallContextMessage,
 	setContextHistoryIndex,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	isValidProviderHeaderName,
+	isValidProviderHeaderValue,
+	MAX_PROVIDER_HEADER_COUNT,
+	RESERVED_PROVIDER_HEADERS,
+} from "@oh-my-pi/pi-ai/utils/provider-headers";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
@@ -36,6 +46,8 @@ import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
+import { assertExtensionCustomEntryType } from "../../session/exit-diagnostics";
+import { MAX_IMAGE_INPUT_BYTES } from "@oh-my-pi/pi-tui/chat/image-loading";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
@@ -45,11 +57,15 @@ import { createExtensionModelQuery } from "./model-api";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type {
 	AfterProviderResponseEvent,
+	AgentActivityOutcome,
+	AgentBeforeSettleEvent,
+	AgentBeforeSettleEventResult,
 	AssistantMessageRewriteEvent,
 	AssistantMessageRewriteResult,
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeProviderHeadersEvent,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	BeforeSubagentSpawnEvent,
@@ -58,6 +74,9 @@ import type {
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
+	ContextWithSystemEvent,
+	ContextWithSystemEventResult,
+	ContextWithSystemMessage,
 	Extension,
 	ExtensionActions,
 	ExtensionAgentIdentity,
@@ -71,10 +90,13 @@ import type {
 	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
+	ExtensionSystemPromptOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	InputEvent,
 	InputEventResult,
+	MarkdownTransformContext,
+	MarkdownTransformer,
 	CacheWarmingAction,
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,
@@ -86,8 +108,10 @@ import type {
 	ResourcesDiscoverResult,
 	SessionBeforeBranchResult,
 	SessionBeforeCompactResult,
+	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
+	SessionBoundaryDraft,
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
@@ -96,6 +120,7 @@ import type {
 	ToolRegistrationListener,
 	ToolResultEvent,
 	ToolResultEventResult,
+	UIPromptKind,
 	UserBashEvent,
 	UserBashEventResult,
 	UserPythonEvent,
@@ -111,6 +136,17 @@ interface BeforeAgentStartCombinedResult {
 }
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
+
+/** Thrown by a session-touching extension context method after its session was disposed. */
+export class ExtensionStaleContextError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ExtensionStaleContextError";
+	}
+}
+
+const STALE_CONTEXT_MESSAGE =
+	"This extension ctx belongs to a disposed session. Do not keep using a captured ctx after its session shut down; use the ctx passed to the current handler instead.";
 
 export interface ToolCallPreflight {
 	before?: (
@@ -128,6 +164,16 @@ export interface ToolCallPreflight {
 }
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
+
+/** Distinct dropped-header reports (extension, name, reason) a runner emits before going quiet. */
+const HEADER_REJECTION_REPORT_CAP = 256;
+/** Header-name characters a dropped-header report includes. */
+const HEADER_REJECTION_LABEL_MAX_CHARS = 64;
+
+/** Most frames the `provider_stream_event` queue holds before dropping the oldest. */
+export const PROVIDER_STREAM_QUEUE_MAX_FRAMES = 256;
+/** Most `data` characters (UTF-16 code units) the `provider_stream_event` queue holds. */
+export const PROVIDER_STREAM_QUEUE_MAX_CHARS = 4 * 1024 * 1024;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
 
 function throwUnsupportedServiceTierAction(): never {
@@ -160,6 +206,124 @@ export function testSetSessionShutdownHandlerTimeoutMs(timeoutMs: number): void 
 
 /** Per-event handler budget. Defaults to the generic cap; `session_shutdown`
  *  uses its own short cap so teardown stays prompt. */
+/** System prompt blocks carried by a `context_with_system` leading message; non-text parts are ignored. */
+function systemPromptBlocks(content: unknown): string[] {
+	if (typeof content === "string") return content.length > 0 ? [content] : [];
+	if (!Array.isArray(content)) return [];
+	return content.flatMap(part =>
+		part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string"
+			? [part.text]
+			: [],
+	);
+}
+
+/**
+ * Whether two messages encode to the same JSON. Bun.deepEquals would also compare the symbol
+ * keys a structured clone loses; a value JSON cannot encode counts as different.
+ */
+function sameJson(left: unknown, right: unknown): boolean {
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
+/** Most drafts one `agent_before_settle` pass may commit. */
+export const MAX_BOUNDARY_DRAFTS = 16;
+/** Longest accepted draft `customType`, in characters. */
+export const MAX_BOUNDARY_CUSTOM_TYPE_CHARS = 128;
+/** Largest JSON encoding of a draft's `data` or `details`, in UTF-16 code units. */
+export const MAX_BOUNDARY_DRAFT_JSON_CHARS = 256 * 1024;
+/** Most text a `custom_message` draft may carry across its text parts, in characters. */
+export const MAX_BOUNDARY_DRAFT_TEXT_CHARS = 256 * 1024;
+
+/** Why `value` cannot be persisted as draft JSON, or undefined when it can. */
+function draftJsonError(label: string, value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	let json: string | undefined;
+	try {
+		json = JSON.stringify(value);
+	} catch (error) {
+		return `${label} is not JSON-serializable (${error instanceof Error ? error.message : String(error)})`;
+	}
+	if (json === undefined) return `${label} is not JSON-serializable`;
+	if (json.length > MAX_BOUNDARY_DRAFT_JSON_CHARS) {
+		return `${label} exceeds ${MAX_BOUNDARY_DRAFT_JSON_CHARS} characters of JSON`;
+	}
+	return undefined;
+}
+
+/** Why a `custom_message` draft's content cannot be committed, or undefined when it can. */
+function draftContentError(content: unknown): string | undefined {
+	if (typeof content === "string") {
+		return content.length > MAX_BOUNDARY_DRAFT_TEXT_CHARS
+			? `content exceeds ${MAX_BOUNDARY_DRAFT_TEXT_CHARS} characters`
+			: undefined;
+	}
+	if (!Array.isArray(content)) return "content must be a string or an array of content parts";
+	let textChars = 0;
+	for (const [index, part] of content.entries()) {
+		if (part === null || typeof part !== "object") return `content part ${index} is not an object`;
+		const { type } = part as { type?: unknown };
+		if (type === "text") {
+			const { text } = part as { text?: unknown };
+			if (typeof text !== "string") return `content part ${index} text must be a string`;
+			textChars += text.length;
+			continue;
+		}
+		if (type === "image") {
+			const { data, mimeType } = part as { data?: unknown; mimeType?: unknown };
+			if (typeof mimeType !== "string" || !mimeType.startsWith("image/")) {
+				return `content part ${index} needs an image/* mimeType`;
+			}
+			if (typeof data !== "string" || data.length === 0) return `content part ${index} needs base64 data`;
+			if (Math.floor((data.length * 3) / 4) > MAX_IMAGE_INPUT_BYTES) {
+				return `content part ${index} image exceeds ${MAX_IMAGE_INPUT_BYTES} bytes`;
+			}
+			continue;
+		}
+		return `content part ${index} has unsupported type ${JSON.stringify(type)}`;
+	}
+	return textChars > MAX_BOUNDARY_DRAFT_TEXT_CHARS
+		? `content exceeds ${MAX_BOUNDARY_DRAFT_TEXT_CHARS} characters of text`
+		: undefined;
+}
+
+/** Why a boundary draft list cannot be committed, or undefined when every draft is valid. */
+function boundaryDraftsError(entries: unknown): string | undefined {
+	if (!Array.isArray(entries)) return "entries must be an array";
+	if (entries.length > MAX_BOUNDARY_DRAFTS) return `at most ${MAX_BOUNDARY_DRAFTS} entries are accepted`;
+	for (const [index, draft] of entries.entries()) {
+		if (draft === null || typeof draft !== "object") return `entry ${index} is not an object`;
+		const { type, customType } = draft as { type?: unknown; customType?: unknown };
+		if (type !== "custom" && type !== "custom_message") {
+			return `entry ${index} has unsupported type ${JSON.stringify(type)}; only "custom" and "custom_message" drafts are supported`;
+		}
+		if (typeof customType !== "string" || customType.length === 0)
+			return `entry ${index} needs a non-empty customType`;
+		if (customType.length > MAX_BOUNDARY_CUSTOM_TYPE_CHARS) {
+			return `entry ${index} customType exceeds ${MAX_BOUNDARY_CUSTOM_TYPE_CHARS} characters`;
+		}
+		try {
+			assertExtensionCustomEntryType(customType);
+		} catch (error) {
+			return `entry ${index}: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		let error: string | undefined;
+		if (type === "custom") {
+			error = draftJsonError("data", (draft as { data?: unknown }).data);
+		} else {
+			const { content, display, details } = draft as { content?: unknown; display?: unknown; details?: unknown };
+			error =
+				draftContentError(content) ??
+				(typeof display !== "boolean" ? "display must be a boolean" : draftJsonError("details", details));
+		}
+		if (error !== undefined) return `entry ${index} ${error}`;
+	}
+	return undefined;
+}
+
 function handlerTimeoutForEvent(eventType: string): number {
 	return eventType === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs;
 }
@@ -278,6 +442,67 @@ function createHandlerContext(
 	return scoped;
 }
 
+const OPTIONAL_DISPLAY_METHODS: ReadonlySet<PropertyKey> = new Set([
+	"setWorkingVisible",
+	"setWorkingIndicator",
+	"setHiddenThinkingLabel",
+]);
+
+function noOp(): void {}
+
+/**
+ * Wrap the blocking prompts of `ui` so each one is bracketed by
+ * `ui_prompt_start` and `ui_prompt_end`. The end event fires however the prompt
+ * settles. `queuePromptEvent` delivers events in call order without delaying the prompt.
+ */
+function createPromptEventUIContext(
+	ui: ExtensionUIContext,
+	queuePromptEvent: (type: "ui_prompt_start" | "ui_prompt_end", kind: UIPromptKind, title?: string) => void,
+): ExtensionUIContext {
+	const bracket = async <T>(kind: UIPromptKind, title: string | undefined, prompt: () => Promise<T>): Promise<T> => {
+		queuePromptEvent("ui_prompt_start", kind, title);
+		try {
+			return await prompt();
+		} finally {
+			queuePromptEvent("ui_prompt_end", kind, title);
+		}
+	};
+	const askDialog = ui.askDialog;
+	const promptMethods = {
+		select: (title, options, dialogOptions) =>
+			bracket("select", title, () => ui.select(title, options, dialogOptions)),
+		confirm: (title, message, dialogOptions) =>
+			bracket("confirm", title, () => ui.confirm(title, message, dialogOptions)),
+		input: (title, placeholder, dialogOptions) =>
+			bracket("input", title, () => ui.input(title, placeholder, dialogOptions)),
+		askDialog: askDialog
+			? (questions, dialogOptions) =>
+					bracket("askDialog", undefined, () => askDialog.call(ui, questions, dialogOptions))
+			: undefined,
+		custom: (factory, options) => bracket("custom", undefined, () => ui.custom(factory, options)),
+		editor: (title, prefill, dialogOptions, editorOptions) =>
+			bracket("editor", title, () => ui.editor(title, prefill, dialogOptions, editorOptions)),
+	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "custom" | "editor">;
+	const delegatedMethods = new Map<PropertyKey, unknown>();
+
+	return new Proxy(ui, {
+		get(target, property) {
+			if (Object.hasOwn(promptMethods, property)) {
+				return Reflect.get(promptMethods, property, promptMethods);
+			}
+			const cached = delegatedMethods.get(property);
+			if (cached) return cached;
+			const value: unknown = Reflect.get(target, property, target);
+			// Hosts written before these display hooks existed may omit them; they are best-effort.
+			if (value === undefined && OPTIONAL_DISPLAY_METHODS.has(property)) return noOp;
+			if (typeof value !== "function") return value;
+			const delegated: unknown = value.bind(target);
+			delegatedMethods.set(property, delegated);
+			return delegated;
+		},
+	});
+}
+
 /**
  * Race `work` against a `timeoutMs` budget and optional cancellation signal,
  * clearing the timer and abort listener as soon as one branch settles.
@@ -387,8 +612,11 @@ type RunnerEmitEvent = Exclude<
 	| ToolResultEvent
 	| UserBashEvent
 	| ContextEvent
+	| ContextWithSystemEvent
+	| AgentBeforeSettleEvent
 	| CacheWarmingDecisionEvent
 	| BeforeProviderRequestEvent
+	| BeforeProviderHeadersEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| ResourcesDiscoverEvent
@@ -397,12 +625,20 @@ type RunnerEmitEvent = Exclude<
 
 type SessionBeforeEvent = Extract<
 	RunnerEmitEvent,
-	{ type: "session_before_switch" | "session_before_branch" | "session_before_compact" | "session_before_tree" }
+	{
+		type:
+			| "session_before_switch"
+			| "session_before_branch"
+			| "session_before_fork"
+			| "session_before_compact"
+			| "session_before_tree";
+	}
 >;
 
 type SessionBeforeEventResult =
 	| SessionBeforeSwitchResult
 	| SessionBeforeBranchResult
+	| SessionBeforeForkResult
 	| SessionBeforeCompactResult
 	| SessionBeforeTreeResult;
 
@@ -410,15 +646,17 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 	? SessionBeforeSwitchResult | undefined
 	: TEvent extends { type: "session_before_branch" }
 		? SessionBeforeBranchResult | undefined
-		: TEvent extends { type: "session_before_compact" }
-			? SessionBeforeCompactResult | undefined
-			: TEvent extends { type: "session_before_tree" }
-				? SessionBeforeTreeResult | undefined
-				: TEvent extends { type: "session.compacting" }
-					? SessionCompactingResult | undefined
-					: TEvent extends { type: "session_stop" }
-						? SessionStopEventResult | undefined
-						: undefined;
+		: TEvent extends { type: "session_before_fork" }
+			? SessionBeforeForkResult | undefined
+			: TEvent extends { type: "session_before_compact" }
+				? SessionBeforeCompactResult | undefined
+				: TEvent extends { type: "session_before_tree" }
+					? SessionBeforeTreeResult | undefined
+					: TEvent extends { type: "session.compacting" }
+						? SessionCompactingResult | undefined
+						: TEvent extends { type: "session_stop" }
+							? SessionStopEventResult | undefined
+							: undefined;
 
 // Session-lifecycle handler types live once in session-handler-types (imported
 // above for local use); re-exported here to keep this module's public API stable.
@@ -446,6 +684,7 @@ export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner 
 		return true;
 	} finally {
 		extensionRunner.disposeFileFallbacks();
+		extensionRunner.disposeSessionListeners();
 		extensionRunner.clearManagedTimers();
 	}
 }
@@ -458,6 +697,9 @@ const noOpUIContext: ExtensionUIContext = {
 	onTerminalInput: () => () => {},
 	setStatus: () => {},
 	setWorkingMessage: () => {},
+	setWorkingVisible: () => {},
+	setWorkingIndicator: () => {},
+	setHiddenThinkingLabel: () => {},
 	setWidget: () => {},
 	setFooter: () => {},
 	setHeader: () => {},
@@ -495,6 +737,13 @@ export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	/** {@link #uiContext} with blocking prompts bracketed by `ui_prompt_*` events; handed to extension contexts. */
+	#promptEventUIContext: ExtensionUIContext;
+	/** Transformers that already reported a failure, so a broken one is not reported on every render. */
+	#failedMarkdownTransformers = new WeakSet<MarkdownTransformer>();
+	#disposeSessionNameListener: (() => void) | undefined;
+	/** Tail of queued `ui_prompt_*` deliveries; never rejects. */
+	#promptEvents: Promise<void> = Promise.resolve();
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -506,6 +755,13 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
+	#getSystemPromptOptionsFn: (() => ExtensionSystemPromptOptions) | undefined;
+	#staleMessage: string | undefined;
+	#streamQueue: { data: string; model: Model }[] = [];
+	#streamQueueChars = 0;
+	#streamDraining = false;
+	#streamOverflowWarned = false;
+	#reportedHeaderRejections = new Set<string>();
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
@@ -722,6 +978,7 @@ export class ExtensionRunner {
 		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#promptEventUIContext = this.#createPromptEventUIContext(noOpUIContext);
 		this.#getMemoryFn = getMemory;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
 	}
@@ -822,8 +1079,21 @@ export class ExtensionRunner {
 		}
 
 		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#promptEventUIContext = this.#createPromptEventUIContext(this.#uiContext);
 		this.#mode = mode;
 		this.#initialized = true;
+
+		this.#disposeSessionNameListener?.();
+		this.#disposeSessionNameListener = this.sessionManager.onSessionNameChanged(() => {
+			if (!this.hasHandlers("session_info_changed")) return;
+			this.emit({ type: "session_info_changed", name: this.sessionManager.getSessionName() }).catch(
+				(error: unknown) => {
+					logger.warn("session_info_changed emit failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				},
+			);
+		});
 
 		// Re-initialize (e.g. a mode switch rewiring UI/runtime actions) must not
 		// accumulate duplicate global registrations — drop the prior generation before
@@ -989,6 +1259,145 @@ export class ExtensionRunner {
 	}
 
 	/**
+	 * Runs `agent_before_settle` handlers in registration order. Each handler sees the drafts
+	 * and decision so far; a returned `entries` replaces the drafts and the last boolean
+	 * `continue` wins. Failed handlers are reported and leave both unchanged. When the final
+	 * drafts are invalid they are reported and the result carries no drafts and no continuation.
+	 */
+	async emitAgentBeforeSettle(
+		outcome: AgentActivityOutcome,
+	): Promise<{ entries: SessionBoundaryDraft[]; continue: boolean }> {
+		let entries: SessionBoundaryDraft[] = [];
+		let shouldContinue = false;
+		let invalid: { extensionPath: string; error: string } | undefined;
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("agent_before_settle");
+			if (!handlers || handlers.length === 0) continue;
+			const ctx = this.createContext();
+			for (const handler of handlers) {
+				const event: AgentBeforeSettleEvent = {
+					type: "agent_before_settle",
+					outcome,
+					entries: [...entries],
+					continue: shouldContinue,
+				};
+				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
+					| AgentBeforeSettleEventResult
+					| undefined;
+				if (result?.entries !== undefined) {
+					entries = result.entries;
+					const error = boundaryDraftsError(entries);
+					invalid = error === undefined ? undefined : { extensionPath: ext.path, error };
+				}
+				if (typeof result?.continue === "boolean") shouldContinue = result.continue;
+			}
+		}
+		if (invalid) {
+			this.emitError({
+				extensionPath: invalid.extensionPath,
+				event: "agent_before_settle",
+				error: `Invalid boundary entries: ${invalid.error}`,
+			});
+			return { entries: [], continue: false };
+		}
+		return { entries, continue: shouldContinue };
+	}
+
+	/**
+	 * Runs `context_with_system` handlers on a provider request. The system prompt and tools
+	 * travel as a leading system message; the result is split back into the request, so a
+	 * dropped leading system message sends no system prompt and no tools. Without handlers
+	 * the context is returned unchanged.
+	 */
+	async emitContextWithSystem(context: Context, model?: Model): Promise<Context> {
+		if (!this.hasHandlers("context_with_system")) return context;
+		let messages: Message[];
+		try {
+			messages = structuredClone(context.messages);
+		} catch (error) {
+			// A shallow copy would let handlers mutate live agent state; skip the hook for this request.
+			this.emitError({
+				extensionPath: "<context_with_system>",
+				event: "context_with_system",
+				error: `Request messages could not be copied for handlers; the request was sent unchanged: ${error instanceof Error ? error.message : String(error)}`,
+			});
+			return context;
+		}
+		// structuredClone drops symbol-keyed provider markers; unchanged messages get their original back.
+		const originals = new Map<Message, Message>();
+		messages.forEach((message, index) => {
+			const original = context.messages[index];
+			if (original && message !== original) originals.set(message, original);
+		});
+		let current: ContextWithSystemMessage[] = [
+			{
+				role: "system",
+				content: (context.systemPrompt ?? []).map(text => ({ type: "text", text })),
+				toolsAdded: context.tools ? [...context.tools] : undefined,
+				timestamp: Date.now(),
+			},
+			...messages,
+		];
+		const ctx = this.createContext(model);
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("context_with_system");
+			if (!handlers || handlers.length === 0) continue;
+			for (const handler of handlers) {
+				const hadLeadingSystem = current[0]?.role === "system";
+				const event: ContextWithSystemEvent = { type: "context_with_system", messages: current };
+				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
+					| ContextWithSystemEventResult
+					| undefined;
+				if (result?.messages !== undefined) {
+					if (!Array.isArray(result.messages)) {
+						this.emitError({
+							extensionPath: ext.path,
+							event: "context_with_system",
+							error: "Handler returned non-array messages; the transcript is unchanged.",
+						});
+						continue;
+					}
+					current = result.messages;
+				}
+				if (hadLeadingSystem && current[0]?.role !== "system") {
+					this.emitError({
+						extensionPath: ext.path,
+						event: "context_with_system",
+						error: "Handler removed the leading system message; the request has no system prompt or tool declarations. Keep it at index 0.",
+					});
+				}
+			}
+		}
+
+		const [first, ...rest] = current;
+		const leading = first?.role === "system" ? first : undefined;
+		const body: Message[] = [];
+		let droppedSystem = false;
+		for (const message of leading ? rest : current) {
+			if (message.role === "system") {
+				droppedSystem = true;
+				continue;
+			}
+			const original = originals.get(message);
+			body.push(original && sameJson(message, original) ? original : message);
+		}
+		if (droppedSystem) {
+			this.emitError({
+				extensionPath: "<context_with_system>",
+				event: "context_with_system",
+				error: "System messages after index 0 are not supported and were dropped from the request.",
+			});
+		}
+		const systemPrompt = leading ? systemPromptBlocks(leading.content) : [];
+		return {
+			...context,
+			systemPrompt: systemPrompt.length > 0 ? systemPrompt : undefined,
+			messages: body,
+			tools: Array.isArray(leading?.toolsAdded) ? leading.toolsAdded : undefined,
+		};
+	}
+
+	/**
 	 * Asks extensions to override a prompt-cache warming decision. The last
 	 * handler returning an action wins; handler failures are reported through
 	 * the extension error listeners and leave the warmer's decision standing.
@@ -1023,6 +1432,23 @@ export class ExtensionRunner {
 	/** Waits until the interactive transcript can show the tool call being approved. */
 	async waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
+	}
+
+	#createPromptEventUIContext(ui: ExtensionUIContext): ExtensionUIContext {
+		return createPromptEventUIContext(ui, (type, kind, title) => {
+			if (!this.hasHandlers(type)) return;
+			// One chain per runner keeps start/end ordered across overlapping prompts.
+			this.#promptEvents = this.#promptEvents.then(async () => {
+				try {
+					await this.emit({ type, reason: "ui_prompt", kind, ...(title !== undefined ? { title } : {}) });
+				} catch (error) {
+					logger.warn("UI prompt event emit failed", {
+						event: type,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			});
+		});
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -1291,6 +1717,41 @@ export class ExtensionRunner {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
 
+	/** Whether any active extension registered a Markdown transformer. */
+	hasMarkdownTransformers(): boolean {
+		return this.extensions.some(ext => ext.markdownTransformer !== undefined);
+	}
+
+	/**
+	 * Run every active extension's Markdown transformer over `markdown`, in load
+	 * order, each receiving the previous output. A transformer that throws or
+	 * returns a non-string is skipped; its first failure is reported through
+	 * {@link onError}.
+	 */
+	transformMarkdown(markdown: string, context: MarkdownTransformContext): string {
+		let current = markdown;
+		for (const ext of this.extensions) {
+			const transformer = ext.markdownTransformer;
+			if (!transformer) continue;
+			let failure: { error: string; stack?: string } | undefined;
+			try {
+				const next: unknown = transformer(current, { ...context });
+				if (typeof next === "string") current = next;
+				else failure = { error: `Markdown transformer returned ${typeof next}, expected string` };
+			} catch (error) {
+				failure = {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				};
+			}
+			if (failure && !this.#failedMarkdownTransformers.has(transformer)) {
+				this.#failedMarkdownTransformers.add(transformer);
+				this.emitError({ extensionPath: ext.path, event: "markdown_transform", ...failure });
+			}
+		}
+		return current;
+	}
+
 	getRegisteredCommands(reserved?: ReadonlySet<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
 
@@ -1365,11 +1826,20 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
 		return {
-			ui: this.#uiContext,
+			ui: this.#promptEventUIContext,
 			mode: this.#mode,
-			getContextUsage: () => this.#getContextUsageFn(),
-			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
-			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			getContextUsage: () => {
+				this.#assertActive();
+				return this.#getContextUsageFn();
+			},
+			compact: async instructionsOrOptions => {
+				this.#assertActive();
+				return this.#compactFn(instructionsOrOptions);
+			},
+			getAsyncJobSnapshot: () => {
+				this.#assertActive();
+				return this.#getAsyncJobSnapshotFn();
+			},
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
@@ -1380,13 +1850,29 @@ export class ExtensionRunner {
 				return getModel();
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
-			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
-			hasPendingMessages: () => this.#hasPendingMessagesFn(),
-			shutdown: () => this.#shutdownHandler(),
-			getSystemPrompt: () => this.#getSystemPromptFn(),
+			isIdle: () => {
+				this.#assertActive();
+				return this.#isIdleFn();
+			},
+			abort: () => {
+				this.#assertActive();
+				this.#abortFn();
+			},
+			hasPendingMessages: () => {
+				this.#assertActive();
+				return this.#hasPendingMessagesFn();
+			},
+			shutdown: () => {
+				this.#assertActive();
+				this.#shutdownHandler();
+			},
+			getSystemPrompt: () => {
+				this.#assertActive();
+				return this.#getSystemPromptFn();
+			},
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
+						this.#assertActive();
 						if (this.#ephemeralTurnBlocker.getStore()) {
 							throw new Error("runEphemeralTurn cannot be called recursively from an ephemeral turn hook");
 						}
@@ -1414,21 +1900,29 @@ export class ExtensionRunner {
 				: undefined,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
-			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
-			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
+			setInterval: (callback, ms, ...args) => {
+				this.#assertActive();
+				return this.#managedTimers.setInterval(callback, ms, ...args);
+			},
+			setTimeout: (callback, ms, ...args) => {
+				this.#assertActive();
+				return this.#managedTimers.setTimeout(callback, ms, ...args);
+			},
 			clearTimer: timer => this.#managedTimers.clear(timer),
 			addAdditionalContext: delegation?.context?.addAdditionalContext,
 			invokeTool:
 				delegation !== undefined && this.hasNativeTool(delegation.toolName)
-					? (params, options) =>
-							this.invokeNativeTool(delegation.toolName, params, {
+					? async (params, options) => {
+							this.#assertActive();
+							return this.invokeNativeTool(delegation.toolName, params, {
 								// Inherit the wrapper's own channels so a bare `ctx.invokeTool(params)` aborts
 								// and streams with the outer call. Explicit options win.
 								signal: options?.signal ?? delegation.signal,
 								onUpdate: options?.onUpdate ?? delegation.onUpdate,
 								depth: (delegation.depth ?? 0) + 1,
 								callerContext: delegation.context,
-							})
+							});
+						}
 					: undefined,
 		};
 	}
@@ -1460,24 +1954,103 @@ export class ExtensionRunner {
 		for (const dispose of this.#fileFallbackDisposers.splice(0)) dispose();
 	}
 
+	/** Stop forwarding session name changes as `session_info_changed`. Called on session shutdown. */
+	disposeSessionListeners(): void {
+		this.#disposeSessionNameListener?.();
+		this.#disposeSessionNameListener = undefined;
+	}
+
 	createCommandContext(): ExtensionCommandContext {
 		return {
 			...this.createContext(),
-			getContextUsage: () => this.#getContextUsageFn(),
-			waitForIdle: () => this.#waitForIdleFn(),
-			newSession: options => this.#newSessionHandler(options),
-			branch: entryId => this.#branchHandler(entryId),
-			navigateTree: (targetId, options) => this.#navigateTreeHandler(targetId, options),
-			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
-			reload: () => this.#reloadHandler(),
-			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+			getContextUsage: () => {
+				this.#assertActive();
+				return this.#getContextUsageFn();
+			},
+			getSystemPromptOptions: () => {
+				this.#assertActive();
+				return this.#getSystemPromptOptionsFn?.() ?? this.#defaultSystemPromptOptions();
+			},
+			waitForIdle: async () => {
+				this.#assertActive();
+				return this.#waitForIdleFn();
+			},
+			newSession: async options => {
+				this.#assertActive();
+				return this.#newSessionHandler(options);
+			},
+			branch: async entryId => {
+				this.#assertActive();
+				return this.#branchHandler(entryId);
+			},
+			fork: async (entryId, options) => {
+				this.#assertActive();
+				if (options?.position === "at") {
+					throw new Error('fork position "at" is not supported; OMP branches before the entry');
+				}
+				return this.#branchHandler(entryId);
+			},
+			navigateTree: async (targetId, options) => {
+				this.#assertActive();
+				return this.#navigateTreeHandler(targetId, options);
+			},
+			switchSession: async sessionPath => {
+				this.#assertActive();
+				return this.#switchSessionHandler(sessionPath);
+			},
+			reload: async () => {
+				this.#assertActive();
+				return this.#reloadHandler();
+			},
+			compact: async instructionsOrOptions => {
+				this.#assertActive();
+				return this.#compactFn(instructionsOrOptions);
+			},
 		};
+	}
+
+	/**
+	 * Mark every context this runner created, and creates later, as stale.
+	 * Session-touching context methods then throw {@link ExtensionStaleContextError}, and
+	 * queued `provider_stream_event` frames are dropped. Called once the owning session
+	 * finished disposing, after `session_shutdown`; idempotent, and the first message wins.
+	 */
+	invalidate(message: string = STALE_CONTEXT_MESSAGE): void {
+		this.#staleMessage ??= message;
+		this.#streamQueue = [];
+		this.#streamQueueChars = 0;
+	}
+
+	/** Whether {@link invalidate} has run. */
+	get isStale(): boolean {
+		return this.#staleMessage !== undefined;
+	}
+
+	#assertActive(): void {
+		if (this.#staleMessage !== undefined) throw new ExtensionStaleContextError(this.#staleMessage);
+	}
+
+	/** Supply the snapshot `ctx.getSystemPromptOptions()` returns in command contexts. */
+	setSystemPromptOptionsProvider(provider: (() => ExtensionSystemPromptOptions) | undefined): void {
+		this.#getSystemPromptOptionsFn = provider;
+	}
+
+	#defaultSystemPromptOptions(): ExtensionSystemPromptOptions {
+		return Object.freeze({
+			cwd: this.cwd,
+			selectedTools: Object.freeze([]),
+			additionalWorkspaceRoots: Object.freeze([]),
+			contextFiles: Object.freeze([]),
+			skills: Object.freeze([]),
+			rules: Object.freeze([]),
+		});
 	}
 
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
 		return (
 			event.type === "session_before_switch" ||
 			event.type === "session_before_branch" ||
+			event.type === "session_before_fork" ||
 			event.type === "session_before_compact" ||
 			event.type === "session_before_tree"
 		);
@@ -2095,6 +2668,183 @@ export class ExtensionRunner {
 				};
 				await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs, undefined, signal);
 			}
+		}
+	}
+
+	/**
+	 * Run `before_provider_headers` handlers in order and return the resulting headers.
+	 *
+	 * Each handler mutates its own copy of the headers so far; the copy is adopted once the
+	 * handler settles (returns or throws), and discarded when it times out, so a late handler
+	 * can never edit headers already sent. Return values are ignored. Entries a handler sets
+	 * with an invalid name or value, or as new names past `MAX_PROVIDER_HEADER_COUNT`, are
+	 * dropped, and changes to reserved connection headers are reverted. Each is reported once
+	 * per extension and name (the first 64 name characters, at most 256 reports per runner)
+	 * through {@link emitError}, which never includes header values. Once `signal` aborts,
+	 * the remaining handlers are skipped and the headers so far are returned.
+	 */
+	async emitBeforeProviderHeaders(
+		headers: ProviderHeaders,
+		model?: Model,
+		signal?: AbortSignal,
+	): Promise<ProviderHeaders> {
+		let current: ProviderHeaders = { ...headers };
+		let ctx: ExtensionContext | undefined;
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("before_provider_headers");
+			if (!handlers || handlers.length === 0) continue;
+			ctx ??= this.createContext(model);
+			for (const handler of handlers) {
+				if (signal?.aborted) return current;
+				const draft: ProviderHeaders = { ...current };
+				const event: BeforeProviderHeadersEvent = { type: "before_provider_headers", headers: draft };
+				let timedOut = false;
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					extensionHandlerTimeoutMs,
+					kind => {
+						timedOut = kind === "timeout";
+						return undefined;
+					},
+					signal,
+				);
+				if (timedOut || signal?.aborted) continue;
+				current = this.#screenHeaderEdits(current, draft, ext);
+			}
+		}
+		return current;
+	}
+
+	/** Drop invalid entries and revert reserved-name changes a handler made; see {@link emitBeforeProviderHeaders}. */
+	#screenHeaderEdits(previous: ProviderHeaders, draft: ProviderHeaders, ext: Extension): ProviderHeaders {
+		const result: ProviderHeaders = {};
+		let count = 0;
+		const reject = (name: string, reason: string) => {
+			const shortName = name.slice(0, HEADER_REJECTION_LABEL_MAX_CHARS);
+			const key = `${ext.path}\0${shortName}\0${reason}`;
+			if (this.#reportedHeaderRejections.has(key)) return;
+			if (this.#reportedHeaderRejections.size >= HEADER_REJECTION_REPORT_CAP) return;
+			this.#reportedHeaderRejections.add(key);
+			const label = isValidProviderHeaderName(shortName) ? shortName : JSON.stringify(shortName);
+			this.emitError({
+				extensionPath: ext.path,
+				event: "before_provider_headers",
+				error: `Dropped header ${label}: ${reason}`,
+			});
+		};
+		for (const [name, value] of Object.entries(draft)) {
+			if (Object.hasOwn(previous, name) && previous[name] === value) {
+				result[name] = value;
+				count++;
+				continue;
+			}
+			const trimmed = name.trim();
+			if (RESERVED_PROVIDER_HEADERS.has(trimmed.toLowerCase())) {
+				reject(trimmed, "reserved header cannot be changed");
+				if (Object.hasOwn(previous, name)) result[name] = previous[name];
+				continue;
+			}
+			if (!isValidProviderHeaderName(trimmed)) {
+				reject(trimmed, "invalid header name");
+				continue;
+			}
+			if (
+				value !== null &&
+				(typeof value !== "string" || !isValidProviderHeaderValue(value.replace(/[\r\n]/g, "")))
+			) {
+				reject(trimmed, "invalid header value");
+				continue;
+			}
+			if (!Object.hasOwn(previous, name) && count >= MAX_PROVIDER_HEADER_COUNT) {
+				reject(trimmed, "too many headers");
+				continue;
+			}
+			result[name] = value;
+			count++;
+		}
+		for (const [name, value] of Object.entries(previous)) {
+			if (Object.hasOwn(draft, name) || !RESERVED_PROVIDER_HEADERS.has(name.trim().toLowerCase())) continue;
+			reject(name.trim(), "reserved header cannot be changed");
+			result[name] = value;
+		}
+		return result;
+	}
+
+	/**
+	 * Queue a raw provider SSE frame for delivery as `provider_stream_event`; never blocks
+	 * the stream or throws.
+	 *
+	 * Does nothing (and parses nothing) unless a handler is registered and `model` is known.
+	 * Skips the `[DONE]` sentinel, comment-only frames, outbound and malformed Codex
+	 * WebSocket frames. One consumer delivers queued frames in arrival order, awaiting each
+	 * frame's handlers before the next. The queue keeps at most
+	 * {@link PROVIDER_STREAM_QUEUE_MAX_FRAMES} frames and
+	 * {@link PROVIDER_STREAM_QUEUE_MAX_CHARS} characters of `data`; beyond that the oldest
+	 * queued frames are dropped, with one warning per overflow episode. Handler failures go
+	 * to {@link emitError}.
+	 */
+	emitProviderStreamEvent(frame: RawSseEvent, model: Model | undefined): void {
+		if (!model || this.isStale || !this.hasHandlers("provider_stream_event")) return;
+		const { data } = frame;
+		if (data === "" || data === "[DONE]") return;
+		const marker = frame.raw[0];
+		if (marker?.startsWith(": ws →") || marker?.startsWith(": ws ← (parse-error")) return;
+		this.#streamQueue.push({ data, model });
+		this.#streamQueueChars += data.length;
+		let dropped = 0;
+		while (
+			this.#streamQueue.length > PROVIDER_STREAM_QUEUE_MAX_FRAMES ||
+			(this.#streamQueueChars > PROVIDER_STREAM_QUEUE_MAX_CHARS && this.#streamQueue.length > 1)
+		) {
+			const oldest = this.#streamQueue.shift();
+			if (!oldest) break;
+			this.#streamQueueChars -= oldest.data.length;
+			dropped++;
+		}
+		if (dropped > 0 && !this.#streamOverflowWarned) {
+			this.#streamOverflowWarned = true;
+			logger.warn("provider_stream_event handlers are falling behind; dropping oldest frames", {
+				maxFrames: PROVIDER_STREAM_QUEUE_MAX_FRAMES,
+				maxChars: PROVIDER_STREAM_QUEUE_MAX_CHARS,
+			});
+		}
+		if (!this.#streamDraining) void this.#drainProviderStreamQueue();
+	}
+
+	async #drainProviderStreamQueue(): Promise<void> {
+		this.#streamDraining = true;
+		try {
+			for (let item = this.#streamQueue.shift(); item; item = this.#streamQueue.shift()) {
+				this.#streamQueueChars -= item.data.length;
+				let parsed: unknown = item.data;
+				try {
+					parsed = JSON.parse(item.data);
+				} catch {
+					// Non-JSON frames are delivered as the raw string.
+				}
+				try {
+					await this.emit({
+						type: "provider_stream_event",
+						provider: item.model.provider,
+						api: item.model.api,
+						model: item.model.id,
+						data: parsed,
+					});
+				} catch (error) {
+					this.emitError({
+						extensionPath: "<runner>",
+						event: "provider_stream_event",
+						error: error instanceof Error ? error.message : String(error),
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				}
+			}
+		} finally {
+			this.#streamDraining = false;
+			this.#streamOverflowWarned = false;
 		}
 	}
 

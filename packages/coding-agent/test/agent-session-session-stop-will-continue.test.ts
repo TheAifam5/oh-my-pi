@@ -88,6 +88,7 @@ describe("AgentSession session_stop willContinue", () => {
 				}
 				return undefined;
 			},
+			invalidate: vi.fn(),
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

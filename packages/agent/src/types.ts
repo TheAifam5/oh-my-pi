@@ -901,6 +901,15 @@ export interface BeforeToolCallResult {
 	reason?: string;
 	args?: Record<string, unknown>;
 	additionalContext?: string;
+	/**
+	 * Honored only with `block`. When every call in a batch is blocked with
+	 * `terminate`, the blocked results are recorded and the loop does not send them
+	 * back for another model turn; the loop goes to its stop boundary, so
+	 * steering, aside, and follow-up messages already queued still start their own
+	 * turn. A pending soft tool requirement does not override this; it stays with
+	 * the host for the next run. A batch with any other call continues.
+	 */
+	terminate?: boolean;
 }
 
 /**

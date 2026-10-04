@@ -194,6 +194,10 @@ export interface AgentOptions {
 	 */
 	onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	/**
+	 * Transform assembled provider request headers before they are sent.
+	 */
+	transformHeaders?: SimpleStreamOptions["transformHeaders"];
+	/**
 	 * Inspect assistant streaming events before they are emitted to subscribers.
 	 * Use this when abort decisions must happen before buffered events continue flowing.
 	 */
@@ -498,6 +502,7 @@ export class Agent {
 	#onPayload?: SimpleStreamOptions["onPayload"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	#transformHeaders?: SimpleStreamOptions["transformHeaders"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
@@ -582,6 +587,7 @@ export class Agent {
 		this.#onPayload = opts.onPayload;
 		this.#onResponse = opts.onResponse;
 		this.#onSseEvent = opts.onSseEvent;
+		this.#transformHeaders = opts.transformHeaders;
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
 		this.#getCursorTools = opts.getCursorTools;
@@ -1852,6 +1858,7 @@ export class Agent {
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
+			transformHeaders: this.#transformHeaders,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async (context, signal) => {

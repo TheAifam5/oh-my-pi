@@ -1848,6 +1848,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
+		transformHeaders: options?.transformHeaders,
 		execHandlers: options?.execHandlers,
 		fetch: options?.fetch,
 		fallbacks: options?.fallbacks,

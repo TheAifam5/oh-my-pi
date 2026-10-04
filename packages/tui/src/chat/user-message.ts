@@ -24,6 +24,7 @@ import type { ReactionTarget } from "./reaction";
 import { card, md, node, row, span, text } from "../native/describe";
 import { base64ImageNode } from "../native/blobs";
 import { hasTranscriptActions, runTranscriptAction } from "./transcript-actions";
+import { transformUserMarkdown } from "./markdown-transform";
 import {
 	type DescribeContext,
 	type NativeChild,
@@ -149,6 +150,7 @@ export class UserMessageComponent extends Container implements ReactionTarget {
 	constructor(text: string, options: UserBubbleOptions = {}) {
 		super();
 		ensureThemeSync();
+		text = transformUserMarkdown(text);
 		// Display-only collapse: the stored/wire text carries bracketed `[Image #N, WxH]` markers,
 		// but the transcript shows the same compact `<icon> #N` chip the composer used. Runs before
 		// Markdown layout so wrapping and bubble padding are computed on the visible text.

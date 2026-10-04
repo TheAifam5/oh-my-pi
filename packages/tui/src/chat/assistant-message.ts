@@ -19,6 +19,8 @@ import { Memo } from "../native/memo";
 import { EMPTY_LINK_TARGETS, resolveImageOptions } from "../render/render-utils";
 import { WidthAwareText } from "../render";
 import { cachedPngConversion, convertImageToPngShared, imagePayloadKey } from "./image-loading";
+import { chatTranscriptDisplayPreferences } from "./display-preferences";
+import { transformAssistantMarkdown } from "./markdown-transform";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "./thinking-display";
 import { resolveAssistantErrorPresentation } from "./transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
@@ -649,7 +651,7 @@ export class AssistantMessageComponent extends Container {
 	#thinkingDotsLabel(): string {
 		const glyph = THINKING_DOTS_FRAMES[this.#thinkingDotsFrame % THINKING_DOTS_FRAMES.length] ?? "…";
 		const coloredGlyph = theme.fg("thinkingText", glyph);
-		const thinkingLabel = theme.fg("muted", " Thinking");
+		const thinkingLabel = theme.fg("muted", ` ${chatTranscriptDisplayPreferences.hiddenThinkingLabel ?? "Thinking"}`);
 		const rate = Math.min(SPEED_MAX, sharedSpeedTracker.getSpeed());
 		// The numeric badge ("<total> · <rate> toks/s") only renders while this block
 		// is genuinely streaming provider tokens. A block that has observed no token
@@ -897,13 +899,35 @@ export class AssistantMessageComponent extends Container {
 								{ gap: "sm", title },
 								[
 									node("spinner", { style: "starburst", role: "omp.thinking.spin" }),
-									text([span("Thinking…", "muted")]),
+									text([
+										span(
+											(this.#hideThinkingBlock
+												? chatTranscriptDisplayPreferences.hiddenThinkingLabel
+												: undefined) ?? "Thinking…",
+											"muted",
+										),
+									]),
 									elapsed(performance.now() - (this.#thinkingClock.get(index)?.start ?? performance.now())),
 									...(rate >= 0.05 ? [node("rate", { value: rate, unit: "tok/s" })] : []),
 								],
 								"head",
 							)
-						: node("text", { spans: [span(thoughtLabel(clock), "muted")], title }, undefined, "head");
+						: node(
+								"text",
+								{
+									spans: [
+										span(
+											(this.#hideThinkingBlock
+												? chatTranscriptDisplayPreferences.hiddenThinkingLabel
+												: undefined) ?? thoughtLabel(clock),
+											"muted",
+										),
+									],
+									title,
+								},
+								undefined,
+								"head",
+							);
 					const body = markdown(`k${index}`, "body", display.text, streaming);
 					children.push(
 						node(
@@ -1690,7 +1714,10 @@ export class AssistantMessageComponent extends Container {
 		this.#lastUpdateTransient = opts?.transient === true;
 		// Everything below renders the display form; #lastMessage keeps the
 		// verbatim message so re-renders re-derive the reaction deterministically.
-		message = this.#displayMessage(message, this.#lastUpdateTransient);
+		message = transformAssistantMarkdown(
+			this.#displayMessage(message, this.#lastUpdateTransient),
+			this.#lastUpdateTransient,
+		);
 		this.#displayedMessage = message;
 
 		// Streaming-speed gauge: only a live, in-flight render of the single

@@ -132,6 +132,7 @@ describe("AgentSession.getAllToolInfos", () => {
 								},
 							}
 						: undefined,
+				invalidate: () => {},
 			} as never,
 		});
 

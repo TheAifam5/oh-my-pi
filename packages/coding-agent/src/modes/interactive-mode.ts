@@ -86,7 +86,8 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type { CompactOptions, WorkingIndicatorOptions } from "../extensibility/extensions/types";
+import { setChatTranscriptDisplayPreferences } from "@oh-my-pi/pi-tui/chat/display-preferences";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -1150,6 +1151,14 @@ const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 /** Repaint cadence of the open jobs sheet: output tails, pids and list ages are polled, not pushed. */
 const JOBS_SHEET_REFRESH_MS = 250;
 
+/**
+ * One-line, bounded form of an extension-supplied status string (indicator frame,
+ * hidden-thinking label). ANSI styling is kept; tabs and line breaks are not.
+ */
+function sanitizeExtensionDisplayText(text: string): string {
+	return truncateToWidth(replaceTabs(text).replace(/[\r\n]+/g, " "), TRUNCATE_LENGTHS.SHORT);
+}
+
 export class InteractiveMode implements InteractiveModeContext {
 	#ownsStartedUi: boolean;
 	session: AgentSession;
@@ -1273,6 +1282,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
+	/** Extension `setWorkingVisible`; survives loader recreation. */
+	#workingVisible = true;
+	/** Extension `setWorkingIndicator` frames; undefined uses the built-in indicator. Survives loader recreation. */
+	#workingIndicator: { frames: string[] } | undefined;
 	#retryHintRow: DescribedComponent | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
@@ -6753,6 +6766,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		this.#extensionUiController.disposeComposerShapes();
+		this.#extensionUiController.disposeExtensionDisplay();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();
 		}
@@ -7357,19 +7371,29 @@ export class InteractiveMode implements InteractiveModeContext {
 			// message is static, so leave `animated` unset and let the loader use
 			// the spinner-only ~12.5fps cadence instead of repainting a frozen line.
 			if (shimmerEnabled()) messageColorFn.animated = true;
+			const customFrames = this.#workingIndicator?.frames;
 			this.loadingAnimation = new Loader(
 				this.ui,
-				spinner => {
-					const accent = this.#getWorkingMessageAccent();
-					return accent ? `${accent.dim}${spinner}\x1b[39m` : theme.fg("muted", spinner);
-				},
+				customFrames
+					? // Extension-supplied frames are rendered verbatim; the extension owns their color.
+						spinner => spinner
+					: spinner => {
+							const accent = this.#getWorkingMessageAccent();
+							return accent ? `${accent.dim}${spinner}\x1b[39m` : theme.fg("muted", spinner);
+						},
 				messageColorFn,
 				DEFAULT_WORKING_MESSAGE,
 				// The brand spinner lives in the status line while working; this row
 				// leads with the interrupt affordance instead of a second spinner.
 				// The leading space nudges the row one column right of the flush-left
-				// status rows so the interrupt glyph reads as indented.
-				[` ${appKey(this.keybindings, "app.interrupt")}`],
+				// status rows so the interrupt glyph reads as indented. An empty
+				// extension frame list hides the indicator, which Loader models as one
+				// empty frame.
+				customFrames
+					? customFrames.length > 0
+						? customFrames
+						: [""]
+					: [` ${appKey(this.keybindings, "app.interrupt")}`],
 			);
 			this.loadingAnimation.setTrailer(() => this.#workingRowTrailer());
 			this.loadingAnimation.setWorkingRow(
@@ -7378,8 +7402,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 			this.#workingMessage = DEFAULT_WORKING_MESSAGE;
 			this.#workingStartedAt = this.viewSession.runStartedAt ?? Date.now();
-			this.statusContainer.addChild(this.loadingAnimation);
-		} else if (!this.statusContainer.children.includes(this.loadingAnimation)) {
+			// Loader starts its own frame timer; a hidden row must neither render nor tick.
+			if (this.#workingVisible) this.statusContainer.addChild(this.loadingAnimation);
+			else this.loadingAnimation.stop();
+		} else if (this.#workingVisible && !this.statusContainer.children.includes(this.loadingAnimation)) {
 			this.statusContainer.disposeChildren();
 			this.loadingAnimation.start();
 			this.statusContainer.addChild(this.loadingAnimation);
@@ -7396,6 +7422,42 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (clearStatusContainer) {
 			this.statusContainer.disposeChildren();
 		}
+	}
+
+	setWorkingVisible(visible: boolean): void {
+		this.#workingVisible = visible;
+		const loader = this.loadingAnimation;
+		if (!loader) return;
+		const shown = this.statusContainer.children.includes(loader);
+		if (visible && !shown) {
+			loader.start();
+			this.statusContainer.addChild(loader);
+		} else if (!visible && shown) {
+			loader.stop();
+			this.statusContainer.removeChild(loader);
+		}
+		this.ui.requestRender();
+	}
+
+	setWorkingIndicator(options?: WorkingIndicatorOptions): void {
+		this.#workingIndicator = options?.frames
+			? { frames: options.frames.map(frame => sanitizeExtensionDisplayText(frame)) }
+			: undefined;
+		if (!this.loadingAnimation) return;
+		// Rebuild the loader with the new frames, keeping the working row's message and timer.
+		const message = this.#workingMessage;
+		const startedAt = this.#workingStartedAt;
+		this.#stopLoadingAnimation(true);
+		this.ensureLoadingAnimation();
+		this.#workingStartedAt = startedAt;
+		if (message !== undefined && message !== DEFAULT_WORKING_MESSAGE) this.setWorkingMessage(message);
+	}
+
+	setHiddenThinkingLabel(label?: string): void {
+		setChatTranscriptDisplayPreferences({
+			hiddenThinkingLabel: label === undefined ? undefined : sanitizeExtensionDisplayText(label),
+		});
+		this.ui.requestRender();
 	}
 
 	setWorkingMessage(message?: string): void {

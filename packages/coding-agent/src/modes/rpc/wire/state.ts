@@ -14,6 +14,14 @@ export const stateDefs = {
 	InterruptMode: "'immediate' | 'wait'",
 	StreamingBehavior: "'steer' | 'followUp'",
 	QueuedMessageQueue: "'steering' | 'followUp'",
+	PromptDisposition: doc(
+		"'handled' | 'queued' | 'started'",
+		"How a `prompt` was admitted: consumed locally without a run, queued during a run, or accepted to start a run. Describes admission, not completion.",
+	),
+	QueuedInputDisposition: doc(
+		"'handled' | 'queued'",
+		"How a `steer` or `follow_up` was admitted: consumed by an `input` handler and never queued, or placed on its queue.",
+	),
 	CacheWarmingMode: "'off' | 'streaming' | 'idle'",
 	MessageUpdates: doc(
 		"'full' | 'delta'",
@@ -195,6 +203,14 @@ export const stateDefs = {
 		},
 		"User-authored queued input withdrawn before the abort, oldest first.",
 	),
+	QueuedInputAck: doc(
+		{ "disposition?": "QueuedInputDisposition" },
+		"`steer`/`follow_up` acknowledgement; servers that predate dispositions, or input superseded before dispatch, omit `disposition`.",
+	),
+	ClearedQueue: doc(
+		{ steering: "string[]", followUp: "string[]" },
+		"Text of the user-authored queued messages `clear_queue` removed, in queue order.",
+	),
 	BranchMessage: { entryId: "string", text: "string" },
 	BranchResult: { text: "string", cancelled: "boolean" },
 	TokenUsage: {
@@ -309,7 +325,7 @@ export const stateDefs = {
 	),
 	HandoffResult: { "savedPath?": "string" },
 	PromptAck: doc(
-		{ "agentInvoked?": "boolean" },
-		"`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows.",
+		{ "agentInvoked?": "boolean", "disposition?": "PromptDisposition" },
+		"`agentInvoked: false` means the prompt completed locally and no `prompt_result` follows. Servers that predate dispositions omit `disposition`.",
 	),
 } satisfies WireDefs;
