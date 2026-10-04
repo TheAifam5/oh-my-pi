@@ -17,6 +17,8 @@ export type MemoryRecallParams = typeof memoryRecallSchema.infer;
 
 export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 	readonly name = "recall";
+	/** Queries the memory backend, which may be remote. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "read" as const;
 	readonly label = "Recall";
 	get description(): string {

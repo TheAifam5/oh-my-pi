@@ -18,6 +18,8 @@ export type MemoryReflectParams = typeof memoryReflectSchema.infer;
 
 export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> {
 	readonly name = "reflect";
+	/** Queries the memory backend, which may be remote. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "read" as const;
 	readonly label = "Reflect";
 	get description(): string {

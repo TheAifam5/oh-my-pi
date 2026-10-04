@@ -29,7 +29,7 @@ import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
-import { resolveToolTier } from "./approval";
+import { localReadReplay, resolveToolTier } from "./approval";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
@@ -411,6 +411,8 @@ export interface GrepToolOptions {
 
 export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails> {
 	readonly name = "grep";
+	/** Searches local files only. */
+	readonly replay = localReadReplay;
 	readonly approval = (args: unknown): ToolTier => {
 		const a = args as { path?: string | string[]; paths?: string | string[] };
 		// Substring scan over the raw entries: delimited lists are only split after approval.

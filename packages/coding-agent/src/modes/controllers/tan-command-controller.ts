@@ -179,6 +179,8 @@ export class TanCommandController {
 								preloadedExtensionPaths: parentExtensionPaths?.length ? [...parentExtensionPaths] : undefined,
 								extensionRoots: () => parentExtensionRoots,
 								localProtocolOptions,
+								// The parent's tail is still live; the fork already closed its dangling calls.
+								skipInterruptedTurnRepair: true,
 							});
 							clone = created.session;
 						} catch (error) {

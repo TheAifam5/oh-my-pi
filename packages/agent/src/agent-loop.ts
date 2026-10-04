@@ -3210,6 +3210,7 @@ async function executeToolCalls(
 		transformToolCallArguments,
 		resolveFallbackTool,
 		suggestFallbackToolNames,
+		beforeToolExecution,
 		afterToolCall,
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
@@ -3464,6 +3465,30 @@ async function executeToolCalls(
 			return;
 		}
 		const effectiveArgs = record.args;
+		// Calls that fail before reaching the tool (unknown tool, blocked, failed
+		// preparation) never run, so the hook is not asked to journal them.
+		const willExecute =
+			tool !== undefined &&
+			!record.blocked &&
+			record.prepareError === undefined &&
+			record.transformError === undefined;
+		if (beforeToolExecution && willExecute && !record.signal.aborted) {
+			try {
+				await beforeToolExecution(
+					{ assistantMessage, toolCall, tool, args: effectiveArgs as Record<string, unknown> },
+					record.signal,
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				emitToolResult(record, { content: [{ type: "text", text: message }], details: {} }, true);
+				return;
+			}
+			// Steering queued during the wait preempts an interruptible call like the check above.
+			if (interruptState.triggered && record.interruptible) {
+				record.skipped = true;
+				return;
+			}
+		}
 		if (record.signal.aborted) {
 			record.skipped = true;
 			recordSkippedTool(telemetry, {

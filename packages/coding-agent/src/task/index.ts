@@ -547,6 +547,8 @@ export async function refreshAgentDiscovery(cwd: string, extensionRoots?: Effect
  */
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
+	/** Spawns subagents. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "exec" as const;
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = args as Partial<TaskParams>;

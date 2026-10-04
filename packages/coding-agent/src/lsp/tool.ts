@@ -170,6 +170,8 @@ function formatRenameStatError(error: unknown): string {
  */
 export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Theme> {
 	readonly name = "lsp";
+	/** Some actions (rename, code actions) edit files through the language server. */
+	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawAction = (args as Partial<LspParams>).action;
 		const action = typeof rawAction === "string" ? rawAction.toLowerCase() : "";

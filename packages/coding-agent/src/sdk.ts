@@ -183,7 +183,7 @@ import {
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
 import { DateCwdReminderInjector } from "./session/date-cwd-reminder";
-import { createInterruptedToolResults, createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
+import { repairInterruptedTurn } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
 	type CustomMessage,
@@ -821,6 +821,12 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+	/**
+	 * Leave an interrupted-looking branch tail untouched instead of closing it
+	 * with interrupted tool results and an aborted assistant record. Set by
+	 * forks of a live session, whose tail is still in progress in the parent.
+	 */
+	skipInterruptedTurnRepair?: boolean;
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -1383,6 +1389,7 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		deferrable: tool.deferrable,
 		readsSkillUris: tool.readsSkillUris,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
+		replay: typeof tool.replay === "function" ? tool.replay.bind(tool) : tool.replay,
 		// Preserved through RegisteredToolAdapter so MCP-backed tools' explicit
 		// `strict: false` (#4336/#4340) survives the custom-tool → definition bridge.
 		strict: tool.strict,
@@ -1903,15 +1910,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		? await buildSecretObfuscator(cwd, agentDir, options.agentDir)
 		: undefined;
 
-	// An abnormal process exit after a non-terminal message tail is durable
-	// evidence that the old process can no longer finish that turn. Preserve the
-	// partial transcript and append one terminal aborted assistant record before
-	// rebuilding runtime context. The helper is idempotent once that record exists.
+	// A loaded branch ending mid-turn (unpaired tool calls, a tool-result tail,
+	// or a user tail) means the process that owned the turn can no longer finish
+	// it, whether it crashed or recorded an abnormal exit. Preserve the partial
+	// transcript, pair unfinished calls with interrupted results, and append one
+	// terminal aborted assistant record before rebuilding runtime context. The
+	// helper is idempotent once those records exist.
 	let existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
-	const interruptedTurnAbort = createInterruptedTurnAbortMessage(existingBranch);
-	if (interruptedTurnAbort) {
-		for (const result of createInterruptedToolResults(existingBranch)) sessionManager.appendMessage(result);
-		sessionManager.appendMessage(interruptedTurnAbort);
+	if (!options.skipInterruptedTurnRepair && repairInterruptedTurn(sessionManager)) {
 		existingBranch = logger.time("getRecoveredSessionBranch", () => sessionManager.getBranch());
 	}
 	let existingSession = logger.time("loadSessionContext", () =>
@@ -3240,15 +3246,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// A first-turn user tail has no assistant metadata to copy. Once startup
 		// has selected its final model, use that model to terminate the
 		// interrupted turn before the live agent consumes the restored context.
-		if (model) {
-			const selectedModelAbort = createInterruptedTurnAbortMessage(existingBranch, {
+		if (model && !options.skipInterruptedTurnRepair) {
+			const selectedModelRepair = repairInterruptedTurn(sessionManager, {
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
 			});
-			if (selectedModelAbort) {
-				for (const result of createInterruptedToolResults(existingBranch)) sessionManager.appendMessage(result);
-				sessionManager.appendMessage(selectedModelAbort);
+			if (selectedModelRepair) {
 				existingBranch = logger.time("getRecoveredUserTailBranch", () => sessionManager.getBranch());
 				existingSession = logger.time("loadRecoveredUserTailContext", () =>
 					deobfuscateSessionContext(sessionManager.buildSessionContext(), obfuscator),
@@ -4304,7 +4308,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// through getters, so mid-session settings UI toggles take effect without
 		// a session recreate. The single shared host keeps its evidence across
 		// toggles; per-turn coordinator close never touches it.
-		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
+		const speculativeToolExecution = createSpeculativeToolExecutionConfig(
+			settings,
+			toolSession,
+			extensionRunner,
+			// Speculation only runs inside prompts, after the session below exists.
+			start => (session as AgentSession | undefined)?.recordSpeculativeToolStart(start),
+		);
 
 		agent = new Agent({
 			initialState: {

@@ -78,6 +78,8 @@ function createIfSupported<T extends ContextNotesTool | NewContextTool>(
 /** Reads or replaces the current branch's durable experimental notebook. */
 export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, ContextNotesToolDetails> {
 	readonly name = "context_notes";
+	/** Writes session notes. */
+	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision =>
 		args !== null && typeof args === "object" && Object.hasOwn(args, "text") ? "write" : "read";
 	readonly label = "Context Notes";
@@ -149,6 +151,8 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 /** Requests a fresh context window; the owning lifecycle consumes this turn-local signal. */
 export class NewContextTool implements AgentTool<typeof newContextSchema, NewContextToolDetails> {
 	readonly name = "new_context";
+	/** Rolls the session context over. */
+	readonly replay = "unsafe" as const;
 	readonly approval = "write" as const;
 	readonly label = "New Context";
 	readonly description = newContextDescription;

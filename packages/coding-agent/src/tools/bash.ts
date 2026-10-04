@@ -494,6 +494,8 @@ function formatTimeoutClampNotice(
  */
 export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
+	/** Runs arbitrary commands. */
+	readonly replay = "unsafe" as const;
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
 	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolApprovalDecision => {

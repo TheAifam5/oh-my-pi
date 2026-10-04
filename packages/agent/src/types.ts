@@ -574,6 +574,20 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 		signal?: AbortSignal,
 	) => Promise<BeforeToolCallResult | undefined> | BeforeToolCallResult | undefined;
 	/**
+	 * Called once per call that is about to reach its tool, after validation and
+	 * before `tool_execution_start` is emitted and the tool runs. Unlike
+	 * `beforeToolCall`, it runs after the assistant message's `message_end`, so a
+	 * host can make that message and a start record durable first. Calls that
+	 * fail validation, are blocked, fail preparation, name no tool, or are
+	 * skipped by steering or an abort do not invoke it.
+	 *
+	 * The loop awaits it with the call's abort signal; an abort raised during the
+	 * wait yields the ordinary aborted result, and steering queued during the
+	 * wait skips an interruptible call, so the tool never starts. Throwing
+	 * surfaces as a tool-error result and the tool never starts.
+	 */
+	beforeToolExecution?: (context: BeforeToolExecutionContext, signal?: AbortSignal) => Promise<void> | void;
+	/**
 	 * Called after a turn ends and before the loop polls steering/asides for the
 	 * next iteration. `context` carries the just-finished turn; `context.willContinue`
 	 * is true when the current tool-loop batch is continuing without yielding to
@@ -933,6 +947,18 @@ export interface BeforeToolCallContext {
 	context: AgentContext;
 }
 
+/** Context passed to `beforeToolExecution`. */
+export interface BeforeToolExecutionContext {
+	/** The assistant message that requested the tool call. */
+	assistantMessage: AssistantMessage;
+	/** The raw tool call block from `assistantMessage.content`. */
+	toolCall: AgentToolCall;
+	/** The resolved tool the call dispatches to. */
+	tool: AgentTool;
+	/** Validated tool arguments the call runs with. */
+	args: Record<string, unknown>;
+}
+
 /** Context passed to `afterToolCall`. */
 export interface AfterToolCallContext {
 	/** The assistant message that requested the tool call. */
@@ -1019,6 +1045,12 @@ export interface RenderResultOptions {
 
 /** Capability tier a tool exercises. Determines which approval modes auto-approve it. */
 export type ToolTier = "read" | "write" | "exec";
+
+/** Whether a tool call can be re-executed after an interrupted run without repeating side effects. */
+export type ToolReplayClass = "safe" | "unsafe";
+
+/** Per-tool replay declaration: static, or resolved from the call's arguments. */
+export type ToolReplay = ToolReplayClass | ((args: unknown) => ToolReplayClass);
 
 /**
  * How an enabled tool is presented to the model. `"essential"` tools are exposed
@@ -1137,6 +1169,12 @@ export interface AgentTool<
 	 * - function: resolved per call from the (raw, pre-validation) arguments
 	 */
 	concurrency?: "shared" | "exclusive" | ((args: Partial<Static<TParameters>>) => "shared" | "exclusive");
+
+	/**
+	 * Whether re-running the call after a crash is harmless. Omitted means
+	 * `"unsafe"`: a tool is replay-safe only when it says so.
+	 */
+	replay?: ToolReplay;
 
 	/**
 	 * Declares the bounded, validated effect of a finalized call that may execute

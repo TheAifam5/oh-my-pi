@@ -289,6 +289,8 @@ const MAX_EMPTY_RESULT_RETRIES = 3;
 export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	readonly name = "yield";
 	readonly approval = "read" as const;
+	/** Delivers the result to the parent; re-running would deliver it twice. */
+	readonly replay = "unsafe" as const;
 	readonly label = "Submit Result";
 	readonly intent = "omit" as const;
 	lenientArgValidation = true;

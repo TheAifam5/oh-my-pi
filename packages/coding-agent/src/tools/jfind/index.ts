@@ -22,6 +22,7 @@ import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
 import { cfgFindEnabled } from "../settings";
+import { localReadReplay } from "../approval";
 
 const findSchema = type({
 	query: "string",
@@ -52,6 +53,8 @@ export function isFindEnabled(session: ToolSession): boolean {
 /** Semantic search tool: describe a behavior, get files and line ranges that implement it. */
 export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 	readonly name = "find";
+	/** Finds local files only. */
+	readonly replay = localReadReplay;
 	readonly approval = "read" as const;
 	readonly loadMode = "essential";
 	readonly label = "Find";

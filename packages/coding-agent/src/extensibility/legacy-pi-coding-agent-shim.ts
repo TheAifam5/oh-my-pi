@@ -61,6 +61,7 @@ import {
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { SessionEntry } from "../session/session-entries";
 import type { Tool, ToolSession } from "../tools";
+import { localReadReplay, resolveToolReplayClass } from "../tools/approval";
 import { BashTool } from "../tools/bash";
 import { GlobTool } from "../tools/glob";
 import { GrepTool } from "../tools/grep";
@@ -474,6 +475,7 @@ export function createReadToolDefinition(cwd: string, options?: ReadToolOptions)
 		description: tool.description,
 		parameters: legacyReadSchema,
 		approval: "read",
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, options, themeArg) => {
 			const theme = renderTheme(options, themeArg);
 			const readPath = stringField(params, "path") ?? "";
@@ -519,6 +521,7 @@ export function createBashToolDefinition(cwd: string, options?: BashToolOptions)
 		description: tool.description,
 		parameters: legacyBashSchema,
 		approval: "exec",
+		replay: "unsafe",
 		...(shellEnv ? { shellEnv } : {}),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
@@ -580,6 +583,7 @@ export function createGrepToolDefinition(cwd: string, options?: GrepToolOptions)
 		description: "Search file contents for a pattern.",
 		parameters: legacyGrepSchema,
 		approval: "read",
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			const pattern = stringField(params, "pattern") ?? "";
@@ -638,6 +642,7 @@ export function createFindToolDefinition(cwd: string, options?: FindToolOptions)
 		description: "Find files by glob pattern.",
 		parameters: legacyFindSchema,
 		approval: "read",
+		replay: args => resolveToolReplayClass(tool, args),
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			const pattern = stringField(params, "pattern") ?? "";
@@ -693,6 +698,7 @@ export function createLsToolDefinition(cwd: string, options?: LsToolOptions): To
 		description: "List directory entries.",
 		parameters: legacyLsSchema,
 		approval: "read",
+		replay: localReadReplay,
 		renderCall: (params, optionsArg, themeArg) => {
 			const theme = renderTheme(optionsArg, themeArg);
 			return new Text(`${themedTitle(theme, "ls")} ${themedMuted(theme, stringField(params, "path") ?? ".")}`, 0, 0);

@@ -15,7 +15,7 @@ import { isScoutSpawnable } from "../task/spawn-policy";
 
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
-import { resolveToolTier } from "./approval";
+import { localReadReplay, resolveToolTier } from "./approval";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
@@ -130,6 +130,8 @@ async function runMultiTargetAstGrep(
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
+	/** Searches local files only. */
+	readonly replay = localReadReplay;
 	readonly approval = "read" as const;
 	readonly label = "AST Grep";
 	readonly summary = "Search code with AST patterns (structural grep)";

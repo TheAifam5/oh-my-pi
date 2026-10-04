@@ -427,7 +427,7 @@ falls back to spawning the replacement with inherited terminal streams.
 5. `sessionManager.setSessionFile(sessionPath)`, update provider-cache/session ids and memory keys, build the display context, resolve the recorded model, and rehydrate checkpoint state. When no recorded model can be restored for a different file, the switch fails here with `Could not restore model <provider/id>` (see below).
 6. Emit `session_switch` with `reason: "resume"`.
 7. Replace agent messages, reset advisor state, and synchronize todos. Close cached provider sessions for a different file, or for a same-file reload whose replay messages changed.
-8. Apply the resolved (or explicitly requested) model. If the loaded branch ended with an interrupted turn, append its synthetic abort message and rebuild context.
+8. Apply the resolved (or explicitly requested) model. If the loaded branch ended with an interrupted turn, append interrupted results for its unfinished tool calls and its synthetic abort message (see [Custom entries](session.md)), then rebuild context.
 9. Restore configured/effective thinking and per-family service tiers, falling back to current settings when the target branch has no corresponding entries.
 10. For a different transcript, reset memory context; for any conversation rewrite, clear session-scoped tool state.
 11. Reconnect agent events, run the optional session-switch reconciler (interactive mode uses it to re-enter persisted modes such as plan), and best-effort refresh the workspace-root system-prompt block. Reconciler/prompt-refresh errors are logged rather than rolling back the committed switch.

@@ -2,6 +2,7 @@ import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
+	AgentToolCall,
 	AgentToolResult,
 	SpeculativeAuthorization,
 	SpeculativeCommitContext,
@@ -115,6 +116,19 @@ async function digestTargetEvidence(target: string, gateContent: boolean): Promi
 	}
 }
 
+/** A speculative start about to happen for a call the model is still streaming. */
+export interface SpeculativeToolStart {
+	toolCall: AgentToolCall;
+	tool: SpeculativeToolReference;
+	args: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Journals a speculative start before it happens, so crash recovery never
+ * reports a speculatively started call as not started. Must not throw.
+ */
+export type SpeculativeStartJournal = (start: SpeculativeToolStart) => void;
+
 /**
  * Session-scoped policy boundary for validated local reads.
  *
@@ -128,6 +142,7 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 		private readonly settings: Settings,
 		private readonly toolSession: ToolSession,
 		private readonly extensionRunner: SpeculationLifecycle,
+		private readonly journalStart?: SpeculativeStartJournal,
 	) {}
 
 	async authorize(context: SpeculativeOperationContext): Promise<SpeculativeAuthorization> {
@@ -213,7 +228,10 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 	 * handler could block or a user must approve never starts early.
 	 */
 	authorizeLaunch(context: SpeculativeLaunchContext): SpeculativeAuthorization {
-		return this.#policyGate(context.tool, context.args);
+		const authorization = this.#policyGate(context.tool, context.args);
+		// The launcher starts the subagent right after an allowed authorization.
+		if (authorization.allowed) this.journalStart?.(context);
+		return authorization;
 	}
 
 	/** Extension lifecycle handlers and non-auto-allow approval both veto early execution. */
@@ -253,6 +271,8 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 		const evidence = await digestTargetEvidence(target.resolved, true);
 		if (!evidence) return false;
 		this.#evidence.set(context.candidateId, evidence);
+		// Eval shadow children are not calls of the assistant turn; only direct reads are journaled.
+		if (context.source === "direct") this.journalStart?.(context);
 		return true;
 	}
 
@@ -326,8 +346,9 @@ export function createSpeculativeToolExecutionConfig(
 	settings: Settings,
 	toolSession: ToolSession,
 	extensionRunner: SpeculationLifecycle,
+	journalStart?: SpeculativeStartJournal,
 ): SpeculativeToolExecutionConfig {
-	const host = new CodingAgentSpeculativeExecutionHost(settings, toolSession, extensionRunner);
+	const host = new CodingAgentSpeculativeExecutionHost(settings, toolSession, extensionRunner, journalStart);
 	return {
 		get enabled() {
 			return cfgToolsSpeculativeExecutionEnabled.get(settings) || cfgTaskSpeculativeLaunch.get(settings);

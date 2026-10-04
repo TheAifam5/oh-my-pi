@@ -14,6 +14,7 @@ import type {
 	ToolApproval,
 	ToolApprovalDecision,
 	ToolLoadMode,
+	ToolReplay,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
@@ -219,6 +220,8 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+	/** Whether re-running the call after a crash is harmless; static or resolved from the call's arguments. Omitted means `"unsafe"`. */
+	replay?: ToolReplay;
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
