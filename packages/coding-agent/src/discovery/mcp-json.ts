@@ -12,6 +12,8 @@ import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { parsePackageLaunchConfig } from "../mcp/package-launch";
+import type { MCPPackageLaunch } from "../mcp/types";
 import { createSourceMeta, expandEnvVarsDeep, parseRequestIdFormat } from "./helpers";
 
 const PROVIDER_ID = "mcp-json";
@@ -29,6 +31,7 @@ interface MCPConfigFile {
 			requestIdFormat?: "string" | "number";
 			instructions?: boolean;
 			command?: string;
+			package?: unknown;
 			args?: string[];
 			env?: Record<string, string>;
 			cwd?: string;
@@ -101,6 +104,13 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				});
 			}
 
+			let packageLaunch: MCPPackageLaunch | undefined;
+			if (serverConfig.package !== undefined) {
+				const { spec, problem } = parsePackageLaunchConfig(serverConfig.package);
+				if (problem) logger.warn("MCP server has invalid 'package' value, ignoring", { name, problem });
+				else packageLaunch = spec;
+			}
+
 			const server: MCPServer = {
 				name,
 				enabled,
@@ -108,6 +118,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				requestIdFormat,
 				instructions,
 				command: serverConfig.command,
+				package: packageLaunch,
 				args: serverConfig.args,
 				env: serverConfig.env,
 				cwd: serverConfig.cwd,
