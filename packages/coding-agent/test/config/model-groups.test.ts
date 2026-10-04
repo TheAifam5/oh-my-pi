@@ -71,7 +71,8 @@ describe("modelRoles values (strict)", () => {
 			[
 				{
 					path: "modelRoles.engineer.routing",
-					message: "funding includes metered, which requires spending.policy: provider-managed",
+					message:
+						"funding includes metered, which requires spending.policy: provider-managed or local-hard-budget",
 				},
 			],
 		],
@@ -106,17 +107,79 @@ describe("modelRoles values (strict)", () => {
 			],
 		],
 		[
-			"a local hard budget",
+			"a local hard budget without a budget",
 			pool({ routing: { funding: { order: ["metered"] }, spending: { policy: "local-hard-budget" } } }),
+			[{ path: "modelRoles.engineer.routing.spending", message: "local-hard-budget requires a budget" }],
+		],
+		[
+			"a malformed budget",
+			pool({
+				routing: {
+					funding: { order: ["metered"] },
+					spending: {
+						policy: "local-hard-budget",
+						budget: {
+							id: "Team",
+							currency: "EUR",
+							perRequestMax: 0.25,
+							window: { type: "fixed", durationMs: 86_400_000, maxSpend: "10" },
+						},
+					},
+				},
+			}),
 			[
 				{
-					path: "modelRoles.engineer.routing.spending.policy",
-					message: '"local-hard-budget" is not one of: provider-managed',
+					path: "modelRoles.engineer.routing.spending.budget.id",
+					message: 'budget id "Team" must match ^[a-z0-9][a-z0-9_-]*$',
 				},
+				{ path: "modelRoles.engineer.routing.spending.budget.currency", message: 'must be "USD"' },
+				{
+					path: "modelRoles.engineer.routing.spending.budget.perRequestMax",
+					message:
+						'must be a quoted decimal amount with at most 12 integer and 9 fractional digits, such as "0.25"',
+				},
+				{ path: "modelRoles.engineer.routing.spending.budget.window.type", message: 'must be "rolling"' },
 			],
+		],
+		[
+			"a per-request maximum above the window maximum",
+			pool({
+				routing: {
+					funding: { order: ["metered"] },
+					spending: {
+						policy: "local-hard-budget",
+						budget: {
+							id: "team",
+							currency: "USD",
+							perRequestMax: "2",
+							window: { type: "rolling", durationMs: 86_400_000, maxSpend: "1" },
+						},
+					},
+				},
+			}),
+			[{ path: "modelRoles.engineer.routing.spending.budget", message: "perRequestMax exceeds window.maxSpend" }],
 		],
 	])("rejects %s", (_name, value, expected) => {
 		expect(roleIssues("engineer", value)).toEqual(expected);
+	});
+
+	it("accepts a local hard budget on metered funding", () => {
+		const budget = {
+			id: "team",
+			currency: "USD",
+			perRequestMax: "0.25",
+			window: { type: "rolling", durationMs: 86_400_000, maxSpend: "10.5" },
+		} as const;
+		const group = roleGroup(
+			"engineer",
+			pool({
+				routing: {
+					funding: { order: ["included", "metered"] },
+					spending: { policy: "local-hard-budget", budget },
+				},
+			}),
+		);
+		expect(group.routing?.spending).toEqual({ policy: "local-hard-budget", budget });
 	});
 
 	it("reports every problem of one value, not just the first", () => {

@@ -1135,6 +1135,7 @@ export class AgentSession implements SettingsScope {
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
+	#detachLocalBudgetBeforeModelCall: (() => void) | undefined;
 	/** Claude account lane (`cred:<id>`/`key:<hash>`) that served the latest Anthropic request. */
 	#anthropicSlowModeLane: string | undefined;
 	/** `<lane>#<window>` of the wrap-up window this session already told the model about. */
@@ -2104,6 +2105,10 @@ export class AgentSession implements SettingsScope {
 				throw new DOMException("Usage preflight cancelled", "AbortError");
 			}
 		});
+		// Runs after the usage preflight, so it judges the model the call will actually use.
+		this.#detachLocalBudgetBeforeModelCall = this.agent.addBeforeModelCallHook(signal =>
+			this.#recovery.enforceLocalBudgets(signal),
+		);
 		const statsHost: SessionStatsTrackerHost = {
 			session: this,
 			agent: this.agent,
@@ -4834,6 +4839,8 @@ export class AgentSession implements SettingsScope {
 					this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp = assistantMsg.timestamp;
 					this.#skippedPostTurnSpeculationCompletion = this.#maintenance.speculationCompletion;
 				}
+				// Charged before settling, which may revert a fallback and change the budgets that govern the model.
+				void this.#recovery.chargeLocalBudget(assistantMsg);
 				await this.#recovery.onAssistantSettledSuccessfully(assistantMsg);
 				// Broker deployments: report this request's burn so the broker can
 				// attribute token usage per install. No-op with a local auth store.
@@ -4936,6 +4943,11 @@ export class AgentSession implements SettingsScope {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			// A one-shot run may exit right after it settles; its charges land before that.
+			// Awaited only when charges are pending: an idle await here lets an interrupted
+			// prompt unwind first, so its `agent_end` would no longer be deferred and re-tagged.
+			const budgetFlush = this.#recovery.flushLocalBudgetCharges();
+			if (budgetFlush) await budgetFlush;
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -6504,6 +6516,8 @@ export class AgentSession implements SettingsScope {
 		this.#detachUsageBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
+		this.#detachLocalBudgetBeforeModelCall?.();
+		this.#detachLocalBudgetBeforeModelCall = undefined;
 		if (this.agent.prepareQueuedMessages === this.#prepareQueuedUserMessages) {
 			this.agent.prepareQueuedMessages = undefined;
 		}
@@ -6777,6 +6791,8 @@ export class AgentSession implements SettingsScope {
 		} catch (error) {
 			logger.warn("Active agent run still settling at dispose deadline", { error: String(error) });
 		}
+		// Drained event handlers have issued every charge of this session's calls.
+		await this.#recovery.flushLocalBudgetCharges();
 
 		// Event handlers can reopen the append writer while they persist their
 		// terminal message; that pipeline has drained (or hit the deadline).
