@@ -14,10 +14,12 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
 import { cfgDefaultThinkingLevel } from "../session/settings";
-import { pickDefaultAvailableModel, resolveModelRoleValue } from "./model-resolver";
+import { FORBIDDEN_ENTRY_KEYS, modelGroupPathKey } from "./model-groups";
+import { pickDefaultAvailableModel, type ResolvedModelRoleValue, resolveModelRoleValue } from "./model-resolver";
 import { cfgModelPresets, cfgModelRoleStorage, type ModelPreset } from "./model-settings";
 import type { Settings, SettingProvenance } from "./settings";
 
@@ -30,13 +32,22 @@ export function isValidModelPresetName(name: string): boolean {
 
 type PresetLookup = { kind: "found"; preset: ModelPreset } | { kind: "missing" } | { kind: "invalid"; reason: string };
 
-/** Validate one raw `modelPresets` entry; hand-edited config can hold anything. */
-function parseModelPreset(raw: unknown): ModelPreset | string {
+/**
+ * Validate one raw `modelPresets` entry; hand-edited config can hold anything. A role named by
+ * {@link FORBIDDEN_ENTRY_KEYS} is left out with a warning, so the rest of the preset still applies.
+ */
+function parseModelPreset(name: string, raw: unknown): ModelPreset | string {
 	if (!isRecord(raw)) return "it is not a mapping";
 	const roles = raw.modelRoles;
 	if (!isRecord(roles)) return "`modelRoles` is missing or not a mapping";
 	const modelRoles: Record<string, string> = {};
 	for (const role of Object.keys(roles)) {
+		if (FORBIDDEN_ENTRY_KEYS.includes(role)) {
+			logger.warn("Settings: model preset role name is reserved; ignored", {
+				setting: `modelPresets.${modelGroupPathKey(name)}.modelRoles.${role}`,
+			});
+			continue;
+		}
 		const value = roles[role];
 		if (typeof value !== "string" || value.trim() === "") return `role \`${role}\` is not a model selector`;
 		modelRoles[role] = value;
@@ -60,7 +71,7 @@ function isDefaultThinkingLevel(
 export function getModelPreset(settings: Settings, name: string): PresetLookup {
 	const owned = settings.getOwnedModelPreset(name);
 	if (!owned) return { kind: "missing" };
-	const parsed = parseModelPreset(owned.entry);
+	const parsed = parseModelPreset(name, owned.entry);
 	return typeof parsed === "string" ? { kind: "invalid", reason: parsed } : { kind: "found", preset: parsed };
 }
 
@@ -106,12 +117,29 @@ export function saveModelPreset(settings: Settings, name: string): ModelPreset {
 		throw new Error(`Invalid preset name "${name}": use a letter, then letters, digits, - or _`);
 	}
 	const modelRoles: Record<string, string> = {};
+	const pools = new Set(modelPresetOmittedRoles(settings));
 	for (const [role, selector] of Object.entries(settings.getModelRoles())) {
-		if (selector) modelRoles[role] = selector;
+		if (selector && !pools.has(role)) modelRoles[role] = selector;
 	}
 	const preset: ModelPreset = { modelRoles, defaultThinkingLevel: cfgDefaultThinkingLevel.get(settings) };
 	cfgModelPresets.setEntry(settings, name, preset);
 	return preset;
+}
+
+/**
+ * Roles whose effective value is a model group or group reference, sorted. Presets hold selector
+ * strings only: saving leaves these roles out, and applying a preset leaves them as they are unless
+ * the preset names the role, in which case its selector replaces the group.
+ */
+export function modelPresetOmittedRoles(settings: Settings): string[] {
+	return Object.keys(settings.getModelRoles())
+		.filter(role => isPoolRole(settings, role))
+		.sort((a, b) => a.localeCompare(b));
+}
+
+function isPoolRole(settings: Settings, role: string): boolean {
+	const kind = settings.getModelRoleSpec(role)?.kind;
+	return kind === "group" || kind === "ref";
 }
 
 export type ModelPresetDeleteResult = "deleted" | "missing" | "project";
@@ -156,8 +184,10 @@ const SOURCE_LABELS: Record<SettingProvenance, string> = {
 /** Status line after saving `name`, naming the higher layer whose same-name preset still wins, if any. */
 export function modelPresetSavedMessage(settings: Settings, name: string): string {
 	const owner = modelPresetShadowOwner(settings, name);
-	if (owner === undefined) return `Saved model preset "${name}"`;
-	return `Saved model preset "${name}" to the global config, but the ${SOURCE_LABELS[owner]} still defines a preset of the same name, which takes precedence`;
+	const omitted = modelPresetOmittedRoles(settings);
+	const note = omitted.length === 0 ? "" : `; model group roles are not saved in presets: ${omitted.join(", ")}`;
+	if (owner === undefined) return `Saved model preset "${name}"${note}`;
+	return `Saved model preset "${name}" to the global config, but the ${SOURCE_LABELS[owner]} still defines a preset of the same name, which takes precedence${note}`;
 }
 
 /** Serialize default-role mutations with the model hub's assign/unassign paths. */
@@ -207,7 +237,7 @@ export type ModelPresetSwitchResult =
 
 export type ModelPresetSession = Pick<
 	AgentSession,
-	"setModel" | "setThinkingLevel" | "getAvailableModels" | "scopedModels" | "modelRegistry"
+	"setModel" | "setThinkingLevel" | "getAvailableModels" | "scopedModels" | "modelRegistry" | "resolveRoleModelAsync"
 >;
 
 function presetCandidates(session: ModelPresetSession): Model[] {
@@ -231,14 +261,15 @@ function pickAutomaticDefault(session: ModelPresetSession, candidates: Model[]):
  * Where `default` lands once the preset is written: its model and thinking selector.
  * Without an explicit `:level` on the selector, the preset's own `defaultThinkingLevel`
  * applies even when a higher layer still decides the setting — the switch is for this
- * session; the shadowing layer is reported separately.
+ * session; the shadowing layer is reported separately. A pool `default` resolves by its strategy and
+ * funding policy through the session; one its policy blocks is reported by the error's message.
  */
-function resolveLiveDefault(
+async function resolveLiveDefault(
 	settings: Settings,
 	session: ModelPresetSession,
 	candidates: Model[],
 	preset: ModelPreset,
-): { model: Model; thinkingLevel: ConfiguredThinkingLevel | undefined } | string {
+): Promise<{ model: Model; thinkingLevel: ConfiguredThinkingLevel | undefined } | string> {
 	const roleValue = settings.getModelRole("default");
 	const fallbackLevel =
 		preset.defaultThinkingLevel ?? parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(settings));
@@ -246,7 +277,17 @@ function resolveLiveDefault(
 		const model = pickAutomaticDefault(session, candidates);
 		return model ? { model, thinkingLevel: fallbackLevel } : "no model with configured credentials is available";
 	}
-	const resolved = resolveModelRoleValue(roleValue, candidates, { settings });
+	let resolved: ResolvedModelRoleValue;
+	if (rolePoolTarget(settings, "default")) {
+		try {
+			resolved = await session.resolveRoleModelAsync("default", { availableModels: candidates });
+		} catch (error) {
+			if (error instanceof RolePoolUnavailableError) return error.message;
+			throw error;
+		}
+	} else {
+		resolved = resolveModelRoleValue(roleValue, candidates, { settings });
+	}
 	if (!resolved.model) return `default model \`${roleValue}\` is not available`;
 	if (!session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 		return `no credentials for ${resolved.model.provider}/${resolved.model.id}`;
@@ -261,6 +302,9 @@ function resolveLiveDefault(
 function writePresetRoles(settings: Settings, preset: ModelPreset): void {
 	const project = cfgModelRoleStorage.get(settings) === "project";
 	const roles = new Set([...Object.keys(settings.getModelRoles()), ...Object.keys(preset.modelRoles)]);
+	for (const role of modelPresetOmittedRoles(settings)) {
+		if (!Object.hasOwn(preset.modelRoles, role)) roles.delete(role);
+	}
 	if (project) {
 		for (const role of roles) {
 			const value = Object.hasOwn(preset.modelRoles, role) ? preset.modelRoles[role] : undefined;
@@ -291,6 +335,9 @@ function writePresetRoles(settings: Settings, preset: ModelPreset): void {
 function shadowedRoles(settings: Settings, preset: ModelPreset): ModelPresetShadowedRole[] {
 	const effective = settings.getModelRoles();
 	const roles = new Set([...Object.keys(effective), ...Object.keys(preset.modelRoles)]);
+	for (const role of modelPresetOmittedRoles(settings)) {
+		if (!Object.hasOwn(preset.modelRoles, role)) roles.delete(role);
+	}
 	const shadowed: ModelPresetShadowedRole[] = [];
 	for (const role of [...roles].sort((a, b) => a.localeCompare(b))) {
 		const expected = Object.hasOwn(preset.modelRoles, role) ? preset.modelRoles[role] : undefined;
@@ -368,7 +415,7 @@ async function applyModelPresetLocked(
 	const shadowed = shadowedRoles(settings, preset);
 	const thinkingShadow = shadowedThinking(settings, preset);
 
-	const live = resolveLiveDefault(settings, session, candidates, preset);
+	const live = await resolveLiveDefault(settings, session, candidates, preset);
 	if (typeof live === "string") return { kind: "failed", reason: live, shadowed };
 	try {
 		await session.setModel(live.model, "default", { persist: false });

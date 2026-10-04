@@ -57,10 +57,14 @@ import {
 	calculateRetryBackoffDelayMs,
 	findRetryFallbackCandidates,
 	formatRetryFallbackSelector,
-	getRetryFallbackChains,
+	getRetryFallbackChain,
+	recordRetryFallbackRoundRobinPosition,
+	type RetryFallbackStrategy,
+	expandDefaultRetryFallbackChains,
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
 	type RetryFallbackChains,
+	type RetryFallbackHealthLookups,
 	type RetryFallbackResolutionContext,
 	type RetryFallbackRevertPolicy,
 	type RetryFallbackSelector,
@@ -69,6 +73,16 @@ import {
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
 import { describeUsageFallback } from "./retry-fallback-reason";
+import {
+	type GroupFallbackChain,
+	getRetryFallbackChainsWithGroups,
+	resolveChainGroupPolicy,
+	resolveRetryFallbackGroupPolicy,
+	resolveRolePoolGroup,
+	rolePoolMemberSelectors,
+	withRolePoolChainKeys,
+} from "./retry-fallback-groups";
+import { PoolSelection } from "./pool-selection";
 import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
@@ -314,6 +328,8 @@ export class TurnRecovery {
 		handle: AnthropicFallbackCreditHandle;
 	};
 	#usageReserveApproval: { model: string; sessionId: string } | undefined;
+	/** Strategy ordering and funding filters of group-form chains, with this session's notice dedupe. */
+	readonly #poolSelection: PoolSelection;
 	#pendingRetryErrors: PendingRetryError[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
 	#emptyStopRetryCount = 0;
@@ -361,6 +377,13 @@ export class TurnRecovery {
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
+		this.#poolSelection = new PoolSelection({
+			settings: host.settings,
+			modelRegistry: host.modelRegistry,
+			sessionId: () => host.sessionId(),
+			emitNotice: message =>
+				host.emitSessionEvent({ type: "notice", level: "warning", message, source: "retry-fallback" }),
+		});
 		if (options.initialRetryFallback) {
 			this.#activeRetryFallback = {
 				...options.initialRetryFallback,
@@ -1641,10 +1664,18 @@ export class TurnRecovery {
 			chains: this.#getRetryFallbackChains(),
 			getModelRole: role => this.#host.settings.getModelRole(role),
 			modelLookup: this.#host.modelRegistry,
+			getRolePoolMembers: role => rolePoolMemberSelectors(this.#host.settings, role),
 		};
 	}
 	#getRetryFallbackChains(): RetryFallbackChains {
-		return getRetryFallbackChains(this.#host.settings);
+		const settings = this.#host.settings;
+		return withRolePoolChainKeys(
+			expandDefaultRetryFallbackChains(
+				getRetryFallbackChainsWithGroups(settings),
+				Object.keys(settings.getModelRoles()),
+			),
+			settings,
+		);
 	}
 
 	/**
@@ -1790,13 +1821,41 @@ export class TurnRecovery {
 	#liveRetryRoleHint(currentModel: Model | null | undefined): string | undefined {
 		const role = this.#host.sessionManager?.getLastModelChangeRole?.();
 		if (!role || role === EPHEMERAL_MODEL_CHANGE_ROLE || !currentModel) return undefined;
+		const poolMembers = rolePoolMemberSelectors(this.#host.settings, role);
+		if (poolMembers) {
+			// A pool role owns whichever of its members is running.
+			const running = poolMembers.some(selector => {
+				const resolved = resolveModelOverride([selector], this.#host.modelRegistry, this.#host.settings, {
+					exact: true,
+				});
+				return resolved.model !== undefined && modelsAreEqual(resolved.model, currentModel);
+			});
+			return running ? role : undefined;
+		}
 		const configured = this.#host.settings.getModelRole(role);
 		if (!configured) return undefined;
 		const resolved = resolveModelOverride([configured], this.#host.modelRegistry, this.#host.settings);
 		return resolved.model && modelsAreEqual(resolved.model, currentModel) ? role : undefined;
 	}
 
-	/** Finds fallback candidates that follow the active selector. */
+	/**
+	 * Resolves a fallback-chain selector to the model it names. Members of a model group are exact
+	 * references, never matched to a fuzzy neighbor; selector-list entries and the role's own
+	 * `modelRoles` assignment keep pattern matching.
+	 */
+	resolveRetryFallbackCandidate(role: string, selector: RetryFallbackSelector): Model | undefined {
+		const isRoleAssignment = this.#host.settings.getModelRole(role)?.trim() === selector.raw;
+		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings, {
+			exact: !isRoleAssignment && resolveRetryFallbackGroupPolicy(this.#host.settings, role) !== undefined,
+		});
+		return resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+	}
+
+	/**
+	 * Finds fallback candidates that follow the active selector, in configured
+	 * order. A chain whose strategy is not `priority` also offers the entries
+	 * before the active selector, since its order is not positional.
+	 */
 	findRetryFallbackCandidates(
 		role: string,
 		currentSelector: string,
@@ -1808,7 +1867,148 @@ export class TurnRecovery {
 			role,
 			currentSelector,
 			currentModel,
+			{ wrapAround: options?.wrapAround === true || this.#retryFallbackStrategy(role) !== "priority" },
+		);
+	}
+
+	/**
+	 * Ordering of the walk of `role`: the strategy of the model group that governs it
+	 * ({@link resolveRetryFallbackGroupPolicy}), `priority` for a selector-list chain
+	 * ({@link PoolSelection.strategy}).
+	 */
+	#retryFallbackStrategy(
+		role: string,
+		policy: GroupFallbackChain | undefined = resolveRetryFallbackGroupPolicy(this.#host.settings, role),
+	): RetryFallbackStrategy {
+		return this.#poolSelection.strategy(policy);
+	}
+
+	/**
+	 * {@link findRetryFallbackCandidates}, ordered by the chain's strategy ({@link PoolSelection.order})
+	 * and filtered by its group's funding policy ({@link PoolSelection.filterFunding}).
+	 *
+	 * `round-robin` starts a new walk (`walkActive` false) after the entry this
+	 * process last applied from the same chain; a walk under way continues
+	 * around the chain from its current entry, and cooldown suppression keeps
+	 * failed entries out. A group with `routing.funding` keeps only candidates
+	 * its billing evidence authorizes, stage by stage in funding order with
+	 * strategy order inside a stage, and emits one `notice` naming the
+	 * candidates it skipped.
+	 */
+	async orderedRetryFallbackCandidates(
+		role: string,
+		currentSelector: string,
+		currentModel: Model | null | undefined,
+		options: {
+			walkActive: boolean;
+			wrapAround?: boolean;
+			signal?: AbortSignal;
+			lookups?: RetryFallbackHealthLookups;
+		},
+	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
+		const settings = this.#host.settings;
+		const candidates = this.findRetryFallbackCandidates(role, currentSelector, currentModel, options);
+		const chain = () =>
+			getRetryFallbackChain(this.#getRetryFallbackResolutionContext(), role, currentSelector, currentModel);
+		const rolePool = this.#rolePoolMembers(role);
+		if (!rolePool) {
+			return this.#orderAndFundCandidates(
+				role,
+				role,
+				candidates,
+				resolveChainGroupPolicy(settings, role),
+				chain,
+				options,
+			);
+		}
+		// A pool role walks its other members by the pool's own policy, then its configured entries by theirs.
+		const memberRaws = new Set(rolePool.members.map(member => member.raw));
+		const pool = await this.#orderAndFundCandidates(
+			role,
+			role,
+			candidates.filter(candidate => memberRaws.has(candidate.raw)),
+			rolePool.policy,
+			() => rolePool.members,
 			options,
+		);
+		const rest = await this.#orderAndFundCandidates(
+			role,
+			`retry.fallbackChains.${role}`,
+			candidates.filter(candidate => !memberRaws.has(candidate.raw)),
+			resolveChainGroupPolicy(settings, role),
+			chain,
+			options,
+		);
+		return {
+			candidates: [...pool.candidates, ...rest.candidates],
+			health: new Map([...pool.health, ...rest.health]),
+		};
+	}
+
+	/** `role`'s pool policy and parsed members in configured order; `undefined` for a legacy role. */
+	#rolePoolMembers(role: string): { policy: GroupFallbackChain; members: RetryFallbackSelector[] } | undefined {
+		const policy = resolveRolePoolGroup(this.#host.settings, role);
+		if (!policy) return undefined;
+		const members: RetryFallbackSelector[] = [];
+		for (const entry of policy.members) {
+			const parsed = parseRetryFallbackSelector(entry.selector, this.#host.modelRegistry);
+			if (parsed && !members.some(member => member.raw === parsed.raw)) members.push(parsed);
+		}
+		return { policy, members };
+	}
+
+	async #orderAndFundCandidates(
+		role: string,
+		label: string,
+		candidates: RetryFallbackSelector[],
+		policy: GroupFallbackChain | undefined,
+		chain: () => readonly RetryFallbackSelector[],
+		options: { walkActive: boolean; signal?: AbortSignal; lookups?: RetryFallbackHealthLookups },
+	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
+		const resolveCandidate = (selector: RetryFallbackSelector) => this.resolveRetryFallbackCandidate(role, selector);
+		const strategy = this.#poolSelection.strategy(policy);
+		const ordered = await this.#poolSelection.order(label, candidates, strategy, policy, {
+			purpose: "retry-fallback",
+			resolveCandidate,
+			chain,
+			walkActive: options.walkActive,
+			signal: options.signal,
+			lookups: options.lookups,
+		});
+		const funding = policy?.group.routing?.funding;
+		if (!policy || !funding || ordered.candidates.length === 0) return ordered;
+		const filtered = await this.#poolSelection.filterFunding(label, ordered.candidates, policy, funding, {
+			purpose: "retry-fallback",
+			resolveCandidate,
+			signal: options.signal,
+		});
+		return { candidates: filtered.funded, health: ordered.health };
+	}
+
+	/**
+	 * Records an applied fallback for its round-robin position: a pool role's member against the
+	 * pool's members (the cursor its role picks share), any other entry against its chain. Other
+	 * strategies ignore it.
+	 */
+	noteRetryFallbackApplied(
+		role: string,
+		selector: RetryFallbackSelector,
+		currentSelector: string,
+		currentModel: Model | null | undefined,
+	): void {
+		const rolePool = this.#rolePoolMembers(role);
+		if (rolePool?.members.some(member => member.raw === selector.raw)) {
+			if (this.#poolSelection.strategy(rolePool.policy) === "round-robin") {
+				recordRetryFallbackRoundRobinPosition(rolePool.members, selector);
+			}
+			return;
+		}
+		const policy = rolePool ? resolveChainGroupPolicy(this.#host.settings, role) : undefined;
+		const strategy = rolePool ? this.#poolSelection.strategy(policy) : this.#retryFallbackStrategy(role);
+		if (strategy !== "round-robin") return;
+		recordRetryFallbackRoundRobinPosition(
+			getRetryFallbackChain(this.#getRetryFallbackResolutionContext(), role, currentSelector, currentModel),
+			selector,
 		);
 	}
 
@@ -1874,11 +2074,17 @@ export class TurnRecovery {
 		let fallback: { role: string; selector: RetryFallbackSelector; apiKey: string } | undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const chainKeys = this.retryFallbackChainKeys(currentSelector, currentModel);
+		const lookups: RetryFallbackHealthLookups = new Map();
 		for (const role of chainKeys) {
-			for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+			const ordered = await this.orderedRetryFallbackCandidates(role, currentSelector, currentModel, {
+				walkActive: this.#activeRetryFallback !== undefined,
+				signal,
+				lookups,
+			});
+			if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
+			for (const candidate of ordered.candidates) {
 				if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
-				const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
+				const candidateModel = this.resolveRetryFallbackCandidate(role, candidate);
 				if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 				// A usage fallback must also fit: skip a candidate whose window cannot
@@ -1886,16 +2092,16 @@ export class TurnRecovery {
 				// (issue #8065).
 				if (!this.#host.contextFitsModel(candidateModel)) continue;
 				try {
-					const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(
-						candidateModel.provider,
-						{
+					// An answer the quota ordering already has is reused; anything else is queried here.
+					const candidateHealth =
+						ordered.health.get(candidate.raw) ??
+						(await this.#host.modelRegistry.authStorage.health.model(candidateModel.provider, {
 							modelId: candidateModel.id,
 							sessionId: this.#host.sessionId(),
 							baseUrl: candidateModel.baseUrl,
 							reserveFraction: cfgRetryUsageReservePct.get(this.#host.settings) / 100,
 							signal,
-						},
-					);
+						}));
 					if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
 					if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
 					if (candidateHealth.state === "healthy") {
@@ -2014,8 +2220,7 @@ export class TurnRecovery {
 		currentSelector: string,
 		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
 	): Promise<boolean> {
-		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+		const candidate = this.resolveRetryFallbackCandidate(role, selector);
 		if (!candidate) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
@@ -2071,6 +2276,7 @@ export class TurnRecovery {
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
+		this.noteRetryFallbackApplied(role, selector, currentSelector, previousModel);
 		if (!this.#activeRetryFallback) {
 			this.#activeRetryFallback = {
 				role,
@@ -2102,6 +2308,7 @@ export class TurnRecovery {
 			pinFallback?: boolean;
 			preserveFailedTurn?: boolean;
 			wrapAround?: boolean;
+			signal?: AbortSignal;
 		},
 	): Promise<boolean> {
 		const ceiling = this.#host.thinkingLevelCeiling();
@@ -2115,11 +2322,20 @@ export class TurnRecovery {
 			? this.#host.modelRegistry.find(failedMessage.provider, failedMessage.model)
 			: undefined;
 		const creditTargets = failedModel ? fallbackCreditTargets(failedModel) : [];
+		const lookups: RetryFallbackHealthLookups = new Map();
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
-			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
+			// A pool role locates its running member by model; selector chains keep the selector-only lookup.
+			const runningModel = rolePoolMemberSelectors(this.#host.settings, role) ? this.#host.model() : undefined;
+			const { candidates } = await this.orderedRetryFallbackCandidates(role, currentSelector, runningModel, {
+				walkActive: this.#activeRetryFallback !== undefined,
+				wrapAround: options?.wrapAround,
+				signal: options?.signal,
+				lookups,
+			});
+			if (options?.signal?.aborted) return false;
+			for (const selector of candidates) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
-				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				const candidate = this.resolveRetryFallbackCandidate(role, selector);
 				if (!candidate) continue;
 				// A candidate that would leave the request exactly as it is — same
 				// routed model, same effective thinking level — is not a switch, and
@@ -2167,7 +2383,10 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
 				}
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), {
+					signal: options?.signal,
+				});
+				if (options?.signal?.aborted) return false;
 				if (!apiKey) continue;
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
@@ -2643,12 +2862,32 @@ export class TurnRecovery {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
 				}
-				switchedModel = await this.#tryRetryModelFallback(currentSelector, message, {
-					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
-					pinFallback: classifierRefusal,
-					preserveFailedTurn,
-					wrapAround: longUsageLimitFallback,
-				});
+				// The fallback search may wait on usage health; register its signal as the
+				// retry controller so `abortRetry()` cancels it like the backoff sleep.
+				const fallbackAbortController = new AbortController();
+				this.#retryAbortController?.abort();
+				this.#retryAbortController = fallbackAbortController;
+				let ownsRetryController = true;
+				try {
+					switchedModel = await this.#tryRetryModelFallback(currentSelector, message, {
+						excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
+						pinFallback: classifierRefusal,
+						preserveFailedTurn,
+						wrapAround: longUsageLimitFallback,
+						signal: fallbackAbortController.signal,
+					});
+				} catch (error) {
+					if (!fallbackAbortController.signal.aborted) throw error;
+				} finally {
+					ownsRetryController = this.#retryAbortController === fallbackAbortController;
+					if (ownsRetryController) this.#retryAbortController = undefined;
+				}
+				if (fallbackAbortController.signal.aborted) {
+					// A swap that committed before the abort stays: its model change is
+					// persisted and announced, and the revert policy restores the primary.
+					// Only the retry request is cancelled.
+					return ownsRetryController ? this.#endCancelledRetry() : false;
+				}
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
 			// of the role-fallback setting: it's intrinsic to the Fast contract (speed

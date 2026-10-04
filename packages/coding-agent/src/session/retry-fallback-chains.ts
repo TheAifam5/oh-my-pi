@@ -1,7 +1,7 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { Model, ModelUsageHealth, ModelUsageHealthState } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../config/model-registry";
-import { cfgModelRoles } from "../config/model-settings";
+import { cfgModelRoles, type ModelRoleEntry } from "../config/model-settings";
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { formatModelString, formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -13,6 +13,13 @@ import {
 import { resolveConfiguredModelPatterns, resolveModelRoleValue } from "../config/model-resolver";
 import { getRoleInfo, isKindRole } from "../config/model-roles";
 
+import {
+	assertModelRoleName,
+	type GroupStrategyName,
+	isModelGroupForm,
+	parseFallbackChainValue,
+} from "../config/model-groups";
+import { getSelectorFallbackChains } from "./retry-fallback-selector-chains";
 import { cfgRetryFallbackChains, cfgRetryFallbackRevertPolicy } from "./settings";
 
 /** Configured fallback chains keyed by role or model selector. */
@@ -20,6 +27,46 @@ export type RetryFallbackChains = Record<string, string[]>;
 
 /** Policy controlling restoration of a fallback chain's primary model. */
 export type RetryFallbackRevertPolicy = "never" | "cooldown-expiry";
+
+/** How a fallback chain orders its candidates. A selector-list chain always uses `priority`. */
+export type RetryFallbackStrategy = GroupStrategyName;
+
+/** Usage evidence the `quota` strategy ranks one candidate by. */
+export interface RetryFallbackQuotaEvidence {
+	state: ModelUsageHealthState;
+	/** Largest remaining quota fraction (0..1) among the candidate's usable accounts. */
+	remainingFraction?: number;
+	/** Epoch ms the evidence was observed; missing or older than the max age counts as unknown. */
+	observedAt?: number;
+}
+
+/** Usage-health lookups shared by the orderings of one fallback walk, keyed by routed model. */
+export type RetryFallbackHealthLookups = Map<string, Promise<ModelUsageHealth | undefined>>;
+
+/** Inputs for {@link orderRetryFallbackCandidates}. */
+export interface RetryFallbackOrderOptions<T> {
+	/** Quota evidence for a candidate; `undefined` counts as unknown. Read only by `quota`. */
+	evidence?: (candidate: T) => RetryFallbackQuotaEvidence | undefined;
+	/** Current epoch ms used to age evidence. */
+	nowMs: number;
+	/** Oldest evidence, in ms, that still counts. */
+	maxAgeMs: number;
+	/** Whether `quota` drops candidates whose fresh evidence is unknown instead of ranking them after known ones. */
+	excludeUnknown?: boolean;
+	/** Positive relative weight of a candidate; missing means 1. Read only by `weighted-random`. */
+	weight?: (candidate: T) => number | undefined;
+	/** Uniform source in [0, 1). Read by `random` and `weighted-random`; default `Math.random`. */
+	random?: () => number;
+	/** A candidate's index in the full effective chain. Read only by `round-robin`. */
+	chainPosition?: (candidate: T) => number | undefined;
+	/** Length of the full effective chain. Read only by `round-robin`. */
+	chainLength?: number;
+	/**
+	 * Chain index of the entry last applied from this chain. `round-robin` starts
+	 * after it; `undefined` keeps the given order.
+	 */
+	lastAppliedPosition?: number;
+}
 
 /** Parsed model selector used by retry fallback resolution. */
 export interface RetryFallbackSelector {
@@ -44,6 +91,12 @@ export interface RetryFallbackResolutionContext {
 	chains: RetryFallbackChains;
 	getModelRole(role: string): string | undefined;
 	modelLookup: RetryFallbackModelLookup;
+	/**
+	 * Member selectors of a role assigned a model pool, in configured order; `undefined` for a role
+	 * with a legacy value. A pool role's chain starts with the member that is running, followed by
+	 * its other members and then its configured entries.
+	 */
+	getRolePoolMembers?(role: string): readonly string[] | undefined;
 }
 
 /** Active retry fallback state retained until the primary can be restored. */
@@ -165,11 +218,12 @@ export function expandDefaultRetryFallbackChains(
 	return chains;
 }
 
-/** Resolves configured fallback chains, applying the default chain to named roles. */
+/**
+ * Resolves configured selector chains, applying the default chain to named roles. Model-group
+ * chains read as unset ({@link getSelectorFallbackChains}).
+ */
 export function getRetryFallbackChains(settings: Settings): RetryFallbackChains {
-	const configuredChains = cfgRetryFallbackChains.get(settings);
-	if (!configuredChains || typeof configuredChains !== "object") return {};
-	return expandDefaultRetryFallbackChains(configuredChains, Object.keys(settings.getModelRoles()));
+	return expandDefaultRetryFallbackChains(getSelectorFallbackChains(settings), Object.keys(settings.getModelRoles()));
 }
 
 /**
@@ -187,7 +241,7 @@ export interface RetryFallbackRole {
 /** Reads the primary and non-empty chain installed for `role`, if any. */
 export function getRetryFallbackRole(settings: Settings, role: string): RetryFallbackRole | undefined {
 	const primary = settings.getModelRole(role);
-	const chain = cfgRetryFallbackChains.get(settings)[role];
+	const chain = getSelectorFallbackChains(settings)[role];
 	if (!primary || !Array.isArray(chain) || chain.length === 0) return undefined;
 	return { primary, chain };
 }
@@ -196,17 +250,21 @@ export function getRetryFallbackRole(settings: Settings, role: string): RetryFal
  * Assigns `role` its primary and installs its chain ahead of every configured
  * chain, so another role assigned the same model cannot capture its routing.
  * Overrides are session-scoped: nothing is written to the user's config.
+ *
+ * @throws ReservedModelRoleError when `role` is `__proto__`, `constructor`, or `prototype`.
  */
 export function installRetryFallbackRole(
 	settings: Settings,
 	role: string,
 	{ primary, chain }: RetryFallbackRole,
 ): void {
-	const modelRoles: Record<string, string> = {};
-	const existingRoles = settings.getModelRoles();
+	assertModelRoleName(role);
+	// Raw entries, not getModelRoles() projections: a pool role must keep its strategy and routing.
+	const modelRoles: Record<string, ModelRoleEntry> = {};
+	const existingRoles = settings.getModelRoleEntries();
 	for (const key in existingRoles) {
-		const selector = existingRoles[key];
-		if (selector) modelRoles[key] = selector;
+		const entry = existingRoles[key];
+		if (entry) modelRoles[key] = entry;
 	}
 	modelRoles[role] = primary;
 	cfgModelRoles.override(settings, modelRoles);
@@ -285,6 +343,11 @@ export function validateRetryFallbackChains(
 				}
 			}
 		}
+		if (isModelGroupForm(chain)) {
+			const parsed = parseFallbackChainValue(key, chain, "strict");
+			if (!parsed.ok) for (const issue of parsed.issues) report(`${issue.path}: ${issue.message}`);
+			continue;
+		}
 		if (!Array.isArray(chain)) {
 			report(`Fallback chain for ${keyKind} '${key}' must be an array of selector strings.`);
 			continue;
@@ -360,6 +423,47 @@ function getRetryFallbackPrimarySelector(
 
 /** How a chain key's primary selector matches the current selector. */
 type SelectorMatchKind = "exact" | "normalized" | "base" | "effort" | "none";
+
+/** Strength of each {@link SelectorMatchKind}; higher wins. */
+const SELECTOR_MATCH_RANK: Record<SelectorMatchKind, number> = { exact: 4, normalized: 3, base: 2, effort: 1, none: 0 };
+
+/** Parsed members of a pool role, deduplicated in configured order; `undefined` for a legacy role. */
+function rolePoolMembers(
+	context: RetryFallbackResolutionContext,
+	chainKey: string,
+): RetryFallbackSelector[] | undefined {
+	if (isRetryFallbackModelKey(chainKey)) return undefined;
+	const selectors = context.getRolePoolMembers?.(chainKey);
+	if (!selectors) return undefined;
+	const seen = new Set<string>();
+	const members: RetryFallbackSelector[] = [];
+	for (const selector of selectors) {
+		const parsed = parseRetryFallbackSelector(selector, context.modelLookup);
+		if (!parsed || seen.has(parsed.raw)) continue;
+		seen.add(parsed.raw);
+		members.push(parsed);
+	}
+	return members;
+}
+
+/** The pool member matching the current selector most strongly, with how it matches. */
+function bestRolePoolMember(
+	members: readonly RetryFallbackSelector[],
+	current: RetryFallbackSelector | undefined,
+	currentPlain: RetryFallbackSelector | undefined,
+	currentModel: Model | null | undefined,
+): { member: RetryFallbackSelector | undefined; kind: SelectorMatchKind } {
+	let best: { member: RetryFallbackSelector | undefined; kind: SelectorMatchKind } = {
+		member: undefined,
+		kind: "none",
+	};
+	if (!current) return best;
+	for (const member of members) {
+		const kind = selectorMatchKind(member, current, currentPlain, currentModel);
+		if (SELECTOR_MATCH_RANK[kind] > SELECTOR_MATCH_RANK[best.kind]) best = { member, kind };
+	}
+	return best;
+}
 
 /**
  * Classify how a chain key's primary selector matches the current selector.
@@ -485,12 +589,15 @@ export function resolveRetryFallbackChainKey(
 	let effortRole: string | undefined;
 	for (const key in context.chains) {
 		if (isRetryFallbackModelKey(key)) continue;
-		const kind = selectorMatchKind(
-			getRetryFallbackPrimarySelector(context, key),
-			parsedCurrent,
-			parsedPlainCurrent,
-			currentModel,
-		);
+		const poolMembers = rolePoolMembers(context, key);
+		const kind = poolMembers
+			? bestRolePoolMember(poolMembers, parsedCurrent, parsedPlainCurrent, currentModel).kind
+			: selectorMatchKind(
+					getRetryFallbackPrimarySelector(context, key),
+					parsedCurrent,
+					parsedPlainCurrent,
+					currentModel,
+				);
 		if (kind === "none") continue;
 		if (kind === "effort") {
 			if (key === "default" || effortRole === undefined) effortRole = key;
@@ -549,6 +656,16 @@ function parseRetryFallbackChainEntry(
 	return { raw: `${provider}/${id}`, provider, id, thinkingLevel: undefined };
 }
 
+/** The effective chain for `chainKey`: its primary selector followed by its entries. */
+export function getRetryFallbackChain(
+	context: RetryFallbackResolutionContext,
+	chainKey: string,
+	currentSelector: string,
+	currentModel?: Model | null,
+): RetryFallbackSelector[] {
+	return getRetryFallbackEffectiveChain(context, chainKey, currentSelector, currentModel, false);
+}
+
 /** Builds a fallback chain beginning with its effective primary selector. */
 function getRetryFallbackEffectiveChain(
 	context: RetryFallbackResolutionContext,
@@ -568,7 +685,23 @@ function getRetryFallbackEffectiveChain(
 			: undefined);
 	const seen = new Set<string>();
 	const chain: RetryFallbackSelector[] = [];
-	if (isRetryFallbackWildcardKey(chainKey)) {
+	const poolMembers = rolePoolMembers(context, chainKey);
+	if (poolMembers && poolMembers.length > 0) {
+		// The running member is the primary; the rest of the pool follows in configured order.
+		const currentPlain = currentModel
+			? parseRetryFallbackSelector(
+					formatModelSelectorValue(formatModelString(currentModel), parsedConfigured?.thinkingLevel),
+					context.modelLookup,
+				)
+			: undefined;
+		const primary =
+			bestRolePoolMember(poolMembers, parsedCurrent, currentPlain, currentModel).member ?? poolMembers[0];
+		for (const member of [primary, ...poolMembers]) {
+			if (seen.has(member.raw)) continue;
+			seen.add(member.raw);
+			chain.push(member);
+		}
+	} else if (isRetryFallbackWildcardKey(chainKey)) {
 		// A wildcard key has no fixed primary: the active model is the
 		// primary, followed by the configured provider-level fallbacks.
 		if (parsedCurrent) {
@@ -647,4 +780,133 @@ export function findRetryFallbackCandidates(
 		return options?.wrapAround ? [...candidatesAfter, ...chain.slice(0, baseIndex)] : candidatesAfter;
 	}
 	return chain;
+}
+
+/** Rank of a quota state; lower is tried first. Depleted is known non-viable, so it follows unknown. */
+const QUOTA_STATE_RANK: Record<ModelUsageHealthState, number> = { healthy: 0, reserve: 1, unknown: 2, depleted: 3 };
+
+/**
+ * Orders fallback candidates by `strategy`, returning a new array.
+ *
+ * - `priority` keeps the given order.
+ * - `round-robin` orders by chain position, starting after
+ *   `lastAppliedPosition` and wrapping; a candidate with no position goes last.
+ * - `random` is a uniform random permutation; `weighted-random` draws without
+ *   replacement with probability proportional to each remaining weight.
+ * - `quota` sorts healthy before reserve before unknown before depleted, and
+ *   by larger remaining fraction within a state, with a fraction-less entry
+ *   after those reporting one. Missing evidence, and evidence older than
+ *   `maxAgeMs`, counts as unknown; `excludeUnknown` drops those candidates.
+ *   Ties keep the given order.
+ */
+export function orderRetryFallbackCandidates<T>(
+	candidates: readonly T[],
+	strategy: RetryFallbackStrategy,
+	options: RetryFallbackOrderOptions<T>,
+): T[] {
+	if (strategy === "random" || strategy === "weighted-random") {
+		const random = options.random ?? Math.random;
+		const weight = (candidate: T): number => {
+			if (strategy === "random") return 1;
+			const value = options.weight?.(candidate);
+			return value !== undefined && Number.isFinite(value) && value > 0 ? value : 1;
+		};
+		// Efraimidis-Spirakis: sorting by u^(1/w) descending samples without replacement by weight.
+		return candidates
+			.map((candidate, index) => ({ candidate, index, key: random() ** (1 / weight(candidate)) }))
+			.sort((a, b) => b.key - a.key || a.index - b.index)
+			.map(entry => entry.candidate);
+	}
+	if (strategy === "priority" || (candidates.length <= 1 && strategy !== "quota")) return [...candidates];
+	if (strategy === "round-robin") {
+		const { chainPosition, chainLength, lastAppliedPosition } = options;
+		if (lastAppliedPosition === undefined || !chainPosition || !chainLength) return [...candidates];
+		const distance = (candidate: T): number => {
+			const position = chainPosition(candidate);
+			return position === undefined ? chainLength : (position - lastAppliedPosition - 1 + chainLength) % chainLength;
+		};
+		return candidates
+			.map((candidate, index) => ({ candidate, index, distance: distance(candidate) }))
+			.sort((a, b) => a.distance - b.distance || a.index - b.index)
+			.map(entry => entry.candidate);
+	}
+	const ranked = candidates.map((candidate, index) => {
+		const evidence = options.evidence?.(candidate);
+		const fresh =
+			evidence?.observedAt !== undefined && options.nowMs - evidence.observedAt <= options.maxAgeMs
+				? evidence
+				: undefined;
+		return {
+			candidate,
+			index,
+			rank: QUOTA_STATE_RANK[fresh?.state ?? "unknown"],
+			remaining: fresh?.state === "unknown" ? undefined : fresh?.remainingFraction,
+		};
+	});
+	const considered = options.excludeUnknown ? ranked.filter(entry => entry.rank !== QUOTA_STATE_RANK.unknown) : ranked;
+	considered.sort((a, b) => {
+		if (a.rank !== b.rank) return a.rank - b.rank;
+		if (a.remaining !== b.remaining) {
+			if (a.remaining === undefined) return 1;
+			if (b.remaining === undefined) return -1;
+			return b.remaining - a.remaining;
+		}
+		return a.index - b.index;
+	});
+	return considered.map(entry => entry.candidate);
+}
+
+/**
+ * Quota evidence summarizing a candidate's usage health: its aggregate state,
+ * the largest remaining fraction among healthy or reserve accounts, and the
+ * newest observation. An account's observation is its usage report's fetch
+ * time; a depleted account with no report reflects a live credential block,
+ * observed at `nowMs`.
+ */
+export function retryFallbackQuotaEvidence(
+	health: ModelUsageHealth | undefined,
+	nowMs: number,
+): RetryFallbackQuotaEvidence | undefined {
+	if (!health) return undefined;
+	let remainingFraction: number | undefined;
+	let observedAt: number | undefined;
+	for (const account of health.accounts) {
+		const accountObservedAt = account.fetchedAt ?? (account.state === "depleted" ? nowMs : undefined);
+		if (accountObservedAt !== undefined) observedAt = Math.max(observedAt ?? accountObservedAt, accountObservedAt);
+		if ((account.state === "healthy" || account.state === "reserve") && account.remainingFraction !== undefined) {
+			remainingFraction = Math.max(remainingFraction ?? account.remainingFraction, account.remainingFraction);
+		}
+	}
+	return { state: health.state, remainingFraction, observedAt };
+}
+
+/**
+ * Chain index of the entry each round-robin chain last applied, keyed by the
+ * chain's selectors so every session and subagent in this process walking the
+ * same chain shares one position. Not persisted; bounded by the number of
+ * distinct configured chains.
+ */
+const roundRobinPositions = new Map<string, number>();
+
+function roundRobinChainId(chain: readonly RetryFallbackSelector[]): string {
+	return chain.map(selector => selector.raw).join("\n");
+}
+
+/** Chain index of the entry last applied from `chain` in this process, if any. */
+export function getRetryFallbackRoundRobinPosition(chain: readonly RetryFallbackSelector[]): number | undefined {
+	return roundRobinPositions.get(roundRobinChainId(chain));
+}
+
+/** Records that `selector` was applied from `chain`; a selector outside the chain is ignored. */
+export function recordRetryFallbackRoundRobinPosition(
+	chain: readonly RetryFallbackSelector[],
+	selector: RetryFallbackSelector,
+): void {
+	const position = chain.findIndex(entry => entry.raw === selector.raw);
+	if (position >= 0) roundRobinPositions.set(roundRobinChainId(chain), position);
+}
+
+/** Forgets every recorded round-robin position, so isolated tests start from configured order. */
+export function resetRetryFallbackRoundRobinPositions(): void {
+	roundRobinPositions.clear();
 }

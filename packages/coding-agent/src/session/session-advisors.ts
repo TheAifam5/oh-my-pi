@@ -101,12 +101,14 @@ import type { AgentSessionEvent } from "./agent-session-events";
 import type { ClientBridge } from "./client-bridge";
 import { resolveCompactionMethodOrder, resolveMethodSettings } from "./compaction-methods";
 import { type CustomMessage, type CustomMessagePayload, isUserAuthoredMessage, isUserTurnInitiator } from "./messages";
+import { warnRolePoolProjection } from "./pool-selection";
 import { isAdvisorCard, isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	calculateRetryBackoffDelayMs,
 	formatRetryFallbackSelector,
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
+	type RetryFallbackHealthLookups,
 	type RetryFallbackSelector,
 } from "./retry-fallback-chains";
 import { getOpenAiRemoteCompactionPayload } from "./session-context";
@@ -503,6 +505,22 @@ export interface SessionAdvisorsHost {
 		currentSelector: string,
 		currentModel?: Model | null,
 	): RetryFallbackSelector[];
+	/** {@link findRetryFallbackCandidates} ordered by the chain's strategy and filtered by its funding policy. */
+	orderedRetryFallbackCandidates(
+		role: string,
+		currentSelector: string,
+		currentModel: Model | null | undefined,
+		options: { walkActive: boolean; signal?: AbortSignal; lookups?: RetryFallbackHealthLookups },
+	): Promise<RetryFallbackSelector[]>;
+	/** The model a fallback selector of `role`'s chain names; group members resolve exactly. */
+	resolveRetryFallbackCandidate(role: string, selector: RetryFallbackSelector): Model | undefined;
+	/** Records an applied fallback for its chain's round-robin position. */
+	noteRetryFallbackApplied(
+		role: string,
+		selector: RetryFallbackSelector,
+		currentSelector: string,
+		currentModel: Model | null | undefined,
+	): void;
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean;
 	noteRetryFallbackCooldown(currentSelector: string, retryAfterMs: number | undefined, errorMessage: string): void;
 	createCodexCompactionContext(options: {
@@ -1142,6 +1160,12 @@ export class SessionAdvisors {
 					continue;
 				}
 			} else {
+				// The roster is built synchronously, so an `advisor` (or inherited `slow`) pool resolves
+				// through its ordered member list without its strategy or funding policy.
+				warnRolePoolProjection(
+					this.#host.settings,
+					this.#host.settings.getModelRole("advisor") === undefined ? "slow" : "advisor",
+				);
 				const sel = resolveAdvisorRoleSelection(this.#host.settings, this.#host.modelRegistry.getAvailable());
 				if (!sel) {
 					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
@@ -2153,11 +2177,17 @@ export class SessionAdvisors {
 		}
 
 		this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		const lookups: RetryFallbackHealthLookups = new Map();
 		for (const role of chainKeys) {
-			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+			const candidates = await this.#host.orderedRetryFallbackCandidates(role, currentSelector, currentModel, {
+				walkActive: advisor.retryFallback !== undefined,
+				signal,
+				lookups,
+			});
+			signal.throwIfAborted();
+			for (const selector of candidates) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
-				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				const candidate = this.#host.resolveRetryFallbackCandidate(role, selector);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
@@ -2166,6 +2196,7 @@ export class SessionAdvisors {
 
 				const originalThinkingLevel = advisor.thinkingLevel;
 				const requestedThinkingLevel = selector.thinkingLevel ?? originalThinkingLevel;
+				this.#host.noteRetryFallbackApplied(role, selector, currentSelector, currentModel);
 				const nextThinkingLevel = this.#setAdvisorModel(advisor, candidate, requestedThinkingLevel);
 				if (advisor.retryFallback) {
 					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;

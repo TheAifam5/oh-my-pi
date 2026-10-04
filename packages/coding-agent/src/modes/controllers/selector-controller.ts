@@ -62,6 +62,7 @@ import {
 	persistForeignSession,
 } from "../../session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
+import { rolePoolTarget } from "../../session/pool-selection";
 import { isTranscriptEntry, type TranscriptEntry } from "../../session/session-context";
 import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
@@ -115,7 +116,7 @@ import type {
 	ModelHubComponent as ModelHubComponentType,
 	ModelRoleSelectionScope,
 } from "@oh-my-pi/pi-tui/overlays/model-hub";
-import { createModelBrowserSource } from "../model-browser-source";
+import { createModelBrowserSource, writeModelHubPool } from "../model-browser-source";
 import type { ModelPickerComponent as ModelPickerComponentType } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { OAuthSelectorComponent as OAuthSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
@@ -1014,9 +1015,13 @@ export class SelectorController {
 								const scopedModels = this.ctx.session.scopedModels.map(sm => sm.model);
 								const availableModels =
 									scopedModels.length > 0 ? scopedModels : this.ctx.session.getAvailableModels();
-								const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, {
-									settings: this.ctx.settings,
-								});
+								// A pool default picks its member by strategy and funding; a blocked pool
+								// throws RolePoolUnavailableError, which the catch below shows.
+								const resolved = rolePoolTarget(this.ctx.settings, "default")
+									? await this.ctx.session.resolveRoleModelAsync("default", { availableModels })
+									: resolveModelRoleValue(fallbackRoleValue, availableModels, {
+											settings: this.ctx.settings,
+										});
 								const live = this.ctx.session.model;
 								const liveDiffers =
 									!live ||
@@ -1075,6 +1080,21 @@ export class SelectorController {
 						);
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onPoolChange: (target, value) => {
+					try {
+						const refused = writeModelHubPool(this.ctx.settings, target, value);
+						if (refused !== undefined) return refused;
+						const name =
+							target.kind === "role" ? (getRoleInfo(target.key, settings)?.tag ?? target.key) : target.key;
+						const pool = `${name} ${target.kind === "role" ? "pool" : "fallback pool"}`;
+						this.ctx.showStatus(value === undefined ? `${pool} cleared` : `${pool} saved`);
+						return undefined;
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						this.ctx.showError(message);
+						return message;
 					}
 				},
 

@@ -8,8 +8,9 @@
  */
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../../config/model-registry";
-import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
+import { getModelMatchPreferences, resolveExplicitModelRole, resolveModelRoleValue } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
+import { warnRolePoolProjection } from "../../session/pool-selection";
 import type { ExtensionModelQuery } from "./types";
 
 /**
@@ -27,12 +28,16 @@ export function createExtensionModelQuery(
 		// resolveModelRoleValue expands a role alias (`@slow`) to its full configured
 		// priority list and tries each pattern — the same path core selection uses — so a
 		// fallback model lower in the list still resolves. Plain model strings pass through
-		// as a single pattern.
-		resolve: (spec: string): Model<Api> | undefined =>
-			resolveModelRoleValue(spec, modelRegistry.getAvailable(), {
+		// as a single pattern. The facade is synchronous, so a pool role resolves through its
+		// ordered member list without its strategy or funding policy.
+		resolve: (spec: string): Model<Api> | undefined => {
+			const role = settings ? resolveExplicitModelRole(spec, settings) : undefined;
+			if (settings && role) warnRolePoolProjection(settings, role);
+			return resolveModelRoleValue(spec, modelRegistry.getAvailable(), {
 				settings,
 				matchPreferences: getModelMatchPreferences(settings),
-			}).model,
+			}).model;
+		},
 		family: (model: Model<Api>): string =>
 			model.identity.class === "unknown" ? model.provider.toLowerCase() : model.identity.class,
 	};

@@ -132,7 +132,7 @@ export function createPersistedSubagentReviverFactory(
 					? {
 							"advisor.enabled": true,
 							...(init.advisor !== "on"
-								? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
+								? { modelRoles: { ...ctx.settings.getModelRoleEntries(), advisor: init.advisor } }
 								: undefined),
 						}
 					: undefined),

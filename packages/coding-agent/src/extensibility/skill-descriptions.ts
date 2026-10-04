@@ -13,10 +13,12 @@ import {
 	prompt,
 } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, parseModelPattern, resolveRoleSelection } from "../config/model-resolver";
+import { getModelMatchPreferences, parseModelPattern } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import compressDescriptionPrompt from "../prompts/skills/compress-description.md" with { type: "text" };
+import { notePoolPickApplied, RolePoolUnavailableError } from "../session/pool-selection";
+import { resolveRoleSelectionAsync } from "../session/role-pool-resolution";
 import { Semaphore } from "../task/parallel";
 import type { Skill } from "./skills";
 
@@ -40,9 +42,18 @@ export function createSkillDescriptionCompressor(
 ): SkillDescriptionCompressor {
 	return async (_name, _description, request) => {
 		const available = registry.getAvailable();
-		const configured = resolveRoleSelection(["smol"], settings, available);
+		const context = { modelRegistry: registry, sessionId };
+		// A blocked smol pool is skipped for the next role, `tiny`, without smol's built-in substitutes.
+		let blocked: RolePoolUnavailableError | undefined;
+		const configured = await resolveRoleSelectionAsync(["smol"], settings, available, context).catch(
+			(error: unknown) => {
+				if (!(error instanceof RolePoolUnavailableError)) throw error;
+				blocked = error;
+				return undefined;
+			},
+		);
 		let preferred: Model<Api> | undefined;
-		if (!configured) {
+		if (!configured && !blocked) {
 			const preferences = getModelMatchPreferences(settings);
 			for (const pattern of MODEL_PRIO.smol) {
 				preferred = parseModelPattern(pattern, available, preferences).model;
@@ -52,11 +63,12 @@ export function createSkillDescriptionCompressor(
 		const selected =
 			configured ??
 			(preferred ? { model: preferred, thinkingLevel: undefined } : undefined) ??
-			resolveRoleSelection(["tiny"], settings, available);
-		if (!selected) throw new Error("No smol or tiny model available");
+			(await resolveRoleSelectionAsync(["tiny"], settings, available, context));
+		if (!selected) throw blocked ?? new Error("No smol or tiny model available");
 		const { model } = selected;
 		const apiKey = await registry.getApiKey(model, sessionId);
 		if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+		if ("pick" in selected && selected.pick) notePoolPickApplied(selected.pick);
 		const response = await instrumentedCompleteSimple(
 			model,
 			{

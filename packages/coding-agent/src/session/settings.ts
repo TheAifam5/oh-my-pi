@@ -1,4 +1,5 @@
 import { combine, effect, register, type SettingValueOf } from "../config/registry";
+import { assertModelGroupSectionWritable } from "../config/model-groups";
 import { cfgEditMode } from "../edit/settings";
 import { cfgEvalJs } from "../eval/settings";
 import {
@@ -834,6 +835,8 @@ export const cfgRetryFallbackChains = register({
 	id: "retry.fallbackChains",
 	type: "record",
 	default: EMPTY_STRING_ARRAYS_RECORD,
+	entryMerge: "replace",
+	validateWrite: raw => assertModelGroupSectionWritable("fallbackChains", raw),
 	ui: {
 		tab: "model",
 		group: "Retry & Fallback",

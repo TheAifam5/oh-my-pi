@@ -135,6 +135,7 @@ import { HistoryStorage } from "../session/history-storage";
 import { syncTextPrediction, textPredictionBackend } from "../predict/client";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
@@ -1531,9 +1532,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	#previousGoalContinuationActivity: string | undefined;
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
+	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel; poolRole?: string } | undefined;
 	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
 	#pendingPlanModelSwitch = false;
+	/** Plan-role resolutions started by plan entry and role changes; only the latest one applies or reports. */
+	#planRoleReapplyGeneration = 0;
 	#planModeHasEntered = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
@@ -2412,7 +2415,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		// event is not replayed, so rebuild from the live array once here too.
 		this.#syncConfigWarningHeader();
 		this.#eventBusUnsubscribers.push(
-			cfgModelRoles.listen(this.settings, () => this.#reapplyPlanModeModelOnRoleChange()),
+			cfgModelRoles.listen(this.settings, () => {
+				this.#reapplyPlanModeModelOnRoleChange().catch((error: unknown) => {
+					logger.warn("Plan role reapply failed", { error: String(error) });
+					this.showError(error instanceof Error ? error.message : String(error));
+				});
+			}),
 		);
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribeCommandMetadataChanged(() => {
@@ -4636,23 +4644,49 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#scheduleGoalContinuation();
 	}
 
-	async #applyPlanModeModel(): Promise<void> {
-		const resolved = this.session.resolveRoleModelWithThinking("plan");
-		if (!resolved.model) return;
+	/**
+	 * The `plan` role's model, resolved synchronously unless the role is a pool, which picks its
+	 * member by strategy and funding. A pool its policy blocks resolves to no model, so the active
+	 * model stays, and is shown as an error unless a later plan-role resolution superseded `generation`.
+	 */
+	#resolvePlanRoleModel(generation: number): ResolvedModelRoleValue | Promise<ResolvedModelRoleValue> {
+		if (rolePoolTarget(this.session.settings, "plan") === undefined) {
+			return this.session.resolveRoleModelWithThinking("plan");
+		}
+		return this.#resolvePooledPlanRoleModel(generation);
+	}
 
+	async #resolvePooledPlanRoleModel(generation: number): Promise<ResolvedModelRoleValue> {
+		try {
+			return await this.session.resolveRoleModelAsync("plan");
+		} catch (error) {
+			if (!(error instanceof RolePoolUnavailableError)) throw error;
+			if (generation === this.#planRoleReapplyGeneration) this.showError(error.message);
+			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
+		}
+	}
+
+	async #applyPlanModeModel(): Promise<void> {
+		const generation = ++this.#planRoleReapplyGeneration;
 		const currentModel = this.session.model;
+		const currentThinkingLevel = this.session.configuredThinkingLevel();
+		const pending = this.#resolvePlanRoleModel(generation);
+		const resolved = pending instanceof Promise ? await pending : pending;
+		const superseded = generation !== this.#planRoleReapplyGeneration;
+		if (!resolved.model && !superseded) return;
+
 		// Capture the pre-plan model so #exitPlanMode can restore it. Only the
 		// entry path records this — a mid-planning role change (below) leaves the
 		// active model on the plan role, so overwriting here would restore the old
-		// plan model instead of the user's real pre-plan model.
+		// plan model instead of the user's real pre-plan model. It is read before
+		// the plan role resolves, which a role change during entry may outlast.
 		this.#planModePreviousModelState = currentModel
-			? {
-					model: currentModel,
-					thinkingLevel: this.session.configuredThinkingLevel(),
-				}
+			? { model: currentModel, thinkingLevel: currentThinkingLevel }
 			: undefined;
+		// A role change during entry applies its newer assignment itself.
+		if (superseded || !resolved.model) return;
 
-		await this.#applyPlanModelTransition(currentModel, resolved);
+		await this.#applyPlanModelTransition(this.session.model, resolved);
 	}
 
 	/**
@@ -4661,11 +4695,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * the plan model there, so a settings-only change would otherwise leave the
 	 * current turn on the model plan mode was entered with (issue #5657). No-op
 	 * outside plan mode — role reassignment for an inactive role only touches
-	 * settings.
+	 * settings. A pool `plan` role may take up to the funding deadline to resolve;
+	 * a later role change supersedes an unfinished reapply, whose result is dropped.
 	 */
 	async #reapplyPlanModeModelOnRoleChange(): Promise<void> {
+		const generation = ++this.#planRoleReapplyGeneration;
 		if (!this.planModeEnabled) return;
-		const resolved = this.session.resolveRoleModelWithThinking("plan");
+		const pending = this.#resolvePlanRoleModel(generation);
+		const resolved = pending instanceof Promise ? await pending : pending;
+		if (generation !== this.#planRoleReapplyGeneration || !this.planModeEnabled) return;
 		if (!resolved.model) {
 			this.#clearPendingPlanModelSwitch();
 			return;
@@ -4690,10 +4728,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (transition.kind !== "apply" || !transition.deferred) {
 			this.#clearPendingPlanModelSwitch();
 		}
+		const pooled = rolePoolTarget(this.session.settings, "plan") !== undefined;
 		switch (transition.kind) {
 			case "none":
+				// The plan model already runs; a pool pick of it is in use.
+				if (pooled && resolved.model) this.session.noteRolePoolPickUsed("plan", resolved.model);
 				return;
 			case "thinking":
+				if (pooled && resolved.model) this.session.noteRolePoolPickUsed("plan", resolved.model);
 				this.session.setThinkingLevel(transition.thinkingLevel);
 				return;
 			case "apply":
@@ -4701,12 +4743,17 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.#pendingModelSwitch = {
 						model: transition.model,
 						thinkingLevel: transition.thinkingLevel,
+						...(pooled ? { poolRole: "plan" } : {}),
 					};
 					this.#pendingPlanModelSwitch = true;
 					return;
 				}
 				try {
-					await this.session.setModelTemporary(transition.model, transition.thinkingLevel);
+					await this.session.setModelTemporary(
+						transition.model,
+						transition.thinkingLevel,
+						...(pooled ? [{ poolRole: "plan" }] : []),
+					);
 				} catch (error) {
 					this.showWarning(
 						`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
@@ -4723,7 +4770,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingPlanModelSwitch = false;
 		if (!pending) return;
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			await this.session.setModelTemporary(
+				pending.model,
+				pending.thinkingLevel,
+				...(pending.poolRole !== undefined ? [{ poolRole: pending.poolRole }] : []),
+			);
 		} catch (error) {
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
@@ -5554,10 +5605,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #applyPlanExecutionModel(entry: ResolvedRoleModel | undefined): Promise<void> {
 		if (!entry) return;
 		try {
-			await this.session.applyRoleModel(entry);
+			const applied = await this.session.applyRoleModel(entry);
 			this.statusLine.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(`Continuing with ${entry.role}: ${entry.model.name || entry.model.id}`);
+			this.showStatus(`Continuing with ${applied.role}: ${applied.model.name || applied.model.id}`);
 		} catch (error) {
 			this.showWarning(
 				`Could not switch to the ${entry.role} model: ${error instanceof Error ? error.message : String(error)}`,

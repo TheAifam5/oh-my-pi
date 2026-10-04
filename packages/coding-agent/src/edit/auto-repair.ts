@@ -13,11 +13,12 @@
  * 94% under 150 lines; smol fixed 99% with one feedback retry, with ~12% of
  * raw candidates being reverts — hence the explicit revert rejection.
  */
-import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { completeSimple, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { diffLineRuns, editDiffString, summarizeCode } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
-import { resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
+import { notePoolPickApplied, type RolePoolPick, RolePoolUnavailableError } from "../session/pool-selection";
+import { resolveRoleSelectionAsync } from "../session/role-pool-resolution";
 import type { ToolSession } from "../tools";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import repairPromptSource from "./auto-repair.md" with { type: "text" };
@@ -346,9 +347,24 @@ export async function attemptEditAutoRepair(options: {
 	if (!cfgEditAutoRepairEnabled.get(session.settings)) return undefined;
 	const registry = session.modelRegistry;
 	if (!registry) return undefined;
-	const model = resolveRoleSelection(["smol"], session.settings, registry.getAvailable())?.model;
-	if (!model) return undefined;
 	const sessionId = session.getSessionId?.() ?? undefined;
+	let model: Model | undefined;
+	let pick: RolePoolPick | undefined;
+	try {
+		const selected = await resolveRoleSelectionAsync(["smol"], session.settings, registry.getAvailable(), {
+			modelRegistry: registry,
+			sessionId,
+			signal: options.signal,
+		});
+		model = selected?.model;
+		pick = selected?.pick;
+	} catch (error) {
+		// A blocked smol pool or a cancelled edit leaves repair unavailable, like a missing model.
+		if (!(error instanceof RolePoolUnavailableError) && !options.signal?.aborted) throw error;
+		logger.debug("Edit auto-repair skipped: smol role unavailable", { error: String(error) });
+		return undefined;
+	}
+	if (!model) return undefined;
 	// Resolve the key eagerly so the session-sticky credential is recorded and
 	// an unauthenticated smol role bails before any region work.
 	const apiKey = await registry.getApiKey(model, sessionId);
@@ -372,6 +388,7 @@ export async function attemptEditAutoRepair(options: {
 	const timeout = AbortSignal.timeout(REPAIR_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 	const complete = async (builtPrompt: string): Promise<string> => {
+		if (pick) notePoolPickApplied(pick);
 		const response = await retryTransientCompletion(
 			() =>
 				completeSimple(

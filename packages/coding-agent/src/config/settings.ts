@@ -55,7 +55,23 @@ import {
 } from "./registry";
 // Registers every setting before any instance is read (definitions live next to their domains).
 import "./all-settings";
-import { cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import {
+	assertModelRoleName,
+	FORBIDDEN_ENTRY_KEYS,
+	groupSelectorProjection,
+	isModelGroupForm,
+	type ModelGroup,
+	ModelGroupConfigError,
+	type ModelGroupIssue,
+	type ModelGroupParseResult,
+	modelGroupPathKey,
+	type ParsedModelValue,
+	parseFallbackChainValue,
+	parseModelGroupDefinition,
+	parseModelRoleValue,
+} from "./model-groups";
+import { cfgModelGroups, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import { cfgRetryFallbackChains } from "../session/settings";
 import { cfgShellPath } from "../exec/settings";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -324,7 +340,7 @@ function projectPathSegments(node: ProjectPathNode): string[] {
  * `project` as it merges over the global layer: `null` (cleared) and unreadable model roles fall back
  * to global without a warning, then every other `null` value and every record nested deeper than
  * {@link MAX_PROJECT_LAYER_DEPTH} is dropped (see {@link withoutNullValues}), so a repository cannot
- * clear what lower layers configure.
+ * clear what lower layers configure. Group mappings are kept for {@link modelGroupLayerForMerge}.
  */
 function projectLayerForMerge(project: RawSettings, onDrop?: ProjectDropListener): RawSettings {
 	let result = project;
@@ -332,8 +348,9 @@ function projectLayerForMerge(project: RawSettings, onDrop?: ProjectDropListener
 	if (isRecord(projectRoles)) {
 		let filteredRoles: Record<string, unknown> | undefined;
 		for (const role in projectRoles) {
-			if (!Object.hasOwn(projectRoles, role) || modelRoleValueFromUnknown(projectRoles[role]) !== undefined)
-				continue;
+			if (!Object.hasOwn(projectRoles, role)) continue;
+			const value = projectRoles[role];
+			if (isRecord(value) || modelRoleValueFromUnknown(value) !== undefined) continue;
 			filteredRoles ??= { ...projectRoles };
 			delete filteredRoles[role];
 		}
@@ -344,7 +361,10 @@ function projectLayerForMerge(project: RawSettings, onDrop?: ProjectDropListener
 
 /**
  * `record` without the `null` values of its keys at any depth and without records nested deeper
- * than {@link MAX_PROJECT_LAYER_DEPTH}; arrays and their items are kept as they are. Itself when
+ * than {@link MAX_PROJECT_LAYER_DEPTH}; arrays and their items are kept as they are. Below a
+ * model-group record path ({@link MODEL_GROUP_RECORDS}) `null` values are kept, since
+ * {@link modelGroupLayerForMerge} owns their meaning, while the depth bound still applies; a `null`
+ * record at such a path is dropped without reaching `onDrop`. Itself when
  * nothing is dropped; otherwise only the records on a changed path are copied, with
  * `Object.fromEntries`, so a `__proto__` key stays an own entry.
  */
@@ -353,6 +373,7 @@ function withoutNullValues(
 	onDrop?: ProjectDropListener,
 	parent?: ProjectPathNode,
 	depth = 0,
+	stripNulls = true,
 ): RawSettings {
 	let entries: [string, unknown][] | undefined;
 	const keys = Object.keys(record);
@@ -361,15 +382,20 @@ function withoutNullValues(
 		const value = record[key];
 		let next: unknown = value;
 		if (value === null) {
-			onDrop?.(projectPathSegments({ parent, key }), "null");
-			next = undefined;
+			if (stripNulls) {
+				const node: ProjectPathNode = { parent, key };
+				// An empty model-group record key (`modelGroups:`) configures nothing and is dropped silently.
+				if (!isModelGroupRecordPath(node, depth + 1)) onDrop?.(projectPathSegments(node), "null");
+				next = undefined;
+			}
 		} else if (isRecord(value)) {
 			const node: ProjectPathNode = { parent, key };
 			if (depth + 1 > MAX_PROJECT_LAYER_DEPTH) {
 				onDrop?.(projectPathSegments(node), "too-deep");
 				next = undefined;
 			} else {
-				next = withoutNullValues(value, onDrop, node, depth + 1);
+				const childStripsNulls = stripNulls && !isModelGroupRecordPath(node, depth + 1);
+				next = withoutNullValues(value, onDrop, node, depth + 1, childStripsNulls);
 			}
 		}
 		if (next === value) {
@@ -380,6 +406,15 @@ function withoutNullValues(
 		if (next !== undefined) entries.push([key, next]);
 	}
 	return entries ? Object.fromEntries(entries) : record;
+}
+
+/** Whether `node`, `depth` keys below the project layer, is the path of a {@link MODEL_GROUP_RECORDS} record. */
+function isModelGroupRecordPath(node: ProjectPathNode, depth: number): boolean {
+	if (depth > 2) return false;
+	const segments = projectPathSegments(node);
+	return MODEL_GROUP_RECORDS.some(
+		record => record.segments.length === depth && record.segments.every((segment, i) => segment === segments[i]),
+	);
 }
 
 /**
@@ -413,6 +448,138 @@ function applyMergeHooks(merged: RawSettings, layers: readonly RawSettings[]): R
 		container[setting.segments[setting.segments.length - 1]] = value;
 	}
 	return result;
+}
+
+/** Most distinct model-group warnings one instance remembers as already logged. */
+const MAX_MODEL_GROUP_WARNINGS_SEEN = 256;
+
+/** Record settings whose entries hold model-group values, with the model-group section each one is. */
+const MODEL_GROUP_RECORDS = [
+	{ segments: ["modelRoles"], section: "modelRoles" },
+	{ segments: ["retry", "fallbackChains"], section: "fallbackChains" },
+	{ segments: ["modelGroups"], section: "modelGroups" },
+] as const;
+
+/** Parsed effective reads of the model-group records at one {@link Settings.revision}, keyed by entry. */
+interface ModelGroupReadCache {
+	revision: number;
+	roleSelectors: Map<string, string | undefined>;
+	roleSpecs: Map<string, ParsedModelValue | undefined>;
+	chainSpecs: Map<string, ParsedModelValue | undefined>;
+	groups: Map<string, ModelGroup | undefined>;
+	roles?: Record<string, string>;
+}
+
+/** Settings layer a model-group value comes from. */
+type ModelGroupLayerSource = "global" | "project" | "overlay" | "runtime";
+
+/** Reports one model-group problem at a settings path; `issues` lists the parse problems of a dropped value. */
+type ModelGroupWarn = (path: string, message: string, issues?: readonly ModelGroupIssue[]) => void;
+
+function parseModelGroupEntry(
+	section: (typeof MODEL_GROUP_RECORDS)[number]["section"],
+	key: string,
+	value: unknown,
+): ModelGroupParseResult<unknown> {
+	switch (section) {
+		case "modelRoles":
+			return parseModelRoleValue(key, value, "tolerant");
+		case "fallbackChains":
+			return parseFallbackChainValue(key, value, "tolerant");
+		case "modelGroups":
+			return parseModelGroupDefinition(key, value, "tolerant");
+	}
+}
+
+/** `layer` with `value` at `segments` (`undefined` removes it); records on the path are copied, `layer` never mutated. */
+function withLayerValue(layer: RawSettings, segments: readonly string[], value: unknown): RawSettings {
+	const result: RawSettings = { ...layer };
+	let container = result;
+	for (const segment of segments.slice(0, -1)) {
+		const copy: RawSettings = isRecord(container[segment]) ? { ...(container[segment] as RawSettings) } : {};
+		container[segment] = copy;
+		container = copy;
+	}
+	const last = segments[segments.length - 1];
+	if (value === undefined) delete container[last];
+	else container[last] = value;
+	return result;
+}
+
+/**
+ * `layer` as it merges for the model-group records:
+ *
+ * - An entry whose key names object internals ({@link FORBIDDEN_ENTRY_KEYS}) is dropped.
+ * - A group-form entry (every `modelGroups` entry; a mapping or `+group` string elsewhere) that a
+ *   tolerant parse rejects is dropped, so the layer below shows through. Legacy selector strings
+ *   and lists pass unchanged.
+ * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
+ *   dropped (a `null` record silently), and entry `null`s are dropped (a cleared entry falls back
+ *   to global).
+ *
+ * Every change is reported through `warn`. Returns `layer` itself when nothing changes.
+ */
+function modelGroupLayerForMerge(layer: RawSettings, source: ModelGroupLayerSource, warn: ModelGroupWarn): RawSettings {
+	const project = source === "project";
+	let result = layer;
+	for (const { segments, section } of MODEL_GROUP_RECORDS) {
+		const record = getByPath(layer, segments);
+		const prefix = segments.join(".");
+		if (record === undefined) continue;
+		if (!isRecord(record)) {
+			if (project) {
+				// An empty YAML key (`modelGroups:`) reads as null and configures nothing.
+				if (record !== null) warn(prefix, "must be a mapping; ignored in project settings");
+				result = withLayerValue(result, segments, undefined);
+			}
+			continue;
+		}
+		let next: RawSettings | undefined;
+		const drop = (key: string) => {
+			next ??= { ...record };
+			delete next[key];
+		};
+		for (const key of Object.keys(record)) {
+			const value = record[key];
+			const path = `${prefix}.${modelGroupPathKey(key)}`;
+			if (FORBIDDEN_ENTRY_KEYS.includes(key)) {
+				warn(path, "is a reserved key; ignored");
+				drop(key);
+				continue;
+			}
+			if (value === null && project) {
+				drop(key);
+				continue;
+			}
+			if (value === null || value === undefined) continue;
+			if (section !== "modelGroups" && !isModelGroupForm(value)) continue;
+			const parsed = parseModelGroupEntry(section, key, value);
+			if (parsed.ok) {
+				for (const issue of parsed.warnings) warn(issue.path, issue.message);
+				continue;
+			}
+			warn(path, "ignoring invalid model group value", parsed.issues);
+			drop(key);
+		}
+		if (next) result = withLayerValue(result, segments, next);
+	}
+	return result;
+}
+
+/** Whether layers replace the entries of the record setting at `segments` whole (`entryMerge: "replace"`). */
+function replacesEntries(segments: readonly string[]): boolean {
+	const definition = lookupSetting(segments.join("."))?.definition;
+	return definition?.type === "record" && definition.entryMerge === "replace";
+}
+
+/**
+ * Runs the strict persisted-write check of `setting` (its record definition's `validateWrite`) on `value`.
+ *
+ * @throws Error (a `ModelGroupConfigError` for model-group records) when the check refuses it.
+ */
+function assertPersistable(setting: AnySetting, value: unknown): void {
+	const definition = setting.definition;
+	if (definition.type === "record") definition.validateWrite?.(value);
 }
 
 /** One instance's own layers, lowest precedence first. */
@@ -585,6 +752,14 @@ function modelRoleValueFromUnknown(value: unknown): string | undefined {
 
 	const entries = stringArrayFromUnknown(value);
 	return entries.length === value.length ? entries.join(",") : undefined;
+}
+
+/**
+ * A `modelRoles` entry as write paths carry it: a legacy value normalized like
+ * {@link modelRoleValueFromUnknown}, a group mapping as configured.
+ */
+function modelRoleEntryFromUnknown(value: unknown): string | RawSettings | undefined {
+	return isRecord(value) ? value : modelRoleValueFromUnknown(value);
 }
 
 /** Receives the setting whose effective value changed (see {@link Settings.onEffectiveChange}). */
@@ -778,7 +953,16 @@ export class Settings {
 	 * source-project value. Maps role → original override value (`undefined`
 	 * when the role had no runtime override).
 	 */
-	#savedRuntimeModelRoleOverrides = new Map<string, string | undefined>();
+	#savedRuntimeModelRoleOverrides = new Map<string, unknown>();
+	/**
+	 * Model-group problems already logged by this instance, keyed by path and message (merges repeat on
+	 * every rebuild); cleared on disk reloads and re-scopes, at most {@link MAX_MODEL_GROUP_WARNINGS_SEEN}.
+	 */
+	#modelGroupWarningsSeen = new Set<string>();
+	/** {@link #liveModelGroupLayers} with the {@link revision} it was computed at. */
+	#liveModelGroupLayersCache: { revision: number; layers: OwnLayers } | undefined;
+	/** Parsed effective model-role, fallback-chain, and group reads, valid for one {@link revision}. */
+	#modelGroupReadCache: ModelGroupReadCache | undefined;
 
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
@@ -818,7 +1002,8 @@ export class Settings {
 	 * handle `override`. `undefined` values are skipped; `null` stays as an unset tombstone.
 	 *
 	 * @throws Error on an unknown setting, a key with a `__proto__`, `constructor`, or `prototype`
-	 * segment, or a value its definition rejects.
+	 * segment, a value its definition rejects, or a `modelRoles` value naming a reserved role
+	 * ({@link ReservedModelRoleError}).
 	 */
 	#overrideLayer(overrides: Readonly<Record<string, unknown>>): RawSettings {
 		const raw: RawSettings = {};
@@ -831,7 +1016,8 @@ export class Settings {
 					`Invalid setting override ${describeSettingValue(key)}: "__proto__", "constructor", and "prototype" are not allowed as path segments`,
 				);
 			}
-			setByPath(raw, segments, value);
+			// Cloned so the caller's objects (another instance's entries) are never shared with this layer.
+			setByPath(raw, segments, structuredClone(value));
 		}
 		const layer = this.#migrateRawSettings(raw);
 		assertKnownSettingPaths(layer);
@@ -840,6 +1026,9 @@ export class Settings {
 			if (value === undefined || value === null) continue;
 			const normalized = setting.definition.normalize ? setting.definition.normalize(value) : value;
 			setting.assertWritable(normalized);
+			if (setting === cfgModelRoles && isRecord(normalized)) {
+				for (const role of Object.keys(normalized)) assertModelRoleName(role);
+			}
 			setByPath(layer, setting.segments, normalized);
 		}
 		return layer;
@@ -918,6 +1107,7 @@ export class Settings {
 		child.#storage = this.#storage;
 		child.#parent = this;
 		inheritWarnings(child, this);
+		child.#inheritModelGroupWarnings(this);
 		child.#rebuildMerged();
 		// The parent holds only a weak reference, so a discarded child is collected without an
 		// explicit dispose; its listener unsubscribes on the next parent change.
@@ -965,7 +1155,7 @@ export class Settings {
 			return;
 		}
 		this.#syncParent();
-		const own = getByPath(this.#mergeOwnLayers(this.#ownLayers()), setting.segments);
+		const own = getByPath(this.#mergeModelGroupLayers(this.#liveModelGroupLayers()), setting.segments);
 		if (own !== undefined && (typeof own !== "object" || own === null || Array.isArray(own))) return;
 		this.#notifyChange(setting);
 	}
@@ -1033,25 +1223,28 @@ export class Settings {
 	getProvenance(setting: AnySetting): SettingProvenance {
 		if (!this.isConfigured(setting)) return "default";
 		const segments = setting.segments;
-		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
-		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
-		if (getByPath(this.#projectLayerForMerge(this.#ownLayers()), segments) !== undefined) return "project";
-		if (getByPath(this.#global, segments) !== undefined) return "global";
+		const own = this.#liveModelGroupLayers();
+		if (getByPath(own.overrides, segments) !== undefined) return "runtime";
+		if (getByPath(own.configOverlay, segments) !== undefined) return "overlay";
+		if (getByPath(this.#projectLayerForMerge(own), segments) !== undefined) return "project";
+		if (getByPath(own.global, segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
 	}
 
 	/**
 	 * Every layer's own configured value of `setting`, lowest precedence first: an overlay parent's
 	 * layers, then global, project, `--config` overlay, and runtime override. Layers that leave the
-	 * setting unset are omitted; a configured `null` is included.
+	 * setting unset are omitted; a configured `null` is included, except in the project layer, which
+	 * drops its `null` values before merging.
 	 */
 	getLayerValues(setting: AnySetting): { source: SettingProvenance; value: unknown }[] {
 		const values = this.#parent?.getLayerValues(setting) ?? [];
+		const own = this.#liveModelGroupLayers();
 		const layers: [SettingProvenance, RawSettings][] = [
-			["global", this.#global],
-			["project", this.#projectLayerForMerge(this.#ownLayers())],
-			["overlay", this.#configOverlay],
-			["runtime", this.#overrides],
+			["global", own.global],
+			["project", this.#projectLayerForMerge(own)],
+			["overlay", own.configOverlay],
+			["runtime", own.overrides],
 		];
 		for (const [source, layer] of layers) {
 			const value = getByPath(layer, setting.segments);
@@ -1070,6 +1263,10 @@ export class Settings {
 	 */
 	writeValue(setting: AnySetting, value: unknown, layer: "global" | "override"): void {
 		setting.assertWritable(value);
+		if (layer === "global") assertPersistable(setting, value);
+		else if (setting === cfgModelRoles && isRecord(value)) {
+			for (const role of Object.keys(value)) assertModelRoleName(role);
+		}
 		if (layer === "override" && setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
@@ -1115,7 +1312,11 @@ export class Settings {
 	 */
 	writeEntry(setting: AnySetting, key: string, value: unknown): void {
 		if (setting.type !== "record") throw new Error(`Setting ${setting.id} is not a record`);
-		if (value !== undefined) setting.assertWritable({ [key]: value });
+		if (setting === cfgModelRoles) assertModelRoleName(key);
+		if (value !== undefined) {
+			setting.assertWritable({ [key]: value });
+			assertPersistable(setting, { [key]: value });
+		}
 		const record = getByPath(this.#global, setting.segments);
 		// An entry re-set to its persisted value stages nothing (no config.yml rewrite).
 		const staged =
@@ -1470,6 +1671,7 @@ export class Settings {
 		const layers = { ...cloned.#ownLayers(), overrides: this.#buildOriginalOverrides() };
 		for (const setting of cloned.#settlePins(layers)) cloned.#softPins.delete(setting);
 		cloned.#overrides = layers.overrides;
+		cloned.#inheritModelGroupWarnings(this);
 		cloned.#rebuildMerged();
 		inheritWarnings(cloned, this);
 		cloned.#validateAll();
@@ -1532,6 +1734,7 @@ export class Settings {
 				this.#readConfigOverlays(false),
 			]);
 			if (mutationGeneration !== this.#persistedMutationGeneration) continue;
+			this.#modelGroupWarningsSeen.clear();
 			for (const result of [globalResult, projectResult, overlayResult]) {
 				if (result.status === "fulfilled") continue;
 				if (!keepLastGood) throw result.reason;
@@ -1656,6 +1859,7 @@ export class Settings {
 		try {
 			if (normalized === this.#cwd) return;
 			await this.flush();
+			this.#modelGroupWarningsSeen.clear();
 			const project = this.#persist ? await this.#readProjectSettings(true, { cwd: normalized }) : undefined;
 			const candidate: OwnLayers = {
 				global: this.#global,
@@ -1730,6 +1934,8 @@ export class Settings {
 	 * pi `SettingsManager` shim to match upstream Pi's `getGlobalSettings()`.
 	 * The clone means callers cannot mutate internal state. An {@link overlay}
 	 * reports its parent's layer with the overlay's own writes merged on top.
+	 * The layer is raw: model-group values have not been through the load-time
+	 * filters (invalid entries, see {@link modelGroupLayerForMerge}).
 	 */
 	getGlobalSettings(): RawSettings {
 		const own = structuredClone(this.#global);
@@ -1740,7 +1946,10 @@ export class Settings {
 	 * Raw project settings layer (`.claude/settings.yml`, `.omp/config.yml`,
 	 * etc.), deep-cloned. Companion to {@link getGlobalSettings} for the legacy
 	 * pi `SettingsManager` shim's `getProjectSettings()`; an {@link overlay}
-	 * likewise reports its parent's layer under its own.
+	 * likewise reports its parent's layer under its own. The layer is raw:
+	 * model-group values still hold what the files say, including the invalid
+	 * entries the merge drops ({@link modelGroupLayerForMerge}); read effective
+	 * values through the typed accessors instead.
 	 */
 	getProjectSettings(): RawSettings {
 		const own = structuredClone(this.#project);
@@ -1790,19 +1999,62 @@ export class Settings {
 		return "user";
 	}
 
+	/** Selector strings of `layer`'s model roles; a pool role reads as its {@link groupSelectorProjection}. */
 	#modelRolesFromLayer(layer: RawSettings): Record<string, string> {
 		const value = getByPath(layer, ["modelRoles"]);
 		if (!isRecord(value)) return {};
 
 		const roles: Record<string, string> = {};
 		for (const role in value) {
-			if (!Object.hasOwn(value, role)) continue;
-			const modelId = modelRoleValueFromUnknown(value[role]);
+			if (!Object.hasOwn(value, role) || FORBIDDEN_ENTRY_KEYS.includes(role)) continue;
+			const modelId = this.#modelRoleSelector(role, value[role]);
 			if (modelId !== undefined) {
-				roles[role] = modelId;
+				defineOwn(roles, role, modelId);
 			}
 		}
 		return roles;
+	}
+
+	/** `layer`'s model roles as write paths carry them ({@link modelRoleEntryFromUnknown}). */
+	#modelRoleEntriesFromLayer(layer: RawSettings): Record<string, string | RawSettings> {
+		const value = getByPath(layer, ["modelRoles"]);
+		if (!isRecord(value)) return {};
+
+		const roles: Record<string, string | RawSettings> = {};
+		for (const role in value) {
+			if (!Object.hasOwn(value, role) || FORBIDDEN_ENTRY_KEYS.includes(role)) continue;
+			const entry = modelRoleEntryFromUnknown(value[role]);
+			if (entry !== undefined) roles[role] = entry;
+		}
+		return roles;
+	}
+
+	/**
+	 * Selector string a configured `modelRoles.<role>` value reads as: a legacy value normalized, a
+	 * pool projected ({@link groupSelectorProjection}), a group reference projected from the effective
+	 * `modelGroups.<use>`; `undefined` when unusable or the referenced group is missing.
+	 */
+	#modelRoleSelector(role: string, value: unknown): string | undefined {
+		if (!isModelGroupForm(value)) return modelRoleValueFromUnknown(value);
+		const parsed = parseModelRoleValue(role, value, "tolerant");
+		return parsed.ok ? this.#projectModelValue(parsed.value) : undefined;
+	}
+
+	#projectModelValue(value: ParsedModelValue): string | undefined {
+		switch (value.kind) {
+			case "group":
+				return groupSelectorProjection(value.group) || undefined;
+			case "ref": {
+				const group = this.#cachedModelGroup(value.ref.use);
+				return group ? groupSelectorProjection(group, value.ref.profile) || undefined : undefined;
+			}
+			case "selector":
+				return value.value;
+			case "list":
+				return value.value.join(",");
+			case "clear":
+				return undefined;
+		}
 	}
 
 	#modelRoleLayerOwns(layer: RawSettings, role: ModelRole | string): boolean {
@@ -1818,22 +2070,22 @@ export class Settings {
 	 * capture invalidation independently of the whole-map replacement
 	 * semantics that `override("modelRoles", …)` carries.
 	 */
-	#setRuntimeModelRoleOverrides(next: Record<string, string>): void {
+	#setRuntimeModelRoleOverrides(next: Record<string, unknown>): void {
 		const prev = cfgModelRoles.get(this);
 		setByPath(this.#overrides, ["modelRoles"], next);
 		this.#rebuildMerged();
 		this.#fireIfChanged(cfgModelRoles, prev);
 	}
 
-	#updateRuntimeModelRoleOverride(role: ModelRole | string, modelId: string | undefined): void {
+	#updateRuntimeModelRoleOverride(role: ModelRole | string, modelId: unknown): void {
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
 
-		const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
+		const nextRuntimeOverride: Record<string, unknown> = this.#modelRoleEntriesFromLayer(this.#overrides);
 		if (modelId === undefined) {
 			delete nextRuntimeOverride[role];
 		} else {
-			nextRuntimeOverride[role] = modelId;
+			defineOwn(nextRuntimeOverride, role, modelId);
 		}
 		this.#setRuntimeModelRoleOverrides(nextRuntimeOverride);
 	}
@@ -1848,7 +2100,7 @@ export class Settings {
 		if (this.#savedRuntimeModelRoleOverrides.has(role)) return;
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
-		this.#savedRuntimeModelRoleOverrides.set(role, this.#modelRolesFromLayer(this.#overrides)[role]);
+		this.#savedRuntimeModelRoleOverrides.set(role, this.#modelRoleEntriesFromLayer(this.#overrides)[role]);
 	}
 
 	/**
@@ -1871,17 +2123,19 @@ export class Settings {
 			if (originalValue === undefined) {
 				delete runtimeRoles[role];
 			} else {
-				runtimeRoles[role] = originalValue;
+				defineOwn(runtimeRoles, role, originalValue);
 			}
 		}
 		return overrides;
 	}
 
 	#setProjectModelRoleValue(role: ModelRole | string, modelId: string | null): void {
+		assertModelRoleName(role);
+		if (modelId !== null) assertPersistable(cfgModelRoles, { [role]: modelId });
 		const prev = cfgModelRoles.get(this);
 		const projectRoles = getByPath(this.#project, ["modelRoles"]);
 		const current: Record<string, unknown> = isRecord(projectRoles) ? { ...projectRoles } : {};
-		current[role] = modelId;
+		defineOwn(current, role, modelId);
 		setByPath(this.#project, ["modelRoles"], current);
 		this.#modifiedProjectModelRoles.add(role);
 		this.#persistedMutationGeneration++;
@@ -1903,18 +2157,48 @@ export class Settings {
 	 * left untouched. The guard is precise so that a later clear, a late
 	 * `overrideModelRoles`, or a storage-mode transition does not leave a
 	 * stale skip in place.
+	 *
+	 * @throws ReservedModelRoleError when `role` is `__proto__`, `constructor`, or `prototype`; nothing is written.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
+		this.#writeGlobalModelRole(role, modelId);
+	}
+
+	/**
+	 * {@link setModelRole} for any `modelRoles.<role>` form: a selector string, a selector list, an
+	 * inline group, or a group reference (`{ use, profile? }` or `+group[@profile]`). `undefined`
+	 * clears the role. Written per role like {@link setModelRole}; a list is stored as its
+	 * comma-joined selector string, like every role write.
+	 *
+	 * @throws ModelGroupConfigError when `role` is a reserved name or a group or reference fails strict
+	 * validation; nothing is written.
+	 */
+	setModelRoleSpec(role: ModelRole | string, value: string | readonly string[] | RawSettings | undefined): void {
+		assertModelRoleName(role);
+		if (value !== undefined) {
+			const parsed = parseModelRoleValue(role, value, "strict");
+			if (!parsed.ok) throw new ModelGroupConfigError(parsed.issues);
+		}
+		// Cloned so a later change to the caller's object cannot reach the stored layer.
+		this.#writeGlobalModelRole(
+			role,
+			value === undefined ? undefined : modelRoleEntryFromUnknown(structuredClone(value)),
+		);
+	}
+
+	#writeGlobalModelRole(role: ModelRole | string, modelId: string | RawSettings | undefined): void {
+		assertModelRoleName(role);
+		if (modelId !== undefined) assertPersistable(cfgModelRoles, { [role]: modelId });
 		const prev = cfgModelRoles.get(this);
 		// Re-setting the persisted role (or clearing an absent one) stages no config.yml rewrite;
 		// the runtime-override sync below still applies.
 		if (!this.#globalWriteIsNoop(["modelRoles", role], modelId)) {
-			const current = this.#modelRolesFromLayer(this.#global);
+			const current = this.#modelRoleEntriesFromLayer(this.#global);
 			this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
 			if (modelId === undefined) {
 				delete current[role];
 			} else {
-				current[role] = modelId;
+				defineOwn(current, role, modelId);
 			}
 			// Persist per-role rather than marking the whole `modelRoles` path
 			// modified: #saveNow merges only the changed role into the re-read
@@ -1948,6 +2232,8 @@ export class Settings {
 	}
 	/**
 	 * Set a model role in the current project's settings layer.
+	 *
+	 * @throws ReservedModelRoleError when `role` is `__proto__`, `constructor`, or `prototype`; nothing is written.
 	 */
 	setProjectModelRole(role: ModelRole | string, modelId: string): void {
 		this.#setProjectModelRoleValue(role, modelId);
@@ -1956,6 +2242,8 @@ export class Settings {
 	}
 	/**
 	 * Clear a model role from the current project's settings layer.
+	 *
+	 * @throws ReservedModelRoleError when `role` is `__proto__`, `constructor`, or `prototype`; nothing is written.
 	 */
 	clearProjectModelRole(role: ModelRole | string): void {
 		this.#setProjectModelRoleValue(role, null);
@@ -1967,15 +2255,114 @@ export class Settings {
 	 * Get a model role (helper for modelRoles record).
 	 */
 	getModelRole(role: ModelRole | string): string | undefined {
+		const cache = this.#modelGroupReads().roleSelectors;
+		if (cache.has(role)) return cache.get(role);
 		const roles: unknown = cfgModelRoles.get(this);
-		if (!isRecord(roles)) return undefined;
-		return modelRoleValueFromUnknown(roles[role]);
+		const selector =
+			isRecord(roles) && Object.hasOwn(roles, role) ? this.#modelRoleSelector(role, roles[role]) : undefined;
+		cache.set(role, selector);
+		return selector;
+	}
+
+	/** The read cache for the current {@link revision}, emptied when the revision moved on. */
+	#modelGroupReads(): ModelGroupReadCache {
+		const revision = this.revision;
+		if (this.#modelGroupReadCache?.revision !== revision) {
+			this.#modelGroupReadCache = {
+				revision,
+				roleSelectors: new Map(),
+				roleSpecs: new Map(),
+				chainSpecs: new Map(),
+				groups: new Map(),
+			};
+		}
+		return this.#modelGroupReadCache;
+	}
+
+	/**
+	 * Effective `modelRoles.<role>` as parsed: a selector, a list, an inline group, or a group
+	 * reference; `undefined` when the role is unset or holds no usable value. Returns a copy, so
+	 * changing it does not affect later reads.
+	 */
+	getModelRoleSpec(role: ModelRole | string): ParsedModelValue | undefined {
+		const cache = this.#modelGroupReads().roleSpecs;
+		if (cache.has(role)) return structuredClone(cache.get(role));
+		const roles: unknown = cfgModelRoles.get(this);
+		const value = isRecord(roles) && Object.hasOwn(roles, role) ? roles[role] : undefined;
+		const parsed = value === undefined || value === null ? undefined : parseModelRoleValue(role, value, "tolerant");
+		const spec = parsed?.ok ? parsed.value : undefined;
+		cache.set(role, spec);
+		return structuredClone(spec);
+	}
+
+	/**
+	 * Effective `retry.fallbackChains.<key>` as parsed: a selector list, an inline group, or a group
+	 * reference; `undefined` when the key is unset or holds no usable value. Returns a copy, so
+	 * changing it does not affect later reads.
+	 */
+	getFallbackChainSpec(key: string): ParsedModelValue | undefined {
+		const cache = this.#modelGroupReads().chainSpecs;
+		if (cache.has(key)) return structuredClone(cache.get(key));
+		const chains = cfgRetryFallbackChains.get(this);
+		const value: unknown = Object.hasOwn(chains, key) ? chains[key] : undefined;
+		const parsed =
+			value === undefined || value === null ? undefined : parseFallbackChainValue(key, value, "tolerant");
+		const spec = parsed?.ok ? parsed.value : undefined;
+		cache.set(key, spec);
+		return structuredClone(spec);
+	}
+
+	/**
+	 * Persists `retry.fallbackChains.<key>` to the global config (`undefined` removes it), written per
+	 * entry like `setEntry`.
+	 *
+	 * @throws ModelGroupConfigError when the value fails strict validation; nothing is written.
+	 */
+	setFallbackChainSpec(key: string, value: readonly string[] | string | RawSettings | undefined): void {
+		if (value !== undefined) {
+			const parsed = parseFallbackChainValue(key, value, "strict");
+			if (!parsed.ok) throw new ModelGroupConfigError(parsed.issues);
+		}
+		// Cloned so a later change to the caller's object cannot reach the stored layer.
+		this.writeEntry(cfgRetryFallbackChains, key, structuredClone(value));
+	}
+
+	/**
+	 * Effective `modelGroups.<name>` as parsed, or `undefined` when it is not defined. Returns a copy,
+	 * so changing it does not affect later reads.
+	 */
+	getModelGroup(name: string): ModelGroup | undefined {
+		return structuredClone(this.#cachedModelGroup(name));
+	}
+
+	#cachedModelGroup(name: string): ModelGroup | undefined {
+		const cache = this.#modelGroupReads().groups;
+		if (cache.has(name)) return cache.get(name);
+		const groups = cfgModelGroups.get(this);
+		const value: unknown = Object.hasOwn(groups, name) ? groups[name] : undefined;
+		const parsed =
+			value === undefined || value === null ? undefined : parseModelGroupDefinition(name, value, "tolerant");
+		const group = parsed?.ok ? parsed.value : undefined;
+		cache.set(name, group);
+		return group;
+	}
+
+	/**
+	 * Persists `modelGroups.<name>` to the global config (`undefined` removes it), written per entry
+	 * like `setEntry`.
+	 *
+	 * @throws ModelGroupConfigError when the definition fails strict validation; nothing is written.
+	 */
+	setModelGroup(name: string, value: RawSettings | undefined): void {
+		// Cloned so a later change to the caller's object cannot reach the stored layer.
+		this.writeEntry(cfgModelGroups, name, structuredClone(value));
 	}
 	/**
 	 * Get a model role from only the global settings layer (an {@link overlay}'s own, else its parent's).
 	 */
 	getGlobalModelRole(role: ModelRole | string): string | undefined {
-		const modelId = this.#modelRolesFromLayer(this.#global)[role];
+		const roles = this.#modelRolesFromLayer(this.#global);
+		const modelId = Object.hasOwn(roles, role) ? roles[role] : undefined;
 		return modelId || this.#parent?.getGlobalModelRole(role);
 	}
 
@@ -1983,7 +2370,8 @@ export class Settings {
 	 * Get a model role from only the current project settings layer (an {@link overlay}'s own, else its parent's).
 	 */
 	getProjectModelRole(role: ModelRole | string): string | undefined {
-		const modelId = this.#modelRolesFromLayer(this.#project)[role];
+		const roles = this.#modelRolesFromLayer(this.#project);
+		const modelId = Object.hasOwn(roles, role) ? roles[role] : undefined;
 		return modelId || this.#parent?.getProjectModelRole(role);
 	}
 
@@ -1994,15 +2382,17 @@ export class Settings {
 	 * for runtime and config-overlay layers and detects ownership by key
 	 * presence rather than normalized value, so a `null` tombstone in the
 	 * overlay or runtime layer correctly blocks lower layers. The project
-	 * layer is checked through {@link projectLayerForMerge} because a
-	 * project null is a cleared value (falls back to global), not a
-	 * tombstone.
+	 * layers are checked as they merge ({@link projectLayerForMerge},
+	 * {@link modelGroupLayerForMerge}): a project null is a cleared value
+	 * (falls back to global), not a tombstone, and an invalid pool in any
+	 * layer is skipped in favor of the layer below.
 	 */
 	getModelRoleProvenance(role: ModelRole | string): SettingProvenance {
-		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
-		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
-		if (this.#modelRoleLayerOwns(projectLayerForMerge(this.#project), role)) return "project";
-		if (this.#modelRoleLayerOwns(this.#global, role)) return "global";
+		const own = this.#liveModelGroupLayers();
+		if (this.#modelRoleLayerOwns(own.overrides, role)) return "runtime";
+		if (this.#modelRoleLayerOwns(own.configOverlay, role)) return "overlay";
+		if (this.#modelRoleLayerOwns(own.project, role)) return "project";
+		if (this.#modelRoleLayerOwns(own.global, role)) return "global";
 		return this.#parent?.getModelRoleProvenance(role) ?? "default";
 	}
 
@@ -2049,28 +2439,44 @@ export class Settings {
 	 * Get all model roles (helper for modelRoles record).
 	 */
 	getModelRoles(): ReadOnlyDict<string> {
+		const cache = this.#modelGroupReads();
+		if (cache.roles) return { ...cache.roles };
 		const roles: unknown = cfgModelRoles.get(this);
 		if (!isRecord(roles)) return {};
 
 		const normalized: Record<string, string> = {};
 		for (const role in roles) {
 			if (!Object.hasOwn(roles, role)) continue;
-			const modelId = modelRoleValueFromUnknown(roles[role]);
+			const modelId = this.getModelRole(role);
 			if (modelId !== undefined) {
-				normalized[role] = modelId;
+				defineOwn(normalized, role, modelId);
 			}
 		}
-		return normalized;
+		cache.roles = normalized;
+		return { ...normalized };
+	}
+
+	/**
+	 * Effective model roles as configured, for copying into another layer (a subagent's overrides): a
+	 * legacy value normalized like {@link getModelRoles}, a group or group reference as its mapping
+	 * or `+group` string. Values have already passed this instance's layer filters.
+	 */
+	getModelRoleEntries(): ReadOnlyDict<string | RawSettings> {
+		// Cloned so the caller's layer never shares a pool mapping with this instance's layers.
+		return structuredClone(this.#modelRoleEntriesFromLayer(this.#mergedView()));
 	}
 
 	/*
 	 * Override model roles (helper for modelRoles record).
+	 *
+	 * @throws ReservedModelRoleError when a role is `__proto__`, `constructor`, or `prototype`; nothing is written.
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = this.#modelRolesFromLayer(this.#overrides);
+		for (const role of Object.keys(roles)) assertModelRoleName(role);
+		const next: Record<string, unknown> = this.#modelRoleEntriesFromLayer(this.#overrides);
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
-				next[role] = modelId;
+				defineOwn(next, role, modelId);
 				this.#savedRuntimeModelRoleOverrides.delete(role);
 			}
 		}
@@ -3807,7 +4213,7 @@ export class Settings {
 		const modifiedModelRoles = [...this.#modifiedGlobalModelRoles];
 		const modifiedPathMutations = new Map(this.#modifiedPathMutations);
 		const modifiedModelRoleMutations = new Map(this.#modifiedGlobalModelRoleMutations);
-		const globalRolesAtStart = this.#modelRolesFromLayer(this.#global);
+		const globalRolesAtStart = this.#modelRoleEntriesFromLayer(this.#global);
 		this.#modified.clear();
 		this.#modifiedGlobalModelRoles.clear();
 		this.#modifiedPathMutations.clear();
@@ -3845,15 +4251,15 @@ export class Settings {
 				// Merge only the model roles captured by this save. Then retain
 				// any role changed while the async read/lock was pending before
 				// replacing #global, so the follow-up save still sees its value.
-				const latestGlobalRoles = this.#modelRolesFromLayer(this.#global);
+				const latestGlobalRoles = this.#modelRoleEntriesFromLayer(this.#global);
 				const rolesToPreserve = new Set(this.#modifiedGlobalModelRoles);
 				for (const role in globalRolesAtStart) {
-					if (globalRolesAtStart[role] !== latestGlobalRoles[role]) {
+					if (!Bun.deepEquals(globalRolesAtStart[role], latestGlobalRoles[role])) {
 						rolesToPreserve.add(role);
 					}
 				}
 				for (const role in latestGlobalRoles) {
-					if (globalRolesAtStart[role] !== latestGlobalRoles[role]) {
+					if (!Bun.deepEquals(globalRolesAtStart[role], latestGlobalRoles[role])) {
 						rolesToPreserve.add(role);
 					}
 				}
@@ -3877,14 +4283,14 @@ export class Settings {
 					const mergedRoles: Record<string, unknown> = { ...currentRoleValues };
 					for (const role of rolesToApply) {
 						if (Object.hasOwn(globalRolesAtStart, role)) {
-							mergedRoles[role] = globalRolesAtStart[role];
+							defineOwn(mergedRoles, role, globalRolesAtStart[role]);
 						} else {
 							delete mergedRoles[role];
 						}
 					}
 					for (const role of rolesToPreserve) {
 						if (Object.hasOwn(latestGlobalRoles, role)) {
-							mergedRoles[role] = latestGlobalRoles[role];
+							defineOwn(mergedRoles, role, latestGlobalRoles[role]);
 						} else {
 							delete mergedRoles[role];
 						}
@@ -3928,9 +4334,9 @@ export class Settings {
 				this.#adoptSavedGlobal(current, configPath);
 				// These pending roles were included in this write. Remove each
 				// only if no newer local change arrived while the write was in flight.
-				const globalRolesAfterWrite = this.#modelRolesFromLayer(this.#global);
+				const globalRolesAfterWrite = this.#modelRoleEntriesFromLayer(this.#global);
 				for (const role of rolesToPreserve) {
-					if (latestGlobalRoles[role] === globalRolesAfterWrite[role]) {
+					if (Bun.deepEquals(latestGlobalRoles[role], globalRolesAfterWrite[role])) {
 						this.#modifiedGlobalModelRoles.delete(role);
 						this.#modifiedGlobalModelRoleMutations.delete(role);
 					}
@@ -3998,7 +4404,7 @@ export class Settings {
 			const targetRoles = getByPath(target, ["modelRoles"]);
 			const roles: Record<string, unknown> = isRecord(targetRoles) ? targetRoles : {};
 			for (const role of this.#modifiedGlobalModelRoles) {
-				if (isRecord(liveRoles) && Object.hasOwn(liveRoles, role)) roles[role] = liveRoles[role];
+				if (isRecord(liveRoles) && Object.hasOwn(liveRoles, role)) defineOwn(roles, role, liveRoles[role]);
 				else delete roles[role];
 			}
 			setByPath(target, ["modelRoles"], roles);
@@ -4081,7 +4487,8 @@ export class Settings {
 	#rebuildMerged(): void {
 		this.#revision++;
 		if (this.#parent) this.#syncedParentRevision = this.#parent.revision;
-		this.#merged = this.#mergeOverParent(this.#mergeOwnLayers(this.#ownLayers()));
+		this.#merged = this.#mergeOverParent(this.#mergeModelGroupLayers(this.#liveModelGroupLayers()));
+		this.#warnUndefinedGroupReferences();
 	}
 
 	#ownLayers(): OwnLayers {
@@ -4095,45 +4502,50 @@ export class Settings {
 
 	/** `layers` (global, project, `--config` overlay, runtime) merged in precedence order. */
 	#mergeOwnLayers(layers: OwnLayers): RawSettings {
-		return this.#mergeOwnLayersWith(layers, this.#projectLayerForMerge(layers));
+		return this.#mergeModelGroupLayers(this.#modelGroupLayers(layers));
 	}
 
-	/** {@link mergeOwnLayers} with `project` standing in for the prepared project layer. */
-	#mergeOwnLayersWith(layers: OwnLayers, project: RawSettings): RawSettings {
-		let merged = this.#deepMerge(this.#deepMerge({}, layers.global), project);
-		merged = this.#deepMerge(merged, layers.configOverlay);
-		merged = this.#deepMerge(merged, layers.overrides);
-		return applyMergeHooks(merged, [layers.global, project, layers.configOverlay, layers.overrides]);
+	/** Layers already passed through {@link #modelGroupLayers}, merged in precedence order. */
+	#mergeModelGroupLayers(own: OwnLayers): RawSettings {
+		return this.#mergeOwnLayersWith(own, this.#projectLayerForMerge(own));
+	}
+
+	/** {@link #mergeModelGroupLayers} with `project` standing in for the prepared project layer. */
+	#mergeOwnLayersWith(own: OwnLayers, project: RawSettings): RawSettings {
+		let merged = this.#deepMerge(this.#deepMerge({}, own.global), project);
+		merged = this.#deepMerge(merged, own.configOverlay);
+		merged = this.#deepMerge(merged, own.overrides);
+		return applyMergeHooks(merged, [own.global, project, own.configOverlay, own.overrides]);
 	}
 
 	/**
-	 * The project layer of `layers` as it merges ({@link projectLayerForMerge}), without the value of
-	 * a `dropInvalidInProject` setting whose merged value fails `validate` only because of it: when
-	 * the merge without that value passes, the value is dropped with one warning. When the other
-	 * layers fail on their own, the project value stays and the failure surfaces as usual.
+	 * The project layer of `own` ({@link #modelGroupLayers} output) without the value of a
+	 * `dropInvalidInProject` setting whose merged value fails `validate` only because of it: when the
+	 * merge without that value passes, the value is dropped with one warning. When the other layers
+	 * fail on their own, the project value stays and the failure surfaces as usual.
 	 */
-	#projectLayerForMerge(layers: OwnLayers): RawSettings {
+	#projectLayerForMerge(own: OwnLayers): RawSettings {
 		const parentRevision = this.#parent?.revision;
 		const cached = this.#preparedProject;
 		if (
 			cached &&
 			cached.revision === this.#revision &&
 			cached.parentRevision === parentRevision &&
-			cached.layers.global === layers.global &&
-			cached.layers.project === layers.project &&
-			cached.layers.configOverlay === layers.configOverlay &&
-			cached.layers.overrides === layers.overrides
+			cached.layers.global === own.global &&
+			cached.layers.project === own.project &&
+			cached.layers.configOverlay === own.configOverlay &&
+			cached.layers.overrides === own.overrides
 		) {
 			return cached.project;
 		}
-		const project = this.#prepareProjectLayer(layers);
-		this.#preparedProject = { layers, revision: this.#revision, parentRevision, project };
+		const project = this.#prepareProjectLayer(own);
+		this.#preparedProject = { layers: own, revision: this.#revision, parentRevision, project };
 		return project;
 	}
 
 	/** The uncached body of `#projectLayerForMerge`. */
-	#prepareProjectLayer(layers: OwnLayers): RawSettings {
-		let project = projectLayerForMerge(layers.project, (segments, reason) => this.#warnProjectDrop(segments, reason));
+	#prepareProjectLayer(own: OwnLayers): RawSettings {
+		let project = own.project;
 		for (const setting of allSettings()) {
 			const validate = setting.definition.validate;
 			if (!setting.definition.dropInvalidInProject || !validate) continue;
@@ -4141,7 +4553,10 @@ export class Settings {
 			if (value === undefined) continue;
 			const warnKey = `project-merged:${setting.id}`;
 			const mergedValue = (candidate: RawSettings): unknown =>
-				getByPath(this.#mergeOverParent(this.#mergeOwnLayersWith(layers, candidate)), setting.segments);
+				getByPath(
+					this.#mergeOverParent(this.#mergeOwnLayersWith({ ...own, project: candidate }, candidate)),
+					setting.segments,
+				);
 			let error: unknown;
 			try {
 				validate(mergedValue(project));
@@ -4171,6 +4586,106 @@ export class Settings {
 	}
 
 	/**
+	 * `layers` as they merge: the project layer through {@link projectLayerForMerge}, and every layer
+	 * through {@link modelGroupLayerForMerge}.
+	 */
+	#modelGroupLayers(layers: OwnLayers): OwnLayers {
+		const warn =
+			(source: ModelGroupLayerSource): ModelGroupWarn =>
+			(path, message, issues) =>
+				this.#warnModelGroupOnce(source, path, message, issues);
+		const global = modelGroupLayerForMerge(layers.global, "global", warn("global"));
+		const configOverlay = modelGroupLayerForMerge(layers.configOverlay, "overlay", warn("overlay"));
+		const overrides = modelGroupLayerForMerge(layers.overrides, "runtime", warn("runtime"));
+		const project = modelGroupLayerForMerge(
+			projectLayerForMerge(layers.project, (segments, reason) => this.#warnProjectDrop(segments, reason)),
+			"project",
+			warn("project"),
+		);
+		return { global, project, configOverlay, overrides };
+	}
+
+	/** {@link #modelGroupLayers} of the live layers, computed once per {@link revision}. */
+	#liveModelGroupLayers(): OwnLayers {
+		this.#syncParent();
+		if (this.#liveModelGroupLayersCache?.revision !== this.#revision) {
+			this.#liveModelGroupLayersCache = {
+				revision: this.#revision,
+				layers: this.#modelGroupLayers(this.#ownLayers()),
+			};
+		}
+		return this.#liveModelGroupLayersCache.layers;
+	}
+
+	/** Logs a model-group problem of the `source` layer the first time this instance meets it. */
+	#warnModelGroupOnce(
+		source: ModelGroupLayerSource,
+		path: string,
+		message: string,
+		issues?: readonly ModelGroupIssue[],
+	): void {
+		const key = `${source}\0${path}\0${message}`;
+		if (this.#modelGroupWarningsSeen.has(key)) return;
+		// Bounded: past the cap a long-lived instance may repeat a warning rather than grow without limit.
+		if (this.#modelGroupWarningsSeen.size >= MAX_MODEL_GROUP_WARNINGS_SEEN) this.#modelGroupWarningsSeen.clear();
+		this.#modelGroupWarningsSeen.add(key);
+		if (issues) logger.warn(`Settings: ${message}`, { setting: path, layer: source, issues });
+		else logger.warn(`Settings: ${path} ${message}`, { setting: path, layer: source });
+	}
+
+	/**
+	 * The model-group warnings already logged by `source` that a derived instance keeps: all but the
+	 * project layer's, which a derived instance may read for another directory.
+	 */
+	#inheritModelGroupWarnings(source: Settings): void {
+		for (const key of source.#modelGroupWarningsSeen) {
+			if (!key.startsWith(`project\0`)) this.#modelGroupWarningsSeen.add(key);
+		}
+	}
+
+	/**
+	 * Warns once for each effective role or fallback chain that references a model group the merged
+	 * view does not define, naming the highest own layer that sets the entry. Entries only an overlay
+	 * parent sets are left to the parent's own warning.
+	 */
+	#warnUndefinedGroupReferences(): void {
+		const groups = getByPath(this.#merged, cfgModelGroups.segments);
+		const own = this.#liveModelGroupLayers();
+		const sources: [ModelGroupLayerSource, RawSettings][] = [
+			["runtime", own.overrides],
+			["overlay", own.configOverlay],
+			["project", own.project],
+			["global", own.global],
+		];
+		for (const { segments, section } of MODEL_GROUP_RECORDS) {
+			if (section === "modelGroups") continue;
+			const record = getByPath(this.#merged, segments);
+			if (!isRecord(record)) continue;
+			for (const key of Object.keys(record)) {
+				const value = record[key];
+				if (!isModelGroupForm(value)) continue;
+				const parsed =
+					section === "modelRoles"
+						? parseModelRoleValue(key, value, "tolerant")
+						: parseFallbackChainValue(key, value, "tolerant");
+				if (!parsed.ok || parsed.value.kind !== "ref") continue;
+				const name = parsed.value.ref.use;
+				if (isRecord(groups) && Object.hasOwn(groups, name) && isRecord(groups[name])) continue;
+				const owner = sources.find(([, layer]) => {
+					const entries = getByPath(layer, segments);
+					return isRecord(entries) && Object.hasOwn(entries, key);
+				});
+				if (!owner) continue;
+				this.#warnModelGroupOnce(
+					owner[0],
+					`${segments.join(".")}.${modelGroupPathKey(key)}`,
+					`references model group "${modelGroupPathKey(name)}", which no settings layer defines; the entry selects no model`,
+				);
+			}
+		}
+	}
+
+	/**
 	 * Warns once per path and reason that a project value is ignored. The path is logged without
 	 * bidirectional or control characters, truncated, and quoted; the value is never logged.
 	 */
@@ -4180,7 +4695,9 @@ export class Settings {
 		if (this.#projectDropWarnings.size >= MAX_PROJECT_NULL_WARNINGS) {
 			if (this.#projectDropWarningsCapped) return;
 			this.#projectDropWarningsCapped = true;
-			logger.warn("Settings: further ignored project values are not reported", { limit: MAX_PROJECT_NULL_WARNINGS });
+			logger.warn("Settings: further ignored project values are not reported", {
+				limit: MAX_PROJECT_NULL_WARNINGS,
+			});
 			return;
 		}
 		this.#projectDropWarnings.add(key);
@@ -4188,11 +4705,12 @@ export class Settings {
 			sanitizeNoticeLine(segments.join(".").slice(0, MAX_LOGGED_PROJECT_PATH_LENGTH)),
 		);
 		if (reason === "null") logger.warn("Settings: ignoring project null value; lower layers apply", { path: shown });
-		else
+		else {
 			logger.warn("Settings: ignoring project value nested too deeply", {
 				path: shown,
 				limit: MAX_PROJECT_LAYER_DEPTH,
 			});
+		}
 	}
 
 	/** `own` merged over an overlay parent's current view (itself for a root instance). */
@@ -4214,20 +4732,23 @@ export class Settings {
 	 * `overrides` deep-merged over `base`. Keys follow the higher layer's order, then base-only keys:
 	 * record order is meaningful to some consumers (`retry.fallbackChains` is searched in order).
 	 * Only own keys are read and every key is defined as an own entry, so a `__proto__` key never
-	 * changes a prototype. Records nested {@link MAX_SETTINGS_MERGE_DEPTH} levels deep (`depth` is the
-	 * nesting of `base` and `overrides`) are taken whole from the higher layer instead of merged, so the
+	 * changes a prototype. Records nested {@link MAX_SETTINGS_MERGE_DEPTH} levels deep (`segments` holds
+	 * the path of `base` and `overrides`) are taken whole from the higher layer instead of merged, so the
 	 * recursion depth stays bounded.
 	 */
-	#deepMerge(base: RawSettings, overrides: RawSettings, depth = 0): RawSettings {
+	#deepMerge(base: RawSettings, overrides: RawSettings, segments: readonly string[] = []): RawSettings {
 		const result: RawSettings = {};
+		// Entries of an `entryMerge: "replace"` record are replaced whole, never merged key by key.
+		const replaceEntries = segments.length > 0 && replacesEntries(segments);
 		for (const key of Object.keys(overrides)) {
 			const override = overrides[key];
-			const baseVal = ownEntry(base, key);
+			const baseVal = Object.hasOwn(base, key) ? base[key] : undefined;
 
 			if (override === undefined) continue;
 
 			if (
-				depth < MAX_SETTINGS_MERGE_DEPTH &&
+				!replaceEntries &&
+				segments.length < MAX_SETTINGS_MERGE_DEPTH &&
 				typeof override === "object" &&
 				override !== null &&
 				!Array.isArray(override) &&
@@ -4235,7 +4756,11 @@ export class Settings {
 				baseVal !== null &&
 				!Array.isArray(baseVal)
 			) {
-				defineOwn(result, key, this.#deepMerge(baseVal as RawSettings, override as RawSettings, depth + 1));
+				defineOwn(
+					result,
+					key,
+					this.#deepMerge(baseVal as RawSettings, override as RawSettings, [...segments, key]),
+				);
 			} else {
 				defineOwn(result, key, override);
 			}

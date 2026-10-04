@@ -451,6 +451,8 @@ export interface ModelUsageAccountHealth {
 	state: ModelUsageHealthState;
 	remainingFraction?: number;
 	resetsAt?: number;
+	/** Epoch ms the usage report behind `state` was fetched; absent when no report decided it. */
+	fetchedAt?: number;
 }
 
 /** Aggregate model usage health and account detail. */

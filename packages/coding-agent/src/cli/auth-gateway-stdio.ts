@@ -18,6 +18,7 @@ import { formatModelStringWithRouting, normalizeModelPatternList, resolveCliMode
 import { Settings } from "../config/settings";
 import { claimRpcInput } from "../modes/rpc/rpc-input";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
+import { warnRolePoolProjection } from "../session/pool-selection";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
 
 /** Names the caller in the gateway's logs. */
@@ -38,6 +39,8 @@ export function selectorCandidates(
 	for (const pattern of normalizeModelPatternList(selector)) {
 		const { model, configuredRole } = resolveCliModel({ cliModel: pattern, modelRegistry: registry, settings });
 		if (!model) continue;
+		// Routing is per request and synchronous, so a pool role runs its ordered member list.
+		if (configuredRole) warnRolePoolProjection(settings, configuredRole);
 		const chain = configuredRole
 			? collectOnlineTinyCandidates([configuredRole], settings, available).map(candidate => candidate.model)
 			: expandOnlineTinyModelFallbacks(model, settings, available);

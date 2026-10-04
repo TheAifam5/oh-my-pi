@@ -13,13 +13,19 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { isEnoent, logger, parseImageMetadata, prompt, ptree, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../config/model-resolver";
+import { type RoleChainCandidate, resolveModelRoleValue } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
 import { settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../session/role-models";
+import {
+	createRolePoolCall,
+	noteRolePoolModelUsed,
+	type RolePoolCall,
+	resolveRoleChainAsync,
+} from "../session/role-pool-resolution";
 import { resolveReadPath } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000;
@@ -237,13 +243,17 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const effectiveSettings = ctx.settings ?? settings;
 			const pool = roleCandidatePool("image", effectiveSettings, ctx.modelRegistry);
 			let candidates: Model[];
+			let poolCall: RolePoolCall | undefined;
 			if (params.model) {
 				const selected = resolveModelRoleValue(params.model, pool, { settings: effectiveSettings }).model;
 				if (!selected)
 					throw new Error(`Image model selector did not match an available image model: ${params.model}`);
 				candidates = [selected];
 			} else {
-				candidates = defaultImageCandidates(resolveRoleChain("image", effectiveSettings, pool), ctx.model, pool);
+				const poolContext = { modelRegistry: ctx.modelRegistry, sessionId, signal: requestSignal };
+				poolCall = createRolePoolCall(effectiveSettings, poolContext);
+				const chain = await resolveRoleChainAsync("image", effectiveSettings, pool, poolContext, poolCall);
+				candidates = defaultImageCandidates(chain, ctx.model, pool);
 			}
 
 			const failures: ProviderHttpError[] = [];
@@ -311,6 +321,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 								ctx.modelRegistry.resolveModelHeaders(carrier, headerSignal),
 						}
 					: undefined;
+				if (poolCall) noteRolePoolModelUsed(poolCall, model);
 				try {
 					const result = await generateImage(resolvedModel, request, {
 						apiKey,

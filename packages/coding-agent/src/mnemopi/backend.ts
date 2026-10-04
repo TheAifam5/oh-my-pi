@@ -9,7 +9,6 @@ import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { roleCandidatePool } from "../config/model-roles";
-import { resolveRoleChain } from "../config/model-resolver";
 import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
 import type {
 	MemoryBackend,
@@ -24,6 +23,7 @@ import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-sy
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { createRolePoolCall, noteRolePoolModelUsed, resolveRoleChainAsync } from "../session/role-pool-resolution";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
@@ -568,7 +568,16 @@ async function resolveMnemopiProviderOptions(
 	}
 
 	try {
-		const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
+		// A memory pool is selected once per backend start; one its policy blocks leaves Mnemopi without an LLM.
+		const poolContext = { modelRegistry, sessionId };
+		const poolCall = createRolePoolCall(settings, poolContext);
+		const candidates = await resolveRoleChainAsync(
+			"memory",
+			settings,
+			roleCandidatePool("memory", settings, modelRegistry),
+			poolContext,
+			poolCall,
+		);
 		const primary = candidates[0]?.model;
 		if (!primary) {
 			logger.warn("Mnemopi: llmMode=smol but no memory model resolved; continuing without LLM.");
@@ -590,6 +599,7 @@ async function resolveMnemopiProviderOptions(
 				if (signal?.aborted) return null;
 				try {
 					if (model.api === "local-inference") {
+						noteRolePoolModelUsed(poolCall, model);
 						const result = await tinyModelClient.complete(model.id, request.prompt, {
 							maxTokens: opts?.maxTokens,
 							systemPrompt: request.systemPrompt,
@@ -612,6 +622,7 @@ async function resolveMnemopiProviderOptions(
 						});
 						continue;
 					}
+					noteRolePoolModelUsed(poolCall, model);
 					const message = await retryTransientCompletion(
 						() =>
 							completeSimple(

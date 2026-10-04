@@ -43,54 +43,9 @@ import { pickerFuzzyHits } from "../native/picker";
 import type { NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { sameItems } from "../native/memo";
 import { plainText } from "../native/spans";
+import { MODEL_ROLE_IDS } from "./model-role-ids";
 
-/** Canonical display ordering of built-in model roles. */
-export type ModelRole =
-	| "default"
-	| "smol"
-	| "slow"
-	| "vision"
-	| "plan"
-	| "commit"
-	| "tiny"
-	| "memory"
-	| "task"
-	| "advisor"
-	| "image"
-	| "web"
-	| "speech"
-	| "dictation"
-	| "judge";
-export const MODEL_ROLE_IDS: ModelRole[] = [
-	"default",
-	"smol",
-	"slow",
-	"vision",
-	"plan",
-	"commit",
-	"tiny",
-	"memory",
-	"task",
-	"advisor",
-	"image",
-	"web",
-	"speech",
-	"dictation",
-	"judge",
-];
-export const CHAT_MODEL_ROLE_IDS: ModelRole[] = [
-	"default",
-	"smol",
-	"slow",
-	"vision",
-	"plan",
-	"commit",
-	"tiny",
-	"memory",
-	"task",
-	"advisor",
-];
-export const KIND_ROLE_IDS: ModelRole[] = ["image", "web", "speech", "dictation", "judge"];
+export * from "./model-role-ids";
 
 /** Measured model performance shown in browser rows. */
 export interface ModelBrowserPerf {

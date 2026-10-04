@@ -3,7 +3,12 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { TspPickerGroup, TspPickerProps } from "@oh-my-pi/pi-wire";
 import type { DescribeContext, NativeChild, NativeNode } from "../src/native/node";
-import { ModelHubComponent, type ModelHubRegistry, type ModelHubSource } from "../src/overlays/model-hub";
+import {
+	ModelHubComponent,
+	type ModelHubPool,
+	type ModelHubRegistry,
+	type ModelHubSource,
+} from "../src/overlays/model-hub";
 import { ModelPickerComponent } from "../src/overlays/model-picker";
 import { initTheme } from "../src/theme";
 import type { TUI } from "../src/tui";
@@ -45,7 +50,11 @@ const MODELS = [
 	model("openai", "gpt-5.6-mini", { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
 ];
 
-function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
+function source(
+	roles: Record<string, string>,
+	mru: string[],
+	pools: { roles?: Record<string, ModelHubPool>; chains?: Record<string, ModelHubPool> } = {},
+): ModelHubSource {
 	return {
 		revision: 0,
 		defaultThinkingLevel: "off",
@@ -62,11 +71,15 @@ function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
 		getModelRole: role => roles[role],
 		disabledProviders: [],
 		fallbackChains: { default: ["openai/gpt-5.6"] },
+		fallbackChainGroupKeys: Object.keys(pools.chains ?? {}),
 		modelRoleStorage: "global",
 		cycleOrder: [],
 		getProjectModelRole: () => undefined,
 		getGlobalModelRole: role => roles[role],
 		getModelRoleSource: () => "global",
+		getPool: target => (target.kind === "role" ? pools.roles : pools.chains)?.[target.key],
+		roleAcceptsPools: () => true,
+		poolWriteBlocker: () => undefined,
 	};
 }
 
@@ -321,6 +334,93 @@ test("the Roles view picker names the active preset and ctrl+←/→ switches it
 	expect(subtitleText()).toStartWith("Preset slow");
 	hub.handleInput("\x1b[1;5D");
 	expect(switched).toEqual(["slow", "fast"]);
+});
+
+test("pools render inside the roles picker and their actions edit only what the pool allows", () => {
+	const raw = {
+		strategy: "priority",
+		strategyOptions: { order: ["opus", "gpt"] },
+		routing: { funding: { order: ["included", "metered"] }, spending: { policy: "provider-managed" } },
+		models: { opus: { model: "anthropic/claude-opus-5", defaultEffort: "high" }, gpt: { model: "openai/gpt-5.6" } },
+	};
+	const pools = {
+		roles: {
+			smol: {
+				source: { kind: "inline" },
+				strategy: "priority",
+				members: [
+					{ alias: "opus", model: "anthropic/claude-opus-5", effort: "high" },
+					{ alias: "gpt", model: "openai/gpt-5.6" },
+				],
+				funding: ["included", "metered"],
+				spending: "provider-managed",
+				raw,
+			},
+		},
+		chains: {
+			default: {
+				source: { kind: "ref", group: "fast" },
+				strategy: "random",
+				members: [{ alias: "mini", model: "openai/gpt-5.6-mini" }],
+				funding: [],
+				readOnly: "edit modelGroups.fast in config",
+			},
+		},
+	} satisfies { roles: Record<string, ModelHubPool>; chains: Record<string, ModelHubPool> };
+	const writes: unknown[] = [];
+	const hub = new ModelHubComponent(
+		ui,
+		source({ default: "demo/demo", smol: "anthropic/claude-opus-5:high,openai/gpt-5.6" }, [], pools),
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{
+			onAssign: () => {},
+			onUnassign: () => {},
+			onCancel: () => {},
+			onPoolChange: (target, value) => {
+				writes.push([target, value]);
+				return undefined;
+			},
+		},
+	);
+	hubs.push(hub);
+	const act = (act: string) => hub.handleNativeEvent({ type: "action", key: "", act, mods: [] });
+	const select = (item: string) => hub.handleNativeEvent({ type: "select", key: "", item });
+
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	let p = props(hub.describe(withPicker));
+	const item = (id: string) => p.items?.find(entry => entry.id === id);
+	expect(item("role:smol")?.facts?.model).toBe(
+		"pool · 2 models · priority · funding included → metered · spending provider-managed",
+	);
+	expect(item("member:role:smol:opus")).toMatchObject({ label: "anthropic/claude-opus-5", depth: 1 });
+	expect(item("member:role:smol:opus")?.facts?.thinking).toBe("high");
+	expect(item("pooled:default")?.label).toContain("read-only: edit modelGroups.fast in config");
+	expect(item("member:chain:default:mini")).toMatchObject({ depth: 2 });
+	expect(p.total).toBe(p.order?.filter(entry => typeof entry === "string").length);
+	// The generic native frame lists the same pool rows.
+	const frame = JSON.stringify(hub.describe(withoutPicker));
+	expect(frame).toContain("member:role:smol:opus");
+
+	// A role whose fallback chain is a read-only pool offers no fallback action, and no list edit reaches it.
+	select("role:default");
+	p = props(hub.describe(withPicker));
+	expect(p.actions?.map(action => action.id)).not.toContain("roles:fallback");
+	select("member:chain:default:mini");
+	p = props(hub.describe(withPicker));
+	expect(p.actions?.map(action => action.id)).toEqual(["close"]);
+
+	select("role:smol");
+	p = props(hub.describe(withPicker));
+	expect(p.actions?.find(action => action.id === "roles:pick")?.label).toBe("Add member");
+	expect(p.actions?.map(action => action.id)).toContain("roles:funding");
+	act("roles:strategy");
+	expect(writes).toEqual([
+		[
+			{ kind: "role", key: "smol" },
+			{ ...raw, strategy: "round-robin", strategyOptions: { order: ["opus", "gpt"] } },
+		],
+	]);
 });
 
 test("the quick picker is an md sheet with the summary below and a task-model toggle", () => {

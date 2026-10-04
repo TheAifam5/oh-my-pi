@@ -384,6 +384,7 @@ import {
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
+import type { RolePoolPick } from "./pool-selection";
 import {
 	isPrewalkPlanNudge,
 	PrewalkCoordinator,
@@ -2247,6 +2248,12 @@ export class AgentSession implements SettingsScope {
 				this.#recovery.retryFallbackChainKeys(selector, model, options),
 			findRetryFallbackCandidates: (role, selector, model) =>
 				this.#recovery.findRetryFallbackCandidates(role, selector, model),
+			resolveRetryFallbackCandidate: (role, selector) =>
+				this.#recovery.resolveRetryFallbackCandidate(role, selector),
+			orderedRetryFallbackCandidates: async (role, selector, model, options) =>
+				(await this.#recovery.orderedRetryFallbackCandidates(role, selector, model, options)).candidates,
+			noteRetryFallbackApplied: (role, selector, currentSelector, model) =>
+				this.#recovery.noteRetryFallbackApplied(role, selector, currentSelector, model),
 			isRetryFallbackSelectorSuppressed: selector => this.#recovery.isRetryFallbackSelectorSuppressed(selector),
 			noteRetryFallbackCooldown: (selector, retryAfterMs, errorMessage) =>
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
@@ -7451,6 +7458,35 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * {@link resolveRoleModelWithThinking} that applies a pool role's strategy and funding policy,
+	 * keeping the pick for this session until settings change or the model is switched elsewhere.
+	 *
+	 * @throws RolePoolUnavailableError when no pool member is eligible and the funding or quota policy excluded one.
+	 */
+	resolveRoleModelAsync(
+		role: string,
+		options?: { signal?: AbortSignal; availableModels?: Model[] },
+	): Promise<ResolvedModelRoleValue> {
+		return this.#models.resolveRoleModelAsync(role, options);
+	}
+
+	/**
+	 * Keeps `pick`, the model this session already runs, as its pick of `role`'s pool, unless
+	 * settings changed since `revision`, the revision it was made at. Returns whether it was kept.
+	 */
+	adoptRolePoolPick(role: string, pick: RolePoolPick, revision: number): boolean {
+		return this.#models.adoptRolePoolPick(role, pick, revision);
+	}
+
+	/**
+	 * Records the round-robin position of `role`'s pool pick kept by {@link resolveRoleModelAsync}
+	 * when `model` is that pick; call it when a request is sent to the pick without switching to it.
+	 */
+	noteRolePoolPickUsed(role: string, model: Model): void {
+		this.#models.noteRolePoolPickUsed(role, model);
+	}
+
+	/**
 	 * Resolve the explicit thinking suffix that should apply when a temporary
 	 * picker selects a model already assigned to a configured role.
 	 */
@@ -10638,11 +10674,15 @@ export class AgentSession implements SettingsScope {
 		return this.#models.setModel(model, role, options);
 	}
 
-	/** Selects a model for this session without updating persisted model settings. */
+	/**
+	 * Selects a model for this session without updating persisted model settings. `options.poolRole`
+	 * names the role whose pool pick the switch applies, keeping that pick and recording its
+	 * round-robin position when `model` is the pick.
+	 */
 	setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; poolRole?: string },
 	): Promise<void> {
 		return this.#models.setModelTemporary(model, thinkingLevel, options);
 	}
@@ -10657,8 +10697,8 @@ export class AgentSession implements SettingsScope {
 		return this.#models.getRoleModelCycle(roleOrder);
 	}
 
-	/** Applies a resolved role model without changing global settings. */
-	applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
+	/** Applies a resolved role model, or a pool role's pick, without changing global settings; returns what it applied. */
+	applyRoleModel(entry: ResolvedRoleModel): Promise<ResolvedRoleModel> {
 		return this.#models.applyRoleModel(entry);
 	}
 

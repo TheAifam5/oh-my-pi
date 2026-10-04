@@ -54,6 +54,11 @@
       "additionalProperties": true,
       "default": {}
     },
+    "modelGroups": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
     "modelPresets": {
       "type": "object",
       "additionalProperties": true,

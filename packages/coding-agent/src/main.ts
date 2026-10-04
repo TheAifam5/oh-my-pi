@@ -51,11 +51,13 @@ import {
 	getModelMatchPreferences,
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
+	resolveExplicitModelRole,
 	resolveModelRoleValue,
 	resolveModelScope,
 	type ScopedModel,
 } from "./config/model-resolver";
 import { ModelsConfigFile } from "./config/models-config";
+import { rolePoolAliasTarget, warnRolePoolProjection } from "./session/pool-selection";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { all, combine, type ProtocolHost, type SettingValueOf } from "./config/registry";
 import { Settings, settings } from "./config/settings";
@@ -1403,7 +1405,11 @@ export async function buildSessionOptions(
 	// createAgentSession's post-extension re-resolution (issue #6694); the
 	// scoped thinking-level seed below must be deferred along with the model.
 	let deferredDefaultRole = false;
-	if (parsed.model) {
+	if (parsed.model && !parsed.provider && rolePoolAliasTarget(parsed.model, activeSettings) !== undefined) {
+		// A pool role (`@role`, `@role:level`) picks its member by strategy and funding during session
+		// creation, which also owns its fallback over the pool's other eligible members.
+		options.modelPattern = parsed.model;
+	} else if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
@@ -1543,6 +1549,9 @@ export async function buildSessionOptions(
 			targetPatterns = configuredPatterns.length > 0 ? configuredPatterns : [targetSelector];
 		}
 
+		// The session prewalk target resolves a pool role through its ordered member list.
+		const prewalkRole = resolveExplicitModelRole(target, activeSettings);
+		if (prewalkRole) warnRolePoolProjection(activeSettings, prewalkRole);
 		const selection = await resolvePrewalkTarget(
 			targetPatterns,
 			target,
@@ -1566,6 +1575,8 @@ export async function buildSessionOptions(
 		throw new Error("--plan-yolo-into requires --plan-yolo");
 	}
 	if (parsed.planYolo) {
+		const planYoloRole = resolveExplicitModelRole(parsed.planYoloInto ?? "@smol", activeSettings);
+		if (planYoloRole) warnRolePoolProjection(activeSettings, planYoloRole);
 		const rolePattern = expandRoleAlias(parsed.planYoloInto ?? "@smol", activeSettings);
 		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
 		if (resolved.warning) {

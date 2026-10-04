@@ -26,6 +26,7 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -419,6 +420,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		};
 
+		noteMemoryModelUsed(session, "default", phase1Model);
 		await runWithConcurrency(claims, config.stage1Concurrency, async claim => {
 			if (!isMemoryStartupActive(options)) return;
 			const result = await runStage1Job({
@@ -584,6 +586,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 
 		try {
 			if (!isMemoryStartupActive(options)) return;
+			noteMemoryModelUsed(session, "smol", phase2Model);
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
@@ -1345,6 +1348,17 @@ function computeModelTokenBudget(model: Model, config: MemoryRuntimeConfig): num
 	return Math.max(2048, Math.floor(maxTokens));
 }
 
+/** The role {@link resolveMemoryModel} resolves for `fallbackRole`: itself when configured, else `default`. */
+function memoryModelRole(settings: Settings, fallbackRole: string): string {
+	return settings.getModelRole(fallbackRole) ? fallbackRole : "default";
+}
+
+/** Records the session's pool pick for the role `fallbackRole` resolves to when `model` is that pick. */
+function noteMemoryModelUsed(session: AgentSession, fallbackRole: string, model: Model): void {
+	const role = memoryModelRole(session.settings, fallbackRole);
+	if (rolePoolTarget(session.settings, role)) session.noteRolePoolPickUsed(role, model);
+}
+
 async function resolveMemoryModel(options: {
 	modelRegistry: ModelRegistry;
 	session: AgentSession;
@@ -1352,6 +1366,18 @@ async function resolveMemoryModel(options: {
 }): Promise<Model | undefined> {
 	const { modelRegistry, session, fallbackRole } = options;
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
+	const requestedRole = memoryModelRole(session.settings, fallbackRole);
+	if (requestedModel && rolePoolTarget(session.settings, requestedRole)) {
+		// A pool role takes the session's pick; one its policy blocks leaves no model rather than a fallback.
+		try {
+			const picked = await session.resolveRoleModelAsync(requestedRole);
+			if (picked.model) return picked.model;
+		} catch (error) {
+			if (!(error instanceof RolePoolUnavailableError)) throw error;
+			logger.debug("Memory model role pool unavailable", { role: requestedRole, error: error.message });
+			return undefined;
+		}
+	}
 	if (requestedModel) {
 		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
 			settings: session.settings,

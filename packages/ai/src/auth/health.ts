@@ -211,6 +211,7 @@ export class CredentialHealth implements HealthApi {
 						credentialType,
 						state: "depleted",
 						resetsAt: futureResets.length > 0 ? Math.min(...futureResets) : undefined,
+						fetchedAt: report.fetchedAt,
 					};
 				}
 
@@ -226,6 +227,7 @@ export class CredentialHealth implements HealthApi {
 					credentialType,
 					state: remainingFraction <= resolveReserveFraction(entry) ? "reserve" : "healthy",
 					remainingFraction,
+					fetchedAt: report.fetchedAt,
 				};
 			}),
 		);

@@ -652,6 +652,18 @@ chain rather than inheriting the active conversation model.
 
 If a role points at another role, the target model still inherits normally and any explicit suffix on the referring role wins for that role-specific use.
 
+### Model pools
+
+A `modelRoles.<role>` or `retry.fallbackChains.<key>` value may be a model group: an inline pool, a `{ use, profile? }` reference, or the shorthand `+<name>[@<profile>]` naming `modelGroups.<name>` (see [Settings](./settings.md)). Selector strings, patterns, comma lists, and selector arrays keep their existing meaning.
+
+- **Strategy.** `priority` and `round-robin` follow `strategyOptions.order`; `round-robin` starts after the member last used from the same members, by any session in the process. `random` and `weighted-random` (by member `weight`) draw a new order on each use. `quota` tries the member with the most remaining coding-plan quota first; usage older than `routing.quota.maxObservationAgeMs` (default 15 min) ranks as unknown, and `routing.quota.unknown: exclude` drops unknown members. Any other strategy or strategy option is a validation error.
+- **Funding.** With `routing.funding.order`, a member is used only when the billing evidence of its provider's accounts shows a source of a listed class (`included`, `free`, `metered`) that is not exhausted or disabled. Members are tried class by class, in strategy order within a class. Unknown, stale, or unavailable evidence skips the member; it is never treated as free. A `metered` source must be reported available, and `metered` funding requires `routing.spending.policy: provider-managed`, which leaves spending limits to the provider. Without `routing.funding` no billing filter applies.
+- **Fallback chains.** A group in `retry.fallbackChains` drives chat-session and advisor fallback with its strategy and funding; skipped members are named in one warning notice. A chat role without its own chain walks a group at `default`; model-kind roles never do. Startup selection, subagent and tiny-model candidates, and the eval completion bridge read a group chain as unset and log it once.
+- **Pool roles.** A pooled role, or a role alias of one (`@role`, `@role:level`, whose effort replaces the member's), picks a member by strategy and funding wherever it becomes a model: the startup `default` model, `--model @role`, subagent spawns, role cycling, the quick-role picker, plan mode, presets, `AgentSession.resolveRoleModelAsync()`, smol, commit, title, memory, `judge`, and `image` work. Members without an available model or configured credentials are passed over first.
+- **Failures.** When the pool's own funding order or quota exclusion leaves no member, startup and spawns fail with `RolePoolUnavailableError` naming the role and each skip reason (use `--model <provider/model>` to start anyway); an interactive switch keeps the active model and shows the error; a background role list skips to its next role. Otherwise the legacy resolution and its fallbacks apply. A restored session keeps its last model.
+- **Round-robin position.** The position advances only when a pick is used: the session switches to it, a spawn starts on it, or a background request is sent with it. A pick that is passed over or only displayed leaves it unchanged.
+- **Synchronous lookups.** Role-cycle labels before a pick, `judge` availability checks, the advisor roster, compaction candidates, extension `ctx.models.resolve()`, and the auth-gateway router use the members in configured order without strategy or funding, and log a warning once for a pool with funding or quota policy.
+
 ### Model presets
 
 A model preset is a named snapshot of every role assignment plus `defaultThinkingLevel`, so you can swap a whole setup at once:
@@ -728,6 +740,26 @@ Selecting a provider row stores its explicit `provider/modelId`.
 The table's `images` column reports what the transport will actually send, so a model whose images are
 stripped (`compat.stripImageInput`, see [Image handling](#compatibility-and-routing-fields)) shows `no`
 even when its spec declares `input: [text, image]`; `--json` keeps the declared `input`.
+
+### Model pools in the Roles view
+
+A role or fallback chain whose value is a model group (see `modelGroups` in [Settings](./settings.md)) shows a pool summary instead of a single model: member count, strategy, funding order, and, as read-only text, any spending policy. Its members follow, in scheduling order, each with its effort, weight, and catalog presence.
+
+| Key | Row | Effect |
+| --- | --- | --- |
+| `m` | selector role, chain entry, or chain key | Turns the selector value into a `priority` pool with one member per selector, in configured order and without a funding order, so the same models are tried in the same order with no billing filter. |
+| `Enter` | pooled role, fallback pool | Adds a member picked from the catalog. |
+| `f` | pooled role or role whose chain is a pool | Adds a member to the fallback pool (a list chain keeps its usual fallback append). |
+| `Enter` / `x` | member | Replaces / removes the member. |
+| `t` / `w` | member | Sets the member's `defaultEffort` / cycles its weight (weighted-random only). |
+| `[` / `]` | member | Moves the member in a priority or round-robin order. |
+| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, and random; leaving weighted-random drops member weights. A `quota` pool keeps its strategy; change it in config. |
+| `o` | pooled row | Sets and then cycles the funding order (`included`, `included → free`, `free → included`, `free`); a configured `metered` stays last. It never removes the funding order: a pool without one applies no billing filter, which is wider than any listed order. |
+| `x` | pooled role / fallback pool | Clears the role / removes the chain. |
+
+How pools pick models at runtime is described in [Model pools](#model-pools).
+
+Edits are written to the global config through the same strict validation as other settings writes. A refused edit shows the validator's message and writes nothing. A pool whose value comes from a project, `--config`, or runtime layer is shown read-only, since a global write would not take effect. A pool that references `modelGroups.<name>` is read-only too, because the group is shared; `x` still removes the reference from the global config.
 
 ## Context promotion (model-level fallback chains)
 

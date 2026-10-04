@@ -4,12 +4,14 @@ import { completeSimple, Effort, type Model, retryTransientCompletion } from "@o
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, resolveModelRoleValue, resolveRoleSelection } from "../config/model-resolver";
+import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import extractInputTemplate from "../prompts/memories/sharpshooter-extract-input.md" with { type: "text" };
 import extractSystemTemplate from "../prompts/memories/sharpshooter-extract-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { customMessageContentText } from "../session/checkpoint-entries";
+import { notePoolPickApplied, type RolePoolPick, RolePoolUnavailableError } from "../session/pool-selection";
+import { resolveRoleSelectionAsync } from "../session/role-pool-resolution";
 import { appendSharpshooterDelta } from "./queue";
 import type { SharpshooterDelta, SharpshooterDeltaKind, SharpshooterDeltaSource, SharpshooterFriction } from "./types";
 
@@ -150,24 +152,46 @@ export function buildSharpshooterEnvelope(
 	};
 }
 
-/** Resolve the configured extraction model, then fall back to the `smol` role. */
-export async function resolveSharpshooterModel(
+/**
+ * Resolve the configured extraction model, then fall back to the `smol` role. `pick` is the `smol`
+ * pool pick the model came from; the caller records it ({@link notePoolPickApplied}) when it sends
+ * a request.
+ */
+export async function resolveSharpshooterSelection(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
-): Promise<Model | undefined> {
+): Promise<{ model: Model; pick?: RolePoolPick } | undefined> {
 	const selector = cfgSharpshooterModel.get(settings);
 	if (selector) {
 		const resolved = resolveModelRoleValue(selector, modelRegistry.getAll(), {
 			settings,
 			matchPreferences: getModelMatchPreferences(settings),
 		});
-		if (resolved.model) return resolved.model;
+		if (resolved.model) return { model: resolved.model };
 		logger.debug("Sharpshooter extraction model selector did not resolve", { selector });
 	}
 
-	const fallback = resolveRoleSelection(["smol"], settings, modelRegistry.getAvailable())?.model;
-	if (!fallback) logger.debug("Sharpshooter extraction skipped: no model available");
-	return fallback;
+	let fallback: { model: Model; pick?: RolePoolPick } | undefined;
+	try {
+		fallback = await resolveRoleSelectionAsync(["smol"], settings, modelRegistry.getAvailable(), { modelRegistry });
+	} catch (error) {
+		if (!(error instanceof RolePoolUnavailableError)) throw error;
+		logger.debug("Sharpshooter extraction skipped: smol pool unavailable", { error: error.message });
+		return undefined;
+	}
+	if (!fallback) {
+		logger.debug("Sharpshooter extraction skipped: no model available");
+		return undefined;
+	}
+	return fallback.pick ? { model: fallback.model, pick: fallback.pick } : { model: fallback.model };
+}
+
+/** The model {@link resolveSharpshooterSelection} resolves, without recording a pool pick. */
+export async function resolveSharpshooterModel(
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+): Promise<Model | undefined> {
+	return (await resolveSharpshooterSelection(settings, modelRegistry))?.model;
 }
 
 /** Start best-effort extraction for one committed user prompt without blocking the caller. */
@@ -210,8 +234,10 @@ async function runSharpshooterExtraction(
 	envelope: SharpshooterEnvelope,
 ): Promise<void> {
 	const { session, settings, modelRegistry, agentDir } = options;
-	const model = await resolveSharpshooterModel(settings, modelRegistry);
-	if (!model || session.isDisposed) return;
+	const selection = await resolveSharpshooterSelection(settings, modelRegistry);
+	if (!selection || session.isDisposed) return;
+	const { model } = selection;
+	if (selection.pick) notePoolPickApplied(selection.pick);
 
 	const input = prompt.render(extractInputTemplate, { ...envelope });
 	const response = await retryTransientCompletion(

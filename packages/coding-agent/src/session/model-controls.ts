@@ -43,6 +43,16 @@ import {
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ModelCycleResult, ResolvedRoleModel, RoleModelCycle, RoleModelCycleResult } from "./agent-session-types";
+import {
+	notePoolPickApplied,
+	PoolSelection,
+	type RolePoolPick,
+	RolePoolUnavailableError,
+	resolveRolePool,
+	rolePoolPolicyBlocked,
+	rolePoolTarget,
+	warnRolePoolProjection,
+} from "./pool-selection";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
@@ -87,6 +97,12 @@ export class ModelControls {
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
 	#serviceTierByFamily: ServiceTierByFamily;
+	/**
+	 * Pool-role picks of this session by role, valid while settings stay at `revision`; `recorded`
+	 * once the pick's round-robin position has been recorded.
+	 */
+	readonly #rolePoolPicks = new Map<string, { revision: number; pick: RolePoolPick; recorded: boolean }>();
+	readonly #poolSelection: PoolSelection;
 
 	constructor(
 		host: ModelControlsHost,
@@ -98,6 +114,12 @@ export class ModelControls {
 		},
 	) {
 		this.#host = host;
+		this.#poolSelection = new PoolSelection({
+			settings: host.settings,
+			modelRegistry: host.modelRegistry,
+			sessionId: () => host.sessionId(),
+			emitNotice: async message => host.emitNotice("warning", message, "model-role"),
+		});
 		this.#scopedModels = options.scopedModels ?? [];
 		this.#serviceTierByFamily = options.serviceTierByFamily ?? {};
 		this.#thinkingLevelCeiling = options.thinkingLevelCeiling;
@@ -209,6 +231,103 @@ export class ModelControls {
 		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model);
 	}
 
+	/**
+	 * {@link resolveRoleModelWithThinking} that applies a pool role's strategy and funding policy
+	 * ({@link resolveRolePool}), also for a role whose value is an alias of a pool role
+	 * ({@link rolePoolTarget}; its `:level` replaces the member's effort); a legacy role value, and
+	 * a pool with no eligible member and no policy skip, resolve exactly as the sync variant does.
+	 *
+	 * A pool pick is kept for this session and returned again until settings change or the session
+	 * switches models to something other than the pick ({@link setModel}, {@link setModelTemporary}).
+	 * `options.availableModels` narrows the members and the legacy resolution to those models (a
+	 * `--models` scope); a kept pick outside them is selected again.
+	 *
+	 * @throws RolePoolUnavailableError when no pool member is eligible and the funding or quota policy excluded one.
+	 * @throws the abort reason when `options.signal` aborts.
+	 */
+	async resolveRoleModelAsync(
+		role: string,
+		options: { signal?: AbortSignal; availableModels?: Model[] } = {},
+	): Promise<ResolvedModelRoleValue> {
+		const settings = this.#host.settings;
+		const scope = options.availableModels;
+		const legacy = (): ResolvedModelRoleValue =>
+			scope ? resolveRoleModelFull(settings, role, scope, this.#model) : this.resolveRoleModelWithThinking(role);
+		const cached = this.#rolePoolPicks.get(role);
+		if (
+			cached &&
+			cached.revision === settings.revision &&
+			(!scope || scope.some(model => modelsAreEqual(model, cached.pick.model)))
+		) {
+			return rolePickResolution(cached.pick);
+		}
+		this.#rolePoolPicks.delete(role);
+		const revision = settings.revision;
+		const target = rolePoolTarget(settings, role);
+		if (!target) return legacy();
+		const resolution = await resolveRolePool(
+			target.role,
+			{
+				settings,
+				modelRegistry: this.#host.modelRegistry,
+				sessionId: () => this.#host.sessionId(),
+				emitNotice: async message => this.#host.emitNotice("warning", message, "model-role"),
+				availableModels: () => scope ?? this.#host.modelRegistry.getAvailable(),
+				selection: this.#poolSelection,
+			},
+			{ signal: options.signal },
+		);
+		if (resolution?.kind === "aborted") options.signal?.throwIfAborted();
+		if (resolution?.kind === "none" && rolePoolPolicyBlocked(resolution.skipped)) {
+			throw new RolePoolUnavailableError(target.role, resolution.skipped);
+		}
+		if (resolution?.kind !== "picked") return legacy();
+		const pick =
+			target.thinkingLevel === undefined
+				? resolution.pick
+				: { ...resolution.pick, thinkingLevel: target.thinkingLevel, explicitThinkingLevel: true };
+		if (settings.revision === revision) this.#rolePoolPicks.set(role, { revision, pick, recorded: false });
+		return rolePickResolution(pick);
+	}
+
+	/**
+	 * Keeps `pick`, already applied, as this session's pick for `role` until settings change or the
+	 * model is switched elsewhere, as {@link resolveRoleModelAsync} keeps its own. `revision` is the
+	 * settings revision the pick was made at; a pick made before a later settings change is not kept.
+	 * Returns whether it was kept.
+	 */
+	adoptRolePoolPick(role: string, pick: RolePoolPick, revision: number): boolean {
+		if (revision !== this.#host.settings.revision) return false;
+		this.#rolePoolPicks.set(role, { revision, pick, recorded: true });
+		return true;
+	}
+
+	/**
+	 * Records the round-robin position of `role`'s pool pick, kept by {@link resolveRoleModelAsync},
+	 * when `model` is that pick. A consumer that sends requests to the pick without switching the
+	 * session to it (local memory consolidation) calls this when it uses the pick. A kept pick is
+	 * recorded once, so reusing it later never moves a position other consumers advanced since.
+	 */
+	noteRolePoolPickUsed(role: string, model: Model): void {
+		const cached = this.#rolePoolPicks.get(role);
+		if (!cached || cached.recorded || !modelsAreEqual(cached.pick.model, model)) return;
+		cached.recorded = true;
+		notePoolPickApplied(cached.pick);
+	}
+
+	/**
+	 * Records the round-robin position of `role`'s cached pool pick, once, when `model` is that pick,
+	 * and forgets every cached pick otherwise.
+	 */
+	#noteModelSwitch(model: Model, role: string | undefined): void {
+		const cached = role === undefined ? undefined : this.#rolePoolPicks.get(role);
+		if (role !== undefined && cached && modelsAreEqual(cached.pick.model, model)) {
+			this.noteRolePoolPickUsed(role, model);
+			return;
+		}
+		this.#rolePoolPicks.clear();
+	}
+
 	resolveTemporaryModelThinkingLevel(model: Model): ConfiguredThinkingLevel | undefined {
 		const availableModels = this.#host.modelRegistry.getAvailable();
 		if (availableModels.length === 0) return undefined;
@@ -248,6 +367,7 @@ export class ModelControls {
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(targetModel);
+		this.#noteModelSwitch(targetModel, role);
 		this.#host.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`, role);
 		if (options?.persist) {
 			this.#host.settings.setModelRole(
@@ -275,13 +395,15 @@ export class ModelControls {
 	 * Set model temporarily (for this session only).
 	 * Validates that a credential source is configured (synchronously, without
 	 * refreshing OAuth or running command-backed key programs), saves to session
-	 * log but NOT to settings.
+	 * log but NOT to settings. `options.poolRole` names the role whose pool pick
+	 * ({@link resolveRoleModelAsync}) this switch applies: when `model` is that pick
+	 * it is kept and its round-robin position recorded; otherwise every cached pick is forgotten.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; poolRole?: string },
 		selection: "explicit" | "automatic" = "explicit",
 	): Promise<void> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
@@ -294,6 +416,7 @@ export class ModelControls {
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(targetModel, undefined, selection);
+		this.#noteModelSwitch(targetModel, options?.poolRole);
 		this.#host.sessionManager.appendModelChange(
 			`${targetModel.provider}/${targetModel.id}`,
 			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
@@ -328,6 +451,8 @@ export class ModelControls {
 	 * the currently active one. Roles that have no configured model, or whose
 	 * configured model is not currently available, are skipped. The `default`
 	 * role falls back to the active model when no explicit assignment exists.
+	 * A pool role lists this session's pick ({@link resolveRoleModelAsync}) once
+	 * it has one, and its first available member in configured order before.
 	 *
 	 * Returns `undefined` only when there is no current model or no available
 	 * models at all; an empty `models` array is never returned (callers should
@@ -343,6 +468,18 @@ export class ModelControls {
 		const models: ResolvedRoleModel[] = [];
 
 		for (const role of roleOrder) {
+			const cached = this.#rolePoolPicks.get(role);
+			if (cached && cached.revision === this.#host.settings.revision) {
+				const { pick } = cached;
+				models.push({
+					role,
+					model: pick.model,
+					thinkingLevel: pick.thinkingLevel,
+					explicitThinkingLevel: pick.explicitThinkingLevel,
+				});
+				continue;
+			}
+			warnRolePoolProjection(this.#host.settings, role);
 			const roleModelStr =
 				role === "default"
 					? (this.#host.settings.getModelRole("default") ?? `${currentModel.provider}/${currentModel.id}`)
@@ -386,17 +523,36 @@ export class ModelControls {
 	/**
 	 * Apply a resolved role model as the active model without changing global
 	 * settings. Shared with role cycling and the plan-approval model slider.
+	 * A pool role's entry is replaced by the pool's pick for this session
+	 * ({@link resolveRoleModelAsync}); returns the entry actually applied.
+	 *
+	 * @throws RolePoolUnavailableError when `entry.role` is a pool its policy blocks.
 	 */
-	async applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
-		await this.setModel(entry.model, entry.role);
-		if (entry.explicitThinkingLevel && entry.thinkingLevel !== undefined) {
-			this.setThinkingLevel(entry.thinkingLevel);
+	async applyRoleModel(entry: ResolvedRoleModel): Promise<ResolvedRoleModel> {
+		let applied = entry;
+		if (rolePoolTarget(this.#host.settings, entry.role)) {
+			const resolved = await this.resolveRoleModelAsync(entry.role);
+			if (resolved.model) {
+				applied = {
+					role: entry.role,
+					model: resolved.model,
+					thinkingLevel: resolved.thinkingLevel,
+					explicitThinkingLevel: resolved.explicitThinkingLevel,
+				};
+			}
 		}
+		await this.setModel(applied.model, applied.role);
+		if (applied.explicitThinkingLevel && applied.thinkingLevel !== undefined) {
+			this.setThinkingLevel(applied.thinkingLevel);
+		}
+		return applied;
 	}
 
 	/**
 	 * Cycle through configured role models in a fixed order.
-	 * Skips missing roles and changes only the active session model.
+	 * Skips missing roles and changes only the active session model. Switching to a
+	 * pool role applies its strategy and funding policy ({@link resolveRoleModelAsync}).
+	 * @throws RolePoolUnavailableError when the next role is a pool its policy blocks.
 	 * @param roleOrder - Order of roles to cycle through (e.g., ["slow", "default", "smol"])
 	 * @param direction - "forward" (default) or "backward"
 	 */
@@ -410,9 +566,9 @@ export class ModelControls {
 		const step = direction === "backward" ? -1 : 1;
 		const next = cycle.models[(cycle.currentIndex + step + cycle.models.length) % cycle.models.length];
 
-		await this.applyRoleModel(next);
+		const applied = await this.applyRoleModel(next);
 
-		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
+		return { model: applied.model, thinkingLevel: this.thinkingLevel, role: applied.role };
 	}
 
 	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
@@ -861,4 +1017,13 @@ export class ModelControls {
 		if (!this.#model) return [];
 		return getSupportedEfforts(this.#model);
 	}
+}
+
+function rolePickResolution(pick: RolePoolPick): ResolvedModelRoleValue {
+	return {
+		model: pick.model,
+		thinkingLevel: pick.thinkingLevel,
+		explicitThinkingLevel: pick.explicitThinkingLevel,
+		warning: undefined,
+	};
 }

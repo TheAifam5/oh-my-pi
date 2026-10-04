@@ -9,9 +9,10 @@ import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
 import { truncateApproxTokens } from "../mnemopi/config";
+import { notePoolPickApplied } from "../session/pool-selection";
 import consolidateInputTemplate from "../prompts/memories/sharpshooter-consolidate-input.md" with { type: "text" };
 import consolidateSystemTemplate from "../prompts/memories/sharpshooter-consolidate-system.md" with { type: "text" };
-import { resolveSharpshooterModel } from "./extract";
+import { resolveSharpshooterSelection } from "./extract";
 import {
 	readSharpshooterState,
 	sharpshooterBankDir,
@@ -138,8 +139,9 @@ async function consolidateLocked(
 			return { ran: false, reason: "empty" };
 		}
 
-		const model = await resolveSharpshooterModel(options.settings, options.modelRegistry);
-		if (!model) return { ran: false, reason: "no_model" };
+		const selection = await resolveSharpshooterSelection(options.settings, options.modelRegistry);
+		if (!selection) return { ran: false, reason: "no_model" };
+		const { model } = selection;
 
 		const currentFiles = await readCurrentMemoryFiles(options.agentDir, options.cwd);
 		const projectDocs = await readProjectDocs(options.cwd);
@@ -155,6 +157,7 @@ async function consolidateLocked(
 			maxFileLines: SHARPSHOOTER_MAX_FILE_LINES,
 		});
 
+		if (selection.pick) notePoolPickApplied(selection.pick);
 		const response = await retryTransientCompletion(
 			() =>
 				completeSimple(

@@ -39,11 +39,18 @@ import {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
+import { QUOTA_ORDERING_DEADLINE_MS, rolePoolTarget, warnRolePoolProjection } from "../session/pool-selection";
+import {
+	createRolePoolCall,
+	noteRolePoolModelUsed,
+	type RolePoolCall,
+	resolveRoleChainAsync,
+} from "../session/role-pool-resolution";
 import type { SessionManager } from "../session/session-manager";
 import { getTinyLocalModelSpec } from "../tiny/models";
 import localPromptTemplate from "../prompts/system/judgment-local.md" with { type: "text" };
@@ -142,13 +149,30 @@ const CANDIDATE_REJECTION_COOLDOWN_MS = 5 * 60 * 1000;
  * per-call consumers (auto-thinking, subagent starts) resolve a fresh judge.
  */
 const CANDIDATE_TTL_MS = 1_000;
+/**
+ * Longest a shared `judge` pool selection may take: the funding read's own deadline plus time for the
+ * picked member's key (a token refresh). A selection past it fails and is not kept.
+ */
+const JUDGE_POOL_SELECTION_DEADLINE_MS = QUOTA_ORDERING_DEADLINE_MS * 2;
 /** Skip-until timestamps keyed by routed model identity, carried by the registry that produced the rejection. */
 const kRejections = Symbol("judgment.rejections");
 /** Last resolved judge role chain, carried by the registry it was drawn from. */
 const kRoleChain = Symbol("judgment.roleChain");
+/** Last pool-selected judge role chain, carried by the registry it was drawn from. */
+const kPoolChain = Symbol("judgment.poolChain");
 interface RegistryWithRejections extends ModelRegistry {
 	[kRejections]?: Map<string, number>;
 	[kRoleChain]?: { settings: Settings; list: RoleChainCandidate[]; expiresAt: number };
+	[kPoolChain]?: {
+		settings: Settings;
+		revision: number;
+		sessionId: string | undefined;
+		chain: Promise<RoleChainCandidate[]>;
+		/** The call the chain's pick was made in; a judgment records the pick when it runs on it. */
+		call: RolePoolCall;
+		/** Epoch ms after which the chain is selected again; unset while the selection runs. */
+		expiresAt?: number;
+	};
 }
 
 /** {@link judgeRoleChain}, reused for {@link CANDIDATE_TTL_MS} across judges over the same settings and registry. */
@@ -159,6 +183,63 @@ function cachedJudgeRoleChain(settings: Settings, registry: RegistryWithRejectio
 	const list = judgeRoleChain(settings, registry);
 	registry[kRoleChain] = { settings, list, expiresAt: now + CANDIDATE_TTL_MS };
 	return list;
+}
+
+/**
+ * The `judge` pool's chain ({@link resolveRoleChainAsync}) and the call its pick was made in, shared
+ * by every judgment over the same settings revision, session, and registry: concurrent judgments
+ * await one selection (one funding read), and its result is reused for {@link CANDIDATE_TTL_MS}
+ * after it settles. A failed selection, including one past {@link JUDGE_POOL_SELECTION_DEADLINE_MS},
+ * is not kept. `signal` cancels only this caller's wait.
+ */
+async function cachedJudgePoolChain(
+	settings: Settings,
+	registry: RegistryWithRejections,
+	sessionId: string | undefined,
+	signal: AbortSignal | undefined,
+): Promise<{ chain: RoleChainCandidate[]; call: RolePoolCall }> {
+	const cached = registry[kPoolChain];
+	const current =
+		cached &&
+		cached.settings === settings &&
+		cached.revision === settings.revision &&
+		cached.sessionId === sessionId &&
+		(cached.expiresAt === undefined || Date.now() < cached.expiresAt)
+			? cached
+			: undefined;
+	let entry = current;
+	if (!entry) {
+		const context = {
+			modelRegistry: registry,
+			sessionId,
+			signal: AbortSignal.timeout(JUDGE_POOL_SELECTION_DEADLINE_MS),
+		};
+		const call = createRolePoolCall(settings, context);
+		const created: NonNullable<RegistryWithRejections[typeof kPoolChain]> = {
+			settings,
+			revision: settings.revision,
+			sessionId,
+			chain: resolveRoleChainAsync(
+				"judge",
+				settings,
+				roleCandidatePool("judge", settings, registry),
+				context,
+				call,
+			).then(nativeTail),
+			call,
+		};
+		created.chain.then(
+			() => {
+				created.expiresAt = Date.now() + CANDIDATE_TTL_MS;
+			},
+			() => {
+				if (registry[kPoolChain] === created) registry[kPoolChain] = undefined;
+			},
+		);
+		registry[kPoolChain] = created;
+		entry = created;
+	}
+	return { chain: await untilAborted(signal, entry.chain), call: entry.call };
 }
 
 /** Append the session model when no candidate is native and the chain does not already route to it. */
@@ -191,7 +272,12 @@ export function kindOf(value: RoleChainCandidate | Model): JudgeKind {
  * judgment, whose calibrated probabilities it cannot reproduce.
  */
 function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
-	const chain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry));
+	warnRolePoolProjection(settings, "judge");
+	return nativeTail(resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry)));
+}
+
+/** `chain` with only native candidates from its first native candidate on. */
+function nativeTail(chain: RoleChainCandidate[]): RoleChainCandidate[] {
 	const firstNative = chain.findIndex(candidate => kindOf(candidate) === "native");
 	if (firstNative < 0) return chain;
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
@@ -249,7 +335,7 @@ export class ChainJudge implements Judge {
 		const signal = options.signal;
 		let lastFailure: string | undefined;
 		let lastUnavailable: string | undefined;
-		const candidates = this.#resolveCandidates();
+		const { candidates, call } = await this.#resolveCandidatesForJudgment(signal);
 		const rejections = this.#rejections();
 		for (const candidate of candidates) {
 			if (signal?.aborted) {
@@ -270,6 +356,7 @@ export class ChainJudge implements Judge {
 					lastUnavailable = `no API key for ${candidate.model.provider}/${candidate.model.id}`;
 					continue;
 				}
+				if (call) noteRolePoolModelUsed(call, candidate.model);
 				return await run(judge, kindOf(candidate));
 			} catch (error) {
 				if (signal?.aborted) {
@@ -313,6 +400,21 @@ export class ChainJudge implements Judge {
 	#rejections(): Map<string, number> {
 		const registry: RegistryWithRejections = this.#deps.registry;
 		return (registry[kRejections] ??= new Map());
+	}
+
+	/**
+	 * Candidates of one judgment: a `judge` pool's chain selected by its strategy and funding policy,
+	 * with the call its pick was made in, otherwise {@link #resolveCandidates}.
+	 *
+	 * @throws RolePoolUnavailableError when the pool's policy excluded every eligible member.
+	 */
+	async #resolveCandidatesForJudgment(
+		signal: AbortSignal | undefined,
+	): Promise<{ candidates: RoleChainCandidate[]; call?: RolePoolCall }> {
+		const { settings, registry, sessionModel, sessionId } = this.#deps;
+		if (!rolePoolTarget(settings, "judge")) return { candidates: this.#resolveCandidates() };
+		const { chain, call } = await cachedJudgePoolChain(settings, registry, sessionId, signal);
+		return { candidates: withSessionFallback(chain, sessionModel), call };
 	}
 
 	#resolveCandidates(): RoleChainCandidate[] {

@@ -31,6 +31,9 @@ describe("commit role thinking selection", () => {
 				getApiKeyWithCredentialForProvider: async () => "test-key",
 				authStorage,
 				resolver: () => async () => "test-key",
+				hasConfiguredAuth: () => true,
+				isSelectorSuppressed: () => false,
+				find: () => undefined,
 			};
 
 			const primary = await resolvePrimaryModel(undefined, settings, registry);

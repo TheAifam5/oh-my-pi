@@ -7,6 +7,7 @@ import { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import { cfgCommit } from "../settings";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../../sdk";
+import { createRolePoolCall } from "../../session/role-pool-resolution";
 import { resolvePrimaryModel, resolveSmolModel } from "../model-selection";
 import type { ConventionalCommit } from "../types";
 import { renderStat } from "../utils";
@@ -93,10 +94,12 @@ async function createOmpInference(
 		const registry = new ModelRegistry(authStorage);
 		await registry.refresh();
 		await loadCliExtensionProviders(registry, settings, options.cwd);
-		const primary = await resolvePrimaryModel(options.modelOverride, settings, registry);
+		// One run picks each pool role once, from one funding read.
+		const rolePoolCall = createRolePoolCall(settings, { modelRegistry: registry });
+		const primary = await resolvePrimaryModel(options.modelOverride, settings, registry, rolePoolCall);
 		const smol = options.modelOverride
 			? primary
-			: await resolveSmolModel(settings, registry, primary.model, primary.apiKey);
+			: await resolveSmolModel(settings, registry, primary.model, primary.apiKey, rolePoolCall);
 		const cache = config.cacheEnabled
 			? await CommitInferenceCache.open(getCommitCacheDbPath(), config.cacheTtlDays)
 			: null;

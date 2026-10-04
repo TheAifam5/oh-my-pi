@@ -59,7 +59,7 @@ import {
 import type { Settings } from "./settings";
 
 import { cfgDisabledProviders, cfgEnabledModels, cfgModelProviderOrder } from "./model-settings";
-import { cfgRetryFallbackChains } from "../session/settings";
+import { getSelectorFallbackChains } from "../session/retry-fallback-selector-chains";
 
 function isKnownProvider(provider: string): provider is KnownProvider {
 	return provider in DEFAULT_MODEL_PER_PROVIDER;
@@ -892,6 +892,16 @@ export interface ParsedModelResult {
 	explicitThinkingLevel: boolean;
 }
 
+interface PatternMatchOptions {
+	allowInvalidThinkingSelectorFallback?: boolean;
+	/**
+	 * Accept only exact matches (provider/id, bare id, revision spelling, variant
+	 * alias, Bedrock inference profile); fuzzy and substring matching never run.
+	 * Thinking suffixes and `@upstream` routing still apply.
+	 */
+	exact?: boolean;
+}
+
 /**
  * Parse a pattern to extract model and thinking level.
  * Handles models with colons in their IDs (e.g., OpenRouter's :exacto suffix).
@@ -908,7 +918,7 @@ function parseModelPatternWithContext(
 	pattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean },
+	options?: PatternMatchOptions,
 ): ParsedModelResult {
 	// Exact match on the full pattern first (no fuzzy): a literal id that
 	const exactMatch = matchModel(pattern, availableModels, context, { exactOnly: true });
@@ -927,7 +937,7 @@ function parseModelPatternWithContext(
 	// fuzzy results (e.g. `kimi-for-coding-highspeed`) cannot absorb the suffix.
 	const { base, level } = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 	if (level) {
-		const literalSuffixMatch = matchModel(pattern, availableModels, context);
+		const literalSuffixMatch = options?.exact ? undefined : matchModel(pattern, availableModels, context);
 		if (literalSuffixMatch?.id.toLowerCase().endsWith(`:${level}`)) {
 			return {
 				model: literalSuffixMatch,
@@ -958,7 +968,7 @@ function parseModelPatternWithContext(
 
 	// No valid thinking suffix: fall back to fuzzy/substring matching on the
 	// whole pattern.
-	const fallbackMatch = matchModel(pattern, availableModels, context);
+	const fallbackMatch = options?.exact ? undefined : matchModel(pattern, availableModels, context);
 	if (fallbackMatch) {
 		return { model: fallbackMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
@@ -996,7 +1006,7 @@ function matchPatternWithContext(
 	pattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean },
+	options?: PatternMatchOptions,
 ): ParsedModelResult {
 	const direct = parseModelPatternWithContext(pattern, availableModels, context, options);
 	if (direct.model) return direct;
@@ -1084,6 +1094,22 @@ export function resolveExplicitModelRole(
 		if (role) return role;
 	}
 	return undefined;
+}
+
+/**
+ * Split an optional `:<level>` suffix off a role-alias-shaped pattern.
+ *
+ * The colon floor is the matched alias prefix (so `pi/default` keeps its
+ * slash-prefixed shape and `*:high` splits after the one-character token);
+ * non-alias patterns fall back to the legacy prefix length, which is what the
+ * role expansion below already does.
+ */
+export function splitRoleAliasThinkingSuffix(value: string): { base: string; level?: ConfiguredThinkingLevel } {
+	return splitThinkingSuffix(
+		value,
+		modelRoleAliasPrefixLength(value) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
+		MAX_THINKING_SUFFIX_OPTIONS,
+	);
 }
 
 function isSessionInheritedAgentPattern(value: string): boolean {
@@ -1409,7 +1435,13 @@ export interface ResolvedModelRoleValue {
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
+	options?: {
+		settings?: Settings;
+		roleLookup?: ModelRoleLookup;
+		matchPreferences?: ModelMatchPreferences;
+		/** Resolve each selector exactly; a selector without an exact match resolves to nothing. */
+		exact?: boolean;
+	},
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1432,7 +1464,9 @@ export function resolveModelRoleValue(
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
 	for (const [patternIndex, effectivePattern] of effectivePatterns.entries()) {
-		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
+		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext, {
+			exact: options?.exact,
+		});
 		if (resolved.model) {
 			return {
 				model: resolved.model,
@@ -1550,20 +1584,37 @@ export interface RoleChainCandidate {
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
-/** Resolve a role's primary and retry candidates in effective attempt order. */
-export function resolveRoleChain(role: string, settings: Settings, pool: Model<Api>[]): RoleChainCandidate[] {
+/**
+ * Resolve a role's primary and retry candidates in effective attempt order.
+ *
+ * `options.leading`, when given, replaces the role's configured value as the head of the chain;
+ * the retry candidates follow it, deduplicated by route against it.
+ */
+export function resolveRoleChain(
+	role: string,
+	settings: Settings,
+	pool: Model<Api>[],
+	options: { leading?: readonly RoleChainCandidate[] } = {},
+): RoleChainCandidate[] {
 	const configuredRoles = settings.getModelRoles();
 	const configured = settings.getModelRole(role)?.trim();
 	const primarySelector = configured || formatModelRoleAlias(role);
-	const configuredFallbacks = cfgRetryFallbackChains.get(settings)[role];
+	const configuredFallbacks = getSelectorFallbackChains(settings)[role];
 	const hasConfiguredFallbackChain = Array.isArray(configuredFallbacks);
 	const fallbackSelectors = hasConfiguredFallbackChain ? configuredFallbacks : rolePriorityDefaults(role);
 	const selectors = [
-		{ selector: primarySelector, explicit: Object.hasOwn(configuredRoles, role) },
+		...(options.leading ? [] : [{ selector: primarySelector, explicit: Object.hasOwn(configuredRoles, role) }]),
 		...fallbackSelectors.map(selector => ({ selector, explicit: hasConfiguredFallbackChain })),
 	];
 	const candidates: RoleChainCandidate[] = [];
 	const candidateByRoute = new Map<string, RoleChainCandidate>();
+	for (const leading of options.leading ?? []) {
+		const key = formatModelStringWithRouting(leading.model);
+		if (candidateByRoute.has(key)) continue;
+		const candidate = { ...leading };
+		candidateByRoute.set(key, candidate);
+		candidates.push(candidate);
+	}
 	for (const { selector, explicit } of selectors) {
 		const resolved = resolveModelRoleValue(selector, pool, { settings });
 		if (!resolved.model) continue;
@@ -1583,11 +1634,16 @@ export function resolveRoleChain(role: string, settings: Settings, pool: Model<A
 
 /**
  * Resolve a list of override patterns to the first matching model.
+ *
+ * With `options.exact`, a pattern resolves only to a model it names exactly, so
+ * a misspelled or unavailable selector yields no model instead of a fuzzy
+ * neighbor.
  */
 export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
 	settings?: Settings,
+	options?: { exact?: boolean },
 ): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
 	const availableModels = modelRegistry.getAvailable();
@@ -1600,6 +1656,7 @@ export function resolveModelOverride(
 			explicitThinkingLevel,
 			warning: patternWarning,
 		} = resolveModelRoleValue(pattern, availableModels, {
+			...options,
 			settings,
 			matchPreferences,
 		});

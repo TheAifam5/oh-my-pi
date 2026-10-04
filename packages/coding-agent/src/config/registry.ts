@@ -191,6 +191,17 @@ export interface RecordDefinition<T = unknown> extends DefinitionBase {
 	type: "record";
 	default: Readonly<Record<string, T>>;
 	env?: SettingEnv<Readonly<Record<string, T>>>;
+	/**
+	 * `"replace"`: a layer that configures an entry replaces the lower layers' entry whole, even when
+	 * both are mappings. Without it, mapping entries deep-merge key by key like the rest of the tree.
+	 */
+	entryMerge?: "replace";
+	/**
+	 * Strict check of a value persisted by a global write (`set`, `setEntry`, and the domain setters
+	 * built on them), receiving the whole record or `{ [key]: entry }`. Loaded values and runtime
+	 * overrides are not checked. Throws to refuse the write.
+	 */
+	validateWrite?: (raw: unknown) => void;
 	ui?: UiBase;
 }
 

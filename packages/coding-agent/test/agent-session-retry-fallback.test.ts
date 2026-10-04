@@ -8,7 +8,9 @@ import {
 	type AnthropicFallbackCreditHandle,
 	type Api,
 	type AssistantMessage,
+	type BillingSource,
 	Effort,
+	knownBilling,
 	type Message,
 	type Model,
 	type ModelUsageHealth,
@@ -36,6 +38,7 @@ import {
 	type ServingModel,
 	validateRetryFallbackChains,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -102,6 +105,21 @@ function createFallbackAgent(
 			return mock.stream(model, context, options);
 		},
 	});
+}
+
+/** Inline `retry.fallbackChains` group trying `selectors` under `strategy`, aliased `m1`, `m2`, … in list order. */
+function fallbackGroup(
+	strategy: "priority" | "round-robin" | "quota",
+	selectors: string[],
+	routing?: Record<string, unknown>,
+): Record<string, unknown> {
+	const aliases = selectors.map((_, index) => `m${index + 1}`);
+	return {
+		strategy,
+		strategyOptions: strategy === "quota" ? { objective: "balance", capacityMetric: "fraction" } : { order: aliases },
+		models: Object.fromEntries(selectors.map((model, index) => [aliases[index], { model }])),
+		...(routing ? { routing } : {}),
+	};
 }
 
 function emptyUsage(): AssistantMessage["usage"] {
@@ -6953,5 +6971,115 @@ describe("AgentSession retry fallback", () => {
 
 		expect(requestedModels).toContain("openrouter/z-ai/glm-4.7@chutes");
 		expect(getLastAssistantMessage(session).stopReason).not.toBe("error");
+	});
+
+	describe("model-group fallback chains", () => {
+		const unregisterBilling: Array<() => void> = [];
+
+		afterEach(() => {
+			for (const unregister of unregisterBilling.splice(0)) unregister();
+		});
+
+		/** Reports one billing source per provider through registered readers and a stubbed usage fetch. */
+		function stubBilling(sources: Record<string, BillingSource>, reportedProviders = Object.keys(sources)): void {
+			for (const [provider, source] of Object.entries(sources)) {
+				unregisterBilling.push(
+					retryFallbackBillingRegistry.register({
+						id: provider,
+						readBilling: report => knownBilling(report, [source]),
+					}),
+				);
+			}
+			vi.spyOn(modelRegistry.authStorage.usage, "reports").mockResolvedValue(
+				reportedProviders.map(provider => ({ provider, fetchedAt: Date.now(), limits: [] })),
+			);
+		}
+
+		function collectNotices(target: AgentSession): string[] {
+			const notices: string[] = [];
+			target.subscribe(event => {
+				if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+			});
+			return notices;
+		}
+
+		it("cancels a quota fallback search when the retry is aborted during a usage lookup", async () => {
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const fallbackA = getBundledModel("openai", "gpt-4o-mini");
+			const fallbackB = getBundledModel("openai", "gpt-4o");
+			if (!primaryModel || !fallbackA || !fallbackB) throw new Error("Expected bundled quota fallback models");
+			const requestedModels: string[] = [];
+			const agent = createFallbackAgent(primaryModel, requestedModels, {
+				firstError: "overloaded_error: provider returned error 503",
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.fallbackChains": {
+					default: fallbackGroup("quota", [
+						`${fallbackA.provider}/${fallbackA.id}`,
+						`${fallbackB.provider}/${fallbackB.id}`,
+					]),
+				},
+			});
+			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			const aborting = session;
+			vi.spyOn(modelRegistry.authStorage.health, "model").mockImplementation(async () => {
+				queueMicrotask(() => aborting.abortRetry());
+				return Promise.withResolvers<never>().promise;
+			});
+			const applied: string[] = [];
+			const retryEnds: (string | undefined)[] = [];
+			session.subscribe(event => {
+				if (event.type === "retry_fallback_applied") applied.push(event.to);
+				if (event.type === "auto_retry_end") retryEnds.push(event.success ? "success" : event.finalError);
+			});
+
+			const startedAt = performance.now();
+			await session.prompt("Abort while usage health is pending");
+			await session.waitForIdle();
+
+			expect(performance.now() - startedAt).toBeLessThan(1_000);
+			expect(applied).toEqual([]);
+			expect(retryEnds).toEqual(["Retry cancelled"]);
+			expect(session.model?.id).toBe(primaryModel.id);
+			expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		});
+
+		it("skips a member whose funding is exhausted, with a notice, and falls back to the next funded member", async () => {
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const exhausted = getBundledModel("openai", "gpt-4o-mini");
+			const funded = getBundledModel("google", "gemini-2.5-flash");
+			if (!primaryModel || !exhausted || !funded) throw new Error("Expected bundled test models to exist");
+			const exhaustedSelector = `${exhausted.provider}/${exhausted.id}`;
+			const fundedSelector = `${funded.provider}/${funded.id}`;
+			const requestedModels: string[] = [];
+			const agent = createFallbackAgent(primaryModel, requestedModels, {
+				firstError: "overloaded_error: provider returned error 503",
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.fallbackChains": {
+					default: fallbackGroup("priority", [exhaustedSelector, fundedSelector], {
+						funding: { order: ["included"] },
+					}),
+				},
+			});
+			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+			stubBilling({
+				openai: { mode: "subscription-included", state: "exhausted" },
+				google: { mode: "subscription-included", state: "available" },
+			});
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			const notices = collectNotices(session);
+
+			await session.prompt("Fail over past the exhausted member");
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`, fundedSelector]);
+			expect(notices).toEqual([`Retry fallback skipped ${exhaustedSelector} (funding exhausted) for default`]);
+		});
 	});
 });

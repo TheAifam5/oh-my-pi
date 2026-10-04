@@ -9,6 +9,7 @@ import {
 	resolveModelRoleValue,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { warnRolePoolProjection } from "./pool-selection";
 
 /** Formats a role assignment while preserving its explicit thinking selector. */
 export function formatRoleModelValue(
@@ -69,6 +70,7 @@ export function resolveRoleModelFull(
 	availableModels: Model[],
 	currentModel: Model | undefined,
 ): ResolvedModelRoleValue {
+	warnRolePoolProjection(settings, role);
 	const roleModelStr =
 		role === "default"
 			? (settings.getModelRole("default") ??

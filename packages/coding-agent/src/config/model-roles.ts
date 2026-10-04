@@ -3,34 +3,23 @@
  */
 
 import { modelKind, type Model } from "@oh-my-pi/pi-catalog/types";
-import {
-	KIND_ROLE_IDS,
-	MODEL_ROLE_IDS,
-	type ModelBrowserRegistry,
-	type ModelBrowserRoleInfo,
-	type ModelRole,
-} from "@oh-my-pi/pi-tui/overlays/model-browser";
+import type { ModelBrowserRegistry, ModelBrowserRoleInfo } from "@oh-my-pi/pi-tui/overlays/model-browser";
+import { MODEL_ROLE_IDS, type ModelRole } from "@oh-my-pi/pi-tui/overlays/model-role-ids";
 import { isValidThemeColor } from "@oh-my-pi/pi-tui/theme";
 import type { Settings } from "./settings";
 
 import { cfgCycleOrder, cfgModelTags } from "./model-settings";
+import { MODEL_ROLE_ALIAS_PREFIX } from "./model-role-ids";
 
-/** Canonical prefix for a configured model role selector. */
-export const MODEL_ROLE_ALIAS_PREFIX = "@";
-
-/** Legacy prefix accepted for backwards-compatible role selectors. */
-export const LEGACY_MODEL_ROLE_ALIAS_PREFIX = "pi/";
-
-/** Shorthand selector for the default model role. */
-export const DEFAULT_MODEL_ROLE_ALIAS = "*";
+export * from "./model-role-ids";
 
 /** Format a model role as its canonical selector. */
 export function formatModelRoleAlias(role: string): string {
 	return `${MODEL_ROLE_ALIAS_PREFIX}${role}`;
 }
 
-export type { ModelRole } from "@oh-my-pi/pi-tui/overlays/model-browser";
-export { CHAT_MODEL_ROLE_IDS, KIND_ROLE_IDS, MODEL_ROLE_IDS } from "@oh-my-pi/pi-tui/overlays/model-browser";
+export type { ModelRole } from "@oh-my-pi/pi-tui/overlays/model-role-ids";
+export { CHAT_MODEL_ROLE_IDS, KIND_ROLE_IDS, MODEL_ROLE_IDS } from "@oh-my-pi/pi-tui/overlays/model-role-ids";
 
 export type ModelRoleInfo = ModelBrowserRoleInfo;
 
@@ -90,11 +79,6 @@ export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 };
 
 export type RoleInfo = ModelRoleInfo;
-
-/** Whether a role belongs to the non-chat model-kind section. */
-export function isKindRole(role: string): boolean {
-	return KIND_ROLE_IDS.some(id => id === role);
-}
 
 function isModelRole(role: string): role is ModelRole {
 	return MODEL_ROLE_IDS.some(id => id === role);

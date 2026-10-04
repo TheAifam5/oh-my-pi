@@ -11,6 +11,14 @@ import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
+import { RolePoolUnavailableError } from "../session/pool-selection";
+import {
+	createRolePoolCall,
+	noteRolePoolModelUsed,
+	pickRolePool,
+	type RolePoolCall,
+	rolePoolPickCandidates,
+} from "../session/role-pool-resolution";
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
 import { concreteThinkingLevel, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 
@@ -41,10 +49,19 @@ function filterDiffNoise(diff: string): string {
 	return filtered.join("\n");
 }
 
-function getSmolModelCandidates(
+/**
+ * Models commit-message drafting tries in order: a `smol` pool's pick and its other eligible members
+ * only; otherwise the `smol` role, its built-in candidates, then every available model. The pool
+ * pick is made in `call`.
+ *
+ * @throws RolePoolUnavailableError when a `smol` pool's policy excluded every eligible member.
+ */
+async function getSmolModelCandidates(
 	registry: ModelRegistry,
 	settings: Settings,
-): Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> {
+	sessionId: string | undefined,
+	call: RolePoolCall,
+): Promise<Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }>> {
 	const availableModels = registry.getAvailable();
 	if (availableModels.length === 0) return [];
 
@@ -56,6 +73,15 @@ function getSmolModelCandidates(
 	};
 
 	const matchPreferences = getModelMatchPreferences(settings);
+	const pick = await pickRolePool("smol", settings, availableModels, { modelRegistry: registry, sessionId }, call);
+	if (pick) {
+		// Only the pool's eligible members may run: built-in substitutes and the catalog tail could
+		// include a member its funding policy excluded.
+		for (const candidate of rolePoolPickCandidates(pick, settings, availableModels)) {
+			addCandidate(candidate.model, concreteThinkingLevel(candidate.thinkingLevel));
+		}
+		return candidates;
+	}
 	const configuredSmol = resolveModelRoleValue(settings.getModelRole("smol"), availableModels, {
 		settings,
 		matchPreferences,
@@ -85,7 +111,15 @@ export async function generateCommitMessage(
 	settings: Settings,
 	sessionId?: string,
 ): Promise<string | null> {
-	const candidates = getSmolModelCandidates(registry, settings);
+	let candidates: Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }>;
+	const call = createRolePoolCall(settings, { modelRegistry: registry, sessionId });
+	try {
+		candidates = await getSmolModelCandidates(registry, settings, sessionId, call);
+	} catch (error) {
+		if (!(error instanceof RolePoolUnavailableError)) throw error;
+		logger.debug("commit-msg-generator: smol pool unavailable", { error: error.message });
+		return null;
+	}
 	if (candidates.length === 0) {
 		logger.debug("commit-msg-generator: no smol model found");
 		return null;
@@ -103,6 +137,7 @@ export async function generateCommitMessage(
 	for (const candidate of candidates) {
 		const apiKey = await registry.getApiKey(candidate.model, sessionId);
 		if (!apiKey) continue;
+		noteRolePoolModelUsed(call, candidate.model);
 
 		try {
 			const maxTokens = COMMIT_MAX_TOKENS;

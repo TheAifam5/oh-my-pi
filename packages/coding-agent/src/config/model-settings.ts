@@ -5,6 +5,7 @@
 import { register, type SettingValueOf } from "./registry";
 import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
 import type { cfgDefaultThinkingLevel } from "../session/settings";
+import { assertModelGroupSectionWritable } from "./model-groups";
 
 /** Display metadata for one model tag. */
 export interface ModelTagDef {
@@ -13,6 +14,12 @@ export interface ModelTagDef {
 	/** If true, the role is functional but not shown in the model selector UI. */
 	hidden?: boolean;
 }
+
+/**
+ * One configured `modelRoles` entry: a selector string, a selector list, or a model-group mapping
+ * (inline group or `use` reference); see `config/model-groups.ts`.
+ */
+export type ModelRoleEntry = string | readonly string[] | Readonly<Record<string, unknown>>;
 
 /** Model tags keyed by tag id (`modelTags`). */
 export type ModelTagsSettings = Record<string, ModelTagDef>;
@@ -28,9 +35,10 @@ export interface ModelPreset {
 }
 
 const EMPTY_STRING_ARRAY: string[] = [];
-const EMPTY_STRING_RECORD: Record<string, string> = {};
+const EMPTY_MODEL_ROLES_RECORD: Record<string, ModelRoleEntry> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
+const EMPTY_MODEL_GROUPS_RECORD: Record<string, Record<string, unknown>> = {};
 const EMPTY_MODEL_PRESETS_RECORD: Record<string, ModelPreset> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
 
@@ -106,7 +114,22 @@ export const cfgModelRoleStorage = register({
 	},
 });
 
-export const cfgModelRoles = register({ id: "modelRoles", type: "record", default: EMPTY_STRING_RECORD });
+export const cfgModelRoles = register({
+	id: "modelRoles",
+	type: "record",
+	default: EMPTY_MODEL_ROLES_RECORD,
+	entryMerge: "replace",
+	validateWrite: raw => assertModelGroupSectionWritable("modelRoles", raw),
+});
+
+/** Named model groups (`modelGroups.<name>`), referenced from roles and fallback chains by `use` or `+<name>`. */
+export const cfgModelGroups = register({
+	id: "modelGroups",
+	type: "record",
+	default: EMPTY_MODEL_GROUPS_RECORD,
+	entryMerge: "replace",
+	validateWrite: raw => assertModelGroupSectionWritable("modelGroups", raw),
+});
 
 /** Named model presets; no settings-panel UI — managed by `/modelpreset` and the model hub. */
 export const cfgModelPresets = register({

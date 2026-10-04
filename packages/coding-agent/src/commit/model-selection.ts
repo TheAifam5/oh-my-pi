@@ -6,12 +6,19 @@ import {
 	type ModelLookupRegistry,
 	parseModelPattern,
 	resolveModelRoleValue,
-	resolveRoleSelection,
 } from "../config/model-resolver";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
+import { notePoolPickApplied, RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
+import {
+	type RolePoolCall,
+	type RolePoolRegistry,
+	resolveRoleSelectionAsync,
+	rolePoolPickCandidates,
+} from "../session/role-pool-resolution";
 import { concreteThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { logger } from "@oh-my-pi/pi-utils";
 
 export interface ResolvedCommitModel {
 	model: Model<Api>;
@@ -29,21 +36,30 @@ export interface ResolvedCommitModel {
 	thinkingLevel?: ThinkingLevel;
 }
 
-type CommitModelRegistry = ModelLookupRegistry &
-	ApiKeyResolverRegistry & {
-		getApiKey: (model: Model<Api>) => Promise<string | undefined>;
-	};
+type CommitModelRegistry = ModelLookupRegistry & ApiKeyResolverRegistry & RolePoolRegistry;
 
+/**
+ * The model commit generation runs on: `override`, else the first of `commit`, `smol`, and the chat
+ * roles that resolves (a blocked pool role is skipped). `call` shares pool picks with
+ * {@link resolveSmolModel} in the same run.
+ */
 export async function resolvePrimaryModel(
 	override: string | undefined,
 	settings: Settings,
 	modelRegistry: CommitModelRegistry,
+	call?: RolePoolCall,
 ): Promise<ResolvedCommitModel> {
 	const available = modelRegistry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
 	const resolved = override
 		? resolveModelRoleValue(override, available, { settings, matchPreferences })
-		: resolveRoleSelection(["commit", "smol", ...CHAT_MODEL_ROLE_IDS], settings, available);
+		: await resolveRoleSelectionAsync(
+				["commit", "smol", ...CHAT_MODEL_ROLE_IDS],
+				settings,
+				available,
+				{ modelRegistry },
+				call,
+			);
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("No model available for commit generation");
@@ -52,6 +68,7 @@ export async function resolvePrimaryModel(
 	if (!apiKey) {
 		throw new Error(`No API key available for model ${model.provider}/${model.id}`);
 	}
+	if (resolved && "pick" in resolved && resolved.pick) notePoolPickApplied(resolved.pick);
 	return {
 		model,
 		apiKey: modelRegistry.resolver(model),
@@ -59,23 +76,52 @@ export async function resolvePrimaryModel(
 	};
 }
 
+/**
+ * The model for commit-message drafting: the `smol` role, its built-in candidates, then the primary
+ * model. A `smol` pool (or an alias of one) never uses the built-in candidates: a pick without a
+ * resolvable key gives way to the pool's other eligible members, then the primary model, and a
+ * blocked pool falls to the primary model. `call` reuses the run's `smol` pick.
+ */
 export async function resolveSmolModel(
 	settings: Settings,
 	modelRegistry: CommitModelRegistry,
 	fallbackModel: Model<Api>,
 	fallbackApiKey: ApiKey,
+	call?: RolePoolCall,
 ): Promise<ResolvedCommitModel> {
 	const available = modelRegistry.getAvailable();
-	const resolvedSmol = resolveRoleSelection(["smol"], settings, available);
+	const resolvedSmol = await resolveRoleSelectionAsync(["smol"], settings, available, { modelRegistry }, call).catch(
+		(error: unknown) => {
+			if (!(error instanceof RolePoolUnavailableError)) throw error;
+			logger.info("Commit smol pool unavailable; using the primary model", { error: error.message });
+			return null;
+		},
+	);
+	// A blocked smol pool is skipped like an unavailable smol role, without its built-in substitutes.
+	if (resolvedSmol === null) return { model: fallbackModel, apiKey: fallbackApiKey };
 	if (resolvedSmol?.model) {
 		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);
 		if (apiKey) {
+			if (resolvedSmol.pick) notePoolPickApplied(resolvedSmol.pick);
 			return {
 				model: resolvedSmol.model,
 				apiKey: modelRegistry.resolver(resolvedSmol.model),
 				thinkingLevel: concreteThinkingLevel(resolvedSmol.thinkingLevel),
 			};
 		}
+	}
+	if (rolePoolTarget(settings, "smol")) {
+		// Built-in substitutes could include a member the pool's funding policy excluded.
+		const rest = resolvedSmol?.pick ? rolePoolPickCandidates(resolvedSmol.pick, settings, available).slice(1) : [];
+		for (const candidate of rest) {
+			if (!(await modelRegistry.getApiKey(candidate.model))) continue;
+			return {
+				model: candidate.model,
+				apiKey: modelRegistry.resolver(candidate.model),
+				thinkingLevel: concreteThinkingLevel(candidate.thinkingLevel),
+			};
+		}
+		return { model: fallbackModel, apiKey: fallbackApiKey };
 	}
 
 	const matchPreferences = getModelMatchPreferences(settings);

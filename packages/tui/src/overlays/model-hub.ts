@@ -1,4 +1,11 @@
-import { parseModelString, splitUpstreamRouting, formatModelSelectorValue } from "./model-selector";
+import {
+	parseModelString,
+	splitThinkingSuffix,
+	splitUpstreamRouting,
+	formatModelSelectorValue,
+} from "./model-selector";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import { sanitizeDisplayLine } from "./extensions/display-text";
 /**
  * Fullscreen /models hub, shown on the alternate screen like /settings.
  *
@@ -80,12 +87,17 @@ const MODEL_HUB_BODY_MIN_WIDTH = 28;
  * A row of the Roles view: a role, a model/wildcard chain-key header, one of a
  * chain's fallback entries, or the trailing "+ New role…". Fallback rows under
  * a chain-key header carry the key in `role` — `retry.fallbackChains` treats
- * roles, `provider/model-id`, and `provider/*` keys uniformly.
+ * roles, `provider/model-id`, and `provider/*` keys uniformly. A role whose
+ * value is a pool summarizes it on its own row; a chain configured as a pool
+ * gets a `pool` summary row in place of its entries. `poolMember` rows list a
+ * pool's members under its summary.
  */
 type RolesRow =
 	| { kind: "role"; role: string }
 	| { kind: "chainKey"; role: string }
 	| { kind: "fallback"; role: string; chainIndex: number; selector: string }
+	| { kind: "pool"; role: string }
+	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string }
 	| { kind: "separator" }
 	| { kind: "newFallback" }
 	| { kind: "newRole" };
@@ -93,17 +105,54 @@ type RolesRow =
 /**
  * What the model browser is currently picking for: a role's model, a slot in
  * a fallback chain (`role` may be a role name, model selector, or `provider/*`
- * key), or the primary model a brand-new fallback chain protects.
+ * key), the primary model a brand-new fallback chain protects, or a pool
+ * member (`alias` replaces that member, `null` adds one).
  */
 type AssignTarget =
 	| { kind: "role"; role: string }
 	| { kind: "fallback"; role: string; index: number | null }
-	| { kind: "fallbackKey" };
+	| { kind: "fallbackKey" }
+	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string | null };
+
+/** A pool's settings entry: a role's `modelRoles` value or a `retry.fallbackChains` entry. */
+export interface ModelHubPoolTarget {
+	kind: "role" | "chain";
+	key: string;
+}
+
+/** One pool member as the hub shows it. */
+export interface ModelHubPoolMember {
+	alias: string;
+	/** `provider/model-id`. */
+	model: string;
+	/** Effort the pool runs the member at: the selected profile's override, else its `defaultEffort`. */
+	effort?: string;
+	weight?: number;
+}
+
+/** Read-only view of a pool configured at a role or fallback-chain entry. */
+export interface ModelHubPool {
+	/** `inline`: the group is written at the entry; `ref`: the entry names `modelGroups.<group>`. */
+	source: { kind: "inline" } | { kind: "ref"; group: string; profile?: string };
+	strategy: string;
+	/** Members in scheduling order: the strategy's `order` for priority and round-robin, else alias order. */
+	members: readonly ModelHubPoolMember[];
+	/** Authorized billing classes in funding order; empty when the pool configures none. */
+	funding: readonly string[];
+	/** Spending policy as display text; never edited by the hub. */
+	spending?: string;
+	/** Why the hub must not edit this pool; undefined when it may. */
+	readOnly?: string;
+	/** The entry exactly as configured, present only when the hub may edit it; edits round-trip through a copy. */
+	raw?: Readonly<Record<string, unknown>>;
+}
 
 /** Live preferences and selector operations supplied by the host. */
 export interface ModelHubSource extends ModelBrowserSource {
 	readonly disabledProviders: readonly string[];
 	readonly fallbackChains: Record<string, string[]>;
+	/** `retry.fallbackChains` keys configured as a model group; list edits never write them. Absent: none. */
+	readonly fallbackChainGroupKeys?: readonly string[];
 	readonly modelRoleStorage: "global" | "project";
 	readonly cycleOrder: readonly string[];
 	getProjectModelRole(role: string): string | undefined;
@@ -114,6 +163,12 @@ export interface ModelHubSource extends ModelBrowserSource {
 	 * matches, if any. Absent hosts have no presets to switch between.
 	 */
 	getModelPresets?(): { names: readonly string[]; active: string | undefined };
+	/** Pool configured at `target`; undefined for a legacy, unset, or invalid entry. Absent hosts have no pools. */
+	getPool?(target: ModelHubPoolTarget): ModelHubPool | undefined;
+	/** Whether `modelRoles.<role>` may hold a pool; absent means no role does. */
+	roleAcceptsPools?(role: string): boolean;
+	/** Why a pool written at `target` would not take effect (another layer supplies the entry); undefined when it would. */
+	poolWriteBlocker?(target: ModelHubPoolTarget): string | undefined;
 }
 
 /** Catalog capabilities required by the model hub. */
@@ -158,6 +213,14 @@ export interface ModelHubCallbacks {
 	onUnassign: (role: string, scope?: ModelRoleSelectionScope) => void;
 	/** Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key. */
 	onFallbackChainChange?: (role: string, chain: string[]) => void;
+	/**
+	 * Persist a pool edit: `value` replaces the entry at `target`, `undefined` removes it.
+	 * Returns the validator's message when the value is refused and nothing was written.
+	 */
+	onPoolChange?: (
+		target: ModelHubPoolTarget,
+		value: Readonly<Record<string, unknown>> | undefined,
+	) => string | undefined;
 	/** Locked provider activation: forward to the /login flow. */
 	onLoginRequest?: (providerId: string) => void;
 	/** Save the current role assignments and default thinking level as a named model preset. */
@@ -213,6 +276,8 @@ type StripState =
 			role?: string;
 			/** Set when a thinking strip edits a fallback-chain entry instead of a role assignment. */
 			fallbackIndex?: number;
+			/** Set when a thinking strip edits a pool member's effort. */
+			poolMember?: { target: ModelHubPoolTarget; alias: string };
 			scope?: ModelRoleSelectionScope;
 			/** Where to land when a scope or thinking strip closes. */
 			returnToRoles: boolean;
@@ -238,7 +303,11 @@ type RolesAction =
 	| "thinking"
 	| "save"
 	| "nextPreset"
-	| "prevPreset";
+	| "prevPreset"
+	| "pool"
+	| "strategy"
+	| "funding"
+	| "weight";
 
 /** Printable keys of the Roles view and the command each runs. */
 const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
@@ -253,7 +322,35 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	// Letter twins of ctrl+←/→, which macOS reserves for switching Spaces.
 	p: "nextPreset",
 	P: "prevPreset",
+	m: "pool",
+	g: "strategy",
+	o: "funding",
+	w: "weight",
 };
+
+/** Strategies `g` cycles through: each needs no options, or only an `order` the hub derives from the members. */
+const POOL_STRATEGY_CYCLE = ["priority", "round-robin", "weighted-random", "random"] as const;
+
+/**
+ * Funding orders `o` cycles through. There is no empty state: a pool without `routing.funding`
+ * applies no billing filter, which is wider than any listed order. `metered` stays as configured
+ * because it needs a spending policy.
+ */
+const POOL_FUNDING_CYCLE: readonly (readonly string[])[] = [
+	["included"],
+	["included", "free"],
+	["free", "included"],
+	["free"],
+];
+
+/** Weights `w` cycles a weighted-random member through; `undefined` leaves the strategy default. */
+const POOL_WEIGHT_CYCLE: readonly (number | undefined)[] = [undefined, 1, 2, 3, 5, 10];
+
+/** Longest member alias the hub derives from a model id; the validator allows 64 and suffixes need room. */
+const POOL_ALIAS_MAX_LENGTH = 48;
+
+/** Member aliases the group grammar reserves. */
+const POOL_RESERVED_ALIASES: readonly string[] = ["window", "__proto__", "constructor", "prototype"];
 
 /** Picker fact columns of the Roles view. */
 const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
@@ -299,12 +396,57 @@ function rolesRowKey(row: RolesRow, index: number): string {
 			return `chain:${row.role}`;
 		case "fallback":
 			return `fallback:${row.role}:${row.chainIndex}`;
+		case "pool":
+			return `pooled:${row.role}`;
+		case "poolMember":
+			return `member:${row.target.kind}:${row.role}:${row.alias}`;
 		case "separator":
 			return `sep:${index}`;
 		case "newRole":
 		case "newFallback":
 			return row.kind;
 	}
+}
+
+/** `parent[key]` as a mapping, replacing a missing or non-mapping value with an empty one. */
+function draftRecord(parent: Record<string, unknown>, key: string): Record<string, unknown> {
+	const value = parent[key];
+	if (isRecord(value)) return value;
+	const created: Record<string, unknown> = {};
+	parent[key] = created;
+	return created;
+}
+
+/** The mutable `strategyOptions.order` of a priority or round-robin pool draft; undefined for other strategies. */
+function draftOrder(draft: Record<string, unknown>): string[] | undefined {
+	if (draft.strategy !== "priority" && draft.strategy !== "round-robin") return undefined;
+	const options = draftRecord(draft, "strategyOptions");
+	if (!Array.isArray(options.order)) options.order = [];
+	return options.order as string[];
+}
+
+function memberModel(member: unknown): unknown {
+	return isRecord(member) ? member.model : undefined;
+}
+
+/**
+ * A member alias for `model` that matches the group name grammar and is not
+ * in `taken`: its model id lowercased, other characters folded to `-`, and a
+ * numeric suffix on collision.
+ */
+function uniquePoolAlias(model: string, taken: readonly string[]): string {
+	const id = model.slice(model.lastIndexOf("/") + 1).toLowerCase();
+	const base =
+		id
+			.replace(/[^a-z0-9_-]+/g, "-")
+			.replace(/^[^a-z0-9]+/, "")
+			.slice(0, POOL_ALIAS_MAX_LENGTH)
+			.replace(/[-_]+$/, "") || "model";
+	let alias = base;
+	for (let suffix = 2; taken.includes(alias) || POOL_RESERVED_ALIASES.includes(alias); suffix++) {
+		alias = `${base}-${suffix}`;
+	}
+	return alias;
 }
 
 /**
@@ -368,6 +510,14 @@ export class ModelHubComponent implements Component {
 	#focus: "scope" | "list" = "scope";
 
 	#rolesRows: RolesRow[] = [];
+	/** Pools read for the current rows, keyed `<kind>:<key>`; cleared on every rows rebuild. */
+	#poolCache = new Map<string, ModelHubPool | undefined>();
+	/**
+	 * Outcome of the last pool edit worth reporting: the validator's message for a refused edit
+	 * (`error`) or a note on an edit the hub declined or adjusted (`warning`). Sanitized; cleared by
+	 * the next roles action or cursor move.
+	 */
+	#poolStatus: { text: string; tone: "error" | "warning" } | undefined;
 	#roleIndex = 0;
 	#roleHover: number | null = null;
 	/** First roles row drawn in the scroll window; follows the cursor and clamps to the list. */
@@ -850,6 +1000,7 @@ export class ModelHubComponent implements Component {
 	 * The configured `retry.fallbackChains` record with malformed keys/entries
 	 * dropped: non-array chains and non-string selectors never reach the rows
 	 * or chain editors, so an edit through the hub replaces them wholesale.
+	 * Model-group keys are dropped too but are never edited ({@link #isPooledChain}).
 	 */
 	#fallbackChains(): Record<string, string[]> {
 		try {
@@ -867,17 +1018,74 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
+	#pooledChainKeys(): readonly string[] {
+		try {
+			return this.#settings.fallbackChainGroupKeys ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/** Whether `key` holds a model-group chain, which list edits never write. */
+	#isPooledChain(key: string): boolean {
+		return this.#pooledChainKeys().includes(key);
+	}
+
+	/** Pool at `target`, memoized until the next rows rebuild so every render path reads one snapshot. */
+	#pool(target: ModelHubPoolTarget): ModelHubPool | undefined {
+		const id = `${target.kind}:${target.key}`;
+		if (this.#poolCache.has(id)) return this.#poolCache.get(id);
+		let pool: ModelHubPool | undefined;
+		try {
+			pool = this.#settings.getPool?.(target);
+		} catch {
+			pool = undefined;
+		}
+		this.#poolCache.set(id, pool);
+		return pool;
+	}
+
+	#rolePool(role: string): ModelHubPool | undefined {
+		return this.#pool({ kind: "role", key: role });
+	}
+
+	#chainPool(key: string): ModelHubPool | undefined {
+		return this.#isPooledChain(key) ? this.#pool({ kind: "chain", key }) : undefined;
+	}
+
+	/** Whether the hub may write the pool at `target`: an inline pool from the global layer with a write callback. */
+	#poolEditable(pool: ModelHubPool | undefined): pool is ModelHubPool & { raw: Readonly<Record<string, unknown>> } {
+		return pool?.raw !== undefined && pool.readOnly === undefined && this.#callbacks.onPoolChange !== undefined;
+	}
+
+	/** Member rows of `pool` in scheduling order. */
+	#poolMemberRows(role: string, target: ModelHubPoolTarget, pool: ModelHubPool | undefined): RolesRow[] {
+		return (pool?.members ?? []).map(member => ({ kind: "poolMember", role, target, alias: member.alias }));
+	}
+
 	/**
-	 * Rebuild the Roles view rows: each visible role followed by its
-	 * fallback-chain entries, then model-oriented chains (`provider/model-id`
-	 * and `provider/*` keys) as headed groups.
+	 * Rebuild the Roles view rows: each visible role followed by its pool
+	 * members and fallback-chain entries, then model-oriented chains
+	 * (`provider/model-id` and `provider/*` keys) as headed groups.
 	 */
 	#buildRolesRows(): void {
+		this.#poolCache.clear();
 		const rows: RolesRow[] = [];
 		const chains = this.#fallbackChains();
+		const appendChainPool = (key: string): void => {
+			rows.push({ kind: "pool", role: key });
+			const target: ModelHubPoolTarget = { kind: "chain", key };
+			rows.push(...this.#poolMemberRows(key, target, this.#chainPool(key)));
+		};
 		const appendRoles = (roles: ReadonlyArray<string>): void => {
 			for (const role of roles) {
 				rows.push({ kind: "role", role });
+				const target: ModelHubPoolTarget = { kind: "role", key: role };
+				rows.push(...this.#poolMemberRows(role, target, this.#rolePool(role)));
+				if (this.#isPooledChain(role)) {
+					appendChainPool(role);
+					continue;
+				}
 				const chain = chains[role] ?? [];
 				for (let i = 0; i < chain.length; i++) {
 					rows.push({ kind: "fallback", role, chainIndex: i, selector: chain[i] });
@@ -896,12 +1104,16 @@ export class ModelHubComponent implements Component {
 		}
 		rows.push({ kind: "newRole" });
 		rows.push({ kind: "separator" });
-		const modelKeys = Object.keys(chains)
+		const modelKeys = [...new Set([...Object.keys(chains), ...this.#pooledChainKeys()])]
 			.filter(key => key.includes("/"))
 			.sort();
 		for (const key of modelKeys) {
 			const chain = chains[key] ?? [];
 			rows.push({ kind: "chainKey", role: key });
+			if (this.#isPooledChain(key)) {
+				appendChainPool(key);
+				continue;
+			}
 			for (let i = 0; i < chain.length; i++) {
 				rows.push({ kind: "fallback", role: key, chainIndex: i, selector: chain[i] });
 			}
@@ -918,8 +1130,14 @@ export class ModelHubComponent implements Component {
 		const chains = this.#fallbackChains();
 		// "New role…" and "New fallback chain…", then each role and model chain with its fallback entries.
 		let count = 2;
-		for (const role of this.#visibleRoleIds()) count += 1 + (chains[role]?.length ?? 0);
-		for (const key in chains) if (key.includes("/")) count += 1 + chains[key].length;
+		const chainPoolRows = (key: string): number => 1 + (this.#chainPool(key)?.members.length ?? 0);
+		for (const role of this.#visibleRoleIds()) {
+			count += 1 + (this.#rolePool(role)?.members.length ?? 0);
+			count += this.#isPooledChain(role) ? chainPoolRows(role) : (chains[role]?.length ?? 0);
+		}
+		for (const key in chains) if (key.includes("/") && !this.#isPooledChain(key)) count += 1 + chains[key].length;
+		// A pooled model key shows its header, the pool summary row, and its members.
+		for (const key of this.#pooledChainKeys()) if (key.includes("/")) count += 1 + chainPoolRows(key);
 		return count;
 	}
 
@@ -1165,6 +1383,8 @@ export class ModelHubComponent implements Component {
 				this.#assignRole(item, target.role, true);
 			} else if (target.kind === "fallbackKey") {
 				this.#openFallbackKeyStrip(item);
+			} else if (target.kind === "poolMember") {
+				this.#commitPoolMember(item, target);
 			} else {
 				this.#commitFallback(item, target);
 			}
@@ -1259,6 +1479,17 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
+	 * Clear a role whose value is a pool, whether or not a member resolves. Only a pool the global
+	 * layer supplies is cleared, so `x` never removes a lower-precedence value instead.
+	 */
+	#unassignPooledRole(role: string): void {
+		if (!this.#poolClearable({ kind: "role", key: role })) return;
+		if (this.#settings.modelRoleStorage === "project") this.#callbacks.onUnassign(role, "global");
+		else this.#callbacks.onUnassign(role);
+		this.#refreshAfterMutation();
+	}
+
+	/**
 	 * Thinking levels a role assignment can actually apply. A model that does
 	 * not reason gets none: no request path sends reasoning for it, and
 	 * `applyAutoThinkingLevel` early-returns on `!model.reasoning`, so
@@ -1279,7 +1510,8 @@ export class ModelHubComponent implements Component {
 	 */
 	#roleThinkingTarget(role: string): { item: ModelBrowserItem; scope?: ModelRoleSelectionScope } | undefined {
 		const assignment = this.#roles[role];
-		if (!assignment) return undefined;
+		// A role assignment would replace the pool with one model; member efforts are edited per member.
+		if (!assignment || this.#rolePool(role)) return undefined;
 		const source =
 			this.#settings.modelRoleStorage === "project" ? this.#settings.getModelRoleSource(role) : "default";
 		const scope = source === "project" || source === "global" ? source : undefined;
@@ -1567,6 +1799,12 @@ export class ModelHubComponent implements Component {
 				}
 				return;
 			case "thinking": {
+				if (chip.thinkingLevel !== undefined && strip.poolMember !== undefined) {
+					this.#strip = null;
+					this.#frame.chipRanges = [];
+					this.#setPoolMemberEffort(strip.poolMember.target, strip.poolMember.alias, chip.thinkingLevel);
+					return;
+				}
 				if (strip.role && chip.thinkingLevel !== undefined && strip.fallbackIndex !== undefined) {
 					this.#setFallbackThinking(strip.role, strip.fallbackIndex, chip.thinkingLevel);
 					this.#strip = null;
@@ -1610,8 +1848,15 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
-	/** Browse the catalog to fill a fallback-chain slot: `index` replaces an entry, `null` appends. */
+	/**
+	 * Browse the catalog to fill a fallback-chain slot: `index` replaces an entry, `null` appends.
+	 * Appending to a chain configured as a pool adds a pool member instead; a read-only pool takes neither.
+	 */
 	#startAssignFallback(role: string, index: number | null): void {
+		if (this.#isPooledChain(role)) {
+			if (index === null) this.#startAssignPoolMember(role, { kind: "chain", key: role }, null);
+			return;
+		}
 		this.#assigning = { kind: "fallback", role, index };
 		this.#focus = "list";
 		this.#browser.setShowProvider(true);
@@ -1677,8 +1922,12 @@ export class ModelHubComponent implements Component {
 		if (rowIndex >= 0) this.#roleIndex = rowIndex;
 	}
 
-	/** Persist `role`'s chain through the host callback and rebuild dependent state. */
+	/**
+	 * Persist `role`'s chain through the host callback and rebuild dependent state. A model-group
+	 * key is left untouched, so no hub edit replaces a configured pool with a list.
+	 */
 	#setFallbackChain(role: string, chain: string[]): void {
+		if (this.#isPooledChain(role)) return;
 		this.#callbacks.onFallbackChainChange?.(role, chain);
 		this.#refreshAfterMutation();
 	}
@@ -1715,6 +1964,350 @@ export class ModelHubComponent implements Component {
 		this.#browser.setQuery("");
 		this.#setActiveEntry("roles");
 		this.#focus = "list";
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Pool editing
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/** The pool a row edits: a pooled role's value, a chain pool, or a member's pool. */
+	#rowPoolTarget(row: RolesRow | undefined): ModelHubPoolTarget | undefined {
+		switch (row?.kind) {
+			case "role":
+				return this.#rolePool(row.role) ? { kind: "role", key: row.role } : undefined;
+			case "pool":
+				return { kind: "chain", key: row.role };
+			case "chainKey":
+				return this.#isPooledChain(row.role) ? { kind: "chain", key: row.role } : undefined;
+			case "poolMember":
+				return row.target;
+			default:
+				return undefined;
+		}
+	}
+
+	/** The editable pool a row edits; undefined when the row has none or it is read-only. */
+	#rowEditablePool(
+		row: RolesRow | undefined,
+	): { target: ModelHubPoolTarget; pool: ModelHubPool & { raw: Readonly<Record<string, unknown>> } } | undefined {
+		const target = this.#rowPoolTarget(row);
+		if (!target) return undefined;
+		const pool = this.#pool(target);
+		return this.#poolEditable(pool) ? { target, pool } : undefined;
+	}
+
+	/** Legacy selectors `m` would turn into a pool, with the entry they live at; undefined when `m` does not apply. */
+	#legacyPoolSource(row: RolesRow | undefined): { target: ModelHubPoolTarget; selectors: string[] } | undefined {
+		if (!this.#callbacks.onPoolChange || !row) return undefined;
+		let target: ModelHubPoolTarget;
+		let selectors: string[];
+		if (row.kind === "role") {
+			if (this.#rolePool(row.role) || !this.#settings.roleAcceptsPools?.(row.role)) return undefined;
+			target = { kind: "role", key: row.role };
+			selectors = (this.#settings.getModelRole(row.role) ?? "")
+				.split(",")
+				.map(selector => selector.trim())
+				.filter(selector => selector.length > 0);
+		} else if (row.kind === "fallback" || (row.kind === "chainKey" && !this.#isPooledChain(row.role))) {
+			target = { kind: "chain", key: row.role };
+			selectors = [...(this.#fallbackChains()[row.role] ?? [])];
+		} else {
+			return undefined;
+		}
+		if (selectors.length === 0) return undefined;
+		try {
+			if (this.#settings.poolWriteBlocker?.(target) !== undefined) return undefined;
+		} catch {
+			return undefined;
+		}
+		return { target, selectors };
+	}
+
+	/**
+	 * Persist `value` at `target` through the host. A refused value leaves the
+	 * settings untouched and its validator message in the status row.
+	 */
+	#writePool(target: ModelHubPoolTarget, value: Readonly<Record<string, unknown>> | undefined): boolean {
+		const write = this.#callbacks.onPoolChange;
+		if (!write) return false;
+		let error: string | undefined;
+		try {
+			error = write(target, value);
+		} catch (failure) {
+			error = failure instanceof Error ? failure.message : String(failure);
+		}
+		this.#poolStatus = error === undefined ? undefined : { text: sanitizeDisplayLine(error), tone: "error" };
+		this.#refreshAfterMutation();
+		return error === undefined;
+	}
+
+	/** Report a pool edit the hub declined or adjusted, in the status row until the next roles action. */
+	#poolNotice(text: string): void {
+		this.#poolStatus = { text: sanitizeDisplayLine(text), tone: "warning" };
+	}
+
+	/** Apply `mutate` to a copy of the editable pool at `target` and persist it; `mutate` returns false to skip the write. */
+	#editPool(target: ModelHubPoolTarget, mutate: (draft: Record<string, unknown>) => boolean): boolean {
+		const pool = this.#pool(target);
+		if (!this.#poolEditable(pool)) return false;
+		const draft = structuredClone(pool.raw) as Record<string, unknown>;
+		if (!mutate(draft)) return false;
+		return this.#writePool(target, draft);
+	}
+
+	/** `m`: turn a legacy selector value into a `priority` pool, one member per selector in configured order. */
+	#convertToPool(row: RolesRow | undefined): void {
+		const source = this.#legacyPoolSource(row);
+		if (!source) return;
+		const models: Record<string, Record<string, unknown>> = {};
+		const order: string[] = [];
+		for (const selector of source.selectors) {
+			const { base, level } = splitThinkingSuffix(selector, selector.indexOf("/"));
+			const alias = uniquePoolAlias(base, order);
+			// An unsupported suffix (`:off`, `:auto`) is kept so the validator names it instead of the hub dropping it.
+			models[alias] =
+				level && level !== ThinkingLevel.Inherit ? { model: base, defaultEffort: level } : { model: base };
+			order.push(alias);
+		}
+		if (this.#writePool(source.target, { strategy: "priority", strategyOptions: { order }, models })) {
+			const index = this.#rolesRows.findIndex(candidate =>
+				source.target.kind === "role"
+					? candidate.kind === "role" && candidate.role === source.target.key
+					: candidate.kind === "pool" && candidate.role === source.target.key,
+			);
+			if (index >= 0) this.#roleIndex = index;
+		}
+	}
+
+	/** Browse the catalog to add a member to the pool at `target` (`alias` null) or replace member `alias`. */
+	#startAssignPoolMember(role: string, target: ModelHubPoolTarget, alias: string | null): void {
+		if (!this.#poolEditable(this.#pool(target))) return;
+		this.#assigning = { kind: "poolMember", role, target, alias };
+		this.#focus = "scope";
+		this.#browser.setShowProvider(true);
+		this.#setCandidateItems(this.#availableItems);
+		this.#browser.setQuery("");
+		const member = alias === null ? undefined : this.#pool(target)?.members.find(entry => entry.alias === alias);
+		if (member) this.#browser.selectSelector(member.model);
+	}
+
+	/** Write the picked model as a new or replaced member and land on its row. */
+	#commitPoolMember(
+		item: ModelBrowserItem,
+		assign: { role: string; target: ModelHubPoolTarget; alias: string | null },
+	): void {
+		const selector = item.selector;
+		let landed = assign.alias;
+		let notice: string | undefined;
+		this.#editPool(assign.target, draft => {
+			const models = draftRecord(draft, "models");
+			const holder = Object.keys(models).find(alias => memberModel(models[alias]) === selector);
+			if (holder !== undefined) {
+				notice = `${selector} is already member ${holder} of this pool`;
+				return false;
+			}
+			if (assign.alias === null) {
+				landed = uniquePoolAlias(selector, Object.keys(models));
+				models[landed] = { model: selector };
+				draftOrder(draft)?.push(landed);
+				return true;
+			}
+			const member = models[assign.alias];
+			if (!isRecord(member)) return false;
+			member.model = selector;
+			// The alias stays; an effort the new model cannot run falls back to inherit.
+			const effort = member.defaultEffort;
+			if (typeof effort === "string" && !getSupportedEfforts(item.model).some(level => level === effort)) {
+				delete member.defaultEffort;
+				notice = `${item.model.id} does not support effort ${effort}; member ${assign.alias} now inherits`;
+			}
+			return true;
+		});
+		// A validator refusal outranks the hub's own note.
+		if (notice !== undefined && this.#poolStatus?.tone !== "error") this.#poolNotice(notice);
+		this.#browser.setQuery("");
+		this.#setActiveEntry("roles");
+		this.#focus = "list";
+		const index = this.#rolesRows.findIndex(
+			row =>
+				row.kind === "poolMember" &&
+				row.alias === landed &&
+				row.target.kind === assign.target.kind &&
+				row.target.key === assign.target.key,
+		);
+		if (index >= 0) this.#roleIndex = index;
+	}
+
+	/** Remove member `alias` with every `order` and profile entry naming it; the cursor stays on the nearest row. */
+	#removePoolMember(target: ModelHubPoolTarget, alias: string): void {
+		this.#editPool(target, draft => {
+			const models = draftRecord(draft, "models");
+			if (!Object.hasOwn(models, alias)) return false;
+			delete models[alias];
+			const order = draftOrder(draft);
+			if (order) {
+				const index = order.indexOf(alias);
+				if (index >= 0) order.splice(index, 1);
+			}
+			if (isRecord(draft.profiles)) {
+				for (const profile of Object.values(draft.profiles)) if (isRecord(profile)) delete profile[alias];
+			}
+			return true;
+		});
+		this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
+	}
+
+	/** Move member `alias` one slot in a priority or round-robin `order`; the cursor follows it. */
+	#movePoolMember(target: ModelHubPoolTarget, alias: string, delta: -1 | 1): void {
+		const moved = this.#editPool(target, draft => {
+			const order = draftOrder(draft);
+			const index = order?.indexOf(alias) ?? -1;
+			const next = index + delta;
+			if (!order || index < 0 || next < 0 || next >= order.length) return false;
+			[order[index], order[next]] = [order[next]!, order[index]!];
+			return true;
+		});
+		if (moved) this.#roleIndex += delta;
+	}
+
+	/** Whether the pool at `target` schedules members in an explicit order that `[`/`]` can change. */
+	#poolOrdered(target: ModelHubPoolTarget): boolean {
+		const strategy = this.#pool(target)?.strategy;
+		return strategy === "priority" || strategy === "round-robin";
+	}
+
+	/**
+	 * `g`: step through {@link POOL_STRATEGY_CYCLE}; leaving weighted-random drops member weights it
+	 * alone accepts. A strategy outside the cycle (`quota`) is left for config, so `g` declines to change it.
+	 */
+	#cyclePoolStrategy(target: ModelHubPoolTarget): void {
+		const pool = this.#pool(target);
+		if (pool && !POOL_STRATEGY_CYCLE.some(name => name === pool.strategy)) {
+			this.#poolNotice(`${pool.strategy} is not in the hub's strategy cycle; change the strategy in config`);
+			return;
+		}
+		this.#editPool(target, draft => {
+			const order = draftOrder(draft) ?? (pool?.members ?? []).map(member => member.alias);
+			const current = POOL_STRATEGY_CYCLE.findIndex(name => name === draft.strategy);
+			const next = POOL_STRATEGY_CYCLE[(current + 1) % POOL_STRATEGY_CYCLE.length]!;
+			draft.strategy = next;
+			if (next === "priority" || next === "round-robin") draft.strategyOptions = { order: [...order] };
+			else delete draft.strategyOptions;
+			if (next !== "weighted-random") {
+				for (const member of Object.values(draftRecord(draft, "models")))
+					if (isRecord(member)) delete member.weight;
+			}
+			return true;
+		});
+	}
+
+	/** `o`: step the non-metered part of the funding order through {@link POOL_FUNDING_CYCLE}. */
+	#cyclePoolFunding(target: ModelHubPoolTarget): void {
+		this.#editPool(target, draft => {
+			const routing = isRecord(draft.routing) ? draft.routing : undefined;
+			const funding = routing && isRecord(routing.funding) ? routing.funding.order : undefined;
+			const classes = Array.isArray(funding)
+				? funding.filter((entry): entry is string => typeof entry === "string")
+				: [];
+			const metered = classes.includes("metered");
+			const prefix = classes.filter(entry => entry !== "metered");
+			const current = POOL_FUNDING_CYCLE.findIndex(
+				order => order.length === prefix.length && order.every((entry, index) => entry === prefix[index]),
+			);
+			const next = [
+				...POOL_FUNDING_CYCLE[(current + 1) % POOL_FUNDING_CYCLE.length]!,
+				...(metered ? ["metered"] : []),
+			];
+			draftRecord(draft, "routing").funding = { order: next };
+			return true;
+		});
+	}
+
+	/** `w`: step a weighted-random member's weight through {@link POOL_WEIGHT_CYCLE}. */
+	#cyclePoolWeight(target: ModelHubPoolTarget, alias: string): void {
+		if (this.#pool(target)?.strategy !== "weighted-random") return;
+		this.#editPool(target, draft => {
+			const member = draftRecord(draft, "models")[alias];
+			if (!isRecord(member)) return false;
+			const current = POOL_WEIGHT_CYCLE.indexOf(typeof member.weight === "number" ? member.weight : undefined);
+			const next = POOL_WEIGHT_CYCLE[(current + 1) % POOL_WEIGHT_CYCLE.length];
+			if (next === undefined) delete member.weight;
+			else member.weight = next;
+			return true;
+		});
+	}
+
+	/** Catalog entry of a member the effort strip can edit; undefined when the model is unknown or has no effort ladder. */
+	#poolMemberEffortItem(row: RolesRow | undefined): ModelBrowserItem | undefined {
+		if (row?.kind !== "poolMember" || !this.#rowEditablePool(row)) return undefined;
+		const member = this.#pool(row.target)?.members.find(entry => entry.alias === row.alias);
+		const parsed = member ? parseModelString(member.model) : undefined;
+		const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
+		return item && getSupportedEfforts(item.model).length > 0 ? item : undefined;
+	}
+
+	/** `t` on a member row: the effort strip, where inherit clears `defaultEffort`. */
+	#openPoolEffortStrip(row: RolesRow | undefined): void {
+		const item = this.#poolMemberEffortItem(row);
+		if (!item || row?.kind !== "poolMember") return;
+		const member = this.#pool(row.target)?.members.find(entry => entry.alias === row.alias);
+		const options: ConfiguredThinkingLevel[] = [ThinkingLevel.Inherit, ...getSupportedEfforts(item.model)];
+		const current = options.find(level => level === member?.effort) ?? ThinkingLevel.Inherit;
+		this.#strip = {
+			kind: "thinking",
+			item,
+			role: row.role,
+			poolMember: { target: row.target, alias: row.alias },
+			chips: this.#thinkingChips(options),
+			index: Math.max(0, options.indexOf(current)),
+			returnToRoles: true,
+		};
+	}
+
+	#setPoolMemberEffort(target: ModelHubPoolTarget, alias: string, level: ConfiguredThinkingLevel): void {
+		this.#editPool(target, draft => {
+			const member = draftRecord(draft, "models")[alias];
+			if (!isRecord(member)) return false;
+			if (level === ThinkingLevel.Inherit) delete member.defaultEffort;
+			else member.defaultEffort = level;
+			return true;
+		});
+	}
+
+	// ─── Pool display ───────────────────────────────────────────────────────
+
+	/** One-line pool summary: members, strategy, funding order, read-only routing, and why it is read-only. */
+	#poolSummary(pool: ModelHubPool | undefined): string {
+		if (!pool) return "invalid pool · fix it in config";
+		const source =
+			pool.source.kind === "ref"
+				? `pool +${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`
+				: "pool";
+		const count = pool.members.length;
+		const parts = [
+			source,
+			`${count} model${count === 1 ? "" : "s"}`,
+			pool.strategy,
+			pool.funding.length > 0 ? `funding ${pool.funding.join(" → ")}` : undefined,
+			pool.spending ? `spending ${pool.spending}` : undefined,
+			pool.readOnly ? `read-only: ${pool.readOnly}` : undefined,
+		];
+		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
+	}
+
+	/** A member's state facts: effort, weight, catalog presence. */
+	#poolMemberFacts(member: ModelHubPoolMember): string[] {
+		const facts: string[] = [];
+		if (member.effort) facts.push(member.effort);
+		if (member.weight !== undefined) facts.push(`weight ${member.weight}`);
+		const parsed = parseModelString(member.model);
+		if (!parsed || !this.#findFallbackModel(parsed.provider, parsed.id)) facts.push("not in catalog");
+		return facts.map(sanitizeDisplayLine);
+	}
+
+	#poolMemberOf(row: RolesRow): ModelHubPoolMember | undefined {
+		if (row.kind !== "poolMember") return undefined;
+		return this.#pool(row.target)?.members.find(member => member.alias === row.alias);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2056,10 +2649,16 @@ export class ModelHubComponent implements Component {
 	#activateRolesRow(row: RolesRow): void {
 		switch (row.kind) {
 			case "role":
-				this.#startAssign(row.role);
+				// A pooled role gains a member; replacing the whole pool with one model is `x` then Enter.
+				if (this.#rolePool(row.role)) this.#startAssignPoolMember(row.role, { kind: "role", key: row.role }, null);
+				else this.#startAssign(row.role);
 				return;
 			case "chainKey":
+			case "pool":
 				this.#startAssignFallback(row.role, null);
+				return;
+			case "poolMember":
+				this.#startAssignPoolMember(row.role, row.target, row.alias);
 				return;
 			case "fallback":
 				this.#startAssignFallback(row.role, row.chainIndex);
@@ -2113,10 +2712,12 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 		if (matchesSelectUp(data)) {
+			this.#poolStatus = undefined;
 			this.#roleIndex = this.#stepRoleIndex(this.#roleIndex, -1);
 			return;
 		}
 		if (matchesSelectDown(data)) {
+			this.#poolStatus = undefined;
 			this.#roleIndex = this.#stepRoleIndex(this.#roleIndex, 1);
 			return;
 		}
@@ -2146,20 +2747,31 @@ export class ModelHubComponent implements Component {
 
 	/** One Roles-view command on the selected row (keys and action-bar buttons share it). */
 	#runRolesAction(action: RolesAction): void {
+		this.#poolStatus = undefined;
 		const row = this.#rolesRows[this.#roleIndex];
 		const role = row?.kind === "role" ? row.role : undefined;
+		const editable = this.#rowEditablePool(row);
 		switch (action) {
 			case "pick":
 				if (row) this.#activateRolesRow(row);
 				return;
 			case "clear":
-				if (role) this.#unassignRole(role);
+				if (role && this.#rolePool(role)) this.#unassignPooledRole(role);
+				else if (role) this.#unassignRole(role);
 				else if (row?.kind === "fallback") this.#removeFallback(row);
-				else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
+				else if (row?.kind === "poolMember") {
+					if (editable) this.#removePoolMember(row.target, row.alias);
+				} else if (row?.kind === "pool" || (row?.kind === "chainKey" && this.#isPooledChain(row.role))) {
+					if (this.#poolClearable({ kind: "chain", key: row.role })) {
+						this.#writePool({ kind: "chain", key: row.role }, undefined);
+					}
+				} else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
 				return;
 			case "fallback":
 				if (row?.kind === "newFallback") this.#startAssignFallbackKey();
-				else if (row && row.kind !== "newRole" && row.kind !== "separator") {
+				else if (row?.kind === "poolMember" && row.target.kind === "chain") {
+					this.#startAssignPoolMember(row.role, row.target, null);
+				} else if (row && row.kind !== "newRole" && row.kind !== "separator") {
 					this.#startAssignFallback(row.role, null);
 				}
 				return;
@@ -2171,8 +2783,23 @@ export class ModelHubComponent implements Component {
 				const delta = action === "earlier" ? -1 : 1;
 				if (role) this.#moveCycleMembership(role, delta);
 				else if (row?.kind === "fallback") this.#moveFallback(row, delta);
+				else if (row?.kind === "poolMember" && editable && this.#poolOrdered(row.target)) {
+					this.#movePoolMember(row.target, row.alias, delta);
+				}
 				return;
 			}
+			case "pool":
+				this.#convertToPool(row);
+				return;
+			case "strategy":
+				if (editable) this.#cyclePoolStrategy(editable.target);
+				return;
+			case "funding":
+				if (editable) this.#cyclePoolFunding(editable.target);
+				return;
+			case "weight":
+				if (row?.kind === "poolMember" && editable) this.#cyclePoolWeight(row.target, row.alias);
+				return;
 			case "new":
 				this.#openNameStrip("role");
 				return;
@@ -2189,6 +2816,8 @@ export class ModelHubComponent implements Component {
 					if (target) this.#openThinkingStrip(target.item, role, true, target.scope);
 				} else if (row?.kind === "fallback") {
 					this.#openFallbackThinkingStrip(row);
+				} else if (row?.kind === "poolMember") {
+					this.#openPoolEffortStrip(row);
 				}
 				return;
 		}
@@ -2407,6 +3036,15 @@ export class ModelHubComponent implements Component {
 			}
 			const info = this.#settings.getRoleInfo(this.#assigning.role);
 			const label = info.tag ?? info.name ?? this.#assigning.role;
+			if (this.#assigning.kind === "poolMember") {
+				return truncateToWidth(
+					theme.fg(
+						"accent",
+						` ${this.#poolAssignVerb(this.#assigning)} ${theme.bold(label)} — ${enter} picks the member model, ${cancel} cancels`,
+					),
+					width,
+				);
+			}
 			if (this.#assigning.kind === "fallback") {
 				const verb = this.#assigning.index === null ? "Adding fallback for" : "Replacing fallback of";
 				return truncateToWidth(
@@ -2449,7 +3087,80 @@ export class ModelHubComponent implements Component {
 			text = this.#configError;
 			return truncateToWidth(theme.fg("error", ` ${text}`), width);
 		}
+		if (this.#poolStatus && entry.kind === "roles") {
+			return truncateToWidth(theme.fg(this.#poolStatus.tone, ` ${this.#poolStatus.text}`), width);
+		}
 		return truncateToWidth(theme.fg("muted", ` ${text}`), width);
+	}
+
+	/** Whether `x` may remove the whole entry at `target`: the global layer supplies it, so the removal takes effect. */
+	#poolClearable(target: ModelHubPoolTarget): boolean {
+		if (!this.#callbacks.onPoolChange && target.kind === "chain") return false;
+		try {
+			return this.#settings.poolWriteBlocker?.(target) === undefined;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Whether `f` on `role`'s rows can add to its fallbacks: a list chain always, a pool chain only when editable. */
+	#fallbackAddable(role: string): boolean {
+		return !this.#isPooledChain(role) || this.#poolEditable(this.#chainPool(role));
+	}
+
+	/**
+	 * Key hints of a row that shows a pool (a pooled role, a chain pool summary or header, a member),
+	 * listing only keys that act on it; undefined for any other row. Both footers render these.
+	 */
+	#poolRowHints(row: RolesRow | undefined): { label: string; keys: KeyName[] }[] | undefined {
+		const target = this.#rowPoolTarget(row);
+		if (!row || !target) return undefined;
+		const editable = this.#rowEditablePool(row) !== undefined;
+		const hints: ({ label: string; keys: KeyName[] } | false)[] = [];
+		const routing = editable && [
+			{ label: "strategy", keys: ["g"] as KeyName[] },
+			{ label: "funding", keys: ["o"] as KeyName[] },
+		];
+		if (row.kind === "role") {
+			hints.push(
+				editable && { label: "add member", keys: ["enter"] },
+				this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
+				this.#poolClearable(target) && { label: "clear", keys: ["x"] },
+				...(routing || []),
+				{ label: "cycle", keys: ["c"] },
+				{ label: "reorder", keys: ["[", "]"] },
+				{ label: "new", keys: ["n"] },
+				this.#callbacks.onSavePreset !== undefined && { label: "save preset", keys: ["s"] },
+				this.#presets().names.length > 0 && { label: "preset", keys: ["p", "shift+p"] },
+			);
+		} else if (row.kind === "poolMember") {
+			const pool = this.#pool(target);
+			hints.push(
+				editable && { label: "replace", keys: ["enter"] },
+				target.kind === "chain" && editable && { label: "add member", keys: ["f"] },
+				target.kind === "role" && this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
+				editable && { label: "remove", keys: ["x"] },
+				this.#poolMemberEffortItem(row) !== undefined && { label: "effort", keys: ["t"] },
+				editable && pool?.strategy === "weighted-random" && { label: "weight", keys: ["w"] },
+				editable && this.#poolOrdered(target) && { label: "reorder", keys: ["[", "]"] },
+				...(routing || []),
+			);
+		} else {
+			hints.push(
+				editable && { label: "add member", keys: ["enter", "f"] },
+				this.#poolClearable(target) && { label: "clear chain", keys: ["x"] },
+				...(routing || []),
+			);
+		}
+		return hints.filter(hint => hint !== false);
+	}
+
+	/** Status verb of a pool-member pick: which pool it adds to or which member it replaces. */
+	#poolAssignVerb(assign: { target: ModelHubPoolTarget; alias: string | null }): string {
+		const pool = assign.target.kind === "role" ? "pool" : "fallback pool";
+		return assign.alias === null
+			? `Adding a member to the ${pool} of`
+			: `Replacing member ${sanitizeDisplayLine(assign.alias)} in the ${pool} of`;
 	}
 
 	/** Clamp a roles row to `width`; the bg band is reserved for mouse hover. */
@@ -2520,6 +3231,31 @@ export class ModelHubComponent implements Component {
 				continue;
 			}
 
+			if (rowDef.kind === "pool") {
+				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
+				const label = theme.fg(selected ? "accent" : "muted", this.#poolSummary(this.#chainPool(rowDef.role)));
+				lines.push(this.#finishRolesRow(` ${cursor} ${branch} ${label}`, width, hovered));
+				continue;
+			}
+
+			if (rowDef.kind === "poolMember") {
+				const member = this.#poolMemberOf(rowDef);
+				// Chain members sit under the chain's `↳ pool` row; role members directly under the role.
+				const depth = tagWidth + 3 + (rowDef.target.kind === "chain" ? 2 : 0);
+				const branch = theme.fg("dim", `${"".padEnd(depth)}•`);
+				const alias = theme.fg(selected ? "accent" : "muted", sanitizeDisplayLine(rowDef.alias));
+				const model = member ? sanitizeDisplayLine(member.model) : "";
+				const facts = member ? this.#poolMemberFacts(member).join(" · ") : "";
+				lines.push(
+					this.#finishRolesRow(
+						` ${cursor} ${branch} ${alias}  ${selected ? theme.fg("accent", model) : model}  ${theme.fg("dim", facts)}`,
+						width,
+						hovered,
+					),
+				);
+				continue;
+			}
+
 			if (rowDef.kind === "fallback") {
 				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
 				const selector = selected ? theme.fg("accent", rowDef.selector) : theme.fg("muted", rowDef.selector);
@@ -2538,7 +3274,13 @@ export class ModelHubComponent implements Component {
 			let tagStyled: string;
 			let value: string;
 			let levelStyled = "";
-			if (assignment && !assignment.autoSelected) {
+			const rolePool = this.#rolePool(role);
+			if (rolePool) {
+				// Members carry their own efforts, so the role-level thinking label stays off.
+				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
+				tagStyled = theme.fg(info.color ?? "muted", tag);
+				value = theme.fg(selected ? "accent" : "muted", this.#poolSummary(rolePool));
+			} else if (assignment && !assignment.autoSelected) {
 				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
 				tagStyled = theme.fg(info.color ?? "muted", tag);
 				value = `${theme.fg("dim", `${assignment.model.provider}/`)}${selected ? theme.fg("accent", assignment.model.id) : assignment.model.id}`;
@@ -2589,7 +3331,7 @@ export class ModelHubComponent implements Component {
 			if (cycleOrder.length > 0) {
 				const selectedRow = this.#rolesRows[this.#roleIndex];
 				const selectedRole =
-					selectedRow && (selectedRow.kind === "role" || selectedRow.kind === "fallback") ? selectedRow.role : "";
+					selectedRow && "role" in selectedRow && selectedRow.kind !== "chainKey" ? selectedRow.role : "";
 				const activeIndex = cycleOrder.indexOf(selectedRole);
 				const track = renderSegmentTrack(
 					cycleOrder.map(role => ({ label: role })),
@@ -2675,6 +3417,8 @@ export class ModelHubComponent implements Component {
 			switch (this.#assigning.kind) {
 				case "fallback":
 					return `${enter} pick fallback · ${browse}`;
+				case "poolMember":
+					return `${enter} pick member · ${browse}`;
 				case "fallbackKey":
 					return `${enter} pick the protected model · ${browse}`;
 				default:
@@ -2689,16 +3433,22 @@ export class ModelHubComponent implements Component {
 				return `${upDown} providers · ${enterRight} roles · ${altLeftRight} tabs${presets} · ${cancel} close`;
 			}
 			const row = this.#rolesRows[this.#roleIndex];
+			const poolHints = this.#poolRowHints(row);
+			if (poolHints) {
+				const parts = poolHints.map(hint => `${formatKeyHints(hint.keys)} ${hint.label}`);
+				return [`${upDown} rows`, ...parts, `${left} providers`].join(" · ");
+			}
+			const convert = this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : "";
 			if (row?.kind === "fallback") {
 				// Advertise `t` only when the entry resolves: wildcards always
 				// inherit and unknown models have no ladder to offer, so the
 				// action would be inert there.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
 				const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking} · [/] reorder · ${left} providers`;
+				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking} · [/] reorder${convert} · ${left} providers`;
 			}
 			if (row?.kind === "chainKey") {
-				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain · ${left} providers`;
+				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain${convert} · ${left} providers`;
 			}
 			if (row?.kind === "newFallback") {
 				return `${upDown} rows · ${enter} new model/provider fallback chain · ${left} providers`;
@@ -2709,7 +3459,9 @@ export class ModelHubComponent implements Component {
 			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
 			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
 			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
-			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking} · ${formatKeyHint("c")} cycle · [/] reorder · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
+			const fallback =
+				row?.kind !== "role" || this.#fallbackAddable(row.role) ? ` · ${formatKeyHint("f")} fallback` : "";
+			return `${upDown} rows · ${enter} pick${fallback} · ${formatKeyHint("x")} clear${thinking}${convert} · ${formatKeyHint("c")} cycle · [/] reorder · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
 		}
 		if (entry.kind === "provider" && entry.locked) {
 			return entry.oauth
@@ -2927,9 +3679,11 @@ export class ModelHubComponent implements Component {
 				const verb =
 					assigning.kind === "role"
 						? "Assigning"
-						: assigning.index === null
-							? "Adding fallback for"
-							: "Replacing fallback of";
+						: assigning.kind === "poolMember"
+							? this.#poolAssignVerb(assigning)
+							: assigning.index === null
+								? "Adding fallback for"
+								: "Replacing fallback of";
 				spans = [span(`${verb} `, "accent"), span(label, "accent strong")];
 			}
 			return node("text", { spans, truncate: "end" }, undefined, "status");
@@ -2937,6 +3691,14 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (this.#configError && entry.kind !== "provider") {
 			return node("text", { spans: [span(this.#configError, "error")], wrap: "word" }, undefined, "status");
+		}
+		if (this.#poolStatus && entry.kind === "roles") {
+			return node(
+				"text",
+				{ spans: [span(this.#poolStatus.text, this.#poolStatus.tone)], wrap: "word" },
+				undefined,
+				"status",
+			);
 		}
 		const scopedSuffix = this.#scopedModels.length > 0 ? " · --models scope" : "";
 		switch (entry.kind) {
@@ -3033,6 +3795,27 @@ export class ModelHubComponent implements Component {
 			}
 			case "fallback":
 				return node("item", { label: [span("  ↳ ", "dim"), span(rowDef.selector, "muted")] }, undefined, key);
+			case "pool":
+				return node(
+					"item",
+					{ label: [span("  ↳ ", "dim"), span(this.#poolSummary(this.#chainPool(rowDef.role)), "muted")] },
+					undefined,
+					key,
+				);
+			case "poolMember": {
+				const member = this.#poolMemberOf(rowDef);
+				const indent = rowDef.target.kind === "chain" ? "      • " : "    • ";
+				return node(
+					"item",
+					{
+						label: [span(indent, "dim"), span(sanitizeDisplayLine(rowDef.alias), "muted")],
+						detail: member ? [span(sanitizeDisplayLine(member.model))] : undefined,
+						value: member ? [span(this.#poolMemberFacts(member).join(" · "), "dim")] : undefined,
+					},
+					undefined,
+					key,
+				);
+			}
 			case "role":
 				break;
 		}
@@ -3043,7 +3826,12 @@ export class ModelHubComponent implements Component {
 		let label: TspSpan[];
 		let detail: TspSpan[];
 		const value: TspSpan[] = [];
-		if (assignment && !assignment.autoSelected) {
+		const rolePool = this.#rolePool(role);
+		if (rolePool) {
+			const color = info.color ?? "muted";
+			label = [span(`${theme.status.enabled} `, color), span(tag, color)];
+			detail = [span(this.#poolSummary(rolePool), "muted")];
+		} else if (assignment && !assignment.autoSelected) {
 			const color = info.color ?? "muted";
 			label = [span(`${theme.status.enabled} `, color), span(tag, color)];
 			detail = [span(`${assignment.model.provider}/`, "dim"), span(assignment.model.id)];
@@ -3084,7 +3872,7 @@ export class ModelHubComponent implements Component {
 		}
 		const selectedRow = this.#rolesRows[this.#roleIndex];
 		const selectedRole =
-			selectedRow && (selectedRow.kind === "role" || selectedRow.kind === "fallback") ? selectedRow.role : "";
+			selectedRow && "role" in selectedRow && selectedRow.kind !== "chainKey" ? selectedRow.role : "";
 		const track: TspSpan[] = [];
 		for (const role of cycleOrder) {
 			if (track.length > 0) track.push(span(" › ", "dim"));
@@ -3258,12 +4046,15 @@ export class ModelHubComponent implements Component {
 			const verb =
 				assigning.kind === "role"
 					? "Assigning"
-					: assigning.index === null
-						? "Adding fallback for"
-						: "Replacing fallback of";
+					: assigning.kind === "poolMember"
+						? this.#poolAssignVerb(assigning)
+						: assigning.index === null
+							? "Adding fallback for"
+							: "Replacing fallback of";
 			return [span(`${verb} `), span(label, "strong")];
 		}
 		if (this.#configError && entry.kind !== "provider") return [span(this.#configError, "error")];
+		if (this.#poolStatus && rolesView) return [span(this.#poolStatus.text, this.#poolStatus.tone)];
 		if (entry.kind === "provider" && entry.providerId && this.#refreshingProviders.has(entry.providerId)) {
 			return `${entry.label} · refreshing model list…`;
 		}
@@ -3412,22 +4203,38 @@ export class ModelHubComponent implements Component {
 					? "Pick fallback"
 					: this.#assigning.kind === "fallbackKey"
 						? "Pick protected model"
-						: "Assign";
+						: this.#assigning.kind === "poolMember"
+							? "Pick member"
+							: "Assign";
 			return compact([pickerAction("assign", label, "enter", { primary: true }), refresh, cancel("Cancel")]);
 		}
 		if (rolesView) {
 			const row = this.#rolesRows[this.#roleIndex];
 			const roleAction = (action: RolesAction, label: string, key: string, primary = false) =>
 				pickerAction(`roles:${action}`, label, key, primary ? { primary: true } : undefined);
+			const poolHints = this.#poolRowHints(row);
+			if (poolHints) {
+				const actions = poolHints.flatMap((hint): TspPickerAction[] => {
+					if (hint.keys[0] === "[")
+						return [roleAction("earlier", "Earlier", "["), roleAction("later", "Later", "]")];
+					const key = hint.keys.includes("enter") ? "enter" : hint.keys[0]!;
+					const action = key === "enter" ? "pick" : ROLES_ACTION_KEYS[key];
+					const label = `${hint.label.charAt(0).toUpperCase()}${hint.label.slice(1)}`;
+					return action ? [roleAction(action, label, key, key === "enter")] : [];
+				});
+				return [...actions, CLOSE_ACTION];
+			}
+			const convert = this.#legacyPoolSource(row) ? roleAction("pool", "Make pool", "m") : undefined;
 			const actions: (TspPickerAction | undefined)[] = [];
 			switch (row?.kind) {
 				case "role": {
 					const assigned = this.#roles[row.role];
 					actions.push(
 						roleAction("pick", "Pick model", "enter", true),
-						roleAction("fallback", "Add fallback", "f"),
+						this.#fallbackAddable(row.role) ? roleAction("fallback", "Add fallback", "f") : undefined,
 						assigned && !assigned.autoSelected ? roleAction("clear", "Clear", "x") : undefined,
 						this.#roleThinkingTarget(row.role) ? roleAction("thinking", "Thinking", "t") : undefined,
+						convert,
 						roleAction("cycle", this.#cycleOrder().includes(row.role) ? "Leave cycle" : "Add to cycle", "c"),
 						roleAction("new", "New role", "n"),
 						this.#callbacks.onSavePreset ? roleAction("save", "Save preset", "s") : undefined,
@@ -3445,10 +4252,15 @@ export class ModelHubComponent implements Component {
 							: undefined,
 						roleAction("earlier", "Earlier", "["),
 						roleAction("later", "Later", "]"),
+						convert,
 					);
 					break;
 				case "chainKey":
-					actions.push(roleAction("pick", "Add fallback", "enter", true), roleAction("clear", "Clear chain", "x"));
+					actions.push(
+						roleAction("pick", "Add fallback", "enter", true),
+						roleAction("clear", "Clear chain", "x"),
+						convert,
+					);
 					break;
 				case "newFallback":
 					actions.push(roleAction("pick", "New fallback chain", "enter", true));
@@ -3552,6 +4364,27 @@ export class ModelHubComponent implements Component {
 				case "fallback":
 					items.push({ id, label: row.selector, mono: true, depth: 1, detail: `fallback ${row.chainIndex + 1}` });
 					return;
+				case "pool":
+					items.push({
+						id,
+						label: this.#poolSummary(this.#chainPool(row.role)),
+						depth: 1,
+						tone: "muted",
+						detail: "fallback pool",
+					});
+					return;
+				case "poolMember": {
+					const member = this.#poolMemberOf(row);
+					items.push({
+						id,
+						label: member ? sanitizeDisplayLine(member.model) : sanitizeDisplayLine(row.alias),
+						mono: true,
+						depth: row.target.kind === "chain" ? 2 : 1,
+						detail: sanitizeDisplayLine(row.alias),
+						facts: member ? { thinking: this.#poolMemberFacts(member).join(" · ") } : {},
+					});
+					return;
+				}
 				case "role":
 					break;
 			}
@@ -3559,7 +4392,10 @@ export class ModelHubComponent implements Component {
 			const tag = info.tag ?? info.name ?? row.role;
 			const assignment = this.#roles[row.role];
 			const facts: Record<string, string> = {};
-			if (assignment) {
+			const rolePool = this.#rolePool(row.role);
+			if (rolePool) {
+				facts.model = this.#poolSummary(rolePool);
+			} else if (assignment) {
 				const selector = `${assignment.model.provider}/${assignment.model.id}`;
 				facts.model = assignment.autoSelected ? `auto → ${selector}` : selector;
 				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
@@ -3629,6 +4465,8 @@ export class ModelHubComponent implements Component {
 				md(chain.map((selector, index) => `${index + 1}. \`${selector}\``).join("\n")),
 			]);
 		};
+		const chainPool = (key: string): NativeChild[] =>
+			this.#isPooledChain(key) ? this.#poolPreview(this.#chainPool(key), "Fallback pool") : [];
 		const modelItem = (model: Model): ModelBrowserItem => ({
 			provider: model.provider,
 			id: model.id,
@@ -3639,7 +4477,13 @@ export class ModelHubComponent implements Component {
 			case "role": {
 				const info = this.#settings.getRoleInfo(row.role);
 				const assignment = this.#roles[row.role];
-				if (assignment) {
+				const rolePool = this.#rolePool(row.role);
+				if (rolePool) {
+					children.push(
+						text(info.name, { role: "omp.picker.title" }),
+						...this.#poolPreview(rolePool, "Role pool"),
+					);
+				} else if (assignment) {
 					children.push(...this.#browser.modelPreview(modelItem(assignment.model), "full", this.#currentSelector));
 					children.push(
 						node("kv", {
@@ -3661,6 +4505,7 @@ export class ModelHubComponent implements Component {
 				}
 				const chain = chainList(row.role);
 				if (chain) children.push(chain);
+				children.push(...chainPool(row.role));
 				break;
 			}
 			case "fallback": {
@@ -3675,6 +4520,25 @@ export class ModelHubComponent implements Component {
 				children.push(text([span(row.role, "mono")], { role: "omp.picker.title" }));
 				const chain = chainList(row.role);
 				if (chain) children.push(chain);
+				children.push(...chainPool(row.role));
+				break;
+			}
+			case "pool":
+				children.push(
+					text([span(row.role, "mono")], { role: "omp.picker.title" }),
+					...this.#poolPreview(this.#chainPool(row.role), "Fallback pool"),
+				);
+				break;
+			case "poolMember": {
+				const member = this.#poolMemberOf(row);
+				const parsed = member ? parseModelString(member.model) : undefined;
+				const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
+				if (item) children.push(...this.#browser.modelPreview(item, "full", this.#currentSelector));
+				else if (member)
+					children.push(text([span(sanitizeDisplayLine(member.model), "mono")], { role: "omp.picker.title" }));
+				children.push(
+					...this.#poolPreview(this.#pool(row.target), row.target.kind === "role" ? "Role pool" : "Fallback pool"),
+				);
 				break;
 			}
 			case "newRole":
@@ -3694,6 +4558,37 @@ export class ModelHubComponent implements Component {
 		}
 		this.#pickerRolePreview = { row, roles: this.#roles, rows: this.#rolesRows, children };
 		return children;
+	}
+
+	/** A pool's preview section: strategy, funding, read-only routing, then each member with effort and weight. */
+	#poolPreview(pool: ModelHubPool | undefined, head: string): NativeChild[] {
+		if (!pool) {
+			return [text([span("This pool is invalid and is skipped; fix it in config.", "warning")], { wrap: "word" })];
+		}
+		const row = (key: string, value: string) => ({ k: [span(key, "muted")], v: sanitizeDisplayLine(value) });
+		const facts = [
+			row("Strategy", pool.strategy || "—"),
+			row("Funding", pool.funding.length > 0 ? pool.funding.join(" → ") : "not configured"),
+			pool.source.kind === "ref"
+				? row("Group", `${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`)
+				: undefined,
+			pool.spending ? row("Spending", pool.spending) : undefined,
+			pool.readOnly ? row("Read-only", pool.readOnly) : undefined,
+		];
+		const members = pool.members.map(member => {
+			const details = [
+				member.model,
+				member.effort,
+				member.weight !== undefined ? `weight ${member.weight}` : undefined,
+			];
+			return row(sanitizeDisplayLine(member.alias), details.filter(detail => detail !== undefined).join(" · "));
+		});
+		return [
+			node("section", { head }, [
+				node("kv", { items: compact(facts) }),
+				...(members.length > 0 ? [node("kv", { items: members })] : []),
+			]),
+		];
 	}
 
 	#lockedMessage(entry: SidebarEntry): string {
@@ -3915,7 +4810,9 @@ export class ModelHubComponent implements Component {
 					? "pick fallback"
 					: this.#assigning.kind === "fallbackKey"
 						? "pick the protected model"
-						: "assign";
+						: this.#assigning.kind === "poolMember"
+							? "pick member"
+							: "assign";
 			return [keys(pick, "enter"), upDown("models"), keys("providers", "left"), search, kind, cancel("cancel")];
 		}
 		const presetHint = this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right") : undefined;
@@ -3931,6 +4828,15 @@ export class ModelHubComponent implements Component {
 				];
 			}
 			const row = this.#rolesRows[this.#roleIndex];
+			const poolHints = this.#poolRowHints(row);
+			if (poolHints) {
+				return [
+					upDown("rows"),
+					...poolHints.map(hint => keys(hint.label, ...hint.keys)),
+					keys("providers", "left"),
+				];
+			}
+			const convert = this.#legacyPoolSource(row) ? keys("pool", "m") : undefined;
 			if (row?.kind === "fallback") {
 				// Advertise `t` only where a strip would open, as the ANSI footer does.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
@@ -3941,6 +4847,7 @@ export class ModelHubComponent implements Component {
 					keys("remove", "x"),
 					editable ? keys("thinking", "t") : undefined,
 					reorder,
+					convert,
 					keys("providers", "left"),
 				];
 			}
@@ -3949,6 +4856,7 @@ export class ModelHubComponent implements Component {
 					upDown("rows"),
 					keys("add fallback", "enter", "f"),
 					keys("clear chain", "x"),
+					convert,
 					keys("providers", "left"),
 				];
 			}
@@ -3959,9 +4867,10 @@ export class ModelHubComponent implements Component {
 			return [
 				upDown("rows"),
 				keys("pick", "enter"),
-				keys("fallback", "f"),
+				row?.kind !== "role" || this.#fallbackAddable(row.role) ? keys("fallback", "f") : undefined,
 				keys("clear", "x"),
 				editable ? keys("thinking", "t") : undefined,
+				convert,
 				keys("cycle", "c"),
 				reorder,
 				keys("new", "n"),
