@@ -18,6 +18,7 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { type BillingMode, knownBilling, type ProviderBilling } from "./billing";
 import { parseIsoTimestamp } from "./shared";
 
 type CopilotQuotaDetail = {
@@ -266,6 +267,13 @@ function normalizeQuotaSnapshots(
 	return { limits, window };
 }
 
+/** Whether premium requests may continue as paid overage, only when the response states it. */
+function premiumOverageMetadata(data: CopilotUsageResponse): { premiumOveragePermitted?: boolean } {
+	const premium = isRecord(data.quota_snapshots) ? data.quota_snapshots.premium_interactions : undefined;
+	const permitted = isRecord(premium) ? toBoolean(premium.overage_permitted) : undefined;
+	return permitted === undefined ? {} : { premiumOveragePermitted: permitted };
+}
+
 function normalizeBillingUsage(data: BillingUsageResponse): UsageLimit[] {
 	const limits: UsageLimit[] = [];
 	const periodLabel = data.timePeriod.month
@@ -379,6 +387,7 @@ export const githubCopilotUsageProvider: UsageProvider = {
 							accountId: username,
 							plan: usage.copilot_plan,
 							quotaResetDate: usage.quota_reset_date,
+							...premiumOverageMetadata(usage),
 						},
 						raw: usage,
 					};
@@ -412,6 +421,7 @@ export const githubCopilotUsageProvider: UsageProvider = {
 						email: params.credential.email,
 						plan: usage.copilot_plan,
 						quotaResetDate: usage.quota_reset_date,
+						...premiumOverageMetadata(usage),
 					},
 					raw: usage,
 				};
@@ -421,5 +431,37 @@ export const githubCopilotUsageProvider: UsageProvider = {
 		}
 
 		return report;
+	},
+};
+
+/** `copilot_plan` values with a known billing mode; any other value reads `unknown`. */
+const COPILOT_PLAN_BILLING_MODES: Record<string, BillingMode> = {
+	free: "free",
+	individual: "subscription-included",
+	individual_pro: "subscription-included",
+	business: "subscription-included",
+	enterprise: "subscription-included",
+};
+
+/**
+ * Copilot billing: the plan's premium request allowance, then paid
+ * premium-request overage. Overage spend is not reported, so that source never
+ * carries an allowance, and `available` only means the account permits
+ * overage (`overage_permitted`), not that a paid budget exists to fund it.
+ */
+export const githubCopilotBilling: ProviderBilling = {
+	id: "github-copilot",
+	readBilling(report) {
+		const plan = report.metadata?.plan;
+		const planMode =
+			(typeof plan === "string" && Object.hasOwn(COPILOT_PLAN_BILLING_MODES, plan)
+				? COPILOT_PLAN_BILLING_MODES[plan]
+				: undefined) ?? "unknown";
+		const permitted = report.metadata?.premiumOveragePermitted;
+		const overageState = permitted === true ? "available" : permitted === false ? "disabled" : "unknown";
+		return knownBilling(report, [
+			{ mode: planMode, state: "unknown" },
+			{ mode: "paid-extra-usage", state: overageState },
+		]);
 	},
 };

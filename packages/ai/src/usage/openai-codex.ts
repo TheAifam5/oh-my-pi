@@ -16,6 +16,16 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import {
+	type BillingMode,
+	type BillingSource,
+	creditsFromDecimal,
+	type DecimalQuantity,
+	knownBilling,
+	type ProviderBilling,
+	quantitySign,
+	unknownBilling,
+} from "./billing";
 import { normalizeCodexBaseUrl } from "./openai-codex-base-url";
 import { listCodexResetCredits } from "./openai-codex-reset";
 import { HOUR_MS, usageStatus } from "./shared";
@@ -231,6 +241,42 @@ function hasPlanCreditOverage(payload: Record<string, unknown>, planLimitReached
 	if (credits.overage_limit_reached === true) return false;
 	const spendControl = isRecord(payload.spend_control) ? payload.spend_control : undefined;
 	return spendControl?.reached !== true;
+}
+
+/**
+ * Credit funding as `/wham/usage` reported it, kept in report metadata because
+ * the auth broker strips `raw`. `balance` stays a decimal string in Codex
+ * credits, not currency.
+ */
+export interface CodexCreditsSummary {
+	hasCredits?: boolean;
+	unlimited?: boolean;
+	overageLimitReached?: boolean;
+	spendControlReached?: boolean;
+	balance?: string;
+}
+
+function summarizeCodexCredits(payload: unknown): CodexCreditsSummary | undefined {
+	if (!isRecord(payload) || !isRecord(payload.credits)) return undefined;
+	const credits = payload.credits;
+	const spendControl = isRecord(payload.spend_control) ? payload.spend_control : undefined;
+	const hasCredits = toBoolean(credits.has_credits);
+	const unlimited = toBoolean(credits.unlimited);
+	const overageLimitReached = toBoolean(credits.overage_limit_reached);
+	const spendControlReached = toBoolean(spendControl?.reached);
+	const balance =
+		typeof credits.balance === "string" && credits.balance.trim()
+			? credits.balance.trim()
+			: typeof credits.balance === "number" && Number.isFinite(credits.balance)
+				? String(credits.balance)
+				: undefined;
+	return {
+		...(hasCredits !== undefined ? { hasCredits } : {}),
+		...(unlimited !== undefined ? { unlimited } : {}),
+		...(overageLimitReached !== undefined ? { overageLimitReached } : {}),
+		...(spendControlReached !== undefined ? { spendControlReached } : {}),
+		...(balance !== undefined ? { balance } : {}),
+	};
 }
 
 function parseUsagePayload(payload: unknown): ParsedUsage | null {
@@ -657,6 +703,7 @@ export const openaiCodexUsageProvider: UsageProvider = {
 			}
 		}
 		const daybreak = await daybreakAccess;
+		const credits = summarizeCodexCredits(payload);
 		const report: UsageReport = {
 			provider: "openai-codex",
 			fetchedAt: nowMs,
@@ -668,6 +715,7 @@ export const openaiCodexUsageProvider: UsageProvider = {
 				email,
 				accountId,
 				meterStates,
+				...(credits ? { credits } : {}),
 				...(daybreak ? { daybreak: true } : {}),
 			},
 			raw: parsed?.raw ?? payload,
@@ -843,5 +891,46 @@ export const codexRankingStrategy: CredentialRankingStrategy = {
 		if (!isFiveHourWindow) return false;
 		const usedFraction = primary.amount.usedFraction;
 		return typeof usedFraction === "number" && Number.isFinite(usedFraction) && usedFraction === 0;
+	},
+};
+
+function codexCreditsSource(credits: unknown): BillingSource | null {
+	if (!isRecord(credits)) return { mode: "prepaid-credits", state: "unknown" };
+	let remaining: DecimalQuantity | undefined;
+	if (credits.balance !== undefined) {
+		remaining = typeof credits.balance === "string" ? creditsFromDecimal(credits.balance, "floor") : undefined;
+		if (!remaining) return null;
+	}
+	const allowance = remaining ? { allowance: { kind: "credits" as const, remaining } } : {};
+	// Caps block even unlimited credits, matching `hasPlanCreditOverage`.
+	if (credits.overageLimitReached === true || credits.spendControlReached === true) {
+		return { mode: "prepaid-credits", state: "exhausted", ...allowance };
+	}
+	if (credits.unlimited === true) return { mode: "prepaid-credits", state: "available", ...allowance };
+	if (credits.hasCredits === false || (remaining && quantitySign(remaining) <= 0)) {
+		return { mode: "prepaid-credits", state: "exhausted", ...allowance };
+	}
+	return { mode: "prepaid-credits", state: credits.hasCredits === true ? "available" : "unknown", ...allowance };
+}
+
+const CODEX_PLAN_BILLING_MODES: Record<OpenAICodexPlanClass, BillingMode> = {
+	free: "free",
+	paid: "subscription-included",
+	pro: "subscription-included",
+	unknown: "unknown",
+};
+
+/**
+ * Codex billing: the ChatGPT plan allowance (`free` for free-class plans,
+ * `unknown` for a missing or unrecognized plan), then prepaid Codex credits
+ * that fund overage once the plan windows are spent.
+ */
+export const codexBilling: ProviderBilling = {
+	id: "openai-codex",
+	readBilling(report) {
+		const planMode = CODEX_PLAN_BILLING_MODES[classifyOpenAICodexPlan(report)];
+		const credits = codexCreditsSource(report.metadata?.credits);
+		if (!credits) return unknownBilling(report, "malformed");
+		return knownBilling(report, [{ mode: planMode, state: "unknown" }, credits]);
 	},
 };

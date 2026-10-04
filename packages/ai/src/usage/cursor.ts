@@ -18,6 +18,7 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { DAY_MS, parseIsoTimestamp, usageStatus } from "./shared";
 
 function parseTimestamp(value: unknown): number | undefined {
@@ -496,5 +497,31 @@ export const cursorUsageProvider: UsageProvider = {
 		};
 		if (Object.keys(metadata).length > 0) report.metadata = metadata;
 		return report;
+	},
+};
+
+const CURSOR_INCLUDED_USD_LIMIT_IDS = ["cursor:usd:individual-overall", "cursor:usd:individual-plan"];
+
+/**
+ * Cursor billing: the plan's included monthly usage, then on-demand usage in
+ * USD. Split plan rails (Cursor Models / Other Models) are separate pools, so
+ * the included source carries an allowance only for a single-pool dashboard.
+ * The fetcher drops an on-demand bucket without a positive cap, so its absence
+ * reads `unknown`.
+ */
+export const cursorBilling: ProviderBilling = {
+	id: "cursor",
+	readBilling(report) {
+		const includedLimit = report.limits.find(
+			limit => CURSOR_INCLUDED_USD_LIMIT_IDS.includes(limit.id) && limit.amount.unit === "usd",
+		);
+		const onDemandLimit = report.limits.find(limit => limit.id === "cursor:usd:individual-ondemand");
+		const included = includedLimit ? sourceFromLimit("subscription-included", includedLimit) : undefined;
+		const onDemand = onDemandLimit ? sourceFromLimit("paid-extra-usage", onDemandLimit) : undefined;
+		if ((includedLimit && !included) || (onDemandLimit && !onDemand)) return unknownBilling(report, "malformed");
+		return knownBilling(report, [
+			included ?? { mode: "subscription-included", state: "unknown" },
+			onDemand ?? { mode: "paid-extra-usage", state: "unknown" },
+		]);
 	},
 };

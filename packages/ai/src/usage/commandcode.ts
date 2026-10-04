@@ -8,6 +8,7 @@ import type {
 	UsageReport,
 } from "../usage";
 import { isRecord } from "../utils";
+import { knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { HOUR_MS, parsePositiveTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const PROVIDER = "commandcode";
@@ -205,5 +206,20 @@ export const commandCodeRankingStrategy: CredentialRankingStrategy = {
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: WEEK_MS,
+	},
+};
+
+/**
+ * Command Code billing: one credit balance (monthly, purchased, and free
+ * credits combined). The 5-hour and weekly windows rate-limit credit spend
+ * and are not funding sources.
+ */
+export const commandCodeBilling: ProviderBilling = {
+	id: PROVIDER,
+	readBilling(report) {
+		const limit = report.limits.find(entry => entry.id === `${PROVIDER}:balance`);
+		if (!limit) return unknownBilling(report, "no-evidence");
+		const source = sourceFromLimit("prepaid-credits", limit);
+		return source ? knownBilling(report, [source]) : unknownBilling(report, "malformed");
 	},
 };
