@@ -519,6 +519,13 @@ function isTerminalClientErrorStatus(status: number | undefined): boolean {
 	return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
+/**
+ * Message prefix of `AccountUnavailableError`, followed by the provider id.
+ * Text carrying it is a pin configuration problem: it never classifies as an
+ * auth, usage, or transient failure, whatever the provider id spells.
+ */
+export const ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX = "Pinned account is unavailable for provider: ";
+
 function classifyText(
 	errorMessage: string | undefined,
 	errorStatus: number | undefined,
@@ -528,6 +535,7 @@ function classifyText(
 	modelId?: string,
 ): number {
 	let kinds = 0;
+	if (errorMessage?.includes(ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX)) return kinds;
 	if (errorMessage) {
 		if (matchesOverflowText(errorMessage)) kinds |= Flag.ContextOverflow;
 		if (matchesPayloadRejectionText(errorMessage)) kinds |= Flag.PayloadRejected;

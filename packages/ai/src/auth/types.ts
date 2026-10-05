@@ -45,19 +45,27 @@ export type AuthCredentialEntry = AuthCredential | AuthCredential[];
 /** Provider-to-credential snapshot returned by the storage facade. */
 export type AuthStorageData = Record<string, AuthCredentialEntry>;
 
-/** Identity fields matched by an account routing policy. */
+/**
+ * Identity fields matched by an account routing policy. OAuth accounts match on
+ * `email`/`accountId`/`projectId` (plus `orgId`); stored API keys match on
+ * `keyFingerprint` alone.
+ */
 export interface AuthAccountSelector {
 	readonly email?: string;
 	readonly accountId?: string;
 	readonly projectId?: string;
 	/** Optional organization/workspace qualifier; not a base identity by itself. */
 	readonly orgId?: string;
+	/** {@link apiKeyFingerprint} of a stored API key; never combined with OAuth identity fields. */
+	readonly keyFingerprint?: string;
 }
 
-/** Priority and reserve policy for a provider account. */
+/** Name, priority, and reserve policy for a provider account. */
 export interface AuthAccountPolicy {
 	readonly provider: string;
 	readonly account: AuthAccountSelector;
+	/** Account name, unique per provider; lowercase `[a-z0-9][a-z0-9_-]*`. Pins address accounts by it. */
+	readonly name?: string;
 	/** Higher values win after hard, plan, reserve, hot-window, and measured-usage safety checks. */
 	readonly priority?: number;
 	/** Protected remaining quota percentage for this account. */
@@ -1031,10 +1039,12 @@ export interface OAuthApi {
 	 * scenarios, prefer {@link AuthStorage.keys.get}.
 	 *
 	 * Returns `undefined` when no usable OAuth credential is available (none
-	 * stored, or every one definitively failed to refresh) or runtime/config
-	 * overrides have replaced OAuth with an explicit API key. Rejects with
-	 * `OAuthRefreshUnavailableError` (transient, retryable) when a retryable
-	 * refresh failure left no usable credential.
+	 * stored, or every one definitively failed to refresh), runtime/config
+	 * overrides have replaced OAuth with an explicit API key, or the session's
+	 * exclusive pin is an API key or an account that cannot refresh. Session
+	 * and project pins and pool member preferences apply as in API-key
+	 * resolution. Rejects with `OAuthRefreshUnavailableError` (transient,
+	 * retryable) when a retryable refresh failure left no usable credential.
 	 */
 	access(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<OAuthAccess | undefined>;
 	/**
@@ -1109,22 +1119,72 @@ export interface OAuthApi {
  */
 export type SessionRestrictionLease = symbol;
 
+/**
+ * Host source of project pins and pool member preferences, read on every
+ * credential resolution so settings changes apply to the next request.
+ */
+export interface AccountPinSource {
+	/** Account name exclusively pinned for `provider` in `sessionId` (project pin), or undefined. */
+	project?(provider: string, sessionId: string): string | undefined;
+	/** Account name preferred, not required, for `sessionId`'s requests to `provider`/`modelId` (pool member `account`). */
+	member?(provider: string, sessionId: string, modelId: string | undefined): string | undefined;
+}
+
+/** One stored credential as listed for account selection; never carries secret material. */
+export interface AuthAccountSummary {
+	credentialId: number;
+	type: AuthCredential["type"];
+	/** `name` of the account policy matching this credential. */
+	name?: string;
+	/** {@link apiKeyFingerprint} of a stored API key; set only on `api_key` rows. */
+	keyFingerprint?: string;
+	accountId?: string;
+	email?: string;
+	projectId?: string;
+	enterpriseUrl?: string;
+	orgId?: string;
+	orgName?: string;
+	/** True when this credential is the session's sticky credential. */
+	active: boolean;
+	/** True when this credential is the session's exclusive pin (session pin, else project pin). */
+	pinned: boolean;
+}
+
 /** Session credential affinity operations. */
 export interface SessionsApi {
 	/**
-	 * Pin one stored OAuth account as this session's preferred credential.
+	 * Pin one stored account (OAuth or API key) as this session's only credential
+	 * for `provider`.
 	 *
 	 * The durable credential id keeps the pin stable across credential refreshes,
-	 * storage reordering, and process restarts. By default this is an explicit
-	 * user pin: ranking and account reserve never evict it; hard unavailability
-	 * and auth retry may still route around it.
+	 * storage reordering, credential resets, and process restarts. By default
+	 * this is an exclusive user pin: ranking, reserve, fallback, and rotation
+	 * never route the session to another stored account, a blocked pinned
+	 * account still sends the request so the provider's usage-limit error
+	 * surfaces, and a removed pinned account fails requests with
+	 * `AccountUnavailableError`. Runtime and config key overrides refuse the pin.
 	 *
-	 * `options.restoredAtMs` instead restores an automatic affinity recorded by a
-	 * persisted session, backdated to its last use, so it keeps the provider's
-	 * warm-window semantics: a resume inside the prompt-cache TTL reuses the
-	 * account, a stale resume re-ranks.
+	 * `options.restoredAtMs` instead restores an automatic OAuth affinity
+	 * recorded by a persisted session, backdated to its last use, so it keeps the
+	 * provider's warm-window semantics: a resume inside the prompt-cache TTL
+	 * reuses the account, a stale resume re-ranks.
 	 */
 	pin(provider: string, sessionId: string, credentialId: number, options?: { restoredAtMs?: number }): boolean;
+	/**
+	 * Record an exclusive session pin whose account is no longer stored, so the
+	 * session's requests to `provider` fail with `AccountUnavailableError`
+	 * instead of using another account until it is unpinned or re-pinned.
+	 */
+	pinMissing(provider: string, sessionId: string): void;
+	/**
+	 * Install (or with `undefined`, remove) the source of project pins and pool
+	 * member preferences for every session. A session pin takes precedence over
+	 * the project pin; an unknown account name fails resolution with
+	 * `AccountUnavailableError`.
+	 */
+	setAccountPinSource(source: AccountPinSource | undefined): void;
+	/** Stored credentials for `provider` in storage order, with names and the session's active and pinned marks. */
+	accounts(provider: string, sessionId?: string): AuthAccountSummary[];
 	/**
 	 * Copy every stored credential affinity from one live session to another.
 	 *
@@ -1159,9 +1219,12 @@ export interface SessionsApi {
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released
 	 * account; usage-aware routing uses it when another sibling has more
-	 * headroom, before considering a model/provider fallback.
+	 * headroom, before considering a model/provider fallback. An exclusive
+	 * session pin is kept and reported as `false`.
 	 */
 	release(provider: string, sessionId: string): boolean;
+	/** Remove the session's exclusive pin for `provider`; returns false when the session had none. */
+	unpin(provider: string, sessionId: string): boolean;
 }
 
 /** Usage reporting, observation, and provider configuration. */
@@ -1301,6 +1364,9 @@ export interface LimitsApi {
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
+	 *
+	 * A session with an exclusive pin never switches: a usage-limit failure is
+	 * still marked, and the result is `{ switched: false }` without waiting.
 	 *
 	 * For usage-limit and account-policy failures with no free sibling, waits
 	 * (abortable via `options.signal`) when a sibling's block expires within a

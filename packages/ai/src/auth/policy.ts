@@ -1,3 +1,4 @@
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
 	AuthAccountPolicies,
@@ -9,8 +10,24 @@ import type {
 } from "./types";
 import { DEFAULT_USAGE_RESERVE_PCT } from "./types";
 
+/** Grammar of account names: lowercase only, so names never differ by case alone. */
+export const ACCOUNT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
+/** Longest account name, in characters. */
+export const MAX_ACCOUNT_NAME_LENGTH = 64;
+const KEY_FINGERPRINT = /^[0-9a-f]{8}$/;
+
+/**
+ * Portable identifier of a stored API key: the first 8 hex digits of the
+ * SHA-256 of the stored key value. Identifies the key across machines without
+ * revealing it.
+ */
+export function apiKeyFingerprint(key: string): string {
+	return new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 8);
+}
+
 /** Whether every identity field set on `selector` matches `identity`. */
 export function matchesAuthAccountSelector(selector: AuthAccountSelector, identity: OAuthAccountIdentity): boolean {
+	if (selector.keyFingerprint !== undefined) return false;
 	return (
 		(selector.email === undefined || selector.email === identity.email) &&
 		(selector.accountId === undefined || selector.accountId === identity.accountId) &&
@@ -23,6 +40,8 @@ export function matchesAuthAccountSelector(selector: AuthAccountSelector, identi
 export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
 	#defaultReservePct: number;
+	/** `provider\0name` pairs already reported as unresolvable under the current policies. */
+	#warnedUnresolved = new Set<string>();
 
 	constructor(policies: AuthAccountPolicies, defaultReservePct: number | undefined) {
 		AccountPolicies.#validateAccountPolicyConfiguration(policies);
@@ -52,9 +71,20 @@ export class AccountPolicies {
 		for (const [provider, credentials] of storedCredentials) next.validateFor(provider, credentials);
 		this.#accountPolicies = next.#accountPolicies;
 		this.#defaultReservePct = next.#defaultReservePct;
+		this.#warnedUnresolved.clear();
+	}
+
+	/** Log once per policy set that a soft account preference names no stored account. */
+	warnUnresolved(provider: string, name: string): void {
+		const key = `${provider}\0${name}`;
+		if (this.#warnedUnresolved.has(key)) return;
+		this.#warnedUnresolved.add(key);
+		logger.warn("Preferred account is not stored; using normal account selection", { provider, account: name });
 	}
 
 	static #validateAccountPolicyConfiguration(accountPolicies: AuthAccountPolicies): void {
+		const namesByProvider = new Map<string, Map<string, number>>();
+		const fingerprintsByProvider = new Map<string, Map<string, number>>();
 		for (let index = 0; index < accountPolicies.length; index += 1) {
 			const policy = accountPolicies[index]!;
 			const path = `auth.accountPolicies[${index}]`;
@@ -67,13 +97,57 @@ export class AccountPolicies {
 					`${path}.provider must be a non-empty string without surrounding whitespace`,
 				);
 			}
+			if (policy.name !== undefined) {
+				if (
+					typeof policy.name !== "string" ||
+					policy.name.length > MAX_ACCOUNT_NAME_LENGTH ||
+					!ACCOUNT_NAME.test(policy.name)
+				) {
+					throw new AIError.ConfigurationError(
+						`${path}.name must match ${ACCOUNT_NAME.source} and be at most ${MAX_ACCOUNT_NAME_LENGTH} characters`,
+					);
+				}
+				const names = namesByProvider.get(policy.provider) ?? new Map<string, number>();
+				const previousIndex = names.get(policy.name);
+				if (previousIndex !== undefined) {
+					throw new AIError.ConfigurationError(
+						`auth.accountPolicies[${previousIndex}] and auth.accountPolicies[${index}] both name a ${policy.provider} account "${policy.name}"`,
+					);
+				}
+				names.set(policy.name, index);
+				namesByProvider.set(policy.provider, names);
+			}
 			if (!policy.account || typeof policy.account !== "object") {
 				throw new AIError.ConfigurationError(`${path}.account must be an object`);
 			}
 			const baseIdentities = [policy.account.email, policy.account.accountId, policy.account.projectId];
-			if (!baseIdentities.some(value => typeof value === "string" && value.length > 0)) {
+			const hasOAuthIdentity = baseIdentities.some(value => typeof value === "string" && value.length > 0);
+			if (policy.account.keyFingerprint !== undefined) {
+				if (
+					typeof policy.account.keyFingerprint !== "string" ||
+					!KEY_FINGERPRINT.test(policy.account.keyFingerprint)
+				) {
+					throw new AIError.ConfigurationError(
+						`${path}.account.keyFingerprint must be 8 lowercase hexadecimal digits`,
+					);
+				}
+				if (hasOAuthIdentity || policy.account.orgId !== undefined) {
+					throw new AIError.ConfigurationError(
+						`${path}.account.keyFingerprint cannot be combined with email, accountId, projectId, or orgId`,
+					);
+				}
+				const fingerprints = fingerprintsByProvider.get(policy.provider) ?? new Map<string, number>();
+				const previousIndex = fingerprints.get(policy.account.keyFingerprint);
+				if (previousIndex !== undefined) {
+					throw new AIError.ConfigurationError(
+						`auth.accountPolicies[${previousIndex}] and auth.accountPolicies[${index}] match the same ${policy.provider} API key`,
+					);
+				}
+				fingerprints.set(policy.account.keyFingerprint, index);
+				fingerprintsByProvider.set(policy.provider, fingerprints);
+			} else if (!hasOAuthIdentity) {
 				throw new AIError.ConfigurationError(
-					`${path}.account must include at least one of email, accountId, or projectId`,
+					`${path}.account must include at least one of email, accountId, projectId, or keyFingerprint`,
 				);
 			}
 			for (const field of ["email", "accountId", "projectId", "orgId"] as const) {
@@ -96,7 +170,10 @@ export class AccountPolicies {
 
 	validateUsageCapability(provider: string, canFetchUsage: boolean): void {
 		const policyIndex = this.#accountPolicies.findIndex(
-			policy => policy.provider === provider && policy.reservePct !== undefined,
+			policy =>
+				policy.provider === provider &&
+				policy.account.keyFingerprint === undefined &&
+				policy.reservePct !== undefined,
 		);
 		if (policyIndex !== -1 && !canFetchUsage) {
 			throw new AIError.ConfigurationError(
@@ -108,7 +185,7 @@ export class AccountPolicies {
 	validateFor(provider: string, credentials: readonly AuthCredential[]): void {
 		const policies = this.#accountPolicies
 			.map((policy, index) => ({ policy, index }))
-			.filter(({ policy }) => policy.provider === provider);
+			.filter(({ policy }) => policy.provider === provider && policy.account.keyFingerprint === undefined);
 		if (policies.length === 0) return;
 		const oauthCredentials = credentials.filter(
 			(credential): credential is OAuthCredential => credential.type === "oauth",
@@ -141,6 +218,28 @@ export class AccountPolicies {
 			}
 			claimedCredentials.set(credentialIndex, index);
 		}
+	}
+
+	static #matchesStored(policy: AuthAccountPolicy, credential: AuthCredential): boolean {
+		if (credential.type === "oauth") return matchesAuthAccountSelector(policy.account, credential);
+		return policy.account.keyFingerprint === apiKeyFingerprint(credential.key);
+	}
+
+	/** Return the policy matching a stored credential of either type (OAuth identity or API key fingerprint). */
+	forStored(provider: string, credential: AuthCredential): AuthAccountPolicy | undefined {
+		return this.#accountPolicies.find(
+			policy => policy.provider === provider && AccountPolicies.#matchesStored(policy, credential),
+		);
+	}
+
+	/**
+	 * Index into `credentials` of the stored credential named `name` for
+	 * `provider`, or -1 when no policy carries the name or no stored credential
+	 * matches it.
+	 */
+	indexOfNamed(provider: string, name: string, credentials: readonly AuthCredential[]): number {
+		const policy = this.#accountPolicies.find(entry => entry.provider === provider && entry.name === name);
+		return policy ? credentials.findIndex(credential => AccountPolicies.#matchesStored(policy, credential)) : -1;
 	}
 
 	/**

@@ -5,7 +5,7 @@ import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
 import * as AIError from "../error";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
-import type { SessionAffinity } from "./affinity";
+import type { AccountTarget, SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
@@ -153,6 +153,8 @@ export interface KeyCascadeDeps {
 /** The provider auth precedence cascade (runtime → config → OAuth → login key → env → stored key). */
 export class KeyCascade implements KeysApi {
 	#deps: KeyCascadeDeps;
+	/** Providers whose account pin a key override already reported suppressing. */
+	#warnedOverriddenPins = new Set<string>();
 
 	constructor(deps: KeyCascadeDeps) {
 		this.#deps = deps;
@@ -331,8 +333,10 @@ export class KeyCascade implements KeysApi {
 
 	/**
 	 * Get API key for a provider.
-	 * Priority (first match wins): runtime override, config override, OAuth,
-	 * login API key, environment variable, then another stored API key.
+	 * Priority (first match wins): runtime override, config override, the
+	 * session's exclusive pin (session pin, else project pin), the pool member's
+	 * preferred account, OAuth, login API key, environment variable, then
+	 * another stored API key.
 	 * A session restricted by `sessions.restrict` resolves only its allowed
 	 * OAuth accounts and throws {@link AIError.MissingApiKeyError} when none
 	 * can serve or a config key (a models.yml `apiKey`, often for a proxy
@@ -340,6 +344,10 @@ export class KeyCascade implements KeysApi {
 	 * A transient OAuth refresh failure resolves `undefined`, so availability
 	 * probes move on to their next candidate; request paths use
 	 * {@link KeyCascade.getWithCredential}, which surfaces it.
+	 *
+	 * @throws AIError.AccountUnavailableError when a pin or preference names no
+	 * stored account, the pinned account is outside the session's restriction,
+	 * or the pinned account cannot produce a key.
 	 */
 	async get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		try {
@@ -361,6 +369,7 @@ export class KeyCascade implements KeysApi {
 		// Runtime override takes highest priority
 		const runtimeKey = restricted ? undefined : this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
+			this.#warnOverriddenPin(provider, sessionId, "runtime");
 			return runtimeKey;
 		}
 
@@ -377,7 +386,23 @@ export class KeyCascade implements KeysApi {
 		}
 		const configKey = restricted ? undefined : this.#deps.overrides.configKey(provider);
 		if (configKey !== undefined) {
+			this.#warnOverriddenPin(provider, sessionId, "config");
 			return this.#deps.overrides.resolve(configKey);
+		}
+
+		// An exclusive pin (session, else project) is the only credential this session may use.
+		await this.#deps.pool.adoptExternalChanges();
+		const pinned = this.#deps.affinity.exclusivePin(provider, sessionId);
+		if (pinned) {
+			const apiKey = await this.#resolveAccount(provider, sessionId, pinned, options, onCredentialId, true);
+			if (apiKey === undefined) throw new AIError.AccountUnavailableError(provider);
+			return apiKey;
+		}
+		// A pool member's account is tried first and falls through to normal selection when unusable.
+		const preferred = this.#deps.affinity.preferredAccount(provider, sessionId, options?.modelId);
+		if (preferred) {
+			const apiKey = await this.#resolveAccount(provider, sessionId, preferred, options, onCredentialId, false);
+			if (apiKey !== undefined) return apiKey;
 		}
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
@@ -451,6 +476,45 @@ export class KeyCascade implements KeysApi {
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
+	}
+
+	#warnOverriddenPin(provider: string, sessionId: string | undefined, override: "runtime" | "config"): void {
+		if (this.#warnedOverriddenPins.has(provider) || !this.#deps.affinity.hasPin(provider, sessionId)) return;
+		this.#warnedOverriddenPins.add(provider);
+		logger.warn("Key override takes precedence over the account pin", { provider, override });
+	}
+
+	/** Resolve the bearer of one stored account; `exclusive` ignores local blocks (see {@link CredentialSelector.resolveOneOAuth}). */
+	async #resolveAccount(
+		provider: string,
+		sessionId: string | undefined,
+		target: AccountTarget,
+		options: AuthApiKeyOptions | undefined,
+		onCredentialId: ((id: number, identity?: OAuthRequestIdentity) => void) | undefined,
+		exclusive: boolean,
+	): Promise<string | undefined> {
+		if (target.credential.type === "oauth") {
+			const resolved = await this.#deps.selector.resolveOneOAuth(
+				provider,
+				target.index,
+				sessionId,
+				options,
+				exclusive,
+			);
+			if (!resolved) return undefined;
+			if (onCredentialId && resolved.credentialId !== undefined) {
+				const { orgId, region, inferenceRegion } = resolved.credential;
+				onCredentialId(resolved.credentialId, { orgId, region, inferenceRegion });
+			}
+			return resolved.apiKey;
+		}
+		if (!exclusive && !this.#deps.selector.isUnblocked(provider, "api_key", target.index, options)) return undefined;
+		const apiKey = await this.#deps.overrides.resolve(target.credential.key);
+		if (apiKey === undefined) return undefined;
+		this.#deps.affinity.record(provider, sessionId, "api_key", target.index);
+		const credentialId = this.#deps.pool.entries(provider)[target.index]?.id;
+		if (credentialId !== undefined) onCredentialId?.(credentialId);
+		return apiKey;
 	}
 
 	/**
@@ -548,6 +612,19 @@ export class KeyCascade implements KeysApi {
 			return `${baseLabel} · ${type} #${chosen.id} (${identity})`;
 		};
 
+		// An exclusive pin (session, else project) is the only credential the session uses.
+		let pinned: AccountTarget | undefined;
+		try {
+			pinned = this.#deps.affinity.exclusivePin(provider, sessionId);
+		} catch (error) {
+			if (error instanceof AIError.AccountUnavailableError) return "pinned account unavailable";
+			throw error;
+		}
+		const pinnedEntry = pinned ? stored[pinned.index] : undefined;
+		const pinnedSource = pinnedEntry
+			? describeStored(pinnedEntry.credential.type, credential => credential === pinnedEntry.credential)
+			: undefined;
+		if (pinnedSource) return pinnedSource;
 		// Deliberate login credentials win; then an explicit env var; then a stored static api_key.
 		const oauthSource = describeStored("oauth");
 		if (oauthSource) return oauthSource;

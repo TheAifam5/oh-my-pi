@@ -196,7 +196,7 @@ describe("modelRoles values (strict)", () => {
 			},
 			{
 				path: "modelRoles.engineer.models.opus.extra",
-				message: "unsupported field; supported: model, defaultEffort, weight",
+				message: "unsupported field; supported: model, defaultEffort, weight, account",
 			},
 			{ path: "modelRoles.engineer.models.opus.weight", message: "applies only to strategy weighted-random" },
 			{

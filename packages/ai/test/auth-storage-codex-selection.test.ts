@@ -776,7 +776,7 @@ describe("AuthStorage codex oauth ranking", () => {
 				new AuthStorage(activeStore, {
 					accountPolicies: [{ provider: "openai-codex", account: { orgId: "org-only" }, priority: 1 }],
 				}),
-		).toThrow("must include at least one of email, accountId, or projectId");
+		).toThrow("must include at least one of email, accountId, projectId, or keyFingerprint");
 		expect(
 			() =>
 				new AuthStorage(activeStore, {
@@ -2629,7 +2629,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-soon");
 	});
 
-	test("prefers discovered model accounts over a pinned Codex account, without filtering unmatched catalogs", async () => {
+	test("prefers discovered model accounts over a sticky Codex account, without filtering unmatched catalogs, but never over an exclusive pin", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.credentials.set("openai-codex", [
@@ -2638,9 +2638,10 @@ describe("AuthStorage codex oauth ranking", () => {
 		]);
 		const firstAccount = authStorage.oauth.accounts("openai-codex")[0];
 		if (!firstAccount) throw new Error("expected first Codex account");
+		const sticky = { restoredAtMs: Date.now() };
 
 		const sessionId = "daybreak-account-eligible";
-		expect(authStorage.sessions.pin("openai-codex", sessionId, firstAccount.credentialId)).toBe(true);
+		expect(authStorage.sessions.pin("openai-codex", sessionId, firstAccount.credentialId, sticky)).toBe(true);
 		expect(await authStorage.keys.get("openai-codex", sessionId)).toBe("api-account-A");
 		expect(
 			await authStorage.keys.get("openai-codex", sessionId, {
@@ -2649,8 +2650,19 @@ describe("AuthStorage codex oauth ranking", () => {
 			}),
 		).toBe("api-account-B");
 
+		const pinnedSessionId = "daybreak-account-pinned";
+		expect(authStorage.sessions.pin("openai-codex", pinnedSessionId, firstAccount.credentialId)).toBe(true);
+		expect(
+			await authStorage.keys.get("openai-codex", pinnedSessionId, {
+				modelId: "gpt-daybreak-blue-latest",
+				accountIds: ["account-B"],
+			}),
+		).toBe("api-account-A");
+
 		const unmatchedSessionId = "daybreak-account-unmatched";
-		expect(authStorage.sessions.pin("openai-codex", unmatchedSessionId, firstAccount.credentialId)).toBe(true);
+		expect(authStorage.sessions.pin("openai-codex", unmatchedSessionId, firstAccount.credentialId, sticky)).toBe(
+			true,
+		);
 		expect(
 			await authStorage.keys.get("openai-codex", unmatchedSessionId, {
 				modelId: "gpt-daybreak-blue-latest",

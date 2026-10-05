@@ -909,6 +909,85 @@ export class CredentialSelector {
 		return undefined;
 	}
 
+	/**
+	 * Resolve one stored OAuth credential and never a sibling.
+	 *
+	 * `exclusive` (a pin): local blocks, usage limits, and plan gates do not stop
+	 * the request, so a blocked account reaches the provider and its own
+	 * usage-limit error surfaces. Otherwise (a preference): a blocked, exhausted,
+	 * or plan-ineligible account yields `undefined` so normal selection proceeds.
+	 * An account the session's restriction does not allow yields `undefined`.
+	 * `options.forceRefresh` re-mints this credential's token first.
+	 *
+	 * @throws AIError.OAuthRefreshUnavailableError when `exclusive` and a retryable refresh failure left the account unusable.
+	 */
+	async resolveOneOAuth(
+		provider: string,
+		index: number,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		exclusive: boolean,
+	): Promise<OAuthResolutionResult | undefined> {
+		const credential = this.#deps.pool.credentials(provider)[index];
+		if (credential?.type !== "oauth" || !this.#deps.affinity.allows(provider, sessionId, credential))
+			return undefined;
+		const selection: OAuthSelection = { credential, index };
+		if (options?.forceRefresh) {
+			const credentialId = this.#deps.pool.entries(provider)[index]?.id;
+			try {
+				const refreshed = await this.#deps.refresher.refresh(
+					provider,
+					{ ...credential, expires: 0 },
+					credentialId,
+					options.signal,
+					options.refreshReason,
+				);
+				const updated = mergeRefreshedCredential(credential, refreshed);
+				selection.credential = updated;
+				if (credentialId !== undefined) {
+					const updatedIndex = this.#deps.pool.replaceById(provider, credentialId, updated);
+					if (updatedIndex !== -1) selection.index = updatedIndex;
+				}
+			} catch (error) {
+				// tryOAuth below reports a dead grant; a still-valid token keeps serving.
+				logger.debug("Forced refresh of a single OAuth account failed", { provider, index, error: String(error) });
+			}
+		}
+		const providerKey = providerTypeKey(provider, "oauth");
+		const strategy = this.#deps.strategies(provider);
+		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
+		const blockScope = strategy?.blockScope?.(rankingContext);
+		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+		let transientRefreshFailure: unknown;
+		const resolved = await this.tryOAuth(provider, selection, providerKey, sessionId, options, {
+			checkUsage: !exclusive && strategy !== undefined,
+			allowBlocked: exclusive,
+			...(exclusive ? { enforcePlanRequirement: false } : {}),
+			strategy,
+			rankingContext,
+			blockScope,
+			blockScopes,
+			allowFallback: false,
+			onTransientRefreshFailure: error => {
+				if (AIError.retriable(AIError.classify(error))) transientRefreshFailure = error;
+			},
+		});
+		// A pinned account has no sibling to fall back to, so a retryable refresh failure surfaces as retryable.
+		if (!resolved && exclusive && transientRefreshFailure !== undefined) {
+			throw new AIError.OAuthRefreshUnavailableError(provider, transientRefreshFailure);
+		}
+		return resolved;
+	}
+
+	/** Whether a stored credential is free of local blocks for a request to `options.modelId`. */
+	isUnblocked(provider: string, type: AuthCredential["type"], index: number, options?: AuthApiKeyOptions): boolean {
+		const strategy = this.#deps.strategies(provider);
+		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
+		const blockScope = strategy?.blockScope?.(rankingContext);
+		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+		return !this.#deps.blocks.isBlocked(provider, providerTypeKey(provider, type), index, blockScopes);
+	}
+
 	#syncOAuthSelectionFromStore(
 		provider: string,
 		selection: { credential: OAuthCredential; index: number },

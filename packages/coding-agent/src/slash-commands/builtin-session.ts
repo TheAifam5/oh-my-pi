@@ -2,7 +2,7 @@ import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
-import type { SessionOAuthAccountList } from "../session/agent-session-types";
+import type { SessionAccountList } from "../session/agent-session-types";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -19,7 +19,12 @@ import { markdownFenceFor } from "../utils/markdown-fence";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, toResetUsageAccounts } from "./helpers/reset-usage";
 import type { ResetUsageAccount } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
-import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
+import {
+	describeSessionPinOutcome,
+	describeSessionUnpinOutcome,
+	matchSessionPinAccounts,
+	toSessionPinAccounts,
+} from "./helpers/session-pin";
 import {
 	launchStatsDashboard,
 	parseStatsDashboardArgs,
@@ -126,9 +131,9 @@ async function handleSessionPinCommand(
 		await output("Cannot pin an account while the session is streaming.");
 		return;
 	}
-	let accountList: SessionOAuthAccountList | undefined;
+	let accountList: SessionAccountList | undefined;
 	try {
-		accountList = await session.listCurrentProviderOAuthAccounts();
+		accountList = await session.listCurrentProviderAccounts();
 	} catch (error) {
 		await output(`Could not load provider accounts: ${errorMessage(error)}`);
 		return;
@@ -144,19 +149,19 @@ async function handleSessionPinCommand(
 		const source = session.modelRegistry.authStorage.keys.describe(accountList.provider, session.sessionId);
 		await output(
 			source
-				? `No stored OAuth accounts for ${providerName}. Current auth comes from ${source}.`
-				: `No stored OAuth accounts for ${providerName}. Use /login to add one.`,
+				? `No stored accounts for ${providerName}. Current auth comes from ${source}.`
+				: `No stored accounts for ${providerName}. Use /login to add one.`,
 		);
 		return;
 	}
 
 	const selector = arg.trim();
 	if (!selector) {
-		const lines = [`OAuth accounts for ${providerName}:`];
+		const lines = [`Accounts for ${providerName}:`];
 		for (const account of accounts) {
 			lines.push(`${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}`);
 		}
-		lines.push("", "Pin one with `/session pin <number|email|account id>`.");
+		lines.push("", "Pin one with `/session pin <number|name|email|account id|key fingerprint>`.");
 		await output(lines.join("\n"));
 		return;
 	}
@@ -175,11 +180,14 @@ async function handleSessionPinCommand(
 		return;
 	}
 	const account = matches[0];
-	if (!account || !session.pinCurrentProviderOAuthAccount(account.credentialId)) {
-		await output(`${account?.label ?? selector} is no longer available to pin.`);
-		return;
-	}
-	await output(`Pinned ${account.label} to this session for ${providerName}.`);
+	if (!account) return;
+	await output(
+		describeSessionPinOutcome(session.pinCurrentProviderAccount(account.credentialId), account.label, providerName),
+	);
+}
+
+async function handleSessionUnpinCommand(session: AgentSession, output: SlashCommandRuntime["output"]): Promise<void> {
+	await output(describeSessionUnpinOutcome(session.unpinCurrentProviderAccount(), session.model?.provider ?? ""));
 }
 
 /**
@@ -247,15 +255,16 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "session",
 		description: "Session management commands",
 		acpDescription: "Show or configure the current session",
-		acpInputHint: "[info|delete|pin [account]]",
+		acpInputHint: "[info|delete|pin [account]|unpin]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
 			{
 				name: "pin",
-				description: "Pin the current provider to a stored OAuth account",
+				description: "Use only one stored account for the current provider in this session",
 				usage: "[account]",
 			},
+			{ name: "unpin", description: "Remove this session's account pin for the current provider" },
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -293,7 +302,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await handleSessionPinCommand(rest, runtime.session, runtime.output);
 				return commandConsumed();
 			}
-			return usage("Usage: /session [info|delete|pin [account]]", runtime);
+			if (verb === "unpin" && !rest) {
+				await handleSessionUnpinCommand(runtime.session, runtime.output);
+				return commandConsumed();
+			}
+			return usage("Usage: /session [info|delete|pin [account]|unpin]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -312,10 +325,16 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				clearSubmittedText(runtime);
 				return;
 			}
+			if (verb === "unpin" && !rest) {
+				await handleSessionUnpinCommand(runtime.ctx.session, text => runtime.ctx.showStatus(text));
+				refreshStatusLine(runtime.ctx);
+				clearSubmittedText(runtime);
+				return;
+			}
 			if (!verb || (verb === "info" && !rest)) {
 				await runtime.ctx.handleSessionCommand();
 			} else {
-				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]]");
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|unpin]");
 			}
 			clearSubmittedText(runtime);
 		},

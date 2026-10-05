@@ -8,13 +8,13 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	AssistantMessage,
+	AuthAccountSummary,
 	Context,
 	Effort,
 	ImageContent,
 	Message,
 	MessageAttribution,
 	Model,
-	OAuthAccountSummary,
 	ServiceTierByFamily,
 	SimpleStreamOptions,
 	ToolChoice,
@@ -555,11 +555,17 @@ export interface SessionStats {
 	contextUsage?: ContextUsage;
 }
 
-/** Stored OAuth accounts available to the current model provider. */
-export interface SessionOAuthAccountList {
+/** Stored accounts (OAuth and API key) available to the current model provider. */
+export interface SessionAccountList {
 	provider: string;
-	accounts: OAuthAccountSummary[];
+	accounts: AuthAccountSummary[];
 }
+
+/** Result of pinning an account for the current provider; only `pinned` changes anything. */
+export type SessionPinOutcome = "pinned" | "no-model" | "streaming" | "overridden" | "unavailable" | "not-persistable";
+
+/** Result of removing the session's account pin for the current provider. */
+export type SessionUnpinOutcome = "unpinned" | "no-model" | "streaming" | "project-pin" | "none";
 
 /** IDs for a newly created session and the session it replaced. */
 export interface FreshSessionResult {

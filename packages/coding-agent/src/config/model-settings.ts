@@ -2,8 +2,11 @@
  * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
+import * as path from "node:path";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { register, type SettingValueOf } from "./registry";
 import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
+import { ACCOUNT_NAME, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import type { cfgDefaultThinkingLevel } from "../session/settings";
 import { assertModelGroupSectionWritable } from "./model-groups";
 
@@ -41,6 +44,7 @@ const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const EMPTY_MODEL_GROUPS_RECORD: Record<string, Record<string, unknown>> = {};
 const EMPTY_MODEL_PRESETS_RECORD: Record<string, ModelPreset> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
+const EMPTY_AUTH_ACCOUNT_PINS: AuthAccountPins = {};
 
 // Auth broker — credentials proxied through a remote `omp auth-broker serve`
 // host. Hidden from the UI; populate via env vars or hand-edited config.yml. Env takes
@@ -66,6 +70,37 @@ export const cfgAuthAccountPolicies = register({
 	id: "auth.accountPolicies",
 	type: "array",
 	default: EMPTY_AUTH_ACCOUNT_POLICIES,
+});
+
+/** Project account pins: absolute project directory → provider id → account name. */
+export type AuthAccountPins = Readonly<Record<string, Readonly<Record<string, string>>>>;
+
+function validateAuthAccountPins(raw: unknown): void {
+	if (!isRecord(raw)) return;
+	for (const [project, pins] of Object.entries(raw)) {
+		if (!path.isAbsolute(project))
+			throw new Error(`auth.accountPins keys must be absolute project paths: ${project}`);
+		if (!isRecord(pins)) throw new Error(`auth.accountPins["${project}"] must map provider ids to account names`);
+		for (const [provider, name] of Object.entries(pins)) {
+			if (typeof name !== "string" || name.length > MAX_ACCOUNT_NAME_LENGTH || !ACCOUNT_NAME.test(name)) {
+				throw new Error(
+					`auth.accountPins["${project}"].${provider} must be an account name matching ${ACCOUNT_NAME.source}`,
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Pins one provider account to every session whose working directory is inside a project.
+ * Read from the global config, `--config` overlays, and runtime overrides only; project settings
+ * cannot pin accounts.
+ */
+export const cfgAuthAccountPins = register({
+	id: "auth.accountPins",
+	type: "record",
+	default: EMPTY_AUTH_ACCOUNT_PINS,
+	validate: validateAuthAccountPins,
 });
 
 export const cfgEnabledModels = register({

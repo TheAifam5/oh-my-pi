@@ -526,6 +526,27 @@ function withLayerValue(layer: RawSettings, segments: readonly string[], value: 
 }
 
 /**
+ * `group` without its members' `account` fields, each reported through `warn`; itself when no
+ * member names one. Project settings may not choose which of the user's accounts a pool member
+ * prefers.
+ */
+function withoutMemberAccounts(group: unknown, path: string, warn: ModelGroupWarn): unknown {
+	if (!isRecord(group) || !isRecord(group.models)) return group;
+	let models: Record<string, unknown> | undefined;
+	for (const [alias, member] of Object.entries(group.models)) {
+		if (!isRecord(member) || !Object.hasOwn(member, "account")) continue;
+		warn(
+			`${path}.models.${modelGroupPathKey(alias)}.account`,
+			"is read from the global config only; ignored in project settings",
+		);
+		const { account: _account, ...rest } = member;
+		models ??= { ...group.models };
+		models[alias] = rest;
+	}
+	return models ? { ...group, models } : group;
+}
+
+/**
  * `layer` as it merges for the model-group records:
  *
  * - An entry whose key names object internals ({@link FORBIDDEN_ENTRY_KEYS}) is dropped.
@@ -534,9 +555,9 @@ function withLayerValue(layer: RawSettings, segments: readonly string[], value: 
  *   and lists pass unchanged.
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
  *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
- *   to global), and `allowProjectMeteredPools` is dropped. Unless `allowProjectMetered`, a
- *   `modelGroups` entry named in `definedBelow` and an inline group whose funding includes
- *   `metered` are dropped too.
+ *   to global), and `allowProjectMeteredPools` and pool member `account` fields are dropped.
+ *   Unless `allowProjectMetered`, a `modelGroups` entry named in `definedBelow` and an inline
+ *   group whose funding includes `metered` are dropped too.
  *
  * Every change is reported through `warn`. Returns `layer` itself when nothing changes.
  */
@@ -598,6 +619,11 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 					continue;
 				}
 				for (const issue of parsed.warnings) warn(issue.path, issue.message);
+				const withoutAccounts = project ? withoutMemberAccounts(value, path, warn) : value;
+				if (withoutAccounts !== value) {
+					next ??= { ...record };
+					next[key] = withoutAccounts;
+				}
 				continue;
 			}
 			warn(path, "ignoring invalid model group value", parsed.issues);

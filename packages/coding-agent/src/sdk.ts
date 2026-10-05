@@ -174,6 +174,7 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
+import { settingsAccountPinSource } from "./session/account-pins";
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import {
 	createAuthStorageSettingsSync,
@@ -1840,6 +1841,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// Project pins and pool member accounts resolve from each session's own settings and cwd.
+	authStorage.sessions.setAccountPinSource(settingsAccountPinSource);
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
 	// listener set non-empty from construction, which defeats AuthStorage's no-listener

@@ -1,14 +1,25 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { getEnvApiKey } from "../env-api-key";
-import type { AuthCredential, OAuthCredential, SessionRestrictionLease, SessionsApi } from "./types";
+import * as AIError from "../error";
+import type {
+	AccountPinSource,
+	AuthAccountSummary,
+	AuthCredential,
+	OAuthCredential,
+	SessionRestrictionLease,
+	SessionsApi,
+} from "./types";
 import type { AuthCredentialStore } from "./store";
 import type { CredentialPool } from "./pool";
 import type { KeyOverrides } from "./cascade";
 import { resolveCredentialIdentityKey } from "./sqlite-credential-store";
+import { type AccountPolicies, apiKeyFingerprint } from "./policy";
 
 /** Prefix for persisted session-to-credential affinity. */
 export const SESSION_STICKY_CACHE_PREFIX = "session:sticky:";
+/** Prefix for persisted exclusive session pins; kept apart from stickies so routing resets never drop a pin. */
+export const SESSION_PIN_CACHE_PREFIX = "session:pin:";
 /** Persisted sticky rows live this long past their last use. */
 const SESSION_STICKY_TTL_SEC = 30 * 24 * 60 * 60;
 /**
@@ -36,7 +47,7 @@ export type SessionCredential = {
 	index: number;
 	credentialId?: number;
 	lastUsedAtMs?: number;
-	/** Set only by the public user-facing pin API; automatic warm affinity leaves it absent. */
+	/** Set only by the public user-facing pin API, which makes the pin exclusive; automatic warm affinity leaves it absent. */
 	explicit?: true;
 };
 
@@ -50,27 +61,60 @@ type SessionRestriction = { readonly allowed: ReadonlySet<string>; readonly leas
  */
 export type SessionRestrictions = Map<string, Map<string, SessionRestriction>>;
 
+/** An exclusive session pin: the pinned row id, or `null` for an account no longer stored. */
+type SessionPin = { provider: string; sessionId: string; credentialId: number | null };
+
+/** Whether two stored credentials are the same account: same API key, or same OAuth identity and scope. */
+function sameAccount(left: AuthCredential, right: AuthCredential): boolean {
+	if (left.type === "api_key" || right.type === "api_key") {
+		return left.type === "api_key" && right.type === "api_key" && left.key === right.key;
+	}
+	return (
+		(left.accountId !== undefined || left.email !== undefined) &&
+		left.accountId === right.accountId &&
+		left.email === right.email &&
+		left.orgId === right.orgId &&
+		left.projectId === right.projectId
+	);
+}
+
+/** One stored credential a pin or preference resolved to. */
+export type AccountTarget = { index: number; credential: AuthCredential };
+
 /** Session → credential affinity (pins), persisted in the store cache. */
 export class SessionAffinity implements SessionsApi {
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
 	#sessionLastCredential: Map<string, LRUCache<string, SessionCredential>> = new Map();
 	/** Persisted sticky rows per provider, keyed by session id, so unchanged re-records skip the write. */
 	#persistedSticky: Map<string, LRUCache<string, PersistedSticky>> = new Map();
+	/**
+	 * Exclusive session pins by cache key: the pinned row id, or `null` for an account no longer stored.
+	 * Not LRU-bounded: entries exist only for explicitly pinned sessions, and this map is the only copy
+	 * {@link adoptPins} carries across a store swap and the only copy when the pin row failed to persist,
+	 * so evicting one would let a pinned session route to a different account.
+	 */
+	#exclusivePins: Map<string, SessionPin> = new Map();
+	#pinSource: AccountPinSource | undefined;
+	/** `provider\0sessionId` whose pin a restriction overrode and was already logged; one bounded LRU. */
+	#restrictedPinWarnings = new LRUCache<string, true>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
 	#restrictions: SessionRestrictions;
+	#policies: AccountPolicies;
 
 	constructor(
 		store: AuthCredentialStore,
 		pool: CredentialPool,
 		overrides: KeyOverrides,
 		restrictions: SessionRestrictions,
+		policies: AccountPolicies,
 	) {
 		this.#store = store;
 		this.#pool = pool;
 		this.#overrides = overrides;
 		this.#restrictions = restrictions;
+		this.#policies = policies;
 	}
 
 	restrict(provider: string, sessionId: string, identityKeys: readonly string[]): SessionRestrictionLease {
@@ -123,7 +167,188 @@ export class SessionAffinity implements SessionsApi {
 		return sessions;
 	}
 
-	/** Drop every pin for a provider, both in memory and in the persisted cache. */
+	setAccountPinSource(source: AccountPinSource | undefined): void {
+		this.#pinSource = source;
+	}
+
+	/**
+	 * Take over the pin source and the live exclusive pins of the affinity this
+	 * one replaces (credential store swap). Row ids are store-specific, so each
+	 * pin moves to the stored credential with the same identity (OAuth account or
+	 * API key fingerprint); a pin with no such credential fails closed.
+	 */
+	adoptPins(previous: SessionAffinity): void {
+		this.#pinSource = previous.#pinSource;
+		for (const pin of previous.#exclusivePins.values()) {
+			const credential =
+				pin.credentialId === null
+					? undefined
+					: previous.#pool.entries(pin.provider).find(entry => entry.id === pin.credentialId)?.credential;
+			const match = credential
+				? this.#pool.entries(pin.provider).find(entry => sameAccount(entry.credential, credential))
+				: undefined;
+			this.#writeSessionPin(pin.provider, pin.sessionId, match?.id ?? null);
+		}
+	}
+
+	#pinKey(provider: string, sessionId: string): string {
+		return `${SESSION_PIN_CACHE_PREFIX}${provider}:${sessionId}`;
+	}
+
+	/** The session pin's row id, `null` for a pinned account no longer stored, `undefined` without a pin. */
+	#sessionPin(provider: string, sessionId: string): number | null | undefined {
+		const key = this.#pinKey(provider, sessionId);
+		const live = this.#exclusivePins.get(key);
+		if (live) return live.credentialId;
+		try {
+			const raw = this.#store.getCache(key);
+			if (!raw) return undefined;
+			const value = JSON.parse(raw) as { credentialId?: unknown };
+			const credentialId = typeof value.credentialId === "number" ? value.credentialId : null;
+			this.#exclusivePins.set(key, { provider, sessionId, credentialId });
+			return credentialId;
+		} catch (err) {
+			logger.debug("Failed to read exclusive session pin from persistent store cache", { err });
+			return undefined;
+		}
+	}
+
+	#writeSessionPin(provider: string, sessionId: string, credentialId: number | null | undefined): void {
+		const key = this.#pinKey(provider, sessionId);
+		if (credentialId === undefined) this.#exclusivePins.delete(key);
+		else this.#exclusivePins.set(key, { provider, sessionId, credentialId });
+		try {
+			if (credentialId === undefined) this.#store.setCache(key, "", 0);
+			else
+				this.#store.setCache(
+					key,
+					JSON.stringify({ credentialId }),
+					Math.floor(Date.now() / 1000) + SESSION_STICKY_TTL_SEC,
+				);
+		} catch (err) {
+			logger.debug("Failed to write exclusive session pin to persistent store cache", { err });
+		}
+	}
+
+	/** Whether a session or project pin exists for `provider`, ignoring key overrides. */
+	hasPin(provider: string, sessionId: string | undefined): boolean {
+		if (!sessionId) return false;
+		return (
+			this.#sessionPin(provider, sessionId) !== undefined ||
+			this.#pinSource?.project?.(provider, sessionId) !== undefined
+		);
+	}
+
+	/** Whether {@link exclusivePin} applies a pin (session or project) for `provider`, resolvable or not. */
+	hasExclusivePin(provider: string, sessionId: string | undefined): boolean {
+		try {
+			return this.exclusivePin(provider, sessionId) !== undefined;
+		} catch (error) {
+			if (error instanceof AIError.AccountUnavailableError) return true;
+			throw error;
+		}
+	}
+
+	/** Whether a key override replaces pins and preferences for the session, as it replaces OAuth (see {@link KeyOverrides.suppressesOAuth}). */
+	#pinsSuppressed(provider: string, sessionId: string | undefined): boolean {
+		return this.#overrides.suppressesOAuth(provider, this.isRestricted(provider, sessionId));
+	}
+
+	/**
+	 * The session's exclusive pin for `provider`: the session pin, else the
+	 * project pin. Key overrides suppress both as they suppress OAuth. A pinned
+	 * account that is no longer stored fails closed instead of falling back.
+	 *
+	 * A session account restriction ({@link restrict}) is the narrower grant: a
+	 * stored pinned account outside its allowlist (inherited from a parent or
+	 * pinned before the restriction) does not apply while the restriction
+	 * holds, and selection stays inside the allowlist, the same way the
+	 * restriction replaces stickies. Each such override is logged once per
+	 * session.
+	 *
+	 * @throws AIError.AccountUnavailableError when the pinned account is not stored.
+	 */
+	exclusivePin(provider: string, sessionId: string | undefined): AccountTarget | undefined {
+		if (!sessionId || this.#pinsSuppressed(provider, sessionId)) return undefined;
+		const pinnedId = this.#sessionPin(provider, sessionId);
+		let target: AccountTarget | undefined;
+		if (pinnedId !== undefined) {
+			const index = pinnedId === null ? -1 : this.#pool.entries(provider).findIndex(entry => entry.id === pinnedId);
+			const credential = this.#pool.credentials(provider)[index];
+			if (!credential) throw new AIError.AccountUnavailableError(provider);
+			target = { index, credential };
+		} else {
+			const name = this.#pinSource?.project?.(provider, sessionId);
+			if (name === undefined) return undefined;
+			target = this.#named(provider, name);
+			if (!target) throw new AIError.AccountUnavailableError(provider, name);
+		}
+		if (this.allows(provider, sessionId, target.credential)) return target;
+		const warnKey = `${provider}\0${sessionId}`;
+		if (!this.#restrictedPinWarnings.has(warnKey)) {
+			this.#restrictedPinWarnings.set(warnKey, true);
+			logger.warn("Session account restriction overrides an account pin outside its allowlist", { provider });
+		}
+		return undefined;
+	}
+
+	/**
+	 * The stored account the pool member serving `provider`/`modelId` prefers.
+	 * An unresolvable name is logged (see {@link AccountPolicies.warnUnresolved}) and ignored;
+	 * an account the session's restriction does not allow is ignored.
+	 */
+	preferredAccount(
+		provider: string,
+		sessionId: string | undefined,
+		modelId: string | undefined,
+	): AccountTarget | undefined {
+		if (!sessionId || this.#pinsSuppressed(provider, sessionId)) return undefined;
+		const name = this.#pinSource?.member?.(provider, sessionId, modelId);
+		if (name === undefined) return undefined;
+		const target = this.#named(provider, name);
+		if (!target) this.#policies.warnUnresolved(provider, name);
+		return target && this.allows(provider, sessionId, target.credential) ? target : undefined;
+	}
+
+	#named(provider: string, name: string): AccountTarget | undefined {
+		const credentials = this.#pool.credentials(provider);
+		const index = this.#policies.indexOfNamed(provider, name, credentials);
+		const credential = credentials[index];
+		return credential ? { index, credential } : undefined;
+	}
+
+	accounts(provider: string, sessionId?: string): AuthAccountSummary[] {
+		const session = this.get(provider, sessionId);
+		let pinnedIndex: number | undefined;
+		try {
+			pinnedIndex = this.exclusivePin(provider, sessionId)?.index;
+		} catch (error) {
+			if (!(error instanceof AIError.AccountUnavailableError)) throw error;
+		}
+		return this.#pool.entries(provider).map((entry, index) => {
+			const credential = entry.credential;
+			const name = this.#policies.forStored(provider, credential)?.name;
+			const summary: AuthAccountSummary = {
+				credentialId: entry.id,
+				type: credential.type,
+				active: session?.index === index && session.type === credential.type,
+				pinned: pinnedIndex === index,
+				...(name !== undefined ? { name } : {}),
+			};
+			if (credential.type === "api_key") return { ...summary, keyFingerprint: apiKeyFingerprint(credential.key) };
+			return {
+				...summary,
+				accountId: credential.accountId,
+				email: credential.email,
+				projectId: credential.projectId,
+				enterpriseUrl: credential.enterpriseUrl,
+				orgId: credential.orgId,
+				orgName: credential.orgName,
+			};
+		});
+	}
+
+	/** Drop every sticky for a provider, in memory and in the persisted cache; exclusive pins stay. */
 	clearProvider(provider: string): void {
 		this.#sessionLastCredential.delete(provider);
 		this.#persistedSticky.delete(provider);
@@ -334,12 +559,8 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
-	 * Pin one stored OAuth account as this session's preferred credential.
-	 *
-	 * The durable credential id keeps the pin stable across credential refreshes,
-	 * storage reordering, and process restarts. By default this is an explicit
-	 * user pin: ranking and account reserve never evict it; hard unavailability
-	 * and auth retry may still route around it.
+	 * Pin one stored account (OAuth or API key) as this session's only
+	 * credential for `provider`; see {@link SessionsApi.pin}.
 	 *
 	 * `options.restoredAtMs` instead restores an automatic affinity recorded by a
 	 * persisted session, backdated to its last use, so it keeps the provider's
@@ -353,10 +574,17 @@ export class SessionAffinity implements SessionsApi {
 		const stored = this.#pool.entries(provider);
 		const index = stored.findIndex(entry => entry.id === credentialId);
 		const target = stored[index];
-		if (target?.credential.type !== "oauth" || !this.allows(provider, sessionId, target.credential)) return false;
+		if (!target || !this.allows(provider, sessionId, target.credential)) return false;
 		const restoredAtMs = options?.restoredAtMs;
-		this.record(provider, sessionId, "oauth", index, restoredAtMs, restoredAtMs === undefined);
+		if (restoredAtMs === undefined) this.#writeSessionPin(provider, sessionId, credentialId);
+		this.record(provider, sessionId, target.credential.type, index, restoredAtMs, restoredAtMs === undefined);
 		return true;
+	}
+
+	pinMissing(provider: string, sessionId: string): void {
+		if (!sessionId) return;
+		this.#writeSessionPin(provider, sessionId, null);
+		this.clear(provider, sessionId);
 	}
 
 	/**
@@ -370,6 +598,10 @@ export class SessionAffinity implements SessionsApi {
 	inherit(sourceSessionId: string, targetSessionId: string): number {
 		if (!sourceSessionId || !targetSessionId || sourceSessionId === targetSessionId) return 0;
 		let inherited = 0;
+		for (const provider of this.#pool.providers()) this.#sessionPin(provider, sourceSessionId);
+		for (const pin of [...this.#exclusivePins.values()]) {
+			if (pin.sessionId === sourceSessionId) this.#writeSessionPin(pin.provider, targetSessionId, pin.credentialId);
+		}
 		for (const provider of this.#pool.providers()) {
 			const credential = this.get(provider, sourceSessionId);
 			if (!credential || !this.#permits(provider, targetSessionId, credential.index)) continue;
@@ -393,7 +625,14 @@ export class SessionAffinity implements SessionsApi {
 	 * headroom, before considering a model/provider fallback.
 	 */
 	release(provider: string, sessionId: string): boolean {
-		if (!this.get(provider, sessionId)) return false;
+		if (this.#sessionPin(provider, sessionId) !== undefined || !this.get(provider, sessionId)) return false;
+		this.clear(provider, sessionId);
+		return true;
+	}
+
+	unpin(provider: string, sessionId: string): boolean {
+		if (this.#sessionPin(provider, sessionId) === undefined) return false;
+		this.#writeSessionPin(provider, sessionId, undefined);
 		this.clear(provider, sessionId);
 		return true;
 	}

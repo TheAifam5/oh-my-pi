@@ -25,6 +25,11 @@
         "accountPolicies": {
           "type": "array",
           "default": []
+        },
+        "accountPins": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
         }
       }
     },

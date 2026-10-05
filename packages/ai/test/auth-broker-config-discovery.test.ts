@@ -218,7 +218,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 					"        orgId: org-only",
 					"",
 				].join("\n"),
-				error: "auth.accountPolicies[0].account must include at least one of email, accountId, or projectId",
+				error: "auth.accountPolicies[0].account must include at least one of email, accountId, projectId, or keyFingerprint",
 			},
 			{
 				yaml: [

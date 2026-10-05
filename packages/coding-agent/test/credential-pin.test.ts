@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { AccountUnavailableError } from "@oh-my-pi/pi-ai/error";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import { credentialPinHash, recordCredentialPin, seedCredentialPins } from "../src/session/credential-pin";
@@ -218,5 +219,37 @@ describe("credential pins", () => {
 		expect(entries).toHaveLength(1);
 		const identity = storage.oauth.identity("anthropic", sessionId);
 		expect(manager.getCredentialPins().get("anthropic")?.hash).toBe(credentialPinHash("anthropic", identity!));
+	});
+
+	test("an exclusive entry restores a pin that overrides live affinity; a legacy entry restores a warm sticky", () => {
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		const accountA = storage.oauth
+			.accounts("anthropic", sessionId)
+			.find(account => account.accountId === "account-a");
+		storage.sessions.pin("anthropic", sessionId, accountA!.credentialId, { restoredAtMs: Date.now() });
+		const hashB = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		manager.appendCredentialPin("anthropic", hashB!, true);
+
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+		const pinned = storage.sessions.accounts("anthropic", sessionId).find(account => account.pinned);
+		expect(pinned?.accountId).toBe("account-b");
+
+		const legacy = SessionManager.create(tempDir.path(), tempDir.path());
+		const legacySessionId = legacy.getSessionId();
+		legacy.appendCredentialPin("anthropic", hashB!);
+		seedCredentialPins(storage, legacy, legacySessionId);
+		const restored = storage.sessions.accounts("anthropic", legacySessionId);
+		expect(restored.find(account => account.active)?.accountId).toBe("account-b");
+		expect(restored.some(account => account.pinned)).toBe(false);
+	});
+
+	test("an exclusive entry for a removed account fails closed and is reported", async () => {
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		manager.appendCredentialPin("anthropic", credentialPinHash("anthropic", { accountId: "account-gone" })!, true);
+
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual(["anthropic"]);
+		await expect(storage.keys.get("anthropic", sessionId)).rejects.toBeInstanceOf(AccountUnavailableError);
 	});
 });

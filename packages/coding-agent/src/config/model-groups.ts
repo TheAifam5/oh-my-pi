@@ -9,6 +9,7 @@
  * own defaults (quota reserve and observation age).
  */
 
+import { ACCOUNT_NAME, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -167,6 +168,8 @@ export interface ModelMember {
 	defaultEffort?: Effort;
 	/** Only under `weighted-random`; absent means the strategy's default. */
 	weight?: number;
+	/** Name of the stored account (`auth.accountPolicies[].name`) tried first for this member's requests; not exclusive. */
+	account?: string;
 }
 
 export type GroupMember = ModelMember;
@@ -413,7 +416,7 @@ function parseMember(
 ): ModelMember | undefined {
 	const before = c.issues.length;
 	readName(c, path, "member alias", alias, alias);
-	if (!checkFields(c, path, raw, ["model", "defaultEffort", "weight"], alias)) return undefined;
+	if (!checkFields(c, path, raw, ["model", "defaultEffort", "weight", "account"], alias)) return undefined;
 	let model: string | undefined;
 	if (raw.model === undefined) {
 		c.add(`${path}.model`, "is required", alias);
@@ -435,6 +438,18 @@ function parseMember(
 			weight = readPositive(c, `${path}.weight`, raw.weight, false, alias);
 		}
 	}
+	let account: string | undefined;
+	if (present(raw, "account")) {
+		if (
+			typeof raw.account !== "string" ||
+			raw.account.length > MAX_ACCOUNT_NAME_LENGTH ||
+			!ACCOUNT_NAME.test(raw.account)
+		) {
+			c.add(`${path}.account`, `must be an account name matching ${ACCOUNT_NAME.source}`, alias);
+		} else {
+			account = raw.account;
+		}
+	}
 	if (c.issues.length > before || model === undefined) return undefined;
 	return {
 		kind: "model",
@@ -442,6 +457,7 @@ function parseMember(
 		model,
 		...(defaultEffort !== undefined ? { defaultEffort } : {}),
 		...(weight !== undefined ? { weight } : {}),
+		...(account !== undefined ? { account } : {}),
 	};
 }
 
@@ -746,7 +762,7 @@ function parseGroupBody(
 	if (Array.isArray(raw.models)) {
 		c.add(
 			modelsPath,
-			"must be a mapping of member aliases to { model, defaultEffort?, weight? }; lists are not accepted",
+			"must be a mapping of member aliases to { model, defaultEffort?, weight?, account? }; lists are not accepted",
 		);
 	} else if (!isRecord(raw.models) || Object.keys(raw.models).length === 0) {
 		// A misspelled `members` block is reported by the field check alone.

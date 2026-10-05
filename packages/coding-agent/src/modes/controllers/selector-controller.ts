@@ -53,7 +53,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
-import type { SessionOAuthAccountList } from "../../session/agent-session-types";
+import type { SessionAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
 	createForeignSessionStore,
@@ -73,7 +73,7 @@ import { FileSessionStorage } from "../../session/session-storage";
 import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
-import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
+import { describeSessionPinOutcome, toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
 import {
 	accountIdentityLabel,
 	collectStoredAccounts,
@@ -2194,9 +2194,9 @@ export class SelectorController {
 			return;
 		}
 		this.ctx.showStatus("Loading provider accounts…", { dim: true });
-		let accountList: SessionOAuthAccountList | undefined;
+		let accountList: SessionAccountList | undefined;
 		try {
-			accountList = await session.listCurrentProviderOAuthAccounts();
+			accountList = await session.listCurrentProviderAccounts();
 		} catch (error) {
 			this.ctx.showError(
 				`Could not load provider accounts: ${error instanceof Error ? error.message : String(error)}`,
@@ -2215,8 +2215,8 @@ export class SelectorController {
 			const source = session.modelRegistry.authStorage.keys.describe(accountList.provider, session.sessionId);
 			this.ctx.showStatus(
 				source
-					? `No stored OAuth accounts for ${providerName}. Current auth comes from ${source}.`
-					: `No stored OAuth accounts for ${providerName}. Use /login to add one.`,
+					? `No stored accounts for ${providerName}. Current auth comes from ${source}.`
+					: `No stored accounts for ${providerName}. Use /login to add one.`,
 			);
 			return;
 		}
@@ -2227,11 +2227,13 @@ export class SelectorController {
 				accounts,
 				account => {
 					done();
-					if (!session.pinCurrentProviderOAuthAccount(account.credentialId)) {
-						this.ctx.showWarning(`${account.label} is no longer available to pin.`);
+					const outcome = session.pinCurrentProviderAccount(account.credentialId);
+					const message = describeSessionPinOutcome(outcome, account.label, providerName);
+					if (outcome !== "pinned") {
+						this.ctx.showWarning(message);
 						return;
 					}
-					this.ctx.showStatus(`Pinned ${account.label} to this session for ${providerName}.`);
+					this.ctx.showStatus(message);
 					this.ctx.statusLine.invalidate();
 					this.ctx.ui.requestRender();
 				},
