@@ -80,6 +80,7 @@ import {
 	type ResolvedModelRoleValue,
 	resolveModelRoleValue,
 	resolveSessionModelSelector,
+	type ScopedModel,
 	sessionModelDiscoveryProviders,
 } from "./config/model-resolver";
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -651,12 +652,13 @@ export interface CreateAgentSessionOptions {
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/**
-	 * Restrict a pool `default` role to {@link scopedModels}: members outside it are passed over as
-	 * unavailable, and with no eligible member and no funding or quota exclusion the session starts on
-	 * the first scoped model with a warning. The CLI sets it for an explicit `--models` scope, which the
-	 * `enabledModels`-filtered candidates do not reflect.
+	 * Scope a pool `default` role is restricted to: members outside it are passed over as unavailable,
+	 * and with no eligible member and no funding or quota exclusion the session starts on the first
+	 * entry with a warning. An entry's explicit `:level` replaces the effort of the member it matches.
+	 * The CLI sets it for an explicit `--models` scope, which the `enabledModels`-filtered candidates
+	 * do not reflect.
 	 */
-	restrictDefaultRolePoolToScope?: boolean;
+	defaultRolePoolScope?: readonly ScopedModel[];
 	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
 	prewalk?: Prewalk;
 	/** CLI prewalk selector awaiting extension provider registration; patterns retain role fallback order. */
@@ -2158,8 +2160,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let defaultRolePoolPick: { pick: RolePoolPick; revision: number } | undefined;
 	/** Picks of `--model @role` selectors; the one the session starts on is recorded as used. */
 	const deferredRolePoolPicks: RolePoolPick[] = [];
-	const defaultRolePoolScope =
-		options.restrictDefaultRolePoolToScope && options.scopedModels?.length ? options.scopedModels : undefined;
+	const defaultRolePoolScope = options.defaultRolePoolScope?.length ? options.defaultRolePoolScope : undefined;
 	const resolveDefaultRolePool = async (candidates: Model[]): Promise<ResolvedModelRoleValue> => {
 		const pickRevision = settings.revision;
 		const poolRole = defaultRolePoolTarget?.role ?? "default";
@@ -2182,8 +2183,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				defaultRolePoolNotice = `No member of the model role pool "${poolRole}" is eligible within the model scope. Using ${scopeFallback.model.provider}/${scopeFallback.model.id}`;
 				return {
 					model: scopeFallback.model,
-					thinkingLevel: scopeFallback.thinkingLevel,
-					explicitThinkingLevel: scopeFallback.thinkingLevel !== undefined,
+					thinkingLevel: scopeFallback.explicitThinkingLevel ? scopeFallback.thinkingLevel : undefined,
+					explicitThinkingLevel: scopeFallback.explicitThinkingLevel,
 					warning: undefined,
 				};
 			}
@@ -2193,18 +2194,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 		}
 		defaultRolePoolNotice = resolution.notice;
-		const aliasLevel = defaultRolePoolTarget?.thinkingLevel;
+		const pickedModel = resolution.pick.model;
+		// An explicit `:level` on the matching scope entry wins over the alias suffix and the member's effort.
+		const scopeLevel = defaultRolePoolScope?.find(
+			entry =>
+				entry.explicitThinkingLevel &&
+				entry.model.provider === pickedModel.provider &&
+				entry.model.id === pickedModel.id,
+		)?.thinkingLevel;
+		const overrideLevel = scopeLevel ?? defaultRolePoolTarget?.thinkingLevel;
 		defaultRolePoolPick = {
 			pick:
-				aliasLevel === undefined
+				overrideLevel === undefined
 					? resolution.pick
-					: { ...resolution.pick, thinkingLevel: aliasLevel, explicitThinkingLevel: true },
+					: { ...resolution.pick, thinkingLevel: overrideLevel, explicitThinkingLevel: true },
 			revision: pickRevision,
 		};
 		return {
-			model: resolution.pick.model,
-			thinkingLevel: aliasLevel ?? resolution.pick.thinkingLevel,
-			explicitThinkingLevel: aliasLevel !== undefined || resolution.pick.explicitThinkingLevel,
+			model: pickedModel,
+			thinkingLevel: overrideLevel ?? resolution.pick.thinkingLevel,
+			explicitThinkingLevel: overrideLevel !== undefined || resolution.pick.explicitThinkingLevel,
 			warning: undefined,
 		};
 	};

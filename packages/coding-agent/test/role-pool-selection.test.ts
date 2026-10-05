@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, type BillingSource, knownBilling, type Model, type Usage } from "@oh-my-pi/pi-ai";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -1055,11 +1057,13 @@ describe("model role pools", () => {
 			roles: Record<string, unknown>,
 			scope: Model[],
 			source: "--models" | "enabledModels",
+			patterns = scope.map(selectorOf),
+			extra: Record<string, unknown> = {},
 		) {
-			const patterns = scope.map(selectorOf);
 			const settings = Settings.isolated({
 				modelRoles: roles,
 				...(source === "enabledModels" ? { enabledModels: patterns } : {}),
+				...extra,
 			});
 			const scoped = await resolveModelScope(patterns, modelRegistry, undefined, settings);
 			const built = await buildSessionOptions(
@@ -1099,6 +1103,56 @@ describe("model role pools", () => {
 			try {
 				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
 				expect(modelFallbackMessage).toContain('model role pool "default"');
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("starts the --models scope fallback at the model's default effort before the settings default", async () => {
+			const settings = Settings.isolated({
+				modelRoles: { default: pool("priority", [ANTHROPIC]) },
+				defaultThinkingLevel: "high",
+			});
+			const google: Model = {
+				...GOOGLE,
+				thinking: {
+					mode: "budget",
+					efforts: [Effort.Low, Effort.Medium, Effort.High],
+					defaultLevel: Effort.Medium,
+				},
+			};
+			const built = await buildSessionOptions(
+				parseArgs(["--models", selectorOf(GOOGLE)]),
+				[{ model: google, explicitThinkingLevel: false }],
+				SessionManager.inMemory(),
+				modelRegistry,
+				settings,
+			);
+			const { session } = await createAgentSession({ ...startupOptions(settings), ...built, cwd: tempDir.path() });
+			try {
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+				expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("starts a default pool member at the effort of its matching --models entry", async () => {
+			const roles = {
+				default: {
+					strategy: "priority",
+					strategyOptions: { order: ["m1"] },
+					models: { m1: { model: selectorOf(GOOGLE), defaultEffort: "low" } },
+				},
+			};
+			const { session } = await createAgentSession(
+				await scopedStartupOptions(roles, [GOOGLE], "--models", [`${selectorOf(GOOGLE)}:high`], {
+					defaultThinkingLevel: "minimal",
+				}),
+			);
+			try {
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+				expect(session.thinkingLevel).toBe(ThinkingLevel.High);
 			} finally {
 				await session.dispose();
 			}

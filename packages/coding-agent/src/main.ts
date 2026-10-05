@@ -1461,7 +1461,7 @@ export async function buildSessionOptions(
 		// A pool `default` picks its member by strategy and funding in createAgentSession; pinning a
 		// model here would bypass it. Its candidates already honor `enabledModels`, not CLI `--models`.
 		deferredDefaultRole = true;
-		options.restrictDefaultRolePoolToScope = (parsed.models?.length ?? 0) > 0;
+		if ((parsed.models?.length ?? 0) > 0) options.defaultRolePoolScope = scopedModels;
 	} else if (scopedModels.length > 0 && !restoringSession) {
 		const remembered = activeSettings.getModelRole("default");
 		if (remembered) {
