@@ -779,7 +779,7 @@ describe("AuthStorage account drain", () => {
 		);
 		expect((await parse({ limits: [limit] })).accountPolicies[0]?.limits).toEqual([{ ...limit, onLimit: "skip" }]);
 		const usage = { metric: "usage", max: 0.9 } as const;
-		const onKey = { provider: PROVIDER, account: { keyFingerprint: "0123abcd" } };
+		const onKey = { provider: PROVIDER, account: { keyFingerprint: "0123abcd4567ef89" } };
 		expect(
 			() => new AuthStorage(store(), { accountPolicies: [{ ...onKey, limits: [{ ...usage, onLimit: "skip" }] }] }),
 		).toThrow("auth.accountPolicies[0].limits[0].metric applies to OAuth accounts only");
@@ -807,7 +807,7 @@ describe("AuthStorage account drain", () => {
 	test("rejects malformed drain fields in policies and in the config parser", async () => {
 		const store = () => new SqliteAuthCredentialStore(new Database(":memory:"));
 		const build = (policy: AuthAccountPolicy) => () => new AuthStorage(store(), { accountPolicies: [policy] });
-		expect(build({ provider: PROVIDER, account: { keyFingerprint: "0123abcd" }, drain: true })).toThrow(
+		expect(build({ provider: PROVIDER, account: { keyFingerprint: "0123abcd4567ef89" }, drain: true })).toThrow(
 			/OAuth accounts only/,
 		);
 		expect(build({ provider: PROVIDER, account: { accountId: "acc-a" }, returnMargin: 150 })).toThrow(/returnMargin/);

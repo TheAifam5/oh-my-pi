@@ -839,6 +839,8 @@ export class AgentSession implements SettingsScope {
 	#observedSessionId: string | undefined;
 	/** Provider session id whose settings-backed account pins are registered, and their teardown. */
 	#accountPins: { sessionId: string; unregister: () => void } | undefined;
+	/** Unavailable-pin warnings this session holds in `configWarnings`, by provider. */
+	#accountPinWarnings = new Map<string, string>();
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -5956,6 +5958,7 @@ export class AgentSession implements SettingsScope {
 		// A fresh or reset id becomes the pool scope's primary id, restricted
 		// before restored pins are seeded so they cannot leave the pool.
 		this.#accountPoolScope?.adopt(sid);
+		this.#retractAccountPinWarnings();
 		// Restore the session's recorded provider accounts before the first
 		// request routes: sticky rows are process-local under a remote auth
 		// broker, and losing them re-ranks onto a different account, cold-missing
@@ -5963,11 +5966,14 @@ export class AgentSession implements SettingsScope {
 		// those explicitly want new routing identity.
 		if (!this.#freshProviderSessionId) {
 			for (const provider of seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid)) {
-				this.emitNotice(
-					"warning",
-					`The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`,
-					"account-pin",
-				);
+				const message = `The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`;
+				// A notice emitted before anyone subscribes (construction) is lost; the header renders configWarnings later.
+				if (this.#eventListeners.length > 0) {
+					this.emitNotice("warning", message, "account-pin");
+				} else {
+					this.#accountPinWarnings.set(provider, message);
+					this.configWarnings.push(message);
+				}
 			}
 		}
 		// Keep every live advisor's provider identity in lockstep with the primary's
@@ -5976,6 +5982,20 @@ export class AgentSession implements SettingsScope {
 		// conversation's session id/metadata (issue #6625). Guarded because this
 		// runs once during construction before the advisor controller exists.
 		if (this.#advisors) this.#advisors.refreshProviderIdentity();
+	}
+
+	/** Drop the unavailable-pin warnings of `provider`, or of every provider, from `configWarnings`. */
+	#retractAccountPinWarnings(provider?: string): void {
+		let changed = false;
+		for (const [pinProvider, message] of this.#accountPinWarnings) {
+			if (provider !== undefined && pinProvider !== provider) continue;
+			this.#accountPinWarnings.delete(pinProvider);
+			const index = this.configWarnings.indexOf(message);
+			if (index === -1) continue;
+			this.configWarnings.splice(index, 1);
+			changed = true;
+		}
+		if (changed) this.#emit({ type: "config_warnings_changed" });
 	}
 
 	#notifySessionChangeCallbacks(): void {
@@ -13290,6 +13310,7 @@ export class AgentSession implements SettingsScope {
 			authStorage.sessions.unpin(provider, this.sessionId);
 			return "not-persistable";
 		}
+		this.#retractAccountPinWarnings(provider);
 		return "pinned";
 	}
 
@@ -13321,6 +13342,7 @@ export class AgentSession implements SettingsScope {
 		}
 		const recorded = this.sessionManager.getCredentialPins().get(provider);
 		if (recorded?.exclusive) this.sessionManager.appendCredentialPin(provider, recorded.hash, false);
+		this.#retractAccountPinWarnings(provider);
 		return "unpinned";
 	}
 

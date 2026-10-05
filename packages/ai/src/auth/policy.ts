@@ -21,15 +21,15 @@ import {
 export const ACCOUNT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
 /** Longest account name, in characters. */
 export const MAX_ACCOUNT_NAME_LENGTH = 64;
-const KEY_FINGERPRINT = /^[0-9a-f]{8}$/;
+const KEY_FINGERPRINT = /^[0-9a-f]{16}$/;
 
 /**
- * Portable identifier of a stored API key: the first 8 hex digits of the
+ * Portable identifier of a stored API key: the first 16 hex digits of the
  * SHA-256 of the stored key value. Identifies the key across machines without
  * revealing it.
  */
 export function apiKeyFingerprint(key: string): string {
-	return new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 8);
+	return new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 16);
 }
 
 /** Whether every identity field set on `selector` matches `identity`. */
@@ -200,7 +200,7 @@ export class AccountPolicies {
 					!KEY_FINGERPRINT.test(policy.account.keyFingerprint)
 				) {
 					throw new AIError.ConfigurationError(
-						`${path}.account.keyFingerprint must be 8 lowercase hexadecimal digits`,
+						`${path}.account.keyFingerprint must be 16 lowercase hexadecimal digits`,
 					);
 				}
 				if (hasOAuthIdentity || policy.account.orgId !== undefined) {

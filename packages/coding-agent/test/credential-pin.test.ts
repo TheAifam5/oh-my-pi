@@ -1,7 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
 import { AccountUnavailableError } from "@oh-my-pi/pi-ai/error";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
+import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import { credentialPinHash, recordCredentialPin, seedCredentialPins } from "../src/session/credential-pin";
 import { SessionManager } from "../src/session/session-manager";
@@ -251,5 +256,30 @@ describe("credential pins", () => {
 
 		expect(seedCredentialPins(storage, manager, sessionId)).toEqual(["anthropic"]);
 		await expect(storage.keys.get("anthropic", sessionId)).rejects.toBeInstanceOf(AccountUnavailableError);
+	});
+
+	test("an unavailable exclusive pin found while the session is built stays visible until unpinned", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		manager.appendCredentialPin("anthropic", credentialPinHash("anthropic", { accountId: "account-gone" })!, true);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: manager,
+			settings: Settings.isolated({}),
+			modelRegistry: new ModelRegistry(storage),
+		});
+		try {
+			// No listener exists during construction, so a notice would be dropped.
+			expect(session.configWarnings.filter(warning => warning.includes("pinned to this session"))).toHaveLength(1);
+
+			const changes: string[] = [];
+			session.subscribe(event => changes.push(event.type));
+			expect(session.unpinCurrentProviderAccount()).toBe("unpinned");
+			expect(session.configWarnings.some(warning => warning.includes("pinned to this session"))).toBe(false);
+			expect(changes).toContain("config_warnings_changed");
+		} finally {
+			await session.dispose();
+		}
 	});
 });
