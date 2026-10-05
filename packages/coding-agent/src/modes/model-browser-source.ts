@@ -43,6 +43,11 @@ export interface ModelBrowserSourceOptions {
 	 * Without it the source reports no billing.
 	 */
 	usageReports?: () => readonly UsageReport[] | undefined;
+	/**
+	 * Base URL of a catalog model, the billing evidence of self-hosted providers. Without it, or
+	 * for a model it does not resolve, those providers report no billing.
+	 */
+	modelBaseUrl?: (provider: string, id: string) => string | undefined;
 }
 
 /**
@@ -58,7 +63,7 @@ export function createModelBrowserSource(
 	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
 	options: ModelBrowserSourceOptions = {},
 ): ModelHubSource {
-	const { usageReports } = options;
+	const { usageReports, modelBaseUrl } = options;
 	return {
 		get billingRevision() {
 			return usageReports?.();
@@ -66,7 +71,9 @@ export function createModelBrowserSource(
 		billingFor: usageReports
 			? (model: string) => {
 					const parsed = parseModelString(model);
-					return parsed ? billingSummary(parsed.provider, usageReports(), Date.now()) : undefined;
+					if (!parsed) return undefined;
+					const baseUrl = modelBaseUrl?.(parsed.provider, parsed.id);
+					return billingSummary(parsed.provider, usageReports(), Date.now(), baseUrl);
 				}
 			: undefined,
 		get revision() {
@@ -235,10 +242,18 @@ function remainingText(allowance: BillingAllowance | undefined): string | undefi
  * each funding source of every account with known evidence as `mode state [remaining]`,
  * deduplicated, then `(+N unknown)` for the accounts without it; or `unknown (reason)` when no
  * account has evidence. Evidence older than the pool funding bound
- * ({@link DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS}) counts as unknown (`stale`).
+ * ({@link DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS}) counts as unknown (`stale`). A self-hosted
+ * provider is judged from the model's `baseUrl` ({@link providerBillingResults}).
  */
-export function billingSummary(provider: string, reports: readonly UsageReport[] | undefined, nowMs: number): string {
-	const results = providerBillingResults(provider, reports ?? [], nowMs, DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS);
+export function billingSummary(
+	provider: string,
+	reports: readonly UsageReport[] | undefined,
+	nowMs: number,
+	baseUrl?: string,
+): string {
+	const results = providerBillingResults(provider, reports ?? [], nowMs, DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS, {
+		baseUrl,
+	});
 	const parts = new Set<string>();
 	let unknownCount = 0;
 	let firstUnknown: BillingUnknownReason | undefined;

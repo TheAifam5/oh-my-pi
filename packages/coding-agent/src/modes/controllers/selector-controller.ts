@@ -912,6 +912,7 @@ export class SelectorController {
 			this.ctx.ui,
 			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model), {
 				usageReports: () => this.ctx.session.lastUsageReports,
+				modelBaseUrl: (provider, id) => this.ctx.session.modelRegistry.find(provider, id)?.baseUrl,
 			}),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,

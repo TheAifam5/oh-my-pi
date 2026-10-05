@@ -22,6 +22,7 @@ import { devinBilling } from "@oh-my-pi/pi-ai/usage/devin";
 import { factoryDroidBilling, parseFactoryDroidUsage } from "@oh-my-pi/pi-ai/usage/factory-droid";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "@oh-my-pi/pi-ai/usage/github-copilot";
 import { googleGeminiCliUsageProvider } from "@oh-my-pi/pi-ai/usage/gemini";
+import { localEndpointUsageReport } from "@oh-my-pi/pi-ai/usage/local-endpoint";
 import { minimaxCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/minimax-code";
 import { ollamaUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 import { codexBilling, openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
@@ -789,5 +790,69 @@ describe("subscription coding-plan billing", () => {
 			],
 		};
 		expect(readDefault(umans)).toMatchObject({ status: "unknown", reason: "no-evidence" });
+	});
+});
+
+describe("self-hosted endpoint billing", () => {
+	function readEndpoint(provider: string, baseUrl: string): BillingResult {
+		const report = localEndpointUsageReport(provider, baseUrl, 7);
+		if (!report) throw new Error(`${provider} is not a self-hosted provider`);
+		const reader = defaultBillingReader(provider);
+		if (!reader) throw new Error(`no billing reader for ${provider}`);
+		return reader.readBilling(report);
+	}
+
+	it.each([
+		["lm-studio", "http://localhost:1234/v1"],
+		["lm-studio", "http://LOCALHOST:1234/v1"],
+		["llama.cpp", "http://127.0.0.2:8080"],
+		["vllm", "http://[::1]:8000/v1"],
+		["local", "local://inference"],
+		["apple", "local://apple-foundation-models"],
+		["vllm", "unix:/run/vllm.sock"],
+	])("treats %s at %s as free and uncapped", (provider, baseUrl) => {
+		expect(sources(readEndpoint(provider, baseUrl))).toEqual([
+			{ mode: "free", state: "available", allowance: { kind: "money", uncapped: true } },
+		]);
+	});
+
+	it.each([
+		["link-local metadata address", "http://169.254.169.254/v1"],
+		["cloud metadata host", "http://metadata.google.internal/v1"],
+		["unspecified address", "http://0.0.0.0:8000/v1"],
+		["mDNS host", "http://foo.local:8000/v1"],
+		["10/8 host", "http://10.0.0.1:8000/v1"],
+		["192.168/16 host", "http://192.168.1.1:8000/v1"],
+		["loopback userinfo before a remote host", "http://127.0.0.1@evil.com/v1"],
+		["localhost userinfo before a public IP", "http://localhost@8.8.8.8/v1"],
+		["localhost-prefixed domain", "http://localhost.evil.com/v1"],
+		["loopback-prefixed domain", "http://127.0.0.1.evil.com/v1"],
+		["trailing-dot localhost", "http://localhost./v1"],
+		["IPv4-mapped IPv6 loopback", "http://[::ffff:7f00:1]/v1"],
+		["public host", "https://vllm.example.com/v1"],
+		["malformed URL", "not a url"],
+		["host-bearing non-HTTP scheme", "ftp://localhost/v1"],
+	])("reads a %s as no evidence, never free", (_label, baseUrl) => {
+		expect(readEndpoint("vllm", baseUrl)).toEqual({
+			status: "unknown",
+			provider: "vllm",
+			reason: "no-evidence",
+			fetchedAt: 7,
+		});
+	});
+
+	it("reads a report without a base URL as no evidence and synthesizes reports only for self-hosted providers", () => {
+		const reader = defaultBillingReader("vllm");
+		expect(reader?.readBilling({ provider: "vllm", fetchedAt: 7, limits: [] })).toMatchObject({
+			status: "unknown",
+			reason: "no-evidence",
+		});
+		expect(
+			reader?.readBilling({ provider: "vllm", fetchedAt: 7, limits: [], metadata: { baseUrl: 1 } }),
+		).toMatchObject({
+			status: "unknown",
+			reason: "no-evidence",
+		});
+		expect(localEndpointUsageReport("openai", "http://localhost:8000/v1", 7)).toBeUndefined();
 	});
 });
