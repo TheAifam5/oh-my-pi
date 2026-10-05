@@ -109,6 +109,7 @@ import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persist
 import { journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { SPEND_RETENTION_MS, type SpendEntry, type SpendLedger, usdToNanos } from "./spend-ledger";
+import { cacheEntryOf, recordCacheEntry } from "./cache-ledger";
 import { recordUsageEntry, usageEntryOf } from "./usage-ledger";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import {
@@ -2116,7 +2117,11 @@ export class TurnRecovery {
 	async #chargeLocalBudget(message: AssistantMessage, conservative: boolean): Promise<void> {
 		const atMs = Date.now();
 		// A usage write waiting on a busy database never delays the budget charge.
-		await Promise.all([this.#recordUsage(message, atMs), this.#chargeBudgets(message, atMs, conservative)]);
+		await Promise.all([
+			this.#recordUsage(message, atMs),
+			this.#recordCacheUsage(message, atMs),
+			this.#chargeBudgets(message, atMs, conservative),
+		]);
 	}
 
 	async #chargeBudgets(message: AssistantMessage, atMs: number, conservative: boolean): Promise<void> {
@@ -2217,6 +2222,27 @@ export class TurnRecovery {
 			if (entry) await recordUsageEntry(ledger, entry);
 		} catch (error) {
 			logger.warn("Usage ledger could not record a model call", {
+				provider: message.provider,
+				model: message.model,
+				error: String(error),
+			});
+		}
+	}
+
+	/** Appends the prompt-cache usage of `message` to the cache ledger; never rejects. */
+	async #recordCacheUsage(message: AssistantMessage, atMs: number): Promise<void> {
+		try {
+			const ledger = this.#host.settings.getStorage()?.cacheLedger;
+			if (!ledger) return;
+			const active = this.#host.model();
+			const model =
+				active?.provider === message.provider && active.id === message.model
+					? active
+					: this.#host.modelRegistry.find(message.provider, message.model);
+			const entry = cacheEntryOf(message, atMs, model?.baseUrl);
+			if (entry) await recordCacheEntry(ledger, entry);
+		} catch (error) {
+			logger.warn("Cache ledger could not record a model call", {
 				provider: message.provider,
 				model: message.model,
 				error: String(error),

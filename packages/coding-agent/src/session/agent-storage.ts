@@ -21,6 +21,7 @@ import {
 	postmortem,
 } from "@oh-my-pi/pi-utils";
 import type { RawSettings as Settings } from "../config/settings";
+import { CacheLedger } from "./cache-ledger";
 import { SpendLedger } from "./spend-ledger";
 import { UsageLedger } from "./usage-ledger";
 
@@ -191,6 +192,8 @@ export class AgentStorage {
 	readonly spendLedger: SpendLedger;
 	/** Per-call usage counted by local limits. */
 	readonly usageLedger: UsageLedger;
+	/** Per-call prompt-cache token usage. */
+	readonly cacheLedger: CacheLedger;
 	#modelUsageCache: string[] | null = null;
 	/** Only the real user db auto-imports stats.db history; custom paths (tests, embedding) opt in explicitly. */
 	#autoPerfBackfill: boolean;
@@ -237,6 +240,7 @@ ON CONFLICT(model_key) DO UPDATE SET
 		};
 		this.spendLedger = new SpendLedger(this.#db);
 		this.usageLedger = new UsageLedger(this.#db);
+		this.cacheLedger = new CacheLedger(this.#db);
 	}
 
 	#prepareUsageStatements(kind: UsageKind): UsageStatements {
@@ -483,6 +487,7 @@ FROM model_usage_legacy
 		}
 		this.spendLedger.close();
 		this.usageLedger.close();
+		this.cacheLedger.close();
 		// SqliteAuthCredentialStore.close() finalizes its own statements and
 		// closes the shared #db handle — must run after our statements finalize.
 		this.#authStore.close();

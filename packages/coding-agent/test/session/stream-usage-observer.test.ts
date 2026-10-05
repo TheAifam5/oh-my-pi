@@ -73,6 +73,9 @@ describe("background request usage", () => {
 			requests: 2n,
 			tokens: 36n,
 		});
+		expect(
+			storage.cacheLedger.cacheHitRate(mock.model.provider, mock.model.id, mock.model.baseUrl, 0, Date.now()),
+		).toEqual({ rate: 0, samples: 1 });
 		await expect(completeSimple(mock.model, context)).rejects.toThrow(
 			`Usage preflight blocked: local limit refused ${member} (*: 2 requests per day: local limit reached)`,
 		);

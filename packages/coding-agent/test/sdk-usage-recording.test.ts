@@ -1,6 +1,7 @@
 import { afterEach, expect, it } from "bun:test";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { completeSimple } from "@oh-my-pi/pi-ai/stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -24,14 +25,13 @@ afterEach(async () => {
 	clearCustomApis();
 });
 
-it("records a main session turn once, not again through the background request observer", async () => {
+async function startSession(mock: MockModel): Promise<{ storage: AgentStorage; session: AgentSession }> {
 	registerMockApi();
 	root = TempDir.createSync("@pi-sdk-usage-");
 	const storage = await AgentStorage.open(root.join("agent.db"));
 	const auth = createInMemoryAuthStorage();
 	auth.keys.setRuntime("mock", "test-key");
 	registry = new ModelRegistry(auth);
-	const mock = createMockModel({ responses: [{ content: ["done"], usage: { input: 5, output: 2 } }] });
 	({ session } = await createAgentSession({
 		cwd: root.path(),
 		agentDir: root.path(),
@@ -49,11 +49,47 @@ it("records a main session turn once, not again through the background request o
 		skipPythonPreflight: true,
 		toolNames: [],
 	}));
+	return { storage, session };
+}
 
-	await session.prompt("hello");
-	await session.waitForIdle();
-	await session.dispose();
+async function endSession(active: AgentSession): Promise<void> {
+	await active.waitForIdle();
+	await active.dispose();
 	session = undefined;
 	await flushBackgroundUsage();
-	expect(storage.usageLedger.totals([{ provider: mock.model.provider }], 0).requests).toBe(1n);
+}
+
+it("records a main session turn once, not again through the background request observer", async () => {
+	const mock = createMockModel({
+		baseUrl: "HTTPS://Mock.Example/v1/",
+		responses: [{ content: ["done"], usage: { input: 5, output: 2, cacheRead: 15 } }],
+	});
+	const background = createMockModel({
+		baseUrl: "https://mock.example/v1",
+		handler: () => ({ content: ["title"], usage: { input: 10, cacheWrite: 10 } }),
+	});
+	const { storage, session: active } = await startSession(mock);
+
+	await active.prompt("hello");
+	await completeSimple(background, { messages: [{ role: "user", content: "title this", timestamp: 1 }] });
+	await endSession(active);
+	// One turn plus one background call: a turn the observer also recorded would count three.
+	expect(storage.usageLedger.totals([{ provider: mock.provider }], 0).requests).toBe(2n);
+	// Both endpoint spellings are one endpoint.
+	expect(storage.cacheLedger.cacheHitRate(mock.provider, mock.id, "https://mock.example/v1/", 0, Date.now())).toEqual({
+		rate: 15 / 40,
+		samples: 2,
+	});
+});
+
+it("still records usage when the cache ledger cannot be written", async () => {
+	const mock = createMockModel({ responses: [{ content: ["done"], usage: { input: 5, output: 2 } }] });
+	const background = createMockModel({ handler: () => ({ content: ["title"], usage: { input: 10 } }) });
+	const { storage, session: active } = await startSession(mock);
+	storage.cacheLedger.close();
+
+	await active.prompt("hello");
+	await completeSimple(background, { messages: [{ role: "user", content: "title this", timestamp: 1 }] });
+	await endSession(active);
+	expect(storage.usageLedger.totals([{ provider: mock.provider }], 0).requests).toBe(2n);
 });

@@ -3,13 +3,14 @@
  * memories, judgment, compaction and handoff, advisors, and other one-shot calls. Every
  * `streamSimple` request not marked `usageRecorded` is checked against the top-level `limits`
  * for its model (global, provider, and model keys; never pool limits) before it is sent, and
- * recorded in the usage ledger when it completes.
+ * recorded in the usage and cache ledgers when it completes.
  */
 import { getStreamUsageObserver, setStreamUsageObserver, type StreamUsageObserver } from "@oh-my-pi/pi-ai";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import type { AuthStorage } from "./auth-storage";
+import { cacheEntryOf, recordCacheEntry } from "./cache-ledger";
 import {
 	describeLimitRefusal,
 	evaluateLimits,
@@ -65,8 +66,22 @@ export function installStreamUsageObserver(settings: Settings, authStorage: Auth
 			if (refused.length === 0) return undefined;
 			return `${USAGE_PREFLIGHT_BLOCKED_PREFIX} local limit refused ${model.provider}/${model.id} (${refused.map(describeLimitRefusal).join(", ")})`;
 		},
-		record(_model, message, options) {
-			const ledger = settings.getStorage()?.usageLedger;
+		record(model, message, options) {
+			const storage = settings.getStorage();
+			const cacheEntry = storage ? cacheEntryOf(message, Date.now(), model.baseUrl) : undefined;
+			if (storage && cacheEntry) {
+				const cacheWrite = recordCacheEntry(storage.cacheLedger, cacheEntry)
+					.catch(error =>
+						logger.warn("Cache ledger could not record a background model call", {
+							provider: message.provider,
+							model: message.model,
+							error: String(error),
+						}),
+					)
+					.finally(() => pendingWrites.delete(cacheWrite));
+				pendingWrites.add(cacheWrite);
+			}
+			const ledger = storage?.usageLedger;
 			if (!ledger) return;
 			const sessionId = options?.sessionId;
 			const active = sessionId

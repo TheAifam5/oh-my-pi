@@ -678,6 +678,8 @@ A pool's `routing.limits` (on `modelRoles.<role>`, `retry.fallbackChains.<key>`,
 
 `omp account list` (and `--json`, as `limits` entries with `metric`, `max`, `used`, `window`, and `resetsAt`) shows each account's limits with the usage counted so far; provider-evidence limits list no usage. The `/usage` full report and `omp usage` end with the configured top-level and pool limits (`omp usage --json` lists them as `localLimits` entries with `name` and the same fields, `used` being `null` when the ledger cannot be read; reading it never creates `agent.db`), and the model hub shows a pool's limit count and the limit closest to its cap.
 
+Every recorded call that sent a prompt also stores its uncached input, cache-read, and cache-write tokens with its provider, model, and endpoint in `agent.db`, for later prompt-cache hit-rate lookups.
+
 ### Model presets
 
 A model preset is a named snapshot of every role assignment plus `defaultThinkingLevel`, so you can swap a whole setup at once:
