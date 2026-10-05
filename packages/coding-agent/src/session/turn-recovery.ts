@@ -285,6 +285,8 @@ export interface TurnRecoveryHost {
 	promptGeneration(): number;
 	promptSequence(): number;
 	sessionId(): string;
+	/** Whether `model`'s prompt cache is warm for this session at `nowMs`; absent: never. */
+	promptCacheWarm?(model: Model, nowMs: number): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	scheduleAgentContinue(options: {
 		source: string;
@@ -440,6 +442,7 @@ export class TurnRecovery {
 			sessionId: () => host.sessionId(),
 			emitNotice: message =>
 				host.emitSessionEvent({ type: "notice", level: "warning", message, source: "retry-fallback" }),
+			promptCacheWarm: (model, nowMs) => host.promptCacheWarm?.(model, nowMs) ?? false,
 		});
 		if (options.initialRetryFallback) {
 			this.#activeRetryFallback = {

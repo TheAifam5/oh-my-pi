@@ -414,6 +414,7 @@ import {
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
 import type { CacheWarmer, CacheWarmingMode, CacheWarmingStatus } from "./cache-warmer";
+import { PromptCacheAffinity } from "./prompt-cache-affinity";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { formatSessionDumpText, formatSubagentDumpText, type SessionDumpArchive } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
@@ -1135,6 +1136,8 @@ export class AgentSession implements SettingsScope {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	readonly #cacheWarmer: CacheWarmer | undefined;
+	/** Prompt caches this session's responses left warm; cleared when the conversation is replaced. */
+	readonly #promptCacheAffinity = new PromptCacheAffinity();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
@@ -1763,6 +1766,7 @@ export class AgentSession implements SettingsScope {
 			},
 			clearActiveRetryFallback: () => this.#recovery.clearActiveRetryFallback(),
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
+			promptCacheWarm: (model, nowMs) => this.#promptCacheAffinity.isWarm(model, nowMs),
 			magicKeywordEnabled: keyword => this.#magicKeywordEnabled(keyword),
 			emit: event => this.#emit(event),
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -1781,7 +1785,10 @@ export class AgentSession implements SettingsScope {
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
-			warmer.onWarmed = (message, extensionOverride) => this.#recordCacheWarmUsage(message, extensionOverride);
+			warmer.onWarmed = (message, extensionOverride) => {
+				this.#recordCacheWarmUsage(message, extensionOverride);
+				this.#notePromptCacheUse(message);
+			};
 			warmer.onRefreshStart = refresh => void this.#emitSessionEvent({ type: "cache_warming_start", ...refresh });
 			warmer.onRefreshEnd = refresh => void this.#emitSessionEvent({ type: "cache_warming_end", ...refresh });
 			this.subscribeRunState(state => {
@@ -1813,6 +1820,7 @@ export class AgentSession implements SettingsScope {
 			promptGeneration: () => this.#promptGeneration,
 			promptSequence: () => this.#promptSequence,
 			sessionId: () => this.sessionId,
+			promptCacheWarm: (model, nowMs) => this.#promptCacheAffinity.isWarm(model, nowMs),
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
@@ -2390,8 +2398,15 @@ export class AgentSession implements SettingsScope {
 			},
 			resetAdvisorRuntimes: (reason?: string) => this.#advisors.resetAllRuntimes(reason),
 			rebaseAdvisorPrefix: reason => this.#advisors.rebaseDeliveredPrefixes(reason),
-			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
-			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
+			// A compaction or history rewrite changes the prompt prefix, so no cache entry it had stays usable.
+			rebaseAfterCompaction: () => {
+				this.#stats.rebaseAfterCompaction();
+				this.#promptCacheAffinity.clear();
+			},
+			recordAnchoredHistoryRewrite: tokensRemoved => {
+				this.#stats.recordAnchoredHistoryRewrite(tokensRemoved);
+				this.#promptCacheAffinity.clear();
+			},
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
@@ -4125,6 +4140,7 @@ export class AgentSession implements SettingsScope {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#cacheWarmer?.onResponse(event.message);
+			this.#notePromptCacheUse(event.message);
 			const deferred = this.#deferredTitle;
 			if (deferred && !deferred.replied) {
 				deferred.words += titleContextWordCount(event.message);
@@ -5770,6 +5786,23 @@ export class AgentSession implements SettingsScope {
 				return message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
 		}
 		return 0;
+	}
+
+	/** Records the prompt-cache use of a response for pools with `routing.cache.affinity`. */
+	#notePromptCacheUse(message: AssistantMessage): void {
+		const active = this.model;
+		const model =
+			active?.provider === message.provider && active.id === message.model
+				? active
+				: this.#modelRegistry.find(message.provider, message.model);
+		if (!model) {
+			logger.debug("Prompt cache affinity could not resolve the response model", {
+				provider: message.provider,
+				model: message.model,
+			});
+			return;
+		}
+		this.#promptCacheAffinity.observe(message, model, Date.now());
 	}
 
 	/** Persist a completed warm request as off-transcript usage so session totals include its cost. */
@@ -10446,6 +10479,7 @@ export class AgentSession implements SettingsScope {
 			this.setTodoPhases([]);
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
+			this.#promptCacheAffinity.clear();
 			this.#syncAgentSessionId();
 			await this.#prewalk.resetForNewSession(this.#agentKind === "main" && cfgPrewalkEnabled.get(this.settings));
 			// Re-apply the configured selector so the new session does not inherit
@@ -12066,6 +12100,7 @@ export class AgentSession implements SettingsScope {
 				this.#freshProviderSessionId = undefined;
 				this.#clearInheritedProviderPromptCacheKey();
 				this.#adoptInheritedProviderPromptCacheKey();
+				this.#promptCacheAffinity.clear();
 			}
 			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();

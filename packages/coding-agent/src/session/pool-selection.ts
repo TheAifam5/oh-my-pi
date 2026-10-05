@@ -71,6 +71,8 @@ export interface PoolSelectionHost {
 	random?(): number;
 	/** Usage reports funding filters read; default `modelRegistry.authStorage.usage.reports`. */
 	usageReports?(options: { signal: AbortSignal }): Promise<UsageReport[] | null>;
+	/** Whether `model`'s prompt cache is warm for this session at `nowMs`; absent: never. */
+	promptCacheWarm?(model: Model, nowMs: number): boolean;
 }
 
 /** Inputs of one {@link PoolSelection.order} call. */
@@ -145,8 +147,36 @@ export class PoolSelection {
 	 * or `signal` aborts, the candidates keep given order (none remain under
 	 * `routing.quota.unknown: exclude`) and `health` is empty. Otherwise `health` holds the answered
 	 * lookups keyed by selector; a failed lookup leaves no entry.
+	 *
+	 * Under `routing.cache.affinity`, the ordered members not cooling down whose prompt cache is warm
+	 * ({@link PoolSelectionHost.promptCacheWarm}) then move ahead of the rest, keeping their relative
+	 * order; members the strategy dropped stay dropped.
 	 */
 	async order(
+		label: string,
+		candidates: RetryFallbackSelector[],
+		strategy: RetryFallbackStrategy,
+		policy: GroupFallbackChain | undefined,
+		options: PoolOrderOptions,
+	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
+		const ordered = await this.#orderByStrategy(label, candidates, strategy, policy, options);
+		const warm = this.#host.promptCacheWarm;
+		if (!policy?.group.routing?.cache?.affinity || !warm || ordered.candidates.length <= 1) return ordered;
+		const nowMs = this.#now();
+		const isWarm = (candidate: RetryFallbackSelector) => {
+			if (this.#host.modelRegistry.isSelectorSuppressed(candidate.raw)) return false;
+			const model = options.resolveCandidate(candidate);
+			return model !== undefined && warm(model, nowMs);
+		};
+		const first = ordered.candidates.filter(isWarm);
+		if (first.length === 0) return ordered;
+		return {
+			candidates: [...first, ...ordered.candidates.filter(candidate => !first.includes(candidate))],
+			health: ordered.health,
+		};
+	}
+
+	async #orderByStrategy(
 		label: string,
 		candidates: RetryFallbackSelector[],
 		strategy: RetryFallbackStrategy,

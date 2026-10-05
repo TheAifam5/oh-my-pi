@@ -186,6 +186,8 @@ export interface GroupRouting {
 	accounts?: AccountRouting;
 	/** Local limits on the calls made through this pool (`routing.limits`); see `session/local-limits.ts`. */
 	limits?: readonly LocalLimit[];
+	/** `affinity`: an eligible member whose prompt cache is warm for the session goes first (`routing.cache`). */
+	cache?: { affinity: boolean };
 }
 
 /** A concrete `provider/model-id` member. */
@@ -736,7 +738,7 @@ function parseAccountRouting(c: Collector, path: string, raw: unknown): AccountR
 
 function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | undefined {
 	const before = c.issues.length;
-	if (!checkFields(c, path, raw, ["funding", "quota", "spending", "accounts", "limits"])) return undefined;
+	if (!checkFields(c, path, raw, ["funding", "quota", "spending", "accounts", "limits", "cache"])) return undefined;
 	const routing: GroupRouting = {};
 	const funding = present(raw, "funding") ? parseFunding(c, `${path}.funding`, raw.funding) : undefined;
 	const spendingRaw = present(raw, "spending") ? raw.spending : undefined;
@@ -777,6 +779,13 @@ function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | 
 	if (present(raw, "accounts")) {
 		const accounts = parseAccountRouting(c, `${path}.accounts`, raw.accounts);
 		if (accounts) routing.accounts = accounts;
+	}
+	if (present(raw, "cache") && checkFields(c, `${path}.cache`, raw.cache, ["affinity"])) {
+		const affinity = raw.cache.affinity;
+		// An explicit null is already reported by checkFields.
+		if (typeof affinity === "boolean") routing.cache = { affinity };
+		else if (affinity === undefined) c.add(`${path}.cache`, "affinity is required");
+		else if (affinity !== null) c.add(`${path}.cache.affinity`, "must be true or false");
 	}
 	return c.issues.length > before ? undefined : routing;
 }
