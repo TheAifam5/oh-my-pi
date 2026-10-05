@@ -234,6 +234,20 @@ export function remainingUsageFraction(
 	rankingContext: CredentialRankingContext,
 	nowMs: number,
 ): number | undefined {
+	const used = usedUsageFraction(strategy, report, rankingContext, nowMs);
+	return used === undefined ? undefined : Math.max(0, 1 - used);
+}
+
+/**
+ * The largest used fraction among the report's windows that apply to the request (the same
+ * windows {@link remainingUsageFraction} reads); `undefined` when none is measured.
+ */
+export function usedUsageFraction(
+	strategy: CredentialRankingStrategy | undefined,
+	report: UsageReport | null,
+	rankingContext: CredentialRankingContext,
+	nowMs: number,
+): number | undefined {
 	if (!report) return undefined;
 	const usedFractions = reserveUsageLimits(strategy, report, rankingContext)
 		.filter(limit => {
@@ -242,7 +256,7 @@ export function remainingUsageFraction(
 		})
 		.map(resolveUsedFraction)
 		.filter((fraction): fraction is number => fraction !== undefined);
-	return usedFractions.length === 0 ? undefined : Math.max(0, 1 - Math.max(...usedFractions));
+	return usedFractions.length === 0 ? undefined : Math.max(...usedFractions);
 }
 
 /**

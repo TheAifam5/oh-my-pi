@@ -21,7 +21,7 @@ import type {
 	UsageResetCredits,
 } from "../usage";
 import type { BillingResult } from "../usage/billing";
-import type { LocalLimit } from "../usage/limits";
+import type { AccountLimit, LocalLimit } from "../usage/limits";
 
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
@@ -99,10 +99,11 @@ export interface AuthAccountPolicy {
 	 */
 	readonly returnWhen?: DrainReturnTrigger | readonly DrainReturnTrigger[];
 	/**
-	 * Local limits on this account's spend, requests, and tokens, counted by the host's
-	 * {@link AccountLimitSource}; an account over a `skip` limit is not selected. No `id`.
+	 * Local limits on this account: spend, requests, and tokens counted by the host's
+	 * {@link AccountLimitSource}, and (OAuth accounts) provider-reported `usage`, `credits`, and
+	 * `extra-usd`; an account over a `skip` limit is not selected. No `id`.
 	 */
-	readonly limits?: readonly LocalLimit[];
+	readonly limits?: readonly AccountLimit[];
 }
 
 /** Funding classes a drain target may spend ({@link AuthAccountPolicy.spend}). */

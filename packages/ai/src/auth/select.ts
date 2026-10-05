@@ -4,7 +4,8 @@ import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
-import type { BillingMode, BillingSnapshot, BillingSource, DecimalQuantity } from "../usage/billing";
+import { type BillingMode, type BillingSnapshot, type BillingSource, type DecimalQuantity } from "../usage/billing";
+import { type AccountEvidenceLimit, isAccountEvidenceLimit, type LocalLimit } from "../usage/limits";
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
 import {
@@ -47,6 +48,7 @@ import {
 	isUsageLimitReached,
 	normalizeUsageFraction,
 	remainingUsageFraction,
+	usedUsageFraction,
 	scopedUsageLimits,
 	usageResetAtMs,
 	windowRequiredDrain,
@@ -117,6 +119,47 @@ function classSpent(snapshot: BillingSnapshot, spendClass: keyof typeof SPEND_CL
 	);
 }
 
+/**
+ * Verdict of a `credits` or `extra-usd` limit on an account spending past its plan allowance:
+ * `reached` at the floor or cap, `unreadable` without the evidence to tell.
+ */
+function evidenceVerdict(
+	limit: AccountEvidenceLimit,
+	snapshot: BillingSnapshot | undefined,
+): AccountLimitRefusal | undefined {
+	if (!snapshot) return "unreadable";
+	const cap = scaledDecimal(String(limit.max));
+	if (limit.metric === "credits") {
+		const sources = sourcesOf(snapshot, "credits");
+		const balances = creditBalances(snapshot);
+		if (balances.length === 0) {
+			return sources.some(source => source.state === "exhausted") ? "reached" : "unreadable";
+		}
+		const exponent = Math.max(cap.exponent, ...balances.map(balance => balance.exponent));
+		const scale = (coefficient: bigint, from: number) => coefficient * 10n ** BigInt(exponent - from);
+		const total = balances.reduce((sum, balance) => sum + scale(BigInt(balance.amountMinor), balance.exponent), 0n);
+		return total < scale(cap.coefficient, cap.exponent) ? "reached" : undefined;
+	}
+	const sources = sourcesOf(snapshot, "money");
+	const used = sources.flatMap(source =>
+		source.allowance?.kind === "money" && source.allowance.used?.currency === "USD" ? [source.allowance.used] : [],
+	);
+	if (used.length === 0) {
+		return sources.some(source => source.state === "exhausted" || source.state === "disabled")
+			? "reached"
+			: "unreadable";
+	}
+	// USD minor units are cents.
+	const total = used.reduce((sum, amount) => sum + BigInt(amount.amountMinor), 0n) * 10n ** BigInt(cap.exponent);
+	return total >= cap.coefficient * 100n ? "reached" : undefined;
+}
+
+/** A quoted decimal amount as an exact coefficient at its own number of decimal places. */
+function scaledDecimal(text: string): { coefficient: bigint; exponent: number } {
+	const [integer = "0", fraction = ""] = text.split(".");
+	return { coefficient: BigInt(integer + fraction), exponent: fraction.length };
+}
+
 /** Reported remaining prepaid credit balances in `snapshot`. */
 function creditBalances(snapshot: BillingSnapshot): DecimalQuantity[] {
 	return sourcesOf(snapshot, "credits").flatMap(source =>
@@ -141,6 +184,9 @@ function creditsAdded(baseline: BillingSnapshot, current: BillingSnapshot): bool
 	return total(after) > total(before);
 }
 
+/** Account limit verdicts by stored row id, shared by every step of one credential resolution. */
+export type AccountRefusals = Map<number, Promise<AccountLimitRefusal | undefined>>;
+
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
 export interface CredentialSelectorDeps {
 	store: AuthCredentialStore;
@@ -159,6 +205,8 @@ export class CredentialSelector {
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** When each drain target last drained, by `rowId\0blockScope\0spend/returnWhen`; cleared once it returns. Process-local. */
 	#drainedSince: Map<string, DrainedState> = new Map();
+	/** Reached `warn` evidence limits already logged, by `provider\0rowId\0metric`; cleared once they clear. */
+	#warnedEvidenceLimits = new Set<string>();
 	/** Drain billing warnings already logged, by `provider\0kind`. */
 	#warnedNoBilling = new Set<string>();
 	#deps: CredentialSelectorDeps;
@@ -375,27 +423,111 @@ export class CredentialSelector {
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (!source || !credential) return undefined;
 		const policy = this.#deps.policies.forStored(provider, credential);
-		if (!policy?.limits?.length) return undefined;
+		const limits = policy?.limits?.filter((limit): limit is LocalLimit => !isAccountEvidenceLimit(limit)) ?? [];
+		if (limits.length === 0) return undefined;
 		const account = accountUsageKey(
 			credential.type === "api_key"
 				? { keyFingerprint: apiKeyFingerprint(credential.key) }
 				: { email: credential.email, accountId: credential.accountId, projectId: credential.projectId },
 		);
-		return account === undefined ? undefined : source.refuses(provider, account, policy.limits, Date.now());
+		return account === undefined ? undefined : source.refuses(provider, account, limits, Date.now());
 	}
 
 	/**
-	 * Fails when every stored account of `provider` is over a local limit, so the request never
+	 * {@link accountLimit}, then the account policy's limits on provider evidence for an OAuth
+	 * account ({@link #evidenceRefusal}), reading its usage report.
+	 */
+	async accountRefusal(
+		provider: string,
+		index: number,
+		options: AuthApiKeyOptions | undefined,
+		memo?: AccountRefusals,
+	): Promise<AccountLimitRefusal | undefined> {
+		const rowId = this.#deps.pool.entries(provider)[index]?.id;
+		const compute = async () =>
+			this.accountLimit(provider, index) ?? (await this.#evidenceRefusal(provider, index, options));
+		if (!memo || rowId === undefined) return compute();
+		let verdict = memo.get(rowId);
+		if (!verdict) {
+			verdict = compute();
+			memo.set(rowId, verdict);
+		}
+		return verdict;
+	}
+
+	/**
+	 * The refusal of the stored OAuth account's `usage`, `credits`, and `extra-usd` limits. `usage`
+	 * holds the account back once its used fraction reaches the cap; unmeasured usage never does.
+	 * `credits` and `extra-usd` only gate an account whose plan allowance is spent, as it would then
+	 * spend that class: a known balance under the floor or reported extra usage at the cap refuses
+	 * with `reached`, missing evidence with `unreadable`. An account whose usage report cannot be
+	 * read is never held back by these limits. A reached `warn` limit is logged once until it clears.
+	 */
+	async #evidenceRefusal(
+		provider: string,
+		index: number,
+		options: AuthApiKeyOptions | undefined,
+	): Promise<AccountLimitRefusal | undefined> {
+		const credential = this.#deps.pool.credentials(provider)[index];
+		if (credential?.type !== "oauth") return undefined;
+		const limits = this.#deps.policies.forStored(provider, credential)?.limits?.filter(isAccountEvidenceLimit) ?? [];
+		if (limits.length === 0) return undefined;
+		const account = accountUsageKey(credential) ?? `#${index}`;
+		const report = await this.#deps.usage.report(provider, credential, {
+			...options,
+			timeoutMs: this.#deps.usage.requestTimeoutMs,
+		});
+		const used = usedUsageFraction(
+			this.#deps.strategies(provider),
+			report,
+			{ modelId: options?.modelId },
+			Date.now(),
+		);
+		const planSpent = used !== undefined && used >= 1;
+		const billing = planSpent && report ? this.#deps.usage.billing(provider, report) : undefined;
+		const snapshot = billing?.status === "known" ? billing.snapshot : undefined;
+		const verdicts = limits.map(limit => {
+			let verdict: AccountLimitRefusal | undefined;
+			if (limit.metric === "usage") {
+				verdict = used !== undefined && used >= Number(limit.max) ? "reached" : undefined;
+			} else if (planSpent) {
+				verdict = evidenceVerdict(limit, snapshot);
+			}
+			const key = `${provider}\0${account}\0${options?.modelId ?? ""}\0${limit.metric}`;
+			if (limit.onLimit === "warn") {
+				if (verdict === "reached" && !this.#warnedEvidenceLimits.has(key)) {
+					this.#warnedEvidenceLimits.add(key);
+					logger.warn("Local account limit reached", { provider, metric: limit.metric, max: limit.max });
+				} else if (verdict === undefined) {
+					this.#warnedEvidenceLimits.delete(key);
+				}
+				return undefined;
+			}
+			return verdict;
+		});
+		return verdicts.includes("reached") ? "reached" : verdicts.includes("unreadable") ? "unreadable" : undefined;
+	}
+
+	/**
+	 * Fails when every stored account of `provider` the session may use is over a local limit, so the request never
 	 * falls back to an environment or fallback key; a limited drain target is recorded as drained.
 	 *
 	 * @throws AIError.AccountLimitError naming only the provider.
 	 */
-	refuseIfAllLimited(provider: string, sessionId: string | undefined, options: AuthApiKeyOptions | undefined): void {
-		const stored = this.#deps.pool.credentials(provider);
-		if (stored.length === 0) return;
-		const refusals = stored.map((_credential, index) => this.accountLimit(provider, index));
+	async refuseIfAllLimited(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		memo?: AccountRefusals,
+	): Promise<void> {
+		// A restricted session only weighs the accounts its restriction allows.
+		const indices = this.#deps.pool
+			.credentials(provider)
+			.flatMap((credential, index) => (this.#deps.affinity.allows(provider, sessionId, credential) ? [index] : []));
+		if (indices.length === 0) return;
+		const refusals = await Promise.all(indices.map(index => this.accountRefusal(provider, index, options, memo)));
 		if (refusals.some(refusal => refusal === undefined)) return;
-		this.#noteLimitedDrain(provider, sessionId, options?.modelId, new Set(stored.map((_credential, index) => index)));
+		this.#noteLimitedDrain(provider, sessionId, options?.modelId, new Set(indices));
 		throw new AIError.AccountLimitError(provider, refusals.includes("unreadable") ? "unreadable" : "reached");
 	}
 
@@ -802,6 +934,7 @@ export class CredentialSelector {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
+		memo?: AccountRefusals,
 	): Promise<OAuthResolutionResult | undefined> {
 		await this.#deps.pool.adoptExternalChanges();
 		const stored = this.#deps.pool
@@ -812,15 +945,16 @@ export class CredentialSelector {
 			provider,
 			stored.map(entry => entry.credential),
 		);
+		// A session restriction drops every other account before limits, ranking,
+		// pins, and the fallback passes below, so none of them can route back to it
+		// or spend a usage read on it.
+		const allowed = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
 		// An account over a local limit is never selected, not even as a last resort.
-		const limited = new Set(
-			stored.filter(entry => this.accountLimit(provider, entry.index) !== undefined).map(entry => entry.index),
+		const refusals = await Promise.all(
+			allowed.map(entry => this.accountRefusal(provider, entry.index, options, memo)),
 		);
-		// A session restriction drops every other account before ranking, pins,
-		// and the fallback passes below, so none of them can route back to it.
-		const credentials = stored.filter(
-			entry => !limited.has(entry.index) && this.#deps.affinity.allows(provider, sessionId, entry.credential),
-		);
+		const limited = new Set(allowed.filter((_entry, at) => refusals[at] !== undefined).map(entry => entry.index));
+		const credentials = allowed.filter(entry => !limited.has(entry.index));
 		const limitedDrain = this.#noteLimitedDrain(provider, sessionId, options?.modelId, limited);
 
 		if (credentials.length === 0) return undefined;
@@ -1246,11 +1380,12 @@ export class CredentialSelector {
 		sessionId: string | undefined,
 		options: AuthApiKeyOptions | undefined,
 		exclusive: boolean,
+		memo?: AccountRefusals,
 	): Promise<OAuthResolutionResult | undefined> {
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (credential?.type !== "oauth" || !this.#deps.affinity.allows(provider, sessionId, credential))
 			return undefined;
-		const refusal = this.accountLimit(provider, index);
+		const refusal = await this.accountRefusal(provider, index, options, memo);
 		if (refusal) {
 			if (exclusive) {
 				throw new AIError.AccountLimitError(

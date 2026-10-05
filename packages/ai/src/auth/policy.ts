@@ -1,6 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { type LocalLimitIssue, parseLocalLimits } from "../usage/limits";
+import { isAccountEvidenceLimit, type LocalLimitIssue, parseAccountLimits } from "../usage/limits";
 import type {
 	AuthAccountPolicies,
 	AuthAccountSummary,
@@ -73,14 +73,23 @@ export function drainFundingIssue(
 }
 
 /**
- * The first problem with an account's `limits`: not a valid list of local limits, or a limit
- * with an `id` (account limits never share a counter).
+ * The first problem with an account's `limits`: not a valid list of account limits, a limit with
+ * an `id` (account limits never share a counter), or, on a stored API key (`apiKey`), a limit on
+ * provider evidence, which only OAuth accounts report.
  */
-export function accountLimitsIssue(limits: unknown, path: string): LocalLimitIssue | undefined {
-	const parsed = parseLocalLimits(limits, path);
+export function accountLimitsIssue(
+	limits: unknown,
+	path: string,
+	options: { apiKey?: boolean } = {},
+): LocalLimitIssue | undefined {
+	const parsed = parseAccountLimits(limits, path);
 	if (parsed.issues.length > 0) return parsed.issues[0];
-	const index = parsed.limits.findIndex(limit => limit.id !== undefined);
-	return index === -1 ? undefined : { path: `${path}[${index}].id`, message: "is not allowed on an account limit" };
+	const withId = parsed.limits.findIndex(limit => "id" in limit && limit.id !== undefined);
+	if (withId !== -1) return { path: `${path}[${withId}].id`, message: "is not allowed on an account limit" };
+	const evidence = options.apiKey ? parsed.limits.findIndex(isAccountEvidenceLimit) : -1;
+	return evidence === -1
+		? undefined
+		: { path: `${path}[${evidence}].metric`, message: "applies to OAuth accounts only" };
 }
 
 /**
@@ -106,7 +115,7 @@ export class AccountPolicies {
 		AccountPolicies.#validateAccountPolicyConfiguration(policies);
 		// Parsed again so `onLimit` defaults for embedders that pass limits untyped.
 		this.#accountPolicies = policies.map(policy =>
-			policy.limits ? { ...policy, limits: parseLocalLimits(policy.limits, "limits").limits } : policy,
+			policy.limits ? { ...policy, limits: parseAccountLimits(policy.limits, "limits").limits } : policy,
 		);
 		this.#defaultReservePct =
 			typeof defaultReservePct === "number" && Number.isFinite(defaultReservePct)
@@ -259,7 +268,9 @@ export class AccountPolicies {
 				AccountPolicies.#validateDrainFunding(policy, path);
 			}
 			if (policy.limits !== undefined) {
-				const issue = accountLimitsIssue(policy.limits, `${path}.limits`);
+				const issue = accountLimitsIssue(policy.limits, `${path}.limits`, {
+					apiKey: policy.account.keyFingerprint !== undefined,
+				});
 				if (issue) throw new AIError.ConfigurationError(`${issue.path} ${issue.message}`);
 			}
 		}

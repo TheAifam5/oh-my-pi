@@ -3,6 +3,7 @@ import {
 	localLimitCap,
 	localLimitWindowResetAt,
 	localLimitWindowStart,
+	parseAccountLimits,
 	parseLocalLimit,
 } from "@oh-my-pi/pi-ai/usage/limits";
 
@@ -46,5 +47,21 @@ describe("local limits", () => {
 				"l",
 			).issues.map(issue => issue.path),
 		).toEqual(["l", "l.max", "l.window.durationMs"]);
+	});
+
+	it("allows provider evidence metrics on account limits only, without a window", () => {
+		expect(
+			parseLocalLimit({ metric: "usage", max: 0.5, window: { type: "calendar", period: "day" } }, "l").issues,
+		).toEqual([{ path: "l.metric", message: "usage is only allowed on auth.accountPolicies limits" }]);
+		expect(
+			parseAccountLimits(
+				[
+					{ metric: "usage", max: 1.5 },
+					{ metric: "credits", max: 5 },
+					{ metric: "extra-usd", max: "20", window: { type: "calendar", period: "day" } },
+				],
+				"a",
+			).issues.map(issue => issue.path),
+		).toEqual(["a[0].max", "a[1].max", "a[2]"]);
 	});
 });

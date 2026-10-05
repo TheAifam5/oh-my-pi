@@ -14,6 +14,7 @@ import {
 	type BillingSourceState,
 	creditsFromDecimal,
 	knownBilling,
+	moneyFromDecimal,
 	unknownBilling,
 } from "@oh-my-pi/pi-ai/usage/billing";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
@@ -59,6 +60,8 @@ describe("AuthStorage account drain", () => {
 	const credits = new Map<string, string>();
 	/** Paid extra usage state by `accountId`. */
 	const money = new Map<string, BillingSourceState>();
+	/** Paid extra usage reported as used by `accountId`, in USD. */
+	const moneyUsed = new Map<string, string>();
 	let storage: AuthStorage;
 
 	/** Used fraction by `accountId`, or by `accountId/modelId` for a model-scoped window. */
@@ -79,7 +82,12 @@ describe("AuthStorage account drain", () => {
 		return {
 			provider: PROVIDER,
 			fetchedAt: Date.now(),
-			metadata: { accountId, credits: credits.get(accountId), money: money.get(accountId) },
+			metadata: {
+				accountId,
+				credits: credits.get(accountId),
+				money: money.get(accountId),
+				moneyUsed: moneyUsed.get(accountId),
+			},
 			limits,
 		};
 	}
@@ -90,6 +98,7 @@ describe("AuthStorage account drain", () => {
 		overage.clear();
 		credits.clear();
 		money.clear();
+		moneyUsed.clear();
 		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
 			const credential = credentials[provider];
 			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
@@ -116,22 +125,33 @@ describe("AuthStorage account drain", () => {
 	function installBilling(): void {
 		storage.usage.setBillingSource({
 			read: (_provider, usage) => {
-				if (usage.metadata?.credits === undefined && usage.metadata?.money === undefined) {
+				const { credits: creditMeta, money: moneyMeta, moneyUsed: usedMeta } = usage.metadata ?? {};
+				if (creditMeta === undefined && moneyMeta === undefined && usedMeta === undefined) {
 					return unknownBilling(usage, "no-evidence");
 				}
 				const balance = usage.metadata?.credits;
 				const remaining = typeof balance === "string" ? creditsFromDecimal(balance, "floor") : undefined;
 				const moneyState = usage.metadata?.money;
+				const spentUsd = usage.metadata?.moneyUsed;
+				const spent = typeof spentUsd === "string" ? moneyFromDecimal(spentUsd, "USD", "ceil") : undefined;
 				return knownBilling(usage, [
 					{ mode: "subscription-included", state: "unknown" },
 					{
 						mode: "prepaid-credits",
-						state: remaining ? (remaining.amountMinor > 0 ? "available" : "exhausted") : "unknown",
+						state:
+							balance === "exhausted"
+								? "exhausted"
+								: remaining
+									? remaining.amountMinor > 0
+										? "available"
+										: "exhausted"
+									: "unknown",
 						...(remaining ? { allowance: { kind: "credits" as const, remaining } } : {}),
 					},
 					{
 						mode: "paid-extra-usage",
 						state: typeof moneyState === "string" ? (moneyState as BillingSourceState) : "unknown",
+						...(spent ? { allowance: { kind: "money" as const, used: spent } } : {}),
 					},
 				]);
 			},
@@ -440,6 +460,155 @@ describe("AuthStorage account drain", () => {
 		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-a");
 	});
 
+	describe("account evidence limits", () => {
+		const unblock = { drain: false } as const;
+		const limited = (limits: unknown[], extra: Partial<AuthAccountPolicy> = {}) =>
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, limits: limits as AuthAccountPolicy["limits"], ...extra },
+					{ ...POLICIES[1]!, ...unblock },
+				],
+				defaultReservePct: 0,
+			});
+
+		beforeEach(() => {
+			installBilling();
+			storage.setAccountPolicies({
+				accountPolicies: [POLICIES[0]!, { ...POLICIES[1]!, ...unblock }],
+				defaultReservePct: 0,
+			});
+		});
+
+		test("holds an account back once its used fraction reaches the usage cap, never while unmeasured", async () => {
+			used.set("acc-b", 1);
+			limited([{ metric: "usage", max: 0.8 }], {});
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+			used.set("acc-b", 0.5);
+			used.set("acc-a", 0.79);
+			expect(await advance(MINUTE)).toBe("access-a");
+			used.set("acc-a", 0.82);
+			expect(await advance(MINUTE)).toBe("access-b");
+
+			const pinned = storage.sessions.accounts(PROVIDER).find(account => account.name === "cool");
+			expect(storage.sessions.pin(PROVIDER, SESSION, pinned?.credentialId ?? -1)).toBe(true);
+			await expect(storage.keys.get(PROVIDER, SESSION)).rejects.toBeInstanceOf(AIError.AccountLimitError);
+		});
+
+		test("gates credits and extra usage only once the plan allowance is spent", async () => {
+			used.set("acc-b", 1);
+			used.set("acc-a", 0.5);
+			credits.set("acc-a", "1");
+			limited([{ metric: "credits", max: "5" }]);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+			used.set("acc-a", 1);
+			overage.add("acc-a");
+			expect(await advance(MINUTE)).toBe("access-b");
+
+			credits.set("acc-a", "10");
+			expect(await advance(MINUTE)).toBe("access-a");
+
+			credits.delete("acc-a");
+			expect(await advance(MINUTE)).toBe("access-b");
+
+			moneyUsed.set("acc-a", "25");
+			limited([{ metric: "extra-usd", max: "20" }]);
+			expect(await advance(MINUTE)).toBe("access-b");
+			moneyUsed.set("acc-a", "10");
+			expect(await advance(MINUTE)).toBe("access-a");
+		});
+
+		test("refuses when every account is gated, but never for an account whose usage cannot be read", async () => {
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, limits: [{ metric: "credits", max: "5", onLimit: "skip" }] },
+					{ ...POLICIES[1]!, drain: false, limits: [{ metric: "credits", max: "5", onLimit: "skip" }] },
+				],
+				defaultReservePct: 0,
+			});
+			used.set("acc-a", 1);
+			used.set("acc-b", 1);
+			overage.add("acc-a");
+			overage.add("acc-b");
+			await expect(storage.keys.get(PROVIDER, SESSION)).rejects.toThrow("(limit usage could not be read)");
+
+			used.clear();
+			expect(await advance(MINUTE)).toMatch(/^access-/);
+		});
+
+		test("holds an account back at a used fraction equal to the cap, in the worst window for the requested model", async () => {
+			used.set("acc-b", 0.5);
+			used.set("acc-a", 0.1);
+			limited([{ metric: "usage", max: 0.1 }]);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+
+			limited([{ metric: "usage", max: 0.8 }]);
+			used.set("acc-a/x", 0.9);
+			expect(await advance(MINUTE, "x")).toBe("access-b");
+			expect(await storage.keys.get(PROVIDER, "session-model-y", { modelId: "y" })).toBe("access-a");
+		});
+
+		test("compares large credit floors exactly and treats spent classes without amounts as reached", async () => {
+			used.set("acc-b", 1);
+			used.set("acc-a", 1);
+			overage.add("acc-a");
+			credits.set("acc-a", "9000000");
+			limited([{ metric: "credits", max: "5000000" }]);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			limited([{ metric: "credits", max: "10000000" }]);
+			expect(await advance(MINUTE)).toBe("access-b");
+
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, limits: [{ metric: "credits", max: "5", onLimit: "skip" }] },
+					{ ...POLICIES[1]!, drain: false, limits: [{ metric: "extra-usd", max: "5", onLimit: "skip" }] },
+				],
+				defaultReservePct: 0,
+			});
+			overage.add("acc-b");
+			credits.set("acc-a", "exhausted");
+			money.set("acc-b", "disabled");
+			const error = await advance(MINUTE).then(
+				() => undefined,
+				(failure: unknown) => failure,
+			);
+			expect(error).toBeInstanceOf(AIError.AccountLimitError);
+			expect((error as AIError.AccountLimitError).reason).toBe("reached");
+		});
+
+		test("judges each account once per request, so a usage refresh between steps cannot reach the fallback key", async () => {
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, limits: [{ metric: "usage", max: 0.8, onLimit: "skip" }] },
+					{ ...POLICIES[1]!, drain: false, limits: [{ metric: "usage", max: 0.8, onLimit: "skip" }] },
+				],
+				defaultReservePct: 0,
+			});
+			storage.keys.setConfig(PROVIDER, "fallback-key", { fallback: true });
+			used.set("acc-a", 0.9);
+			let readsOfB = 0;
+			const service = storage.usage as unknown as {
+				report(provider: string, credential: { accountId?: string }): Promise<UsageReport | null>;
+			};
+			vi.spyOn(service, "report").mockImplementation(async (_provider, credential) => {
+				if (credential.accountId === "acc-b") used.set("acc-b", ++readsOfB === 1 ? 0.5 : 0.9);
+				return credential.accountId ? report(credential.accountId) : null;
+			});
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+		});
+
+		test("logs a reached warn limit once and keeps serving", async () => {
+			const warn = vi.spyOn(logger, "warn");
+			used.set("acc-a", 0.82);
+			used.set("acc-b", 0.5);
+			limited([{ metric: "usage", max: 0.8, onLimit: "warn" }]);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			expect(await advance(MINUTE)).toBe("access-a");
+			expect(warn.mock.calls.filter(([message]) => message === "Local account limit reached")).toHaveLength(1);
+		});
+	});
+
 	describe("account limits", () => {
 		const limited = new Set<string>();
 		const once = [
@@ -609,6 +778,15 @@ describe("AuthStorage account drain", () => {
 			"auth.accountPolicies[0].limits[0].id is not allowed on an account limit",
 		);
 		expect((await parse({ limits: [limit] })).accountPolicies[0]?.limits).toEqual([{ ...limit, onLimit: "skip" }]);
+		const usage = { metric: "usage", max: 0.9 } as const;
+		const onKey = { provider: PROVIDER, account: { keyFingerprint: "0123abcd" } };
+		expect(
+			() => new AuthStorage(store(), { accountPolicies: [{ ...onKey, limits: [{ ...usage, onLimit: "skip" }] }] }),
+		).toThrow("auth.accountPolicies[0].limits[0].metric applies to OAuth accounts only");
+		await expect(loadAuthAccountPolicyConfig({ accountPolicies: [{ ...onKey, limits: [usage] }] })).rejects.toThrow(
+			"auth.accountPolicies[0].limits[0].metric applies to OAuth accounts only",
+		);
+		expect((await parse({ limits: [usage] })).accountPolicies[0]?.limits).toEqual([{ ...usage, onLimit: "skip" }]);
 		await expect(parse({ drain: true, spend: ["credits"], returnWhen: ["money-available"] })).rejects.toThrow(
 			"auth.accountPolicies[0].returnWhen money-available requires spend to include money",
 		);

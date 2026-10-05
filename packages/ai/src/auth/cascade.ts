@@ -7,7 +7,7 @@ import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import type { AccountTarget, SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
-import type { CredentialSelector, OAuthResolutionResult } from "./select";
+import type { AccountRefusals, CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
 	AuthApiKeyOptions,
 	AuthCredential,
@@ -394,25 +394,51 @@ export class KeyCascade implements KeysApi {
 		// An exclusive pin (session, else project) is the only credential this session may use.
 		await this.#deps.pool.adoptExternalChanges();
 		const pinned = this.#deps.affinity.exclusivePin(provider, sessionId);
+		// One verdict per account for the whole resolution, so a usage refresh between steps cannot disagree.
+		const refusals: AccountRefusals = new Map();
 		if (pinned) {
-			const apiKey = await this.#resolveAccount(provider, sessionId, pinned, options, onCredentialId, true);
+			const apiKey = await this.#resolveAccount(
+				provider,
+				sessionId,
+				pinned,
+				options,
+				onCredentialId,
+				true,
+				refusals,
+			);
 			if (apiKey === undefined) throw new AIError.AccountUnavailableError(provider);
 			return apiKey;
 		}
 		// A pool member's account is tried first and falls through to normal selection when unusable.
 		const preferred = this.#deps.affinity.preferredAccount(provider, sessionId, options?.modelId);
 		if (preferred) {
-			const apiKey = await this.#resolveAccount(provider, sessionId, preferred, options, onCredentialId, false);
+			const apiKey = await this.#resolveAccount(
+				provider,
+				sessionId,
+				preferred,
+				options,
+				onCredentialId,
+				false,
+				refusals,
+			);
 			if (apiKey !== undefined) return apiKey;
 		}
 		// Then the pool's account order, each tried the same way.
 		for (const target of this.#deps.affinity.orderedAccounts(provider, sessionId, options?.modelId)) {
 			if (target.index === preferred?.index) continue;
-			const apiKey = await this.#resolveAccount(provider, sessionId, target, options, onCredentialId, false);
+			const apiKey = await this.#resolveAccount(
+				provider,
+				sessionId,
+				target,
+				options,
+				onCredentialId,
+				false,
+				refusals,
+			);
 			if (apiKey !== undefined) return apiKey;
 		}
 		// With every stored account over a local limit the request fails instead of reaching an env key.
-		this.#deps.selector.refuseIfAllLimited(provider, sessionId, options);
+		await this.#deps.selector.refuseIfAllLimited(provider, sessionId, options, refusals);
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
@@ -421,7 +447,7 @@ export class KeyCascade implements KeysApi {
 		let oauthResolved: OAuthResolutionResult | undefined;
 		let oauthRefreshFailure: AIError.OAuthRefreshUnavailableError | undefined;
 		try {
-			oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
+			oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options, refusals);
 		} catch (error) {
 			if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
 			oauthRefreshFailure = error;
@@ -501,6 +527,7 @@ export class KeyCascade implements KeysApi {
 		options: AuthApiKeyOptions | undefined,
 		onCredentialId: ((id: number, identity?: OAuthRequestIdentity) => void) | undefined,
 		exclusive: boolean,
+		refusals?: AccountRefusals,
 	): Promise<string | undefined> {
 		if (target.credential.type === "oauth") {
 			const resolved = await this.#deps.selector.resolveOneOAuth(
@@ -509,6 +536,7 @@ export class KeyCascade implements KeysApi {
 				sessionId,
 				options,
 				exclusive,
+				refusals,
 			);
 			if (!resolved) return undefined;
 			if (onCredentialId && resolved.credentialId !== undefined) {
