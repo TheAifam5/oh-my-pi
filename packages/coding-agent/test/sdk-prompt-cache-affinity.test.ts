@@ -162,3 +162,20 @@ it("keeps warmth across a branch and forgets it once compaction rewrites the pro
 	await current.compact();
 	expect(await pick("reviewer")).toBe(COLD);
 });
+
+it("forgets warmth once a shake rewrites the prompt history", async () => {
+	const { session: current, pick } = await startSession();
+	await turn(current, "first");
+	current.sessionManager.appendMessage({
+		role: "user",
+		content: [
+			{ type: "text", text: "look" },
+			{ type: "image", data: "iVBORw0KGgo", mimeType: "image/png" },
+		],
+		timestamp: Date.now(),
+	});
+	expect(await pick("engineer")).toBe(WARM);
+
+	expect((await current.shake("images")).imagesDropped).toBe(1);
+	expect(await pick("reviewer")).toBe(COLD);
+});

@@ -96,6 +96,11 @@ export class PromptCacheAffinity {
 		return tokens ? tokens.hits / tokens.prompt : undefined;
 	}
 
+	/** Forgets every model's warmth but keeps its hit rate, as when an in-place rewrite changes the sent prefix. */
+	clearWarmth(): void {
+		this.#entries.clear();
+	}
+
 	/** Forgets every model, as when the session's conversation is replaced or rewritten. */
 	clear(): void {
 		this.#entries.clear();
