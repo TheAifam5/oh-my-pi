@@ -10,10 +10,13 @@ import type { UsageScope } from "../session/usage-ledger";
 /** Key of the limits that apply to every call. */
 export const GLOBAL_LIMIT_KEY = "*";
 
-/** The calls a `limits` key covers, or `undefined` for a malformed key. */
+/** Prefix of a pool id (`role:<role>`, `chain:<key>`); a `limits` key may not take that form. */
+const POOL_ID_PREFIX = /^(?:role|chain):/;
+
+/** The calls a `limits` key covers, or `undefined` for a malformed key or one spelled as a pool id. */
 export function limitKeyScope(key: string): UsageScope | undefined {
 	if (key === GLOBAL_LIMIT_KEY) return {};
-	if (key.trim() !== key || key.length === 0) return undefined;
+	if (key.trim() !== key || key.length === 0 || POOL_ID_PREFIX.test(key)) return undefined;
 	const slash = key.indexOf("/");
 	if (slash === -1) return { provider: key };
 	const provider = key.slice(0, slash);
@@ -33,6 +36,9 @@ export function parseLimitsSetting(raw: unknown): Map<string, LocalLimit[]> {
 	if (raw === null || raw === undefined) return parsed;
 	if (!isRecord(raw)) throw new Error("limits must map provider/model, provider, or * to a list of limits");
 	for (const [key, value] of Object.entries(raw)) {
+		if (POOL_ID_PREFIX.test(key)) {
+			throw new Error(`limits key "${key}" names a pool; set pool limits in its routing.limits`);
+		}
 		if (!limitKeyScope(key)) throw new Error(`limits key "${key}" must be provider/model-id, provider, or *`);
 		const { limits, issues } = parseLocalLimits(value, `limits["${key}"]`);
 		const [issue] = issues;
