@@ -98,6 +98,25 @@ describe("background request usage", () => {
 		await expect(completeSimple(mock.model, context)).resolves.toMatchObject({ stopReason: "stop" });
 	});
 
+	it("records a cache-warming replay as usage but leaves it out of the cache ledger", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const mock = createMockModel({
+			handler: () => ({ content: ["."], usage: { input: 0, cacheRead: 1000, output: 1 } }),
+		});
+		teardowns.push(installStreamUsageObserver(Settings.isolated({}, { storage }), authStorage));
+
+		await completeSimple(mock.model, context, { cacheWarm: true });
+		await flushBackgroundUsage();
+		expect(storage.usageLedger.totals([{ provider: mock.model.provider }], 0).requests).toBe(1n);
+		const rate = () =>
+			storage.cacheLedger.cacheHitRate(mock.model.provider, mock.model.id, mock.model.baseUrl, 0, Date.now());
+		expect(rate()).toBeUndefined();
+
+		await completeSimple(mock.model, context);
+		await flushBackgroundUsage();
+		expect(rate()).toEqual({ rate: 1, samples: 1 });
+	});
+
 	it("records a side request under the account of the session that made it", async () => {
 		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
 		const mock = createMockModel({ handler: () => ({ content: ["btw"], usage: { input: 2, output: 1 } }) });

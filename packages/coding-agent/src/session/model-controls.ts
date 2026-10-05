@@ -83,6 +83,8 @@ export interface ModelControlsHost {
 	clearInheritedProviderPromptCacheKey(): void;
 	/** Whether `model`'s prompt cache is warm for this session at `nowMs`; absent: never. */
 	promptCacheWarm?(model: Model, nowMs: number): boolean;
+	/** Expected prompt-cache hit rate of `model` at `nowMs`, in [0, 1]; undefined or absent: unknown. */
+	cacheHitRate?(model: Model, nowMs: number): number | undefined;
 	magicKeywordEnabled(keyword: MagicKeywordId): boolean;
 	emit(event: AgentSessionEvent): void;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
@@ -122,6 +124,7 @@ export class ModelControls {
 			sessionId: () => host.sessionId(),
 			emitNotice: async message => host.emitNotice("warning", message, "model-role"),
 			promptCacheWarm: (model, nowMs) => host.promptCacheWarm?.(model, nowMs) ?? false,
+			cacheHitRate: (model, nowMs) => host.cacheHitRate?.(model, nowMs),
 		});
 		this.#scopedModels = options.scopedModels ?? [];
 		this.#serviceTierByFamily = options.serviceTierByFamily ?? {};

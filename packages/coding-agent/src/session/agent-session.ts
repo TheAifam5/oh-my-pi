@@ -1767,6 +1767,8 @@ export class AgentSession implements SettingsScope {
 			clearActiveRetryFallback: () => this.#recovery.clearActiveRetryFallback(),
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
 			promptCacheWarm: (model, nowMs) => this.#promptCacheAffinity.isWarm(model, nowMs),
+			cacheHitRate: (model, nowMs) =>
+				this.#promptCacheAffinity.cacheHitRate(model, nowMs, this.settings.getStorage()?.cacheLedger),
 			magicKeywordEnabled: keyword => this.#magicKeywordEnabled(keyword),
 			emit: event => this.#emit(event),
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -1787,7 +1789,7 @@ export class AgentSession implements SettingsScope {
 			const warmer = config.cacheWarmer;
 			warmer.onWarmed = (message, extensionOverride) => {
 				this.#recordCacheWarmUsage(message, extensionOverride);
-				this.#notePromptCacheUse(message);
+				this.#notePromptCacheUse(message, true);
 			};
 			warmer.onRefreshStart = refresh => void this.#emitSessionEvent({ type: "cache_warming_start", ...refresh });
 			warmer.onRefreshEnd = refresh => void this.#emitSessionEvent({ type: "cache_warming_end", ...refresh });
@@ -1821,6 +1823,8 @@ export class AgentSession implements SettingsScope {
 			promptSequence: () => this.#promptSequence,
 			sessionId: () => this.sessionId,
 			promptCacheWarm: (model, nowMs) => this.#promptCacheAffinity.isWarm(model, nowMs),
+			cacheHitRate: (model, nowMs) =>
+				this.#promptCacheAffinity.cacheHitRate(model, nowMs, this.settings.getStorage()?.cacheLedger),
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
@@ -5788,8 +5792,8 @@ export class AgentSession implements SettingsScope {
 		return 0;
 	}
 
-	/** Records the prompt-cache use of a response for pools with `routing.cache.affinity`. */
-	#notePromptCacheUse(message: AssistantMessage): void {
+	/** Records the prompt-cache use of a response for pools with `routing.cache` affinity or pricing. */
+	#notePromptCacheUse(message: AssistantMessage, cacheWarm = false): void {
 		const active = this.model;
 		const model =
 			active?.provider === message.provider && active.id === message.model
@@ -5802,7 +5806,7 @@ export class AgentSession implements SettingsScope {
 			});
 			return;
 		}
-		this.#promptCacheAffinity.observe(message, model, Date.now());
+		this.#promptCacheAffinity.observe(message, model, Date.now(), cacheWarm);
 	}
 
 	/** Persist a completed warm request as off-transcript usage so session totals include its cost. */

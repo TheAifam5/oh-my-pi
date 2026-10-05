@@ -561,6 +561,7 @@ export class CacheWarmer {
 		let stream: CacheWarmStream;
 		const replayOptions: SimpleStreamOptions = {
 			...run.options,
+			cacheWarm: true,
 			maxTokens: 1,
 			signal: AbortSignal.any([run.controller.signal, cutoff.signal]),
 		};

@@ -810,6 +810,11 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * installed {@link StreamUsageObserver} skips it.
 	 */
 	usageRecorded?: boolean;
+	/**
+	 * The request is a prompt-cache warming replay, whose cache reads are by design. Read only by the
+	 * installed {@link StreamUsageObserver}; never sent to the provider.
+	 */
+	cacheWarm?: boolean;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
 	/** Cursor exec handlers for local tool execution */

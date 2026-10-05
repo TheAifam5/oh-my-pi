@@ -3,7 +3,8 @@
  * memories, judgment, compaction and handoff, advisors, and other one-shot calls. Every
  * `streamSimple` request not marked `usageRecorded` is checked against the top-level `limits`
  * for its model (global, provider, and model keys; never pool limits) before it is sent, and
- * recorded in the usage and cache ledgers when it completes.
+ * recorded in the usage and cache ledgers when it completes; a `cacheWarm` replay only in the
+ * usage ledger.
  */
 import { getStreamUsageObserver, setStreamUsageObserver, type StreamUsageObserver } from "@oh-my-pi/pi-ai";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
@@ -68,7 +69,9 @@ export function installStreamUsageObserver(settings: Settings, authStorage: Auth
 		},
 		record(model, message, options) {
 			const storage = settings.getStorage();
-			const cacheEntry = storage ? cacheEntryOf(message, Date.now(), model.baseUrl) : undefined;
+			// A warming replay's cache reads are by design, so they would inflate the recorded hit rate.
+			const cacheEntry =
+				storage && !options?.cacheWarm ? cacheEntryOf(message, Date.now(), model.baseUrl) : undefined;
 			if (storage && cacheEntry) {
 				const cacheWrite = recordCacheEntry(storage.cacheLedger, cacheEntry)
 					.catch(error =>

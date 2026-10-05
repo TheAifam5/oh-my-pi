@@ -21,7 +21,7 @@ import {
 	rolePoolPolicyBlocked,
 } from "@oh-my-pi/pi-coding-agent/session/pool-selection";
 import { trackInFlightRequest } from "@oh-my-pi/pi-coding-agent/session/in-flight-requests";
-import { PromptCacheAffinity } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-affinity";
+import { LEDGER_HIT_RATE_TTL_MS, PromptCacheAffinity } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-affinity";
 import { resetRetryFallbackRoundRobinPositions } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -688,6 +688,183 @@ describe("model role pools", () => {
 			} finally {
 				AgentStorage.close();
 			}
+		});
+	});
+
+	describe("cache pricing", () => {
+		// Full price: CHEAP 2 < CACHED 3.5. At a 0.9 hit rate CACHED's input is 0.9 * 0.3 + 0.1 * 3 = 0.57, so 1.07.
+		const CHEAP: Model = { ...OPENAI, cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 } };
+		const CACHED: Model = { ...GOOGLE, cost: { input: 3, output: 0.5, cacheRead: 0.3, cacheWrite: 3 } };
+		const UNPRICED: Model = {
+			...ANTHROPIC,
+			cost: { input: Number.POSITIVE_INFINITY, output: 1, cacheRead: 0, cacheWrite: 0 },
+		};
+		const pricingPool = (pricing: boolean) =>
+			Settings.isolated({
+				modelRoles: { engineer: pool("cheapest", [UNPRICED, CHEAP, CACHED], { cache: { pricing } }) },
+			});
+
+		async function order(
+			settings: Settings,
+			cacheHitRate: RolePoolDeps["cacheHitRate"],
+			models: Model[] = [UNPRICED, CHEAP, CACHED],
+		): Promise<string[]> {
+			const resolution = await resolveRolePool(
+				"engineer",
+				deps(settings, { availableModels: () => models, cacheHitRate }),
+			);
+			if (resolution?.kind !== "picked") throw new Error("expected a pick");
+			return [resolution.pick.selector, ...resolution.pick.rest].map(selector => selector.raw);
+		}
+
+		function promptTokens(model: Model, input: number, cacheRead: number): AssistantMessage {
+			return {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input,
+					output: 10,
+					cacheRead,
+					cacheWrite: 0,
+					totalTokens: input + cacheRead + 10,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+		}
+
+		it("prices cached input at the ledger's hit rate only when pricing is on, keeping unpriced members last", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "cache-pricing-ledger.db"));
+			try {
+				const record = (model: Model, inputTokens: number, cacheReadTokens: number) =>
+					storage.cacheLedger.record({
+						atMs: Date.now() - 1000,
+						provider: model.provider,
+						model: model.id,
+						baseUrl: model.baseUrl,
+						inputTokens,
+						cacheReadTokens,
+						cacheWriteTokens: 0,
+					});
+				record(CACHED, 100, 900);
+				record(UNPRICED, 0, 1000);
+				const affinity = new PromptCacheAffinity();
+				const hitRate = (model: Model, nowMs: number) => affinity.cacheHitRate(model, nowMs, storage.cacheLedger);
+				expect(await order(pricingPool(true), hitRate)).toEqual([CACHED, CHEAP, UNPRICED].map(selectorOf));
+				expect(await order(pricingPool(false), hitRate)).toEqual([CHEAP, CACHED, UNPRICED].map(selectorOf));
+				// Without any recorded or observed calls a member keeps its full price.
+				expect(
+					await order(pricingPool(true), (model, nowMs) => affinity.cacheHitRate(model, nowMs, undefined)),
+				).toEqual([CHEAP, CACHED, UNPRICED].map(selectorOf));
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
+		it("prefers the ledger's rate, which already holds this session's turns, over one cold session sample", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "cache-pricing-session.db"));
+			try {
+				storage.cacheLedger.record({
+					atMs: Date.now() - 1000,
+					provider: CACHED.provider,
+					model: CACHED.id,
+					baseUrl: CACHED.baseUrl,
+					inputTokens: 100,
+					cacheReadTokens: 900,
+					cacheWriteTokens: 0,
+				});
+				const affinity = new PromptCacheAffinity();
+				affinity.observe(promptTokens(CACHED, 1000, 0), CACHED, Date.now());
+				expect(
+					await order(pricingPool(true), (model, nowMs) =>
+						affinity.cacheHitRate(model, nowMs, storage.cacheLedger),
+					),
+				).toEqual([CACHED, CHEAP, UNPRICED].map(selectorOf));
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
+		it("falls back to the session's own turns without ledger data, leaving cache-warming replays out", async () => {
+			const affinity = new PromptCacheAffinity();
+			const hitRate = (model: Model, nowMs: number) => affinity.cacheHitRate(model, nowMs, undefined);
+			// A cache-warming replay keeps the cache warm but is not a sample of the hit rate.
+			const warmable: Model = { ...CACHED, promptCache: { short: 300 } };
+			affinity.observe(promptTokens(CACHED, 0, 1000), warmable, Date.now(), true);
+			expect(affinity.isWarm(warmable, Date.now())).toBe(true);
+			expect(await order(pricingPool(true), hitRate)).toEqual([CHEAP, CACHED, UNPRICED].map(selectorOf));
+			affinity.observe(promptTokens(CACHED, 50, 450), CACHED, Date.now());
+			affinity.observe(promptTokens(CACHED, 50, 450), CACHED, Date.now());
+			expect(await order(pricingPool(true), hitRate)).toEqual([CACHED, CHEAP, UNPRICED].map(selectorOf));
+			affinity.clear();
+			expect(await order(pricingPool(true), hitRate)).toEqual([CHEAP, CACHED, UNPRICED].map(selectorOf));
+		});
+
+		it("reads the ledger once per member per 30 seconds, and again after the record is cleared", async () => {
+			let reads = 0;
+			const ledger = {
+				cacheHitRate: () => {
+					reads++;
+					return { rate: 0.9, samples: 1 };
+				},
+			};
+			const affinity = new PromptCacheAffinity();
+			const hitRate = (model: Model, nowMs: number) => affinity.cacheHitRate(model, nowMs, ledger);
+			const at = async (nowMs: number) =>
+				(
+					await resolveRolePool(
+						"engineer",
+						deps(pricingPool(true), {
+							availableModels: () => [UNPRICED, CHEAP, CACHED],
+							cacheHitRate: hitRate,
+							now: () => nowMs,
+						}),
+					)
+				)?.kind;
+			const T = 1_000_000;
+			// Every member has a cache-read price, so each is read once.
+			await at(T);
+			expect(reads).toBe(3);
+			await at(T + LEDGER_HIT_RATE_TTL_MS - 1);
+			expect(reads).toBe(3);
+			await at(T + LEDGER_HIT_RATE_TTL_MS);
+			expect(reads).toBe(6);
+			affinity.clear();
+			await at(T + LEDGER_HIT_RATE_TTL_MS);
+			expect(reads).toBe(9);
+		});
+
+		// CHEAP 2 < RIVAL 2.05; each rate would flip the two if it were used for the member it is given to.
+		const RIVAL: Model = { ...GOOGLE, cost: { input: 1.05, output: 1, cacheRead: 0.05, cacheWrite: 1 } };
+		it.each([
+			[Number.NaN, CHEAP],
+			[-0.1, CHEAP],
+			[1.5, RIVAL],
+		])("keeps full price for an out-of-range hit rate %p", async (rate, target) => {
+			const settings = Settings.isolated({
+				modelRoles: { engineer: pool("cheapest", [RIVAL, CHEAP], { cache: { pricing: true } }) },
+			});
+			const hitRate = (model: Model) => (model.provider === target.provider ? rate : undefined);
+			expect(await order(settings, hitRate, [RIVAL, CHEAP])).toEqual([CHEAP, RIVAL].map(selectorOf));
+		});
+
+		it("keeps full price for a member without a cache-read price and never picks a cheaper member that is cooling down", async () => {
+			const noCacheRead: Model = { ...CACHED, cost: { ...CACHED.cost, cacheRead: Number.NaN } };
+			expect(await order(pricingPool(true), () => 0.9, [UNPRICED, CHEAP, noCacheRead])).toEqual(
+				[CHEAP, CACHED, UNPRICED].map(selectorOf),
+			);
+
+			modelRegistry.suppressSelector(selectorOf(CACHED), Date.now() + 60_000);
+			const resolution = await resolveRolePool(
+				"engineer",
+				deps(pricingPool(true), { availableModels: () => [UNPRICED, CHEAP, CACHED], cacheHitRate: () => 0.9 }),
+			);
+			if (resolution?.kind !== "picked") throw new Error("expected a pick");
+			expect(resolution.pick.selector.raw).toBe(selectorOf(CHEAP));
 		});
 	});
 
