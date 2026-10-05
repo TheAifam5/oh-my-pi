@@ -805,6 +805,11 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	hideThinkingSummary?: boolean;
 	/** OpenAI Responses/Codex `text.verbosity` response detail level. */
 	textVerbosity?: "low" | "medium" | "high";
+	/**
+	 * The caller records this request's usage and enforces its local limits itself, so the
+	 * installed {@link StreamUsageObserver} skips it.
+	 */
+	usageRecorded?: boolean;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
 	/** Cursor exec handlers for local tool execution */
@@ -1650,4 +1655,15 @@ export interface AnthropicFallbackCreditHandle {
 	expiresAt: number;
 	/** The refused response's content, in `AssistantMessage` block form. */
 	refusedContent?: AssistantMessage["content"];
+}
+
+/**
+ * Host observer of `streamSimple` requests, for usage accounting outside the caller's own
+ * bookkeeping. `admit` runs synchronously before the request and returns a reason to refuse it;
+ * a refused request fails with that reason and never reaches the provider. `record` receives
+ * every completed result and must not throw.
+ */
+export interface StreamUsageObserver {
+	admit(model: Model, options: SimpleStreamOptions | undefined): string | undefined;
+	record(model: Model, message: AssistantMessage, options: SimpleStreamOptions | undefined): void;
 }

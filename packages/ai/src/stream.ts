@@ -65,6 +65,7 @@ import type {
 	OptionsForApi,
 	SimpleStreamOptions,
 	StreamOptions,
+	StreamUsageObserver,
 	ThinkingBudgets,
 	ToolChoice,
 } from "./types";
@@ -1231,7 +1232,67 @@ function withSupportedSamplingParams<T extends SamplingOptions>(model: Model<Api
 	return supported;
 }
 
+let streamUsageObserver: StreamUsageObserver | undefined;
+/** Whether a throwing `admit` has been logged; the request goes ahead regardless. */
+let warnedAdmitFailure = false;
+
+/** The installed {@link StreamUsageObserver}, if any. */
+export function getStreamUsageObserver(): StreamUsageObserver | undefined {
+	return streamUsageObserver;
+}
+
+/** Install (or with `undefined`, remove) the process-wide {@link StreamUsageObserver}. */
+export function setStreamUsageObserver(observer: StreamUsageObserver | undefined): void {
+	streamUsageObserver = observer;
+}
+
+/**
+ * Streams a request with the simplified options, through the installed
+ * {@link StreamUsageObserver} unless `options.usageRecorded` is set. A refusal from `admit` fails
+ * the stream with that reason, even for an already aborted signal; an `admit` that throws lets
+ * the request go ahead (logged once), so a broken observer never blocks requests. The request
+ * is marked `usageRecorded` once admitted, so a provider that delegates back to `streamSimple`
+ * is not observed twice. A throwing `record` is logged, never surfaced.
+ */
 export function streamSimple<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const observer = options?.usageRecorded ? undefined : streamUsageObserver;
+	if (!observer) return streamSimpleDirect(model, context, options);
+	let refusal: string | undefined;
+	try {
+		refusal = observer.admit(model, options);
+	} catch (error) {
+		if (!warnedAdmitFailure) {
+			warnedAdmitFailure = true;
+			logger.warn("Stream usage observer failed to admit a request; sending it anyway", { error: String(error) });
+		}
+	}
+	if (refusal !== undefined) {
+		const refused = new AssistantMessageEventStream();
+		refused.fail(new Error(refusal));
+		return refused;
+	}
+	const stream = streamSimpleDirect(model, context, { ...options, usageRecorded: true });
+	stream
+		.result()
+		.then(
+			message => {
+				try {
+					observer.record(model, message, options);
+				} catch (error) {
+					logger.warn("Stream usage observer failed to record a request", { error: String(error) });
+				}
+			},
+			() => {},
+		)
+		.catch(() => {});
+	return stream;
+}
+
+function streamSimpleDirect<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: SimpleStreamOptions,

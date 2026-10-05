@@ -19,6 +19,7 @@ import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types
 import type { SessionManager } from "./session-manager";
 
 import { cfgCompactionHandoffSaveToDisk } from "./context-settings";
+import { sideRequestSessionId } from "./request-session-ids";
 
 function createHandoffFileName(date = new Date()): string {
 	const fileTimestamp = date.toISOString().replace(/[:.]/g, "-");
@@ -160,7 +161,7 @@ export class SessionHandoff {
 			const handoffStreamOptions = this.#host.prepareSimpleStreamOptions(
 				{
 					apiKey: this.#host.modelRegistry.resolver(model, cacheSessionId),
-					sessionId: `${cacheSessionId}:side:${Snowflake.next()}`,
+					sessionId: sideRequestSessionId(cacheSessionId, Snowflake.next()),
 					promptCacheKey: handoffPromptCacheKey,
 					preferWebsockets: false,
 					serviceTier: this.#host.effectiveServiceTier(model),

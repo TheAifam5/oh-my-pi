@@ -521,6 +521,7 @@ import {
 	cfgToolsApproval,
 } from "../tools/settings";
 import { cfgTtsrJudge } from "../export/ttsr-settings";
+import { sideRequestSessionId } from "./request-session-ids";
 
 /** Advisor settings whose edit toggles or rebuilds a running advisor. */
 const cfgAdvisorRuntimeInputs = combine({
@@ -11747,9 +11748,10 @@ export class AgentSession implements SettingsScope {
 				// stable, but isolate provider routing from the main conversation.
 				// Serialized BTW follow-ups reuse a topic-specific lineage; standalone
 				// side requests retain their unique request lineage.
-				sessionId: args.conversationKey
-					? `${cacheSessionId}:side:conversation:${args.conversationKey}`
-					: `${cacheSessionId}:side:${Snowflake.next()}`,
+				sessionId: sideRequestSessionId(
+					cacheSessionId,
+					args.conversationKey ? `conversation:${args.conversationKey}` : Snowflake.next(),
+				),
 				promptCacheKey: this.agent.promptCacheKey ?? this.agent.sessionId,
 				preferWebsockets: this.preferWebsockets,
 				providerSessionState: this.#providerSessionState,

@@ -109,7 +109,7 @@ import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persist
 import { journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { SPEND_RETENTION_MS, type SpendEntry, type SpendLedger, usdToNanos } from "./spend-ledger";
-import { USAGE_RETENTION_MS, type UsageEntry } from "./usage-ledger";
+import { recordUsageEntry, usageEntryOf } from "./usage-ledger";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import {
 	describeLimitRefusal,
@@ -118,6 +118,7 @@ import {
 	type LimitEvaluation,
 	limitTargets,
 	limitWarningKey,
+	USAGE_PREFLIGHT_BLOCKED_PREFIX,
 } from "./local-limits";
 import { sanitizeNoticeLine } from "../utils/notice-text";
 
@@ -148,7 +149,6 @@ const SPEND_RECORD_RETRY_BASE_MS = 50;
 export const BUDGET_CHARGE_FLUSH_TIMEOUT_MS = 2_000;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
-const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
 const HTTP2_STREAM_RESET_ERROR_RE =
 	/stream closed with error code\s+nghttp2_(?:internal_error|refused_stream)|nghttp2_(?:internal_error|refused_stream)|HTTP2(?:StreamReset|RefusedStream)/i;
@@ -2185,10 +2185,9 @@ export class TurnRecovery {
 	 */
 	async #recordUsage(message: AssistantMessage, atMs: number): Promise<void> {
 		try {
-			const { input, output, cacheRead, cacheWrite, cost } = message.usage;
-			const validCost = usdToNanos(cost.total);
+			const validCost = usdToNanos(message.usage.cost.total);
 			const costNanos = validCost ?? 0;
-			if (input + output + cacheRead + cacheWrite <= 0 && costNanos === 0) return;
+			if (!usageEntryOf(message, atMs)) return;
 			const ledger = this.#host.settings.getStorage()?.usageLedger;
 			if (!ledger) return;
 			const model = this.#host.modelRegistry.find(message.provider, message.model);
@@ -2212,18 +2211,8 @@ export class TurnRecovery {
 					this.#warnUnpricedLimitModel(message);
 				}
 			}
-			const account = this.#servingAccount(message.provider);
-			const entry: UsageEntry = {
-				atMs,
-				provider: message.provider,
-				model: message.model,
-				...(account !== undefined ? { account } : {}),
-				...(pool !== undefined ? { pool } : {}),
-				costNanos,
-				inputTokens: input,
-				outputTokens: output,
-			};
-			await this.#writeWithRetry(() => ledger.record(entry, USAGE_RETENTION_MS));
+			const entry = usageEntryOf(message, atMs, { account: this.#servingAccount(message.provider), pool });
+			if (entry) await recordUsageEntry(ledger, entry);
 		} catch (error) {
 			logger.warn("Usage ledger could not record a model call", {
 				provider: message.provider,

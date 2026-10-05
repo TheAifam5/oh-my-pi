@@ -6,6 +6,7 @@ import { YAML } from "bun";
 import { expandAtImports } from "../discovery/at-imports";
 import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import { collectConfigCandidates } from "./watchdog";
+import { registerDerivedSessionId } from "../session/request-session-ids";
 
 import {
 	ADVISOR_SYNC_BACKLOG_MODES,
@@ -156,6 +157,7 @@ export function getOrCreateAdvisorProviderSessionId(
 		throw new Error("Advisor provider session id generator returned a non-UUIDv7 value");
 	}
 	ids.set(key, next);
+	registerDerivedSessionId(next, primarySessionId);
 	return next;
 }
 
