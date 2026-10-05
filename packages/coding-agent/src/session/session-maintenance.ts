@@ -489,6 +489,8 @@ export interface SessionMaintenanceHost {
 	rebaseAdvisorPrefix(reason: string): void;
 	rebaseAfterCompaction(): void;
 	recordAnchoredHistoryRewrite(tokensRemoved: number): void;
+	/** Forgets prompt-cache warmth, keeping hit rates, after a rewrite that changed the sent prefix. */
+	clearPromptCacheWarmth(): void;
 	getContextBreakdown(options?: {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
@@ -741,6 +743,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAdvisorPrefix("prune-tool-outputs");
+		this.#host.clearPromptCacheWarmth();
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;
@@ -791,6 +794,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAdvisorPrefix("prune-stale-tool-results");
+		this.#host.clearPromptCacheWarmth();
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;
@@ -876,6 +880,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.resetAdvisorRuntimes("drop-images");
+		this.#host.clearPromptCacheWarmth();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return { removed, tokensFreed };
 	}

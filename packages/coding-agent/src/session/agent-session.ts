@@ -2689,6 +2689,7 @@ export class AgentSession implements SettingsScope {
 				this.#stats.recordAnchoredHistoryRewrite(tokensRemoved);
 				this.#promptCacheAffinity.clear();
 			},
+			clearPromptCacheWarmth: () => this.#promptCacheAffinity.clearWarmth(),
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
