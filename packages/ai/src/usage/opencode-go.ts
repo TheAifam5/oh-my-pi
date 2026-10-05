@@ -11,11 +11,17 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { type ProviderBilling, subscriptionQuotaBilling } from "./billing";
 import { DAY_MS, HOUR_MS } from "./shared";
 
 const OPENCODE_GO_PROVIDER = "opencode-go";
 const DEFAULT_ENDPOINT = "https://opencode.ai/zen/go";
 const USAGE_PATH = "/v1/usage";
+
+/** Windows that bound the plan; an exhausted monthly window may still serve through the console "Use balance" fallback. */
+function opencodeGoPlanLimits(report: UsageReport): UsageLimit[] {
+	return report.limits.filter(limit => limit.id !== "monthly");
+}
 
 /**
  * `GET /zen/go/v1/usage` response windows. The route is first-party but
@@ -203,9 +209,12 @@ export const opencodeGoRankingStrategy: CredentialRankingStrategy = {
 		primary: report.limits.find(limit => limit.id === "rolling-5h"),
 		secondary: report.limits.find(limit => limit.id === "weekly"),
 	}),
-	scopeLimits: report => report.limits.filter(limit => limit.id !== "monthly"),
+	scopeLimits: opencodeGoPlanLimits,
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: 7 * DAY_MS,
 	},
 };
+
+/** OpenCode Go billing: the plan allowance from its rolling and weekly windows. */
+export const opencodeGoBilling: ProviderBilling = subscriptionQuotaBilling(OPENCODE_GO_PROVIDER, opencodeGoPlanLimits);

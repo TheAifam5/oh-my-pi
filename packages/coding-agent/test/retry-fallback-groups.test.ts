@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { type BillingResult, type BillingSource } from "@oh-my-pi/pi-ai";
+import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
+import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	fundingVerdict,
@@ -110,6 +114,68 @@ describe("group funding verdicts", () => {
 				spent(10_000_000_000n),
 			),
 		).toEqual({ kind: "funded", stage: 0, billingClass: "included" });
+	});
+});
+
+describe("group funding verdicts from provider billing readers", () => {
+	function billingOf(report: UsageReport): BillingResult {
+		const reader = defaultBillingReader(report.provider);
+		if (!reader) throw new Error(`no billing reader for ${report.provider}`);
+		return reader.readBilling(report);
+	}
+
+	it("keeps an OpenCode Go account whose only spent window is the monthly one", async () => {
+		const fetch = (async () =>
+			Response.json({
+				usage: {
+					rolling: { status: "ok", percent: 12, resetsAt: "2026-08-12T15:09:04.847Z" },
+					weekly: { status: "ok", percent: 8, resetsAt: "2026-08-17T00:00:00.847Z" },
+					monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-08-19T00:31:53.847Z" },
+				},
+			})) as unknown as FetchImpl;
+		const report = await opencodeGoUsageProvider.fetchUsage(
+			{ provider: "opencode-go", credential: { type: "api_key", apiKey: "sk-test" } },
+			{ fetch },
+		);
+		if (!report) throw new Error("fixture did not parse");
+		expect(fundingVerdict(["included"], [billingOf(report)])).toEqual({
+			kind: "funded",
+			stage: 0,
+			billingClass: "included",
+		});
+	});
+
+	it("falls back to SuperGrok on-demand usage only while it has headroom", () => {
+		const report = (onDemandUsed: number): UsageReport => {
+			const onDemandFraction = onDemandUsed / 50;
+			const limits: UsageLimit[] = [
+				{
+					id: "xai-oauth:credits:1w",
+					label: "SuperGrok Weekly Credits",
+					scope: { provider: "xai-oauth", windowId: "1w", shared: true },
+					amount: { used: 100, usedFraction: 1, unit: "percent" },
+					status: "exhausted",
+				},
+				{
+					id: "xai-oauth:on-demand",
+					label: "On-demand",
+					scope: { provider: "xai-oauth", shared: true },
+					amount: { used: onDemandUsed, limit: 50, usedFraction: onDemandFraction, unit: "unknown" },
+					status: onDemandFraction >= 1 ? "exhausted" : "ok",
+				},
+			];
+			return { provider: "xai-oauth", fetchedAt: NOW, limits };
+		};
+
+		expect(fundingVerdict(["included", "metered"], [billingOf(report(10))])).toEqual({
+			kind: "funded",
+			stage: 1,
+			billingClass: "metered",
+		});
+		expect(fundingVerdict(["included", "metered"], [billingOf(report(50))])).toEqual({
+			kind: "skipped",
+			reason: { kind: "exhausted" },
+		});
 	});
 });
 

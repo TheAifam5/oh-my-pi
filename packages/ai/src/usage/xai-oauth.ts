@@ -28,6 +28,14 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import {
+	type BillingSource,
+	knownBilling,
+	type ProviderBilling,
+	sourceStateFromLimit,
+	subscriptionStateFromLimits,
+	unknownBilling,
+} from "./billing";
 import { DAY_MS, HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const PROVIDER_ID = "xai-oauth";
@@ -481,5 +489,26 @@ export const xaiOauthRankingStrategy: CredentialRankingStrategy = {
 		// Inert: findWindowLimits never reports a primary window.
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: WEEK_MS,
+	},
+};
+
+const XAI_PLAN_LIMIT_IDS: readonly string[] = [`${PROVIDER_ID}:credits:1w`, `${PROVIDER_ID}:included:1mo`];
+const XAI_ON_DEMAND_LIMIT_ID = `${PROVIDER_ID}:on-demand`;
+
+/**
+ * SuperGrok billing: the plan allowance, read from the overall weekly or
+ * monthly window only, then on-demand usage when the account has a positive
+ * on-demand cap. Per-product rows do not bound the plan as a whole. xAI does
+ * not label the on-demand unit, so that source carries no allowance.
+ */
+export const xaiOauthBilling: ProviderBilling = {
+	id: PROVIDER_ID,
+	readBilling(report) {
+		const sources: BillingSource[] = [];
+		const plan = report.limits.filter(limit => XAI_PLAN_LIMIT_IDS.includes(limit.id));
+		if (plan.length > 0) sources.push({ mode: "subscription-included", state: subscriptionStateFromLimits(plan) });
+		const onDemand = report.limits.find(limit => limit.id === XAI_ON_DEMAND_LIMIT_ID);
+		if (onDemand) sources.push({ mode: "paid-extra-usage", state: sourceStateFromLimit(onDemand, undefined) });
+		return sources.length > 0 ? knownBilling(report, sources) : unknownBilling(report, "no-evidence");
 	},
 };

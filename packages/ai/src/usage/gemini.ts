@@ -9,6 +9,7 @@ import type {
 	UsageReport,
 	UsageWindow,
 } from "../usage";
+import { type BillingMode, knownBilling, type ProviderBilling, unknownBilling } from "./billing";
 import { parseIsoTimestamp } from "./shared";
 
 // (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
@@ -225,5 +226,27 @@ export const googleGeminiCliUsageProvider: UsageProvider = {
 		};
 
 		return report;
+	},
+};
+
+/** Code Assist tiers by `loadCodeAssist` `currentTier.id`; legacy and unlisted tiers carry no billing evidence. */
+const GEMINI_TIER_BILLING_MODES: Readonly<Record<string, BillingMode>> = {
+	"free-tier": "free",
+	"standard-tier": "subscription-included",
+};
+
+/**
+ * Gemini CLI billing: the Code Assist tier. Quota buckets are per model and
+ * carry no status, so the source state is `unknown`.
+ */
+export const googleGeminiCliBilling: ProviderBilling = {
+	id: "google-gemini-cli",
+	readBilling(report) {
+		const tierId = report.metadata?.currentTierId;
+		const mode =
+			typeof tierId === "string" && Object.hasOwn(GEMINI_TIER_BILLING_MODES, tierId)
+				? GEMINI_TIER_BILLING_MODES[tierId]
+				: undefined;
+		return mode ? knownBilling(report, [{ mode, state: "unknown" }]) : unknownBilling(report, "no-evidence");
 	},
 };

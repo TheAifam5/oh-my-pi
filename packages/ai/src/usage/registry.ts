@@ -2,7 +2,7 @@ import type { Provider } from "../types";
 import type { CredentialRankingStrategy, UsageProvider } from "../usage";
 import { aimlapiBilling, aimlapiUsageProvider } from "./aimlapi";
 import { alibabaTokenPlanRankingStrategy, alibabaTokenPlanUsageProvider } from "./alibaba-token-plan";
-import { type ProviderBilling, ProviderBillingRegistry } from "./billing";
+import { noEvidenceBilling, type ProviderBilling, ProviderBillingRegistry, subscriptionQuotaBilling } from "./billing";
 import { charmHyperBilling, charmHyperUsageProvider } from "./charm-hyper";
 import { claudeBilling, claudeRankingStrategy, claudeUsageProvider } from "./claude";
 import { clinePassUsageProvider } from "./cline-pass";
@@ -12,10 +12,10 @@ import { deepinfraBilling, deepinfraUsageProvider } from "./deepinfra";
 import { deepseekBilling, deepseekUsageProvider } from "./deepseek";
 import { devinBilling, devinUsageProvider } from "./devin";
 import { factoryDroidBilling, factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
-import { googleGeminiCliUsageProvider } from "./gemini";
+import { googleGeminiCliBilling, googleGeminiCliUsageProvider } from "./gemini";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "./github-copilot";
 import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
-import { kimiRankingStrategy, kimiUsageProvider } from "./kimi";
+import { kimiBilling, kimiRankingStrategy, kimiUsageProvider } from "./kimi";
 import { museCodeUsageProvider } from "./muse-code";
 import { minimaxCodeUsageProvider } from "./minimax-code";
 import { moonshotBilling, moonshotUsageProvider } from "./moonshot";
@@ -23,15 +23,15 @@ import { nanogptBilling, nanogptUsageProvider } from "./nanogpt";
 import { novitaBilling, novitaUsageProvider } from "./novita";
 import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
-import { opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
+import { opencodeGoBilling, opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
 import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
 import { siliconflowBilling, siliconflowUsageProvider } from "./siliconflow";
 import { syntheticBilling, syntheticUsageProvider } from "./synthetic";
 import { umansUsageProvider } from "./umans";
 import { veniceBilling, veniceUsageProvider } from "./venice";
 import { vercelAiGatewayBilling, vercelAiGatewayUsageProvider } from "./vercel-ai-gateway";
-import { xaiOauthRankingStrategy, xaiOauthUsageProvider } from "./xai-oauth";
-import { zaiRankingStrategy, zaiUsageProvider } from "./zai";
+import { xaiOauthBilling, xaiOauthRankingStrategy, xaiOauthUsageProvider } from "./xai-oauth";
+import { zaiBilling, zaiRankingStrategy, zaiUsageProvider } from "./zai";
 
 /** Resolves the usage-based ranking strategy for a provider. */
 export type RankingStrategyResolver = (provider: Provider) => CredentialRankingStrategy | undefined;
@@ -100,7 +100,10 @@ export function defaultRankingStrategy(provider: Provider): CredentialRankingStr
 	return DEFAULT_RANKING_STRATEGIES.get(provider);
 }
 
-/** Built-in billing readers, one per provider whose usage reports carry billing evidence. */
+/**
+ * Built-in billing readers, at most one per provider. Readers of providers
+ * whose usage reports carry no billing fields answer `no-evidence`.
+ */
 export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	claudeBilling,
 	codexBilling,
@@ -121,6 +124,18 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	veniceBilling,
 	siliconflowBilling,
 	deepinfraBilling,
+	zaiBilling,
+	xaiOauthBilling,
+	kimiBilling,
+	opencodeGoBilling,
+	googleGeminiCliBilling,
+	subscriptionQuotaBilling("minimax-code"),
+	subscriptionQuotaBilling("muse-code"),
+	subscriptionQuotaBilling("alibaba-token-plan"),
+	subscriptionQuotaBilling("cline-pass"),
+	noEvidenceBilling("umans"),
+	noEvidenceBilling("ollama"),
+	noEvidenceBilling("ollama-cloud"),
 ];
 
 const DEFAULT_BILLING_READER_MAP = new Map<Provider, ProviderBilling>(

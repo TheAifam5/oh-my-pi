@@ -272,12 +272,12 @@ export function meteredSpendingRefusal(
  * draw on wins.
  *
  * Source-state contract: an `included` or `free` source counts unless it is `exhausted` or
- * `disabled`, so its `unknown` state is usable (subscription windows are model-scoped and their
- * exhaustion is judged by quota ranking, see `BillingSourceState`). A `metered` source counts only
- * when reported `available`, since an unknown state is not authorization to spend.
- * Results that are all `unknown`, or `unavailable` reports, skip the candidate: missing evidence
- * is never read as free. A usable metered source is further gated by `spending`
- * ({@link meteredSpendingRefusal}).
+ * `disabled`, so its `unknown` state is usable (readers report a subscription `exhausted` only from
+ * account-wide windows; model-scoped exhaustion is judged by quota ranking, see `BillingSourceState`).
+ * A `metered` source counts only when reported `available`, since an unknown state is not
+ * authorization to spend. Results that are all `unknown`, or `unavailable` reports, skip the
+ * candidate: missing evidence is never read as free. A usable metered source is further gated by
+ * `spending` ({@link meteredSpendingRefusal}).
  */
 export function fundingVerdict(
 	funding: readonly BillingClass[],
