@@ -12,6 +12,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as modelHubModule from "@oh-my-pi/pi-tui/overlays/model-hub";
+import * as modelPickerModule from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -77,6 +78,29 @@ describe("SelectorController model hub writes", () => {
 		if (!callbacks) throw new Error("model hub was not opened");
 		return callbacks;
 	}
+
+	it("gives the /models hub billing from the session's held reports, and the session-only picker none", () => {
+		const settings = Settings.isolated();
+		const { controller } = start(settings, model("claude-sonnet-4-5"));
+		let hubSource: modelHubModule.ModelHubSource | undefined;
+		vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (...args: unknown[]) {
+			hubSource = args[1] as modelHubModule.ModelHubSource;
+			return { refreshAfterExternalMutation: () => {}, dispose: () => {} };
+		} as never);
+		let pickerSource: modelHubModule.ModelHubSource | undefined;
+		vi.spyOn(modelPickerModule, "ModelPickerComponent").mockImplementation(function (...args: unknown[]) {
+			pickerSource = args[1] as modelHubModule.ModelHubSource;
+			return { dispose: () => {} };
+		} as never);
+
+		controller.showModelSelector();
+		controller.showModelSelector({ temporaryOnly: true });
+
+		// No poll has run yet, so the anthropic reader has no report to read.
+		expect(hubSource?.billingFor?.("anthropic/claude-sonnet-4-5")).toBe("unknown (no-report)");
+		expect(pickerSource).toBeDefined();
+		expect(pickerSource?.billingFor).toBeUndefined();
+	});
 
 	it("saves only the edited fallback chain, never the chains a --config overlay supplies", async () => {
 		const agentDir = tempDir.join("agent");

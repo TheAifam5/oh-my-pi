@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { TspPickerGroup, TspPickerProps } from "@oh-my-pi/pi-wire";
@@ -482,4 +482,89 @@ test("shows a non-default service tier's own speed aggregate", () => {
 	expect(speed("anthropic/claude-opus-5")).toBe("40");
 	// Only a tier aggregate exists: show it rather than nothing.
 	expect(speed("openai/gpt-5.6-mini")).toBe("90 priority");
+});
+
+describe("model hub billing", () => {
+	const pools = {
+		roles: {
+			smol: {
+				source: { kind: "inline" },
+				strategy: "random",
+				members: [{ alias: "gpt", model: "openai/gpt-5.6" }],
+				funding: [],
+			},
+		},
+	} satisfies { roles: Record<string, ModelHubPool> };
+
+	/** A roles-scoped hub whose host answers billing through `billing`, recording each lookup. */
+	function billingHub(billing: ((model: string) => string | undefined) | undefined, revision: { value: unknown }) {
+		const asked: string[] = [];
+		const hub = new ModelHubComponent(
+			ui,
+			{
+				...source({ default: "demo/demo" }, [], pools),
+				get billingRevision() {
+					return revision.value;
+				},
+				billingFor: billing
+					? model => {
+							asked.push(model);
+							return billing(model);
+						}
+					: undefined,
+			},
+			registry(MODELS),
+			MODELS.map(entry => ({ model: entry })),
+			{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+		);
+		hubs.push(hub);
+		hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+		return { hub, asked };
+	}
+
+	const byProvider = (model: string) => (model.startsWith("openai/") ? "metered available\n$1.00" : "free unknown");
+
+	test("role and fallback rows carry billing in a Billing column that only appears when a row has billing", () => {
+		const { hub } = billingHub(byProvider, { value: 1 });
+		const p = props(hub.describe(withPicker));
+		const item = (id: string) => p.items?.find(entry => entry.id === id);
+		expect(item("role:default")?.facts).toEqual({ model: "demo/demo", thinking: "off", billing: "free unknown" });
+		// The host text is sanitized onto one line.
+		expect(item("fallback:default:0")?.facts).toEqual({ billing: "metered available $1.00" });
+		expect(p.columns?.map(column => column.id)).toEqual(["model", "thinking", "billing"]);
+
+		const none = billingHub(() => undefined, { value: 1 }).hub;
+		expect(props(none.describe(withPicker)).columns?.map(column => column.id)).toEqual(["model", "thinking"]);
+	});
+
+	test("a pool member row and the role preview show the member's and the role's billing", () => {
+		const { hub } = billingHub(byProvider, { value: 1 });
+		const root = hub.describe(withPicker);
+		expect(props(root).items?.find(entry => entry.id === "member:role:smol:gpt")?.facts?.thinking).toBe(
+			"billing metered available $1.00",
+		);
+		// The selected role row is `default`; its preview lists a Billing row.
+		const kvItems = (root.c ?? []).flatMap(child => (prop(child, "items") as { k: unknown; v: unknown }[]) ?? []);
+		const billingRow = kvItems.find(entry => JSON.stringify(entry.k).includes("Billing"));
+		expect(billingRow?.v).toBe("free unknown");
+	});
+
+	test("billing is read once per model until the rows rebuild or the billing revision changes", () => {
+		const revision = { value: 1 as unknown };
+		const { hub, asked } = billingHub(byProvider, revision);
+		const gptLookups = () => asked.filter(model => model === "openai/gpt-5.6").length;
+		hub.describe(withPicker);
+		hub.handleNativeEvent({ type: "select", key: "", item: "member:role:smol:gpt" });
+		hub.describe(withPicker);
+		expect(gptLookups()).toBe(1);
+
+		hub.handleNativeEvent({ type: "action", key: "", act: "tab", value: "chat", mods: [] });
+		hub.describe(withPicker);
+		expect(gptLookups()).toBe(2);
+
+		// A new poll (revision) refreshes an open hub without any navigation.
+		revision.value = 2;
+		hub.describe(withPicker);
+		expect(gptLookups()).toBe(3);
+	});
 });

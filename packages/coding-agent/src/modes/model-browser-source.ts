@@ -1,5 +1,12 @@
 import { type Model, resolveModelServiceTier, type ServiceTier, shouldSendServiceTier } from "@oh-my-pi/pi-ai";
+import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import {
+	type BillingAllowance,
+	type BillingUnknownReason,
+	currencyMinorUnitExponent,
+} from "@oh-my-pi/pi-ai/usage/billing";
 import type { ModelHubPool, ModelHubPoolTarget, ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { isModelGroupForm, type ModelGroup, ModelGroupConfigError, roleAcceptsGroups } from "../config/model-groups";
 import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
@@ -15,7 +22,12 @@ import {
 	cfgModelRoleStorage,
 } from "../config/model-settings";
 import { poolLimitsSummary } from "../session/local-limits";
-import { chainPoolId, rolePoolId } from "../session/retry-fallback-groups";
+import {
+	chainPoolId,
+	DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS,
+	providerBillingResults,
+	rolePoolId,
+} from "../session/retry-fallback-groups";
 import {
 	cfgDefaultThinkingLevel,
 	cfgRetryFallbackChains,
@@ -24,18 +36,39 @@ import {
 	cfgTierOpenai,
 } from "../session/settings";
 
+/** Optional host data for {@link createModelBrowserSource}. */
+export interface ModelBrowserSourceOptions {
+	/**
+	 * Usage reports already held by the session, read on every billing lookup; it must not fetch.
+	 * Without it the source reports no billing.
+	 */
+	usageReports?: () => readonly UsageReport[] | undefined;
+}
+
 /**
  * Supply live model-overlay preferences and runtime resolution from the host.
  * @param settings - Settings backing preferences, roles, and model perf
  * @param sessionServiceTier - The live session's effective tier for a model
  *   (`/fast`, `/fast ultra`, `/slow`, resumed tiers). Omit only where no session
  *   exists; the configured `tier.*` settings stand in then.
+ * @param options - Optional host data such as the session's usage reports
  */
 export function createModelBrowserSource(
 	settings: Settings,
 	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
+	options: ModelBrowserSourceOptions = {},
 ): ModelHubSource {
+	const { usageReports } = options;
 	return {
+		get billingRevision() {
+			return usageReports?.();
+		},
+		billingFor: usageReports
+			? (model: string) => {
+					const parsed = parseModelString(model);
+					return parsed ? billingSummary(parsed.provider, usageReports(), Date.now()) : undefined;
+				}
+			: undefined,
 		get revision() {
 			return settings.revision;
 		},
@@ -168,6 +201,61 @@ function withPoolLimits(
 	const poolId = target.kind === "role" ? rolePoolId(target.key) : chainPoolId(target.key);
 	const limits = poolLimitsSummary(settings, poolId, settings.getStorage()?.usageLedger, Date.now());
 	return limits ? { ...pool, limits } : pool;
+}
+
+/** `amountMinor * 10^-exponent` as an exact decimal string. */
+function decimalText(amountMinor: number, exponent: number): string {
+	const digits = Math.abs(amountMinor)
+		.toString()
+		.padStart(exponent + 1, "0");
+	const text = exponent === 0 ? digits : `${digits.slice(0, -exponent)}.${digits.slice(-exponent)}`;
+	return amountMinor < 0 ? `-${text}` : text;
+}
+
+/** What remains of `allowance` as display text (`$12.30`, `-$0.50`, `12.30 EUR`, `489.25 credits`, `uncapped`). */
+function remainingText(allowance: BillingAllowance | undefined): string | undefined {
+	if (!allowance) return undefined;
+	if (allowance.uncapped) return "uncapped";
+	if (allowance.kind === "credits") {
+		const credits = allowance.remaining;
+		return credits ? `${decimalText(credits.amountMinor, credits.exponent)} credits` : undefined;
+	}
+	const money = allowance.remaining;
+	if (!money) return undefined;
+	const exponent = currencyMinorUnitExponent(money.currency);
+	// Without the ISO exponent the minor-unit count is still exact, so show it as such.
+	if (exponent === undefined) return `${money.amountMinor} ${money.currency} minor units`;
+	if (money.currency !== "USD") return `${decimalText(money.amountMinor, exponent)} ${money.currency}`;
+	const sign = money.amountMinor < 0 ? "-" : "";
+	return `${sign}$${decimalText(Math.abs(money.amountMinor), exponent)}`;
+}
+
+/**
+ * Compact billing state of `provider` from `reports` (the session's last polled usage reports):
+ * each funding source of every account with known evidence as `mode state [remaining]`,
+ * deduplicated, then `(+N unknown)` for the accounts without it; or `unknown (reason)` when no
+ * account has evidence. Evidence older than the pool funding bound
+ * ({@link DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS}) counts as unknown (`stale`).
+ */
+export function billingSummary(provider: string, reports: readonly UsageReport[] | undefined, nowMs: number): string {
+	const results = providerBillingResults(provider, reports ?? [], nowMs, DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS);
+	const parts = new Set<string>();
+	let unknownCount = 0;
+	let firstUnknown: BillingUnknownReason | undefined;
+	for (const result of results) {
+		if (result.status === "unknown") {
+			unknownCount++;
+			firstUnknown ??= result.reason;
+			continue;
+		}
+		for (const source of result.snapshot.sources) {
+			const remaining = remainingText(source.allowance);
+			parts.add(`${source.mode} ${source.state}${remaining ? ` ${remaining}` : ""}`);
+		}
+	}
+	if (parts.size === 0) return firstUnknown ? `unknown (${firstUnknown})` : "unknown";
+	const known = [...parts].join(", ");
+	return unknownCount > 0 ? `${known} (+${unknownCount} unknown)` : known;
 }
 
 /**

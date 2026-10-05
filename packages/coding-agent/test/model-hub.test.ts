@@ -1,4 +1,4 @@
-import { createModelBrowserSource, writeModelHubPool } from "../src/modes/model-browser-source";
+import { billingSummary, createModelBrowserSource, writeModelHubPool } from "../src/modes/model-browser-source";
 import { afterEach, beforeAll, describe, expect, type Mock, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -6,6 +6,9 @@ import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { knownBilling } from "@oh-my-pi/pi-ai/usage/billing";
+import { parseClaudeUsagePayload } from "@oh-my-pi/pi-ai/usage/claude";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
@@ -23,6 +26,7 @@ import type { TUI } from "@oh-my-pi/pi-tui";
 
 import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -119,6 +123,8 @@ function createHub(options: {
 	hub?: ModelHubOptions;
 	callbacks?: Partial<ModelHubCallbacks>;
 	terminalRows?: number;
+	/** Usage reports the session holds; omitted means the host wires no billing. */
+	usageReports?: () => readonly UsageReport[] | undefined;
 }): HubHarness {
 	installTestTheme();
 	const modelsFn = typeof options.models === "function" ? options.models : () => options.models as Model[];
@@ -141,7 +147,7 @@ function createHub(options: {
 	});
 	const hub = new ModelHubComponent(
 		ui,
-		createModelBrowserSource(settings),
+		createModelBrowserSource(settings, undefined, options.usageReports ? { usageReports: options.usageReports } : {}),
 		registry,
 		options.scoped ? modelsFn().map(model => ({ model })) : [],
 		{
@@ -1278,6 +1284,180 @@ describe("ModelHub", () => {
 			if (spec?.kind !== "group") throw new Error(`smol is not a pool: ${spec?.kind}`);
 			return spec.group;
 		}
+
+		/** A Charm Hyper prepaid balance report fetched at `fetchedAt`. */
+		function hyperReport(remaining: number, unit: "usd" | "credits", fetchedAt: number): UsageReport {
+			return {
+				provider: "charm-hyper",
+				fetchedAt,
+				limits: [
+					{
+						id: "charm-hyper:credits",
+						label: "Credit balance",
+						scope: { provider: "charm-hyper", windowId: "balance", shared: true },
+						amount: { remaining, unit },
+					},
+				],
+			};
+		}
+
+		test("the billing summary names each source state, remaining amount, and unknown reason", () => {
+			const now = 10_000_000;
+			const copilot: UsageReport = {
+				provider: "github-copilot",
+				fetchedAt: now,
+				limits: [],
+				metadata: { plan: "individual", premiumOveragePermitted: true },
+			};
+			expect(billingSummary("charm-hyper", [hyperReport(12.3, "usd", now)], now)).toBe(
+				"prepaid-credits available $12.30",
+			);
+			expect(billingSummary("charm-hyper", [hyperReport(0, "credits", now)], now)).toBe(
+				"prepaid-credits exhausted 0 credits",
+			);
+			expect(billingSummary("charm-hyper", [hyperReport(0.05, "usd", now)], now)).toBe(
+				"prepaid-credits available $0.05",
+			);
+			expect(billingSummary("github-copilot", [copilot], now)).toBe(
+				"subscription-included unknown, paid-extra-usage available",
+			);
+			// Two accounts reporting the same balance show it once.
+			expect(
+				billingSummary(
+					"charm-hyper",
+					[hyperReport(489.25, "credits", now), hyperReport(489.25, "credits", now)],
+					now,
+				),
+			).toBe("prepaid-credits available 489.25 credits");
+			expect(billingSummary("charm-hyper", [], now)).toBe("unknown (no-report)");
+			expect(billingSummary("charm-hyper", undefined, now)).toBe("unknown (no-report)");
+			expect(billingSummary("test", [], now)).toBe("unknown (no-reader)");
+			expect(billingSummary("charm-hyper", [hyperReport(5, "usd", now - 16 * 60_000)], now)).toBe("unknown (stale)");
+		});
+
+		test("the billing summary formats amounts exactly per currency, sign, and cap", () => {
+			const now = 10_000_000;
+			const window = { five_hour: { utilization: 12, resets_at: "2099-01-01T00:00:00Z" } };
+			const claude = (spend: Record<string, unknown>) => {
+				const report = parseClaudeUsagePayload(
+					{ ...window, spend: { enabled: true, ...spend } },
+					{},
+					undefined,
+					now,
+				);
+				if (!report) throw new Error("fixture did not parse");
+				return billingSummary("anthropic", [report], now);
+			};
+			expect(claude({ used: { amount_minor: 4200, exponent: 2, currency: "USD" }, limit: null })).toBe(
+				"subscription-included unknown, paid-extra-usage available uncapped",
+			);
+			expect(billingSummary("charm-hyper", [hyperReport(-0.5, "usd", now)], now)).toBe(
+				"prepaid-credits exhausted -$0.50",
+			);
+			// No bundled reader reports a non-USD balance, so a test reader supplies one per currency.
+			const moneyIn = (amountMinor: number, currency: string) => {
+				const unregister = retryFallbackBillingRegistry.register({
+					id: "test",
+					readBilling: report =>
+						knownBilling(report, [
+							{
+								mode: "prepaid-credits",
+								state: "available",
+								allowance: { kind: "money", remaining: { amountMinor, currency } },
+							},
+						]),
+				});
+				try {
+					return billingSummary("test", [{ provider: "test", fetchedAt: now, limits: [] }], now);
+				} finally {
+					unregister();
+				}
+			};
+			expect(moneyIn(1000, "JPY")).toBe("prepaid-credits available 1000 JPY");
+			expect(moneyIn(3766, "BHD")).toBe("prepaid-credits available 3.766 BHD");
+			expect(moneyIn(-50, "EUR")).toBe("prepaid-credits available -0.50 EUR");
+			expect(moneyIn(1234, "ZZZ")).toBe("prepaid-credits available 1234 ZZZ minor units");
+		});
+
+		test("the billing summary lists each account's balance and counts accounts without evidence", () => {
+			const now = 10_000_000;
+			expect(billingSummary("charm-hyper", [hyperReport(12.3, "usd", now), hyperReport(5, "usd", now)], now)).toBe(
+				"prepaid-credits available $12.30, prepaid-credits available $5.00",
+			);
+			expect(
+				billingSummary(
+					"charm-hyper",
+					[hyperReport(12.3, "usd", now), hyperReport(5, "usd", now - 16 * 60_000)],
+					now,
+				),
+			).toBe("prepaid-credits available $12.30 (+1 unknown)");
+		});
+
+		test("the source reads billing from held reports only, and shows none without them", () => {
+			const fetchSpy = vi.spyOn(globalThis, "fetch");
+			try {
+				const settings = Settings.isolated();
+				let reads = 0;
+				const source = createModelBrowserSource(settings, undefined, {
+					usageReports: () => {
+						reads++;
+						return [hyperReport(12.3, "usd", Date.now())];
+					},
+				});
+				expect(source.billingFor?.("charm-hyper/model-a")).toBe("prepaid-credits available $12.30");
+				expect(reads).toBe(1);
+				expect(fetchSpy).not.toHaveBeenCalled();
+				// The revision follows the held reports, so a hub left open re-reads after a poll.
+				let held: UsageReport[] = [hyperReport(1, "usd", Date.now())];
+				const polled = createModelBrowserSource(settings, undefined, { usageReports: () => held });
+				const before = polled.billingRevision;
+				expect(polled.billingRevision).toBe(before);
+				held = [hyperReport(2, "usd", Date.now())];
+				expect(polled.billingRevision).not.toBe(before);
+				expect(createModelBrowserSource(settings).billingFor).toBeUndefined();
+			} finally {
+				fetchSpy.mockRestore();
+			}
+		});
+
+		test("a pool member row shows the member's billing from held reports", () => {
+			const settings = pooledSettings({ a: { model: "charm-hyper/model-a" } });
+			const { hub } = createHub({
+				models: [makeModel("charm-hyper", "model-a")],
+				scoped: true,
+				settings,
+				usageReports: () => [hyperReport(12.3, "usd", Date.now())],
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput(DOWN); // its only member
+			expect(normalize(hub.render(220))).toContain("a charm-hyper/model-a billing prepaid-credits available $12.30");
+		});
+
+		test("a narrow role row drops its billing before the thinking label", () => {
+			const settings = Settings.isolated();
+			settings.setModelRole("smol", "charm-hyper/model-a:high");
+			const { hub } = createHub({
+				models: [makeModel("charm-hyper", "model-a")],
+				scoped: true,
+				settings,
+				usageReports: () => [hyperReport(12.3, "usd", Date.now())],
+			});
+			enterRolesView(hub);
+			const smolRow = (width: number) =>
+				hub
+					.render(width)
+					.map(line => stripVTControlCharacters(line))
+					.find(line => line.includes("SMOL")) ?? "";
+			expect(smolRow(220)).toContain("billing prepaid-credits available $12.30");
+			expect(smolRow(80)).toContain("high");
+			expect(smolRow(80)).not.toContain("billing");
+			// At no width does billing stay while the thinking label goes.
+			for (let width = 60; width <= 220; width++) {
+				const row = smolRow(width);
+				if (row.includes("billing")) expect(row).toContain("high");
+			}
+		});
 
 		test("the source summarises a pool's local limits", () => {
 			const settings = Settings.isolated({

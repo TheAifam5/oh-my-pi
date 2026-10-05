@@ -4,7 +4,7 @@ import {
 	splitUpstreamRouting,
 	formatModelSelectorValue,
 } from "./model-selector";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayLine } from "./extensions/display-text";
 /**
  * Fullscreen /models hub, shown on the alternate screen like /settings.
@@ -171,6 +171,14 @@ export interface ModelHubSource extends ModelBrowserSource {
 	roleAcceptsPools?(role: string): boolean;
 	/** Why a pool written at `target` would not take effect (another layer supplies the entry); undefined when it would. */
 	poolWriteBlocker?(target: ModelHubPoolTarget): string | undefined;
+	/**
+	 * Billing state of the provider of `provider/model-id` (every model of a provider reads the
+	 * same) as display text, from the usage reports the host last polled; must not fetch.
+	 * Undefined, or an absent member, shows no billing.
+	 */
+	billingFor?(model: string): string | undefined;
+	/** Changes (by identity) whenever {@link billingFor} may answer differently; absent: never. */
+	readonly billingRevision?: unknown;
 }
 
 /** Catalog capabilities required by the model hub. */
@@ -360,6 +368,12 @@ const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 	{ id: "thinking", head: "Thinking", format: "dim", priority: 1 },
 ];
 
+/** Roles view columns when some row carries billing; billing hides first when narrow. */
+const ROLE_PICKER_BILLING_COLUMNS: readonly TspPickerColumn[] = [
+	...ROLE_PICKER_COLUMNS,
+	{ id: "billing", head: "Billing", format: "dim", priority: 0 },
+];
+
 /** Kind tab labels (sentence case; acronyms stay upper). */
 const MODEL_KIND_LABELS: Record<"all" | ModelKind, string> = {
 	all: "All",
@@ -514,6 +528,9 @@ export class ModelHubComponent implements Component {
 	#rolesRows: RolesRow[] = [];
 	/** Pools read for the current rows, keyed `<kind>:<key>`; cleared on every rows rebuild. */
 	#poolCache = new Map<string, ModelHubPool | undefined>();
+	/** Sanitized billing text per `provider/model-id` for the current rows; cleared on every rows rebuild. */
+	#billingCache = new Map<string, string | undefined>();
+	#billingRevision: unknown;
 	/**
 	 * Outcome of the last pool edit worth reporting: the validator's message for a refused edit
 	 * (`error`) or a note on an edit the hub declined or adjusted (`warning`). Sanitized; cleared by
@@ -575,19 +592,26 @@ export class ModelHubComponent implements Component {
 	#rolesRowStart = 1;
 	/** Bumped on every visible-state change; the described node is rebuilt when it moves. */
 	#nativeVersion = 0;
-	#nativeCache: { version: number; picker: boolean; node: NativeNode } | undefined;
+	#nativeCache: { version: number; picker: boolean; billing: unknown; node: NativeNode } | undefined;
 	#currentSelector: string | undefined;
 	/** The opening online catalog refresh is still in flight (an empty scope then shows as loading). */
 	#catalogRefreshing = false;
 	#kindTabsMemo: { candidates: readonly ModelBrowserItem[]; tabs: TspPickerProps["tabs"] } | undefined;
 	#pickerRoleItems:
-		| { rows: readonly RolesRow[]; roles: RoleAssignments; cycle: string; items: readonly TspPickerItem[] }
+		| {
+				rows: readonly RolesRow[];
+				roles: RoleAssignments;
+				cycle: string;
+				billing: unknown;
+				items: readonly TspPickerItem[];
+		  }
 		| undefined;
 	#pickerRolePreview:
 		| {
 				row: RolesRow | undefined;
 				roles: RoleAssignments;
 				rows: readonly RolesRow[];
+				billing: unknown;
 				children: readonly NativeChild[];
 		  }
 		| undefined;
@@ -1047,6 +1071,35 @@ export class ModelHubComponent implements Component {
 		return pool;
 	}
 
+	/**
+	 * Billing text of `model` from the host, memoised per rows rebuild and per
+	 * {@link ModelHubSource.billingRevision}; undefined when the host shows none.
+	 */
+	#billing(model: string): string | undefined {
+		const revision = this.#settings.billingRevision;
+		if (revision !== this.#billingRevision) {
+			this.#billingRevision = revision;
+			this.#billingCache.clear();
+		}
+		if (this.#billingCache.has(model)) return this.#billingCache.get(model);
+		let billing: string | undefined;
+		try {
+			const text = this.#settings.billingFor?.(model);
+			billing = text ? sanitizeDisplayLine(text) : undefined;
+		} catch (error) {
+			logger.debug("Model hub billing lookup failed", { model, error: String(error) });
+			billing = undefined;
+		}
+		this.#billingCache.set(model, billing);
+		return billing;
+	}
+
+	/** `billing <text>` for `model`, or undefined when the host shows none. */
+	#billingFact(model: string): string | undefined {
+		const billing = this.#billing(model);
+		return billing ? `billing ${billing}` : undefined;
+	}
+
 	#rolePool(role: string): ModelHubPool | undefined {
 		return this.#pool({ kind: "role", key: role });
 	}
@@ -1072,6 +1125,7 @@ export class ModelHubComponent implements Component {
 	 */
 	#buildRolesRows(): void {
 		this.#poolCache.clear();
+		this.#billingCache.clear();
 		const rows: RolesRow[] = [];
 		const chains = this.#fallbackChains();
 		const appendChainPool = (key: string): void => {
@@ -2298,13 +2352,15 @@ export class ModelHubComponent implements Component {
 		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
 	}
 
-	/** A member's state facts: effort, weight, catalog presence. */
+	/** A member's state facts: effort, weight, catalog presence, billing. */
 	#poolMemberFacts(member: ModelHubPoolMember): string[] {
 		const facts: string[] = [];
 		if (member.effort) facts.push(member.effort);
 		if (member.weight !== undefined) facts.push(`weight ${member.weight}`);
 		const parsed = parseModelString(member.model);
 		if (!parsed || !this.#findFallbackModel(parsed.provider, parsed.id)) facts.push("not in catalog");
+		const billing = this.#billingFact(member.model);
+		if (billing) facts.push(billing);
 		return facts.map(sanitizeDisplayLine);
 	}
 
@@ -3262,7 +3318,8 @@ export class ModelHubComponent implements Component {
 			if (rowDef.kind === "fallback") {
 				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
 				const selector = selected ? theme.fg("accent", rowDef.selector) : theme.fg("muted", rowDef.selector);
-				let line = ` ${cursor} ${branch} ${selector}`;
+				const billing = this.#billingFact(rowDef.selector);
+				let line = ` ${cursor} ${branch} ${selector}${billing ? `  ${theme.fg("dim", billing)}` : ""}`;
 				line = this.#finishRolesRow(line, width, hovered);
 				lines.push(line);
 				continue;
@@ -3309,6 +3366,16 @@ export class ModelHubComponent implements Component {
 			let line = ` ${cursor} ${dot} ${tagStyled}  ${value}`;
 			const right = [levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");
 			const rightWidth = visibleWidth(right);
+			// Billing drops first: it is shown only when it fits beside the thinking and cycle badges.
+			const billing =
+				assignment && !assignment.autoSelected && !rolePool
+					? this.#billingFact(`${assignment.model.provider}/${assignment.model.id}`)
+					: undefined;
+			if (billing) {
+				const suffix = `  ${theme.fg("dim", billing)}`;
+				const reserved = rightWidth > 0 ? rightWidth + 2 : 0;
+				if (visibleWidth(line) + visibleWidth(suffix) + reserved <= width) line += suffix;
+			}
 			const lineWidth = visibleWidth(line);
 			if (rightWidth > 0 && lineWidth + rightWidth + 2 <= width) {
 				line = `${line}${" ".repeat(width - lineWidth - rightWidth - 1)}${right}`;
@@ -3546,10 +3613,13 @@ export class ModelHubComponent implements Component {
 	describe(cx: DescribeContext): NativeNode {
 		const usePicker = cx.supports("picker");
 		const cached = this.#nativeCache;
-		if (cached?.version === this.#nativeVersion && cached.picker === usePicker) return cached.node;
+		const billing = this.#settings.billingRevision;
+		if (cached?.version === this.#nativeVersion && cached.picker === usePicker && cached.billing === billing) {
+			return cached.node;
+		}
 		if (usePicker) {
 			const described = this.#describePicker();
-			this.#nativeCache = { version: this.#nativeVersion, picker: true, node: described };
+			this.#nativeCache = { version: this.#nativeVersion, picker: true, billing, node: described };
 			return described;
 		}
 		const footer: NativeChild[] = [];
@@ -3563,7 +3633,7 @@ export class ModelHubComponent implements Component {
 			this.#describeBody(),
 			node("col", { gap: "xs" }, footer, "footer"),
 		);
-		this.#nativeCache = { version: this.#nativeVersion, picker: false, node: described };
+		this.#nativeCache = { version: this.#nativeVersion, picker: false, billing, node: described };
 		return described;
 	}
 
@@ -3963,6 +4033,7 @@ export class ModelHubComponent implements Component {
 		};
 		if (rolesView) {
 			const row = this.#rolesRows[this.#roleIndex];
+			const items = this.#rolePickerItems();
 			return picker(
 				{
 					...props,
@@ -3974,8 +4045,10 @@ export class ModelHubComponent implements Component {
 						).length,
 					})),
 					tab: this.#roleTab,
-					columns: ROLE_PICKER_COLUMNS,
-					items: this.#rolePickerItems(),
+					columns: items.some(item => item.facts?.billing !== undefined)
+						? ROLE_PICKER_BILLING_COLUMNS
+						: ROLE_PICKER_COLUMNS,
+					items,
 					order: this.#rolePickerOrder(),
 					selected: row && row.kind !== "separator" ? rolesRowKey(row, this.#roleIndex) : null,
 					total: this.#allRolesRowCount(),
@@ -4348,7 +4421,15 @@ export class ModelHubComponent implements Component {
 		const cycleOrder = this.#cycleOrder();
 		const cycle = cycleOrder.join("\0");
 		const memo = this.#pickerRoleItems;
-		if (memo?.rows === this.#rolesRows && memo.roles === this.#roles && memo.cycle === cycle) return memo.items;
+		const billingRevision = this.#settings.billingRevision;
+		if (
+			memo?.rows === this.#rolesRows &&
+			memo.roles === this.#roles &&
+			memo.cycle === cycle &&
+			memo.billing === billingRevision
+		) {
+			return memo.items;
+		}
 		const items: TspPickerItem[] = [];
 		this.#rolesRows.forEach((row, index) => {
 			const id = rolesRowKey(row, index);
@@ -4364,9 +4445,18 @@ export class ModelHubComponent implements Component {
 				case "chainKey":
 					items.push({ id, label: row.role, mono: true, icon: "git-branch", detail: "fallback chain" });
 					return;
-				case "fallback":
-					items.push({ id, label: row.selector, mono: true, depth: 1, detail: `fallback ${row.chainIndex + 1}` });
+				case "fallback": {
+					const billing = this.#billing(row.selector);
+					items.push({
+						id,
+						label: row.selector,
+						mono: true,
+						depth: 1,
+						detail: `fallback ${row.chainIndex + 1}`,
+						...(billing ? { facts: { billing } } : {}),
+					});
 					return;
+				}
 				case "pool":
 					items.push({
 						id,
@@ -4404,6 +4494,8 @@ export class ModelHubComponent implements Component {
 				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
 					facts.thinking = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
 				}
+				const billing = this.#billing(selector);
+				if (billing) facts.billing = billing;
 			} else {
 				facts.model = "—";
 			}
@@ -4427,7 +4519,7 @@ export class ModelHubComponent implements Component {
 					: {}),
 			});
 		});
-		this.#pickerRoleItems = { rows: this.#rolesRows, roles: this.#roles, cycle, items };
+		this.#pickerRoleItems = { rows: this.#rolesRows, roles: this.#roles, cycle, billing: billingRevision, items };
 		return items;
 	}
 
@@ -4457,7 +4549,14 @@ export class ModelHubComponent implements Component {
 	/** The selected Roles-view row's preview: its model's facts and its fallback chain. */
 	#rolePreview(row: RolesRow | undefined): readonly NativeChild[] {
 		const memo = this.#pickerRolePreview;
-		if (memo !== undefined && memo.row === row && memo.roles === this.#roles && memo.rows === this.#rolesRows) {
+		const billingRevision = this.#settings.billingRevision;
+		if (
+			memo !== undefined &&
+			memo.row === row &&
+			memo.roles === this.#roles &&
+			memo.rows === this.#rolesRows &&
+			memo.billing === billingRevision
+		) {
 			return memo.children;
 		}
 		const children: NativeChild[] = [];
@@ -4470,6 +4569,10 @@ export class ModelHubComponent implements Component {
 		};
 		const chainPool = (key: string): NativeChild[] =>
 			this.#isPooledChain(key) ? this.#poolPreview(this.#chainPool(key), "Fallback pool") : [];
+		const billingRow = (model: string) => {
+			const billing = this.#billing(model);
+			return billing ? [{ k: [span("Billing", "muted")], v: billing }] : [];
+		};
 		const modelItem = (model: Model): ModelBrowserItem => ({
 			provider: model.provider,
 			id: model.id,
@@ -4497,6 +4600,7 @@ export class ModelHubComponent implements Component {
 									v: getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label,
 								},
 								{ k: [span("Source", "muted")], v: assignment.autoSelected ? "auto-selected" : "configured" },
+								...billingRow(`${assignment.model.provider}/${assignment.model.id}`),
 							],
 						}),
 					);
@@ -4515,6 +4619,8 @@ export class ModelHubComponent implements Component {
 				const resolved = this.#resolveFallbackEntry(row.role, row.chainIndex);
 				if (resolved) children.push(...this.#browser.modelPreview(resolved.item, "full", this.#currentSelector));
 				else children.push(text([span(row.selector, "mono")], { role: "omp.picker.title" }));
+				const billing = billingRow(row.selector);
+				if (billing.length > 0) children.push(node("kv", { items: billing }));
 				const chain = chainList(row.role);
 				if (chain) children.push(chain);
 				break;
@@ -4559,7 +4665,7 @@ export class ModelHubComponent implements Component {
 				);
 				break;
 		}
-		this.#pickerRolePreview = { row, roles: this.#roles, rows: this.#rolesRows, children };
+		this.#pickerRolePreview = { row, roles: this.#roles, rows: this.#rolesRows, billing: billingRevision, children };
 		return children;
 	}
 
@@ -4584,6 +4690,7 @@ export class ModelHubComponent implements Component {
 				member.model,
 				member.effort,
 				member.weight !== undefined ? `weight ${member.weight}` : undefined,
+				this.#billingFact(member.model),
 			];
 			return row(sanitizeDisplayLine(member.alias), details.filter(detail => detail !== undefined).join(" · "));
 		});

@@ -910,7 +910,9 @@ export class SelectorController {
 		};
 		const hub = new ModelHubComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
+			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model), {
+				usageReports: () => this.ctx.session.lastUsageReports,
+			}),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{

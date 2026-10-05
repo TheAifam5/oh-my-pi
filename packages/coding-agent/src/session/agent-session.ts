@@ -13144,6 +13144,31 @@ export class AgentSession implements SettingsScope {
 		return this.#stats.revision;
 	}
 
+	/** Last polled reports per provider; a poll replaces only the providers it reports. */
+	#heldUsageReports = new Map<string, UsageReport[]>();
+	#lastUsageReports: readonly UsageReport[] | undefined;
+
+	/**
+	 * Every provider's reports from the latest {@link fetchUsageReports} poll that included it, each
+	 * with its own `fetchedAt`; a failed, empty, or partial poll keeps the other providers' reports.
+	 * The array is replaced only when a poll changes it. Reading it never fetches.
+	 */
+	get lastUsageReports(): readonly UsageReport[] | undefined {
+		return this.#lastUsageReports;
+	}
+
+	#holdUsageReports(reports: readonly UsageReport[]): void {
+		if (reports.length === 0) return;
+		const polled = new Map<string, UsageReport[]>();
+		for (const report of reports) {
+			const own = polled.get(report.provider);
+			if (own) own.push(report);
+			else polled.set(report.provider, [report]);
+		}
+		for (const [provider, own] of polled) this.#heldUsageReports.set(provider, own);
+		this.#lastUsageReports = [...this.#heldUsageReports.values()].flat();
+	}
+
 	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.usage.reports) return null;
@@ -13163,7 +13188,10 @@ export class AgentSession implements SettingsScope {
 		});
 		// Every fresh usage snapshot doubles as the salvage-sweep heartbeat: the
 		// status line calls this every 5 minutes while the TUI is open.
-		if (reports) this.#maybeScheduleResetSweep(reports);
+		if (reports) {
+			this.#holdUsageReports(reports);
+			this.#maybeScheduleResetSweep(reports);
+		}
 		return reports;
 	}
 
