@@ -205,6 +205,57 @@ describe("model role pools", () => {
 		});
 	});
 
+	describe("local limits", () => {
+		it("passes over a member whose model limit is reached and picks the next one", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "limits.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: { engineer: pool("priority", [OPENAI, GOOGLE]) },
+						limits: {
+							[selectorOf(OPENAI)]: [
+								{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } },
+							],
+						},
+					},
+					{ storage },
+				);
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: OPENAI.provider,
+					model: OPENAI.id,
+					costNanos: 0,
+					inputTokens: 10,
+					outputTokens: 5,
+				});
+
+				const resolution = await resolveRolePool("engineer", deps(settings));
+
+				expect(resolution?.kind).toBe("picked");
+				if (resolution?.kind !== "picked") return;
+				expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
+			} finally {
+				AgentStorage.close();
+			}
+		});
+		it("passes over a member whose skip limit cannot be read and ignores an unreadable warn limit", async () => {
+			const day = { type: "calendar", period: "day" };
+			const settings = Settings.isolated({
+				modelRoles: { engineer: pool("priority", [OPENAI, GOOGLE]) },
+				limits: {
+					[selectorOf(OPENAI)]: [{ metric: "requests", max: 100, window: day }],
+					[GOOGLE.provider]: [{ metric: "requests", max: 1, window: day, onLimit: "warn" }],
+				},
+			});
+
+			const resolution = await resolveRolePool("engineer", deps(settings));
+
+			expect(resolution?.kind).toBe("picked");
+			if (resolution?.kind !== "picked") return;
+			expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
+		});
+	});
+
 	describe("selection order", () => {
 		it("lists availability and credential skips in member order before policy skips", async () => {
 			const settings = Settings.isolated({

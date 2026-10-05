@@ -18,7 +18,7 @@ import {
 	type ToolCall,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -7003,6 +7003,204 @@ describe("AgentSession retry fallback", () => {
 			});
 			return notices;
 		}
+
+		describe("local limits", () => {
+			let storage: AgentStorage | undefined;
+			let storageCount = 0;
+
+			afterEach(async () => {
+				if (session) {
+					await session.dispose();
+					session = undefined;
+				}
+				storage = undefined;
+				AgentStorage.close();
+				vi.restoreAllMocks();
+			});
+
+			/** A session on `primary`; each call answers with the next of `responses`, then with a $0.40 reply. */
+			async function limitSession(
+				limits: Record<string, unknown>,
+				primary: Model,
+				fallbacks: Model[],
+				options: { ledger?: boolean; responses?: MockResponse[] } = {},
+			) {
+				storage =
+					options.ledger === false
+						? undefined
+						: await AgentStorage.open(path.join(tempDir.path(), `limits-${++storageCount}.db`));
+				const responses = [...(options.responses ?? [])];
+				const settings = Settings.isolated(
+					{
+						"compaction.enabled": false,
+						"retry.maxRetries": 0,
+						limits,
+						"retry.fallbackChains": { default: fallbacks.map(model => `${model.provider}/${model.id}`) },
+					},
+					storage ? { storage } : {},
+				);
+				settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+				const requestedModels: string[] = [];
+				session = new AgentSession({
+					agent: new Agent({
+						getApiKey: target => `${target.provider}-test-key`,
+						initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+						streamFn: (target, context, options) => {
+							requestedModels.push(`${target.provider}/${target.id}`);
+							const mock = createMockModel({ provider: target.provider, id: target.id });
+							mock.push(responses.shift() ?? { content: ["ok"], usage: { cost: { total: 0.4 } } });
+							return mock.stream(target, context, options);
+						},
+					}),
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				});
+				return { requestedModels, notices: collectNotices(session) };
+			}
+
+			const DAY = { type: "calendar", period: "day" };
+
+			it("records each call with its account and switches to a fallback once the model's request limit is reached", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				const fallback = getBundledModel("google", "gemini-2.5-flash");
+				if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
+				vi.spyOn(modelRegistry.authStorage.sessions, "accounts").mockReturnValue([
+					{ credentialId: 1, type: "oauth", name: "work", active: true, pinned: false },
+				]);
+				const { requestedModels } = await limitSession(
+					{ "openai/gpt-4o-mini": [{ metric: "requests", max: 1, window: DAY }] },
+					primary,
+					[fallback],
+				);
+
+				await session!.prompt("First call fits the limit");
+				await session!.waitForIdle();
+				await session!.prompt("Second call would pass it");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "google/gemini-2.5-flash"]);
+				expect(storage!.usageLedger.totals([{ provider: "openai", account: "work" }], 0).requests).toBe(1n);
+			});
+
+			it("skips a fallback whose own limit is reached", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				const limited = getBundledModel("google", "gemini-2.5-flash");
+				const open = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!primary || !limited || !open) throw new Error("Expected bundled test models to exist");
+				const once = [{ metric: "requests", max: 1, window: DAY }];
+				const { requestedModels } = await limitSession({ "openai/gpt-4o-mini": once, google: once }, primary, [
+					limited,
+					open,
+				]);
+				storage!.usageLedger.record({
+					atMs: Date.now(),
+					provider: "google",
+					model: "gemini-2.5-flash",
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+
+				await session!.prompt("First call fits the limit");
+				await session!.waitForIdle();
+				await session!.prompt("Second call needs a fallback");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "anthropic/claude-sonnet-4-5"]);
+			});
+
+			it("fails the request when a global spend limit is reached and no fallback is eligible", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels } = await limitSession(
+					{ "*": [{ metric: "usd", max: "0.4", window: DAY }] },
+					primary,
+					[],
+				);
+
+				await session!.prompt("First call spends the limit");
+				await session!.waitForIdle();
+				await session!.prompt("Second call is refused");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini"]);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain(
+					"local limit refused openai/gpt-4o-mini (*: 0.4 USD per day: local limit reached)",
+				);
+			});
+
+			it("refuses on a skip limit and stays quiet on a warn limit when usage cannot be read", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels, notices } = await limitSession(
+					{
+						"*": [{ metric: "requests", max: 1, window: DAY, onLimit: "warn" }],
+						openai: [{ metric: "requests", max: 100, window: DAY }],
+					},
+					primary,
+					[],
+					{ ledger: false },
+				);
+
+				await session!.prompt("No ledger to count against");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual([]);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain(
+					"openai: 100 requests per day: local limit usage unreadable",
+				);
+				expect(notices.some(notice => notice.startsWith("Local limit reached"))).toBe(false);
+			});
+
+			it("records input and output tokens of calls with usage, warning once about a priced model reporting no cost", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const free = { content: ["ok"], usage: { input: 10, output: 5, cacheRead: 1000, cost: { total: 0 } } };
+				const { notices } = await limitSession(
+					{ openai: [{ metric: "usd", max: "1", window: DAY }] },
+					primary,
+					[],
+					{ responses: [{ stopReason: "error", errorMessage: "invalid request" }, free, free] },
+				);
+				const record = vi.spyOn(storage!.usageLedger, "record").mockImplementationOnce(() => {
+					throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+				});
+
+				for (const text of ["fails", "free one", "free two"]) {
+					await session!.prompt(text);
+					await session!.waitForIdle();
+				}
+				await session!.dispose();
+				session = undefined;
+
+				expect(storage!.usageLedger.totals([{ provider: "openai" }], 0)).toEqual({
+					costNanos: 0n,
+					requests: 2n,
+					tokens: 30n,
+				});
+				expect(record).toHaveBeenCalledTimes(3);
+				expect(notices.filter(notice => notice.startsWith("Local USD limits cannot count"))).toHaveLength(1);
+			});
+
+			it("only notifies, once per window, when a warn limit is reached", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels, notices } = await limitSession(
+					{ openai: [{ metric: "requests", max: 1, window: DAY, onLimit: "warn" }] },
+					primary,
+					[],
+				);
+
+				for (const text of ["one", "two", "three"]) {
+					await session!.prompt(text);
+					await session!.waitForIdle();
+				}
+
+				expect(requestedModels).toHaveLength(3);
+				expect(notices).toEqual(["Local limit reached: openai: 1 requests per day."]);
+			});
+		});
 
 		describe("local budgets", () => {
 			let ledgerCount = 0;

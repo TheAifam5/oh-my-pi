@@ -109,6 +109,15 @@ import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persist
 import { journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { SPEND_RETENTION_MS, type SpendEntry, type SpendLedger, usdToNanos } from "./spend-ledger";
+import { USAGE_RETENTION_MS, type UsageEntry } from "./usage-ledger";
+import {
+	describeLimitRefusal,
+	evaluateLimits,
+	hasLocalLimits,
+	type LimitEvaluation,
+	limitTargets,
+	limitWarningKey,
+} from "./local-limits";
 import { sanitizeNoticeLine } from "../utils/notice-text";
 
 import {
@@ -417,6 +426,10 @@ export class TurnRecovery {
 	readonly #chargedCalls = new WeakSet<AssistantMessage>();
 	/** `provider/model` keys already warned about reporting usage without a cost. */
 	readonly #unpricedBudgetModels = new Set<string>();
+	/** `provider/model` keys already warned about being unpriced under a `usd` limit. */
+	readonly #unpricedLimitModels = new Set<string>();
+	/** `warn` limit windows already notified ({@link limitWarningKey}). */
+	readonly #warnedLimitWindows = new Set<string>();
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -2056,7 +2069,8 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Charges the cost of the completed call `message` to every distinct `local-hard-budget` that
+	 * Records the completed call `message` in the usage ledger counted by local limits, with the
+	 * account that served it, and charges its cost to every distinct `local-hard-budget` that
 	 * governs its model ({@link #localBudgetTargets}), once per `budget.id`. A call a group's funding
 	 * order would fund from an `included` or `free` source is not charged to that group's budget
 	 * ({@link chargesLocalBudget}); with {@link MAX_PENDING_BUDGET_CHARGES} charges already pending,
@@ -2098,6 +2112,11 @@ export class TurnRecovery {
 
 	async #chargeLocalBudget(message: AssistantMessage, conservative: boolean): Promise<void> {
 		const atMs = Date.now();
+		// A usage write waiting on a busy database never delays the budget charge.
+		await Promise.all([this.#recordUsage(message, atMs), this.#chargeBudgets(message, atMs, conservative)]);
+	}
+
+	async #chargeBudgets(message: AssistantMessage, atMs: number, conservative: boolean): Promise<void> {
 		try {
 			const model = this.#host.modelRegistry.find(message.provider, message.model);
 			const targets = model ? this.#localBudgetTargets(model) : [];
@@ -2153,10 +2172,97 @@ export class TurnRecovery {
 	}
 
 	/** Writes `entry`, retrying up to {@link SPEND_RECORD_MAX_ATTEMPTS} times while agent.db is busy. */
-	async #recordSpend(ledger: SpendLedger, entry: SpendEntry): Promise<void> {
+	#recordSpend(ledger: SpendLedger, entry: SpendEntry): Promise<void> {
+		return this.#writeWithRetry(() => ledger.record(entry, SPEND_RETENTION_MS));
+	}
+
+	/**
+	 * Appends `message` to the usage ledger; never rejects. A call that reported no usage at all (a
+	 * failed request) is not recorded. A call whose cost is not a valid amount is recorded at zero
+	 * cost with a warning. A call of a priced model that reports zero cost is recorded at zero and,
+	 * when a `usd` limit governs the model, warned about once per model; a free model never is.
+	 */
+	async #recordUsage(message: AssistantMessage, atMs: number): Promise<void> {
+		try {
+			const { input, output, cacheRead, cacheWrite, cost } = message.usage;
+			const validCost = usdToNanos(cost.total);
+			const costNanos = validCost ?? 0;
+			if (input + output + cacheRead + cacheWrite <= 0 && costNanos === 0) return;
+			const ledger = this.#host.settings.getStorage()?.usageLedger;
+			if (!ledger) return;
+			if (validCost === undefined) {
+				logger.warn("Usage ledger recorded a call at zero cost: its cost is not a valid amount", {
+					provider: message.provider,
+					model: message.model,
+				});
+			} else if (costNanos === 0) {
+				const pricing = this.#host.modelRegistry.find(message.provider, message.model)?.cost;
+				const priced =
+					pricing !== undefined &&
+					(pricing.input > 0 || pricing.output > 0 || pricing.cacheRead > 0 || pricing.cacheWrite > 0);
+				if (
+					priced &&
+					limitTargets(this.#host.settings, message.provider, message.model).some(
+						target => target.limit.metric === "usd",
+					)
+				) {
+					this.#warnUnpricedLimitModel(message);
+				}
+			}
+			const account = this.#servingAccount(message.provider);
+			const entry: UsageEntry = {
+				atMs,
+				provider: message.provider,
+				model: message.model,
+				...(account !== undefined ? { account } : {}),
+				costNanos,
+				inputTokens: input,
+				outputTokens: output,
+			};
+			await this.#writeWithRetry(() => ledger.record(entry, USAGE_RETENTION_MS));
+		} catch (error) {
+			logger.warn("Usage ledger could not record a model call", {
+				provider: message.provider,
+				model: message.model,
+				error: String(error),
+			});
+		}
+	}
+
+	/** The session's account for `provider`: its policy name, else a stable identity; unset without one. */
+	#servingAccount(provider: string): string | undefined {
+		const active = this.#host.modelRegistry.authStorage.sessions
+			.accounts(provider, this.#host.sessionId())
+			.find(account => account.active);
+		if (!active) return undefined;
+		if (active.name !== undefined) return active.name;
+		if (active.keyFingerprint !== undefined) return `key:${active.keyFingerprint}`;
+		return active.email ?? active.accountId ?? active.projectId;
+	}
+
+	#warnUnpricedLimitModel(message: AssistantMessage): void {
+		const key = `${message.provider}/${message.model}`;
+		if (this.#unpricedLimitModels.has(key)) return;
+		this.#unpricedLimitModels.add(key);
+		logger.warn("Local limit cannot count an unpriced model in USD", {
+			provider: message.provider,
+			model: message.model,
+		});
+		void this.#host
+			.emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				message: sanitizeNoticeLine(`Local USD limits cannot count ${key}: its calls report no cost.`),
+				source: "retry-fallback",
+			})
+			.catch(error => logger.debug("Local limit notice failed", { error: String(error) }));
+	}
+
+	/** Runs `write`, retrying up to {@link SPEND_RECORD_MAX_ATTEMPTS} times while agent.db is busy. */
+	async #writeWithRetry(write: () => void): Promise<void> {
 		for (let attempt = 1; ; attempt++) {
 			try {
-				ledger.record(entry, SPEND_RETENTION_MS);
+				write();
 				return;
 			} catch (error) {
 				if (!isSqliteBusyError(error) || attempt >= SPEND_RECORD_MAX_ATTEMPTS) throw error;
@@ -2278,23 +2384,58 @@ export class TurnRecovery {
 		return refused;
 	}
 
+	/** The local limits ({@link limitTargets}) governing `model` that refuse or warn about another call. */
+	#evaluateLimits(model: Model, nowMs: number): LimitEvaluation {
+		const targets = limitTargets(this.#host.settings, model.provider, model.id);
+		return evaluateLimits(this.#host.settings.getStorage()?.usageLedger, targets, nowMs);
+	}
+
 	/**
-	 * Re-checks the local budgets governing the active model before a model call. When one refuses
-	 * the call, switches to the first eligible fallback candidate whose own budgets admit it, through
-	 * the retry fallback path; does nothing for a model no local budget governs.
+	 * Notifies each reached `warn` limit once per calendar period, or for a rolling window once until
+	 * it is seen below its cap again.
+	 */
+	#noteWarnedLimits({ warned, quiet }: LimitEvaluation, nowMs: number): void {
+		for (const target of quiet) {
+			if (target.limit.window.type === "rolling") this.#warnedLimitWindows.delete(limitWarningKey(target, nowMs));
+		}
+		for (const target of warned) {
+			const key = limitWarningKey(target, nowMs);
+			if (this.#warnedLimitWindows.has(key)) continue;
+			this.#warnedLimitWindows.add(key);
+			const message = sanitizeNoticeLine(`Local limit reached: ${target.label}.`);
+			void this.#host
+				.emitSessionEvent({ type: "notice", level: "warning", message, source: "retry-fallback" })
+				.catch(error => logger.debug("Local limit notice failed", { error: String(error) }));
+		}
+	}
+
+	/**
+	 * Re-checks the local budgets and local limits governing the active model before a model call.
+	 * When one refuses the call, switches to the first eligible fallback candidate whose own budgets
+	 * and limits admit it, through the retry fallback path; does nothing for a model none governs.
+	 * A reached `warn` limit only notifies, once per window.
 	 *
-	 * @throws Error when a budget refuses the active model and no eligible fallback exists; retry and
-	 *   fallback do not act on it.
+	 * @throws Error when a budget or limit refuses the active model and no eligible fallback exists;
+	 *   retry and fallback do not act on it.
 	 */
 	async enforceLocalBudgets(signal?: AbortSignal): Promise<void> {
-		if (!hasLocalBudgets(this.#host.settings)) return;
+		if (!hasLocalBudgets(this.#host.settings) && !hasLocalLimits(this.#host.settings)) return;
 		const model = this.#host.model();
 		if (!model || signal?.aborted) return;
 		const nowMs = Date.now();
 		const refused = await this.#refusedLocalBudgets(model, nowMs);
-		if (refused.length === 0 || signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
+		const limits = this.#evaluateLimits(model, nowMs);
+		this.#noteWarnedLimits(limits, nowMs);
+		if (refused.length === 0 && limits.refused.length === 0) return;
+		if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
 		const currentSelector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
-		const reason = refused.map(entry => `${entry.id}: ${describeFundingSkip(entry.reason)}`).join(", ");
+		const refusing = [refused.length > 0 ? "budget" : undefined, limits.refused.length > 0 ? "limit" : undefined]
+			.filter(kind => kind !== undefined)
+			.join(" and ");
+		const reason = [
+			...refused.map(entry => `${entry.id}: ${describeFundingSkip(entry.reason)}`),
+			...limits.refused.map(describeLimitRefusal),
+		].join(", ");
 		if (cfgRetryModelFallback.get(this.#host.settings)) {
 			const ceiling = this.#host.thinkingLevelCeiling();
 			for (const role of this.retryFallbackChainKeys(currentSelector, model)) {
@@ -2311,13 +2452,14 @@ export class TurnRecovery {
 					if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 					if (!this.#host.contextFitsModel(candidateModel)) continue;
 					if ((await this.#refusedLocalBudgets(candidateModel, nowMs)).length > 0) continue;
+					if (this.#evaluateLimits(candidateModel, nowMs).refused.length > 0) continue;
 					if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
 					try {
 						if (
 							await this.applyRetryFallbackCandidate(role, candidate, currentSelector, {
 								pinFallback: true,
 								signal,
-								reason: `local budget refused (${reason})`,
+								reason: `local ${refusing} refused (${reason})`,
 							})
 						) {
 							return;
@@ -2334,7 +2476,7 @@ export class TurnRecovery {
 			}
 		}
 		const message = sanitizeNoticeLine(
-			`${USAGE_PREFLIGHT_BLOCKED_PREFIX} local budget refused ${currentSelector} (${reason}) and no fallback model is eligible.`,
+			`${USAGE_PREFLIGHT_BLOCKED_PREFIX} local ${refusing} refused ${currentSelector} (${reason}) and no fallback model is eligible.`,
 		);
 		await this.#host.emitSessionEvent({ type: "notice", level: "warning", message, source: "retry-fallback" });
 		throw new Error(message);

@@ -33,6 +33,11 @@
         }
       }
     },
+    "limits": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
     "enabledModels": {
       "type": "array",
       "default": []

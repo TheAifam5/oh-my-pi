@@ -8,6 +8,7 @@ import { register, type SettingValueOf } from "./registry";
 import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
 import { ACCOUNT_NAME, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import type { cfgDefaultThinkingLevel } from "../session/settings";
+import { parseLimitsSetting } from "./local-limits";
 import { assertModelGroupSectionWritable } from "./model-groups";
 
 /** Display metadata for one model tag. */
@@ -45,6 +46,7 @@ const EMPTY_MODEL_GROUPS_RECORD: Record<string, Record<string, unknown>> = {};
 const EMPTY_MODEL_PRESETS_RECORD: Record<string, ModelPreset> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
 const EMPTY_AUTH_ACCOUNT_PINS: AuthAccountPins = {};
+const EMPTY_LIMITS: Readonly<Record<string, unknown>> = {};
 
 // Auth broker — credentials proxied through a remote `omp auth-broker serve`
 // host. Hidden from the UI; populate via env vars or hand-edited config.yml. Env takes
@@ -101,6 +103,22 @@ export const cfgAuthAccountPins = register({
 	type: "record",
 	default: EMPTY_AUTH_ACCOUNT_PINS,
 	validate: validateAuthAccountPins,
+});
+
+/**
+ * Local limits on spend, requests, and tokens, keyed by `provider/model-id`, `provider`, or `*`.
+ * Read from the global config, `--config` overlays, and runtime overrides only; project settings
+ * cannot set them.
+ */
+export const cfgLimits = register({
+	id: "limits",
+	type: "record",
+	default: EMPTY_LIMITS,
+	entryMerge: "replace",
+	validate: raw => {
+		parseLimitsSetting(raw);
+	},
+	dropInvalidInProject: true,
 });
 
 export const cfgEnabledModels = register({

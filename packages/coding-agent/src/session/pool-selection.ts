@@ -34,6 +34,7 @@ import {
 	resolveRolePoolGroup,
 } from "./retry-fallback-groups";
 import { cfgRetryUsageReservePct } from "./settings";
+import { evaluateLimits, hasLocalLimits, limitTargets } from "./local-limits";
 
 /**
  * Longest the `quota` strategy waits for usage health before keeping configured order, and the
@@ -370,7 +371,11 @@ export type RolePoolSkipReason =
 	/** The member is cooling down after a failure. */
 	| { kind: "cooldown" }
 	/** The `quota` strategy dropped the member under `routing.quota.unknown: exclude`. */
-	| { kind: "quota-unknown" };
+	| { kind: "quota-unknown" }
+	/** A local limit on the member's model refuses another call (`limits`). */
+	| { kind: "limit-reached"; limit: string }
+	/** The usage counted by a local limit on the member's model could not be read. */
+	| { kind: "limit-unreadable"; limit: string };
 
 /** A member {@link resolveRolePool} passed over, and why. */
 export interface RolePoolSkip {
@@ -415,6 +420,8 @@ export function isPolicySkipReason(reason: RolePoolSkipReason): boolean {
 		case "unauthorized":
 		case "budget-exhausted":
 		case "budget-unreadable":
+		case "limit-reached":
+		case "limit-unreadable":
 			return true;
 		default:
 			return false;
@@ -467,6 +474,10 @@ export function describeRolePoolSkip(reason: RolePoolSkipReason): string {
 			return "cooling down";
 		case "quota-unknown":
 			return "usage unknown";
+		case "limit-reached":
+			return `local limit reached (${reason.limit})`;
+		case "limit-unreadable":
+			return `local limit usage unreadable (${reason.limit})`;
 		default:
 			return describeFundingSkip(reason);
 	}
@@ -597,6 +608,19 @@ export async function resolveRolePool(
 		eligible = filtered.funded;
 		skipped.push(...filtered.skipped);
 		notice = filtered.notice;
+	}
+	if (hasLocalLimits(deps.settings)) {
+		const ledger = deps.settings.getStorage()?.usageLedger;
+		const nowMs = Date.now();
+		eligible = eligible.filter(candidate => {
+			const model = resolve(candidate).model;
+			if (!model) return true;
+			const [refusal] = evaluateLimits(ledger, limitTargets(deps.settings, model.provider, model.id), nowMs).refused;
+			if (!refusal) return true;
+			const kind = refusal.reason === "reached" ? "limit-reached" : "limit-unreadable";
+			skipped.push({ selector: candidate.raw, reason: { kind, limit: refusal.target.label } });
+			return false;
+		});
 	}
 	for (const candidate of eligible.filter(isSuppressed)) {
 		skipped.push({ selector: candidate.raw, reason: { kind: "cooldown" } });
