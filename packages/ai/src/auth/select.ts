@@ -156,7 +156,7 @@ export interface CredentialSelectorDeps {
 export class CredentialSelector {
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
-	/** When each drain target last drained, by `rowId\0blockScope`; cleared once it returns. Process-local. */
+	/** When each drain target last drained, by `rowId\0blockScope\0spend/returnWhen`; cleared once it returns. Process-local. */
 	#drainedSince: Map<string, DrainedState> = new Map();
 	/** Drain billing warnings already logged, by `provider\0kind`. */
 	#warnedNoBilling = new Set<string>();
@@ -598,33 +598,42 @@ export class CredentialSelector {
 	}
 
 	/** The OAuth account `sessionId` drains first for `provider`: the session override, else the account policy. */
-	#drainTarget(provider: string, sessionId: string | undefined): DrainTarget | undefined {
+	#drainTarget(provider: string, sessionId: string | undefined, modelId: string | undefined): DrainTarget | undefined {
 		const override = this.#deps.affinity.drainOverride(provider, sessionId);
 		if (override === null) return undefined;
 		const entries = this.#deps.pool.entries(provider);
+		const routing = this.#deps.affinity.accountRouting(provider, sessionId, modelId);
 		let index = override === undefined ? -1 : entries.findIndex(entry => entry.id === override);
 		let policy: AuthAccountPolicy | undefined;
 		const overridden = entries[index]?.credential;
 		if (overridden?.type === "oauth") {
 			policy = this.#deps.policies.forCredential(provider, overridden);
 		} else {
-			// An override whose account is gone falls back to the account policy.
+			// An override whose account is gone falls back to the pool's drain target, then the account policy.
 			if (override !== undefined && sessionId) this.#deps.affinity.drain(provider, sessionId, undefined);
-			const found = this.#deps.policies.drainTarget(
-				provider,
-				entries.map(entry => entry.credential),
-			);
-			if (!found) return undefined;
-			({ index, policy } = found);
+			const named =
+				routing?.drain === undefined ? undefined : this.#deps.affinity.namedAccount(provider, routing.drain);
+			if (named?.credential.type === "oauth") {
+				index = named.index;
+				policy = this.#deps.policies.forCredential(provider, named.credential);
+			} else {
+				const found = this.#deps.policies.drainTarget(
+					provider,
+					entries.map(entry => entry.credential),
+				);
+				if (!found) return undefined;
+				({ index, policy } = found);
+			}
 		}
+		const policyFunding = policy?.drain ? policy : undefined;
 		return {
 			index,
 			credentialId: entries[index]!.id,
 			returnFraction: (policy?.returnMargin ?? DEFAULT_DRAIN_RETURN_MARGIN_PCT) / 100,
 			cooldownMs: policy?.returnCooldownMs ?? DEFAULT_DRAIN_RETURN_COOLDOWN_MS,
 			provider,
-			spend: policy?.drain ? (policy.spend ?? []) : [],
-			returnWhen: policy?.drain && policy.returnWhen !== undefined ? [policy.returnWhen].flat() : ["reset"],
+			spend: routing?.spend ?? policyFunding?.spend ?? [],
+			returnWhen: routing?.returnWhen ?? (policyFunding?.returnWhen ? [policyFunding.returnWhen].flat() : ["reset"]),
 		};
 	}
 
@@ -673,7 +682,9 @@ export class CredentialSelector {
 		billing: DrainBilling | undefined,
 	): boolean {
 		const snapshot = billing?.snapshot;
-		const key = `${target.credentialId}\0${blockScope ?? ""}`;
+		// Pool and policy funding of one account drain and return independently.
+		const funding = `${[...target.spend].sort().join(",")}/${[...target.returnWhen].sort().join(",")}`;
+		const key = `${target.credentialId}\0${blockScope ?? ""}\0${funding}`;
 		const state = this.#drainedSince.get(key);
 		// A clock that stepped back restarts the cooldown instead of ending it early or never.
 		if (state !== undefined && nowMs < state.since) state.since = nowMs;
@@ -785,7 +796,7 @@ export class CredentialSelector {
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
 			(strategy !== undefined || policyReserveEnabled) && (credentials.length > 1 || hasPlanRequirement);
-		const drain = credentials.length > 1 ? this.#drainTarget(provider, sessionId) : undefined;
+		const drain = credentials.length > 1 ? this.#drainTarget(provider, sessionId, options?.modelId) : undefined;
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
 		const sessionPreferredCredential =

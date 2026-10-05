@@ -41,6 +41,35 @@ export function matchesAuthAccountSelector(selector: AuthAccountSelector, identi
 	);
 }
 
+/**
+ * The first problem with a drain target's `spend` and `returnWhen` values,
+ * as the field and a message to follow its path; `undefined` when both are
+ * valid or absent. A billing return trigger needs its `spend` class.
+ */
+export function drainFundingIssue(
+	spend: unknown,
+	returnWhen: unknown,
+): { field: "spend" | "returnWhen"; message: string } | undefined {
+	const classes: unknown = spend === undefined ? [] : spend;
+	if (!Array.isArray(classes) || classes.some(entry => !(DRAIN_SPEND_CLASSES as readonly unknown[]).includes(entry))) {
+		return { field: "spend", message: `must be a list of ${DRAIN_SPEND_CLASSES.join(", ")}` };
+	}
+	const triggers: readonly unknown[] =
+		returnWhen === undefined ? [] : Array.isArray(returnWhen) ? returnWhen : [returnWhen];
+	if (
+		(Array.isArray(returnWhen) && returnWhen.length === 0) ||
+		triggers.some(entry => !(DRAIN_RETURN_TRIGGERS as readonly unknown[]).includes(entry))
+	) {
+		return { field: "returnWhen", message: `must be one or a non-empty list of ${DRAIN_RETURN_TRIGGERS.join(", ")}` };
+	}
+	for (const [trigger, spendClass] of Object.entries(DRAIN_TRIGGER_SPEND_CLASS)) {
+		if (triggers.includes(trigger) && !classes.includes(spendClass)) {
+			return { field: "returnWhen", message: `${trigger} requires spend to include ${spendClass}` };
+		}
+	}
+	return undefined;
+}
+
 /** Validated per-account routing policies (priority/reserve) plus the global reserve fallback. */
 export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
@@ -208,29 +237,8 @@ export class AccountPolicies {
 		if (policy.drain !== true) {
 			throw new AIError.ConfigurationError(`${path}.spend and ${path}.returnWhen require drain: true`);
 		}
-		const spend: unknown = policy.spend === undefined ? [] : policy.spend;
-		if (!Array.isArray(spend) || spend.some(entry => !(DRAIN_SPEND_CLASSES as readonly unknown[]).includes(entry))) {
-			throw new AIError.ConfigurationError(`${path}.spend must be a list of ${DRAIN_SPEND_CLASSES.join(", ")}`);
-		}
-		const triggers: readonly unknown[] =
-			policy.returnWhen === undefined || Array.isArray(policy.returnWhen)
-				? (policy.returnWhen ?? [])
-				: [policy.returnWhen];
-		if (
-			(Array.isArray(policy.returnWhen) && policy.returnWhen.length === 0) ||
-			triggers.some(entry => !(DRAIN_RETURN_TRIGGERS as readonly unknown[]).includes(entry))
-		) {
-			throw new AIError.ConfigurationError(
-				`${path}.returnWhen must be one or a non-empty list of ${DRAIN_RETURN_TRIGGERS.join(", ")}`,
-			);
-		}
-		for (const [trigger, spendClass] of Object.entries(DRAIN_TRIGGER_SPEND_CLASS)) {
-			if (triggers.includes(trigger) && !spend.includes(spendClass)) {
-				throw new AIError.ConfigurationError(
-					`${path}.returnWhen ${trigger} requires spend to include ${spendClass}`,
-				);
-			}
-		}
+		const issue = drainFundingIssue(policy.spend, policy.returnWhen);
+		if (issue) throw new AIError.ConfigurationError(`${path}.${issue.field} ${issue.message}`);
 	}
 
 	validateUsageCapability(provider: string, canFetchUsage: boolean): void {

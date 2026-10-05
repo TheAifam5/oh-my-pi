@@ -4,6 +4,7 @@ import { getEnvApiKey } from "../env-api-key";
 import * as AIError from "../error";
 import type {
 	AccountPinSource,
+	AccountRouting,
 	AuthAccountSummary,
 	AuthCredential,
 	OAuthCredential,
@@ -339,10 +340,36 @@ export class SessionAffinity implements SessionsApi {
 	): AccountTarget | undefined {
 		if (!sessionId || this.#pinsSuppressed(provider, sessionId)) return undefined;
 		const name = this.#pinSource?.member?.(provider, sessionId, modelId);
-		if (name === undefined) return undefined;
+		const target = name === undefined ? undefined : this.namedAccount(provider, name);
+		return target && this.allows(provider, sessionId, target.credential) ? target : undefined;
+	}
+
+	/** Pool account routing for `provider`/`modelId`; key overrides suppress it like pins. */
+	accountRouting(
+		provider: string,
+		sessionId: string | undefined,
+		modelId: string | undefined,
+	): AccountRouting | undefined {
+		if (!sessionId || this.#pinsSuppressed(provider, sessionId)) return undefined;
+		return this.#pinSource?.routing?.(provider, sessionId, modelId);
+	}
+
+	/**
+	 * Stored accounts of the pool's `routing.accounts.order`, in order; unresolvable names are logged and skipped,
+	 * and accounts the session's restriction does not allow are skipped.
+	 */
+	orderedAccounts(provider: string, sessionId: string | undefined, modelId: string | undefined): AccountTarget[] {
+		return (this.accountRouting(provider, sessionId, modelId)?.order ?? []).flatMap(name => {
+			const target = this.namedAccount(provider, name);
+			return target && this.allows(provider, sessionId, target.credential) ? [target] : [];
+		});
+	}
+
+	/** The stored account `name` names for `provider`; a miss is logged once and yields `undefined`. */
+	namedAccount(provider: string, name: string): AccountTarget | undefined {
 		const target = this.#named(provider, name);
 		if (!target) this.#policies.warnUnresolved(provider, name);
-		return target && this.allows(provider, sessionId, target.credential) ? target : undefined;
+		return target;
 	}
 
 	#named(provider: string, name: string): AccountTarget | undefined {

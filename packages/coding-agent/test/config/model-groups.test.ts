@@ -102,7 +102,50 @@ describe("modelRoles values (strict)", () => {
 			[
 				{
 					path: "modelRoles.engineer.routing.limits",
-					message: "unsupported field; supported: funding, quota, spending",
+					message: "unsupported field; supported: funding, quota, spending, accounts",
+				},
+			],
+		],
+		...(
+			[
+				[
+					"an empty account order",
+					{ order: [] },
+					"order",
+					"must be a non-empty list of account names matching ^[a-z0-9][a-z0-9_-]*$",
+				],
+				[
+					"an account order that is not a list",
+					{ order: "work" },
+					"order",
+					"must be a non-empty list of account names matching ^[a-z0-9][a-z0-9_-]*$",
+				],
+				["an unknown spend class", { spend: ["gold"] }, "spend", "must be a list of plan, credits, money"],
+				["empty account routing", {}, "", "must set at least one of order, drain, spend, returnWhen"],
+				[
+					"account routing that is not a mapping",
+					"work",
+					"",
+					"expected a mapping with order, drain, spend, returnWhen",
+				],
+			] as const
+		).map(([name, accounts, field, message]): [string, unknown, ModelGroupIssue[]] => [
+			name,
+			pool({ routing: { accounts } }),
+			[{ path: `modelRoles.engineer.routing.accounts${field ? `.${field}` : ""}`, message }],
+		]),
+		[
+			"account routing with a repeated, malformed, or unfunded entry",
+			pool({ routing: { accounts: { order: ["work", "work"], drain: "Work", returnWhen: "credits-added" } } }),
+			[
+				{ path: "modelRoles.engineer.routing.accounts.order", message: "lists an account twice" },
+				{
+					path: "modelRoles.engineer.routing.accounts.drain",
+					message: "must be one of the account names matching ^[a-z0-9][a-z0-9_-]*$",
+				},
+				{
+					path: "modelRoles.engineer.routing.accounts.returnWhen",
+					message: "credits-added requires spend to include credits",
 				},
 			],
 		],
@@ -180,6 +223,23 @@ describe("modelRoles values (strict)", () => {
 			}),
 		);
 		expect(group.routing?.spending).toEqual({ policy: "local-hard-budget", budget });
+	});
+
+	it("parses account routing and normalizes a single returnWhen to a list", () => {
+		const group = roleGroup(
+			"engineer",
+			pool({
+				routing: {
+					accounts: { order: ["work", "home"], drain: "home", spend: ["credits"], returnWhen: "credits-added" },
+				},
+			}),
+		);
+		expect(group.routing?.accounts).toEqual({
+			order: ["work", "home"],
+			drain: "home",
+			spend: ["credits"],
+			returnWhen: ["credits-added"],
+		});
 	});
 
 	it("reports every problem of one value, not just the first", () => {

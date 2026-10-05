@@ -404,6 +404,12 @@ export class KeyCascade implements KeysApi {
 			const apiKey = await this.#resolveAccount(provider, sessionId, preferred, options, onCredentialId, false);
 			if (apiKey !== undefined) return apiKey;
 		}
+		// Then the pool's account order, each tried the same way.
+		for (const target of this.#deps.affinity.orderedAccounts(provider, sessionId, options?.modelId)) {
+			if (target.index === preferred?.index) continue;
+			const apiKey = await this.#resolveAccount(provider, sessionId, target, options, onCredentialId, false);
+			if (apiKey !== undefined) return apiKey;
+		}
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.

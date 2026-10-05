@@ -9,7 +9,8 @@
  * own defaults (quota reserve and observation age).
  */
 
-import { ACCOUNT_NAME, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
+import type { AccountRouting, DrainReturnTrigger } from "@oh-my-pi/pi-ai/auth-storage";
+import { ACCOUNT_NAME, drainFundingIssue, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -158,6 +159,8 @@ export interface GroupRouting {
 	quota?: GroupQuotaPolicy;
 	/** Present exactly when `funding` includes `metered`. */
 	spending?: GroupSpendingPolicy;
+	/** Account order, drain target, and drain funding for requests to this group's members (`routing.accounts`). */
+	accounts?: AccountRouting;
 }
 
 /** A concrete `provider/model-id` member. */
@@ -650,9 +653,43 @@ function parseFunding(c: Collector, path: string, raw: unknown): BillingClass[] 
 	return classes;
 }
 
+function isAccountName(value: unknown): value is string {
+	return typeof value === "string" && value.length <= MAX_ACCOUNT_NAME_LENGTH && ACCOUNT_NAME.test(value);
+}
+
+function parseAccountRouting(c: Collector, path: string, raw: unknown): AccountRouting | undefined {
+	const before = c.issues.length;
+	if (!checkFields(c, path, raw, ["order", "drain", "spend", "returnWhen"])) return undefined;
+	if (!["order", "drain", "spend", "returnWhen"].some(field => present(raw, field))) {
+		c.add(path, "must set at least one of order, drain, spend, returnWhen");
+		return undefined;
+	}
+	const nameRule = `account names matching ${ACCOUNT_NAME.source}`;
+	if (present(raw, "order")) {
+		if (!Array.isArray(raw.order) || raw.order.length === 0 || !raw.order.every(isAccountName)) {
+			c.add(`${path}.order`, `must be a non-empty list of ${nameRule}`);
+		} else if (new Set(raw.order).size !== raw.order.length) {
+			c.add(`${path}.order`, "lists an account twice");
+		}
+	}
+	if (present(raw, "drain") && !isAccountName(raw.drain)) c.add(`${path}.drain`, `must be one of the ${nameRule}`);
+	const issue = drainFundingIssue(raw.spend ?? undefined, raw.returnWhen ?? undefined);
+	if (issue) c.add(`${path}.${issue.field}`, issue.message);
+	if (c.issues.length > before) return undefined;
+	const returnWhen = raw.returnWhen ?? undefined;
+	return {
+		...(present(raw, "order") ? { order: [...(raw.order as string[])] } : {}),
+		...(present(raw, "drain") ? { drain: raw.drain as string } : {}),
+		...(present(raw, "spend") ? { spend: [...(raw.spend as NonNullable<AccountRouting["spend"]>)] } : {}),
+		...(returnWhen !== undefined
+			? { returnWhen: [returnWhen as DrainReturnTrigger | DrainReturnTrigger[]].flat() }
+			: {}),
+	};
+}
+
 function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | undefined {
 	const before = c.issues.length;
-	if (!checkFields(c, path, raw, ["funding", "quota", "spending"])) return undefined;
+	if (!checkFields(c, path, raw, ["funding", "quota", "spending", "accounts"])) return undefined;
 	const routing: GroupRouting = {};
 	const funding = present(raw, "funding") ? parseFunding(c, `${path}.funding`, raw.funding) : undefined;
 	const spendingRaw = present(raw, "spending") ? raw.spending : undefined;
@@ -684,6 +721,10 @@ function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | 
 		if (present(q, "unknown"))
 			quota.unknown = readOneOf(c, `${path}.quota.unknown`, ["exclude", "allow"] as const, q.unknown);
 		routing.quota = quota;
+	}
+	if (present(raw, "accounts")) {
+		const accounts = parseAccountRouting(c, `${path}.accounts`, raw.accounts);
+		if (accounts) routing.accounts = accounts;
 	}
 	return c.issues.length > before ? undefined : routing;
 }

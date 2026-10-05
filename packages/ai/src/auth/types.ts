@@ -1177,6 +1177,24 @@ export interface AccountPinSource {
 	project?(provider: string, sessionId: string): string | undefined;
 	/** Account name preferred, not required, for `sessionId`'s requests to `provider`/`modelId` (pool member `account`). */
 	member?(provider: string, sessionId: string, modelId: string | undefined): string | undefined;
+	/** Account routing overrides for `sessionId`'s requests to `provider`/`modelId` (pool `routing.accounts`). */
+	routing?(provider: string, sessionId: string, modelId: string | undefined): AccountRouting | undefined;
+}
+
+/**
+ * Account routing for the requests of one model pool, overriding the account
+ * policies below a pool member's `account` and above `auth.accountPolicies`.
+ * Account names that match no stored account are logged and skipped.
+ */
+export interface AccountRouting {
+	/** Accounts tried in this order before normal selection; the first usable one serves. */
+	readonly order?: readonly string[];
+	/** The OAuth account drained first in place of the policy drain target. */
+	readonly drain?: string;
+	/** {@link AuthAccountPolicy.spend} for the drain target. */
+	readonly spend?: readonly DrainSpendClass[];
+	/** {@link AuthAccountPolicy.returnWhen} for the drain target. */
+	readonly returnWhen?: readonly DrainReturnTrigger[];
 }
 
 /** One stored credential as listed for account selection; never carries secret material. */

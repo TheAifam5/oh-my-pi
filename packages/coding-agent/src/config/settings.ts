@@ -526,12 +526,19 @@ function withLayerValue(layer: RawSettings, segments: readonly string[], value: 
 }
 
 /**
- * `group` without its members' `account` fields, each reported through `warn`; itself when no
- * member names one. Project settings may not choose which of the user's accounts a pool member
- * prefers.
+ * `group` without its members' `account` fields and its `routing.accounts`, each reported through
+ * `warn`; itself when it has neither. Project settings may not choose which of the user's
+ * accounts a pool uses.
  */
-function withoutMemberAccounts(group: unknown, path: string, warn: ModelGroupWarn): unknown {
-	if (!isRecord(group) || !isRecord(group.models)) return group;
+function withoutAccountChoices(group: unknown, path: string, warn: ModelGroupWarn): unknown {
+	if (!isRecord(group)) return group;
+	let result = group;
+	if (isRecord(group.routing) && Object.hasOwn(group.routing, "accounts")) {
+		warn(`${path}.routing.accounts`, "is read from the global config only; ignored in project settings");
+		const { accounts: _accounts, ...routing } = group.routing;
+		result = { ...result, routing };
+	}
+	if (!isRecord(group.models)) return result;
 	let models: Record<string, unknown> | undefined;
 	for (const [alias, member] of Object.entries(group.models)) {
 		if (!isRecord(member) || !Object.hasOwn(member, "account")) continue;
@@ -543,7 +550,7 @@ function withoutMemberAccounts(group: unknown, path: string, warn: ModelGroupWar
 		models ??= { ...group.models };
 		models[alias] = rest;
 	}
-	return models ? { ...group, models } : group;
+	return models ? { ...result, models } : result;
 }
 
 /**
@@ -555,7 +562,7 @@ function withoutMemberAccounts(group: unknown, path: string, warn: ModelGroupWar
  *   and lists pass unchanged.
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
  *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
- *   to global), and `allowProjectMeteredPools` and pool member `account` fields are dropped.
+ *   to global), and `allowProjectMeteredPools`, pool member `account` fields, and `routing.accounts` are dropped.
  *   Unless `allowProjectMetered`, a `modelGroups` entry named in `definedBelow` and an inline
  *   group whose funding includes `metered` are dropped too.
  *
@@ -619,7 +626,7 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 					continue;
 				}
 				for (const issue of parsed.warnings) warn(issue.path, issue.message);
-				const withoutAccounts = project ? withoutMemberAccounts(value, path, warn) : value;
+				const withoutAccounts = project ? withoutAccountChoices(value, path, warn) : value;
 				if (withoutAccounts !== value) {
 					next ??= { ...record };
 					next[key] = withoutAccounts;
