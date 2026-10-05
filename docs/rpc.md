@@ -969,7 +969,8 @@ as well.
 
 `warmingStopReason` explains why warming stopped because of or during the
 refresh, for example `"refresh missed the cache"`, `"refresh failed"`,
-`"cache warming disabled"`, or `"conversation context changed"`. It is absent
+`"cache warming disabled"`, `"conversation context changed"`, or
+`"account changed"`. It is absent
 when warming continues: the refresh rescheduled, or a new request replaced the
 run.
 

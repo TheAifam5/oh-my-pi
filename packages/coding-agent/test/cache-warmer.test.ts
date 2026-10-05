@@ -469,6 +469,46 @@ describe("cache warmer lifecycle", () => {
 		expect(h.warmer.status).toMatchObject({ state: "inactive", reason: "conversation context changed" });
 	});
 
+	test("stops without replaying once the session's account changes", async () => {
+		let account: string | undefined = "acct-a";
+		const h = harness({ getAccount: () => account });
+		start(h);
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+		account = "acct-b";
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+		expect(h.refreshes.map(event => event.type)).toEqual(["start", "end"]);
+		expect(h.warmer.status).toMatchObject({ state: "inactive", reason: "account changed" });
+	});
+
+	test("adopts the account the armed request's response came from", async () => {
+		let account: string | undefined = "acct-a";
+		const h = harness({ getAccount: () => account });
+		start(h, { apiKey: () => "resolved-at-request-time" });
+		// A usage-limit rotation during the real request moved the session to acct-b.
+		account = "acct-b";
+		h.warmer.onResponse(makeMessage(makeUsage({ cacheWrite: 500 })));
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+	});
+
+	test("keeps warming when the account cannot be resolved", async () => {
+		let account: string | undefined;
+		const unknownAtArm = harness({ getAccount: () => account });
+		start(unknownAtArm);
+		account = "acct-b";
+		await advance(SHORT_DELAY_MS);
+		expect(unknownAtArm.replays).toHaveLength(1);
+
+		account = "acct-a";
+		const unknownAtReplay = harness({ getAccount: () => account });
+		start(unknownAtReplay);
+		account = undefined;
+		await advance(SHORT_DELAY_MS);
+		expect(unknownAtReplay.replays).toHaveLength(1);
+	});
+
 	test("extensions can stop a refresh and force one past the threshold", async () => {
 		const stopped = harness({ decide: () => Promise.resolve("stop") });
 		start(stopped);

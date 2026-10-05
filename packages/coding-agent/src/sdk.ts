@@ -26,6 +26,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
+import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
@@ -4615,6 +4616,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getPromptTokens: () => session.lastPromptTokens(),
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
+						getAccount: provider => {
+							const active = authStorage.sessions
+								.accounts(provider, session.sessionId)
+								.find(account => account.active);
+							return active ? accountUsageKey(active) : undefined;
+						},
 					});
 		const codeModeState: { namespacesInfo?: unknown } = {};
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
