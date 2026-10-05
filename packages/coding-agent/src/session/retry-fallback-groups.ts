@@ -328,6 +328,20 @@ export function fundingVerdict(
  */
 export function providerBillingResults(
 	provider: Provider,
+	reports: readonly UsageReport[],
+	nowMs: number,
+	maxAgeMs: number,
+	registry?: ProviderBillingRegistry,
+): BillingResult[];
+export function providerBillingResults(
+	provider: Provider,
+	reports: readonly UsageReport[] | undefined,
+	nowMs: number,
+	maxAgeMs: number,
+	registry?: ProviderBillingRegistry,
+): BillingResult[] | "unavailable";
+export function providerBillingResults(
+	provider: Provider,
 	reports: readonly UsageReport[] | undefined,
 	nowMs: number,
 	maxAgeMs: number,
