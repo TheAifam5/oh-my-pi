@@ -1459,6 +1459,52 @@ describe("ModelHub", () => {
 			}
 		});
 
+		test("g cycles a pool through the implemented strategies, never into quota, and back to priority", () => {
+			const settings = pooledSettings();
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+				scoped: true,
+				settings,
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			const seen: string[] = [];
+			for (let i = 0; i < 9; i++) {
+				hub.handleInput("g");
+				seen.push(smolGroup(settings).strategy.name);
+			}
+			expect(seen).toEqual([
+				"random",
+				"cheapest",
+				"least-used",
+				"least-loaded",
+				"p2c",
+				"shuffle-bag",
+				"priority",
+				"round-robin",
+				"weighted-random",
+			]);
+		});
+
+		test("g drops a least-used window when cycling past it", () => {
+			const settings = Settings.isolated();
+			settings.setModelRoleSpec("smol", {
+				strategy: "least-used",
+				strategyOptions: { window: { type: "rolling", durationMs: 3_600_000 } },
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+			});
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+				scoped: true,
+				settings,
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput("g");
+			expect(smolGroup(settings).strategy).toEqual({ name: "least-loaded" });
+			expect(settings.getModelRoleEntries().smol).not.toHaveProperty("strategyOptions");
+		});
+
 		test("the source summarises a pool's local limits", () => {
 			const settings = Settings.isolated({
 				modelRoles: {

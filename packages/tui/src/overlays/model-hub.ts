@@ -339,7 +339,17 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 };
 
 /** Strategies `g` cycles through: each needs no options, or only an `order` the hub derives from the members. */
-const POOL_STRATEGY_CYCLE = ["priority", "round-robin", "weighted-random", "random"] as const;
+const POOL_STRATEGY_CYCLE = [
+	"priority",
+	"round-robin",
+	"weighted-random",
+	"random",
+	"cheapest",
+	"least-used",
+	"least-loaded",
+	"p2c",
+	"shuffle-bag",
+] as const;
 
 /**
  * Funding orders `o` cycles through. There is no empty state: a pool without `routing.funding`

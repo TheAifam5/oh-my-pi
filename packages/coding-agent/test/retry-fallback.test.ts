@@ -5,7 +5,10 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
+	getRetryFallbackShuffleBag,
 	orderRetryFallbackCandidates,
+	recordRetryFallbackUse,
+	resetRetryFallbackRoundRobinPositions,
 	type RetryFallbackQuotaEvidence,
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
@@ -394,6 +397,71 @@ describe("retry fallback strategies", () => {
 		expect(order(["a", "b"], "priority", { b: { state: "healthy", remainingFraction: 1, observedAt: NOW } })).toEqual(
 			["a", "b"],
 		);
+	});
+
+	it("orders cheapest, least-used, and least-loaded by rank, unranked last, ties in given order", () => {
+		const rank: Record<string, number> = { a: 2, c: 0, d: 2 };
+		for (const strategy of ["cheapest", "least-used", "least-loaded"] as const) {
+			expect(
+				orderRetryFallbackCandidates(["a", "b", "c", "d"], strategy, {
+					nowMs: NOW,
+					maxAgeMs: MAX_AGE,
+					rank: candidate => rank[candidate],
+				}),
+			).toEqual(["c", "a", "d", "b"]);
+		}
+	});
+
+	it("puts the less loaded of two distinct random candidates first under p2c, the rest in given order", () => {
+		const p2c = (draws: number[], rank: Record<string, number>) =>
+			orderRetryFallbackCandidates(["a", "b", "c"], "p2c", {
+				nowMs: NOW,
+				maxAgeMs: MAX_AGE,
+				random: () => draws.shift() ?? 0,
+				rank: candidate => rank[candidate],
+			});
+		// Draws pick a (index 0) and c (the second draw skips index 0, so 0.9 lands on index 2).
+		expect(p2c([0, 0.9], { a: 2, b: 0, c: 1 })).toEqual(["c", "a", "b"]);
+		// Identical draws still yield two distinct candidates.
+		expect(p2c([0, 0], { a: 1, b: 0, c: 0 })).toEqual(["b", "a", "c"]);
+		// A tie keeps the first drawn, so all-tied members each come first for some draw.
+		const tied = { a: 0, b: 0, c: 0 };
+		expect([p2c([0, 0.9], tied)[0], p2c([0.5, 0], tied)[0], p2c([0.9, 0], tied)[0]]).toEqual(["a", "b", "c"]);
+	});
+
+	it("uses every shuffle-bag member once per cycle before reshuffling", () => {
+		resetRetryFallbackRoundRobinPositions();
+		const chain = ["p", "a", "b"].map(raw => ({ raw, provider: "x", id: raw, thinkingLevel: undefined }));
+		const draws = [0, 0, 0.99, 0.99];
+		const random = () => draws.shift() ?? 0;
+		const used: string[] = [];
+		for (let i = 0; i < 6; i++) {
+			const bag = getRetryFallbackShuffleBag(chain, ["p", "a", "b"], random);
+			const [next] = orderRetryFallbackCandidates(["p", "a", "b"], "shuffle-bag", {
+				nowMs: NOW,
+				maxAgeMs: MAX_AGE,
+				bagPosition: candidate => (bag.includes(candidate) ? bag.indexOf(candidate) : undefined),
+			});
+			used.push(next!);
+			recordRetryFallbackUse(
+				"shuffle-bag",
+				chain,
+				chain.find(entry => entry.raw === next)!,
+			);
+		}
+		expect(used.slice(0, 3).sort()).toEqual(["a", "b", "p"]);
+		expect(used.slice(3).sort()).toEqual(["a", "b", "p"]);
+		// The second cycle draws a fresh shuffle instead of repeating the first.
+		expect(used.slice(3)).not.toEqual(used.slice(0, 3));
+		// With no member pickable right now (all cooling down), the bag keeps its progress.
+		const [first] = getRetryFallbackShuffleBag(chain, ["p", "a", "b"], random);
+		recordRetryFallbackUse(
+			"shuffle-bag",
+			chain,
+			chain.find(entry => entry.raw === first)!,
+		);
+		expect(getRetryFallbackShuffleBag(chain, [], random)).toHaveLength(2);
+		resetRetryFallbackRoundRobinPositions();
 	});
 
 	it("starts round-robin after the last applied chain entry and wraps past the end", () => {

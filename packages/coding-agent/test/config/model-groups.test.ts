@@ -31,6 +31,21 @@ function roleGroup(role: string, value: unknown): ModelGroup {
 }
 
 describe("modelRoles values (strict)", () => {
+	it("parses the option-free strategies and least-used's rolling window, defaulting to 24 hours", () => {
+		for (const strategy of ["cheapest", "least-loaded", "p2c", "shuffle-bag"] as const) {
+			expect(roleGroup("engineer", pool({ strategy })).strategy).toEqual({ name: strategy });
+		}
+		expect(roleGroup("engineer", pool({ strategy: "least-used" })).strategy).toEqual({
+			name: "least-used",
+			windowMs: 86_400_000,
+		});
+		const hourly = pool({
+			strategy: "least-used",
+			strategyOptions: { window: { type: "rolling", durationMs: 3_600_000 } },
+		});
+		expect(roleGroup("engineer", hourly).strategy).toEqual({ name: "least-used", windowMs: 3_600_000 });
+	});
+
 	it("returns legacy strings and lists verbatim", () => {
 		const list = ["anthropic/claude-opus:high", "@smol"];
 		const listResult = parseModelRoleValue("engineer", list);
@@ -78,11 +93,28 @@ describe("modelRoles values (strict)", () => {
 		],
 		[
 			"a strategy that is not implemented",
-			pool({ strategy: "cheapest" }),
+			pool({ strategy: "fastest" }),
 			[
 				{
 					path: "modelRoles.engineer.strategy",
-					message: '"cheapest" is not one of: priority, round-robin, weighted-random, random, quota',
+					message:
+						'"fastest" is not one of: priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, shuffle-bag',
+				},
+			],
+		],
+		[
+			"a window on a strategy without options",
+			pool({ strategy: "cheapest", strategyOptions: { window: { type: "rolling", durationMs: 1000 } } }),
+			[{ path: "modelRoles.engineer.strategyOptions.window", message: "unsupported field; supported: none" }],
+		],
+		[
+			"a least-used window that is not rolling or too long",
+			pool({ strategy: "least-used", strategyOptions: { window: { type: "calendar", durationMs: 4e10 } } }),
+			[
+				{ path: "modelRoles.engineer.strategyOptions.window.type", message: 'must be "rolling"' },
+				{
+					path: "modelRoles.engineer.strategyOptions.window.durationMs",
+					message: "must be at most 31536000000 (365 days)",
 				},
 			],
 		],

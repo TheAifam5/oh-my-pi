@@ -217,6 +217,7 @@ import {
 import { getSelectorFallbackChains } from "./session/retry-fallback-selector-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { retryFallbackBillingRegistry, rolePoolMemberSelectors } from "./session/retry-fallback-groups";
+import { trackInFlightRequest } from "./session/in-flight-requests";
 import { createRolePoolCall, pickRolePoolTarget } from "./session/role-pool-resolution";
 import {
 	notePoolPickApplied,
@@ -4699,6 +4700,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					usageRecorded: true,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
 				});
+				trackInFlightRequest(
+					streamModel.provider,
+					streamModel.id,
+					Promise.resolve(stream).then(started => started.result()),
+				);
 				// Every request through this streamFn is this session's own main
 				// loop (side-channel, advisor, and maintenance requests use
 				// dedicated wrappers), so it owns the warmer. The replay omits the

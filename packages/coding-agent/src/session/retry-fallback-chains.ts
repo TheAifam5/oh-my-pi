@@ -66,6 +66,14 @@ export interface RetryFallbackOrderOptions<T> {
 	 * after it; `undefined` keeps the given order.
 	 */
 	lastAppliedPosition?: number;
+	/**
+	 * A candidate's rank, lower first; `undefined` ranks after every ranked candidate. Read by
+	 * `cheapest` (price), `least-used` (recorded requests), and `least-loaded` and `p2c` (requests in
+	 * flight).
+	 */
+	rank?: (candidate: T) => number | undefined;
+	/** A candidate's position in the current shuffle bag; `undefined` (already used) goes after. Read only by `shuffle-bag`. */
+	bagPosition?: (candidate: T) => number | undefined;
 }
 
 /** Parsed model selector used by retry fallback resolution. */
@@ -798,6 +806,12 @@ const QUOTA_STATE_RANK: Record<ModelUsageHealthState, number> = { healthy: 0, re
  *   after those reporting one. Missing evidence, and evidence older than
  *   `maxAgeMs`, counts as unknown; `excludeUnknown` drops those candidates.
  *   Ties keep the given order.
+ * - `cheapest`, `least-used`, and `least-loaded` sort by `rank`, unranked last,
+ *   ties in given order.
+ * - `p2c` draws two distinct candidates with `random` and puts the lower-ranked
+ *   first (the first drawn on a tie), then the rest in given order.
+ * - `shuffle-bag` puts candidates still in the bag first, in bag order, then the
+ *   rest in given order.
  */
 export function orderRetryFallbackCandidates<T>(
 	candidates: readonly T[],
@@ -818,6 +832,20 @@ export function orderRetryFallbackCandidates<T>(
 			.map(entry => entry.candidate);
 	}
 	if (strategy === "priority" || (candidates.length <= 1 && strategy !== "quota")) return [...candidates];
+	if (strategy === "cheapest" || strategy === "least-used" || strategy === "least-loaded") {
+		return sortByKey(candidates, options.rank);
+	}
+	if (strategy === "p2c") {
+		const random = options.random ?? Math.random;
+		const first = Math.min(candidates.length - 1, Math.floor(random() * candidates.length));
+		// The second draw skips the first index, so the two are always distinct.
+		let second = Math.min(candidates.length - 2, Math.floor(random() * (candidates.length - 1)));
+		if (second >= first) second++;
+		const rank = (index: number) => options.rank?.(candidates[index]!) ?? Number.POSITIVE_INFINITY;
+		const chosen = rank(second) < rank(first) ? second : first;
+		return [candidates[chosen]!, ...candidates.filter((_candidate, index) => index !== chosen)];
+	}
+	if (strategy === "shuffle-bag") return sortByKey(candidates, options.bagPosition);
 	if (strategy === "round-robin") {
 		const { chainPosition, chainLength, lastAppliedPosition } = options;
 		if (lastAppliedPosition === undefined || !chainPosition || !chainLength) return [...candidates];
@@ -854,6 +882,14 @@ export function orderRetryFallbackCandidates<T>(
 		return a.index - b.index;
 	});
 	return considered.map(entry => entry.candidate);
+}
+
+/** `candidates` sorted by `key` ascending, keyless last, ties in given order. */
+function sortByKey<T>(candidates: readonly T[], key: ((candidate: T) => number | undefined) | undefined): T[] {
+	return candidates
+		.map((candidate, index) => ({ candidate, index, key: key?.(candidate) ?? Number.POSITIVE_INFINITY }))
+		.sort((a, b) => a.key - b.key || a.index - b.index)
+		.map(entry => entry.candidate);
 }
 
 /**
@@ -906,7 +942,54 @@ export function recordRetryFallbackRoundRobinPosition(
 	if (position >= 0) roundRobinPositions.set(roundRobinChainId(chain), position);
 }
 
-/** Forgets every recorded round-robin position, so isolated tests start from configured order. */
+/**
+ * Selectors each shuffle-bag chain has not used in its current cycle, in shuffled order, keyed
+ * like {@link roundRobinPositions} and likewise shared by the process and not persisted. A member
+ * that is never picked (filtered out by funding, limits, or cooldown) stays in the bag.
+ */
+const shuffleBags = new Map<string, string[]>();
+
+/**
+ * The selectors of `chain` not yet used in its current shuffle-bag cycle, in bag order. A bag
+ * holding none of `candidates` (the members eligible now; empty keeps the bag) is refilled with
+ * every chain selector, shuffled with `random`, so members that cannot be picked never stall a cycle.
+ */
+export function getRetryFallbackShuffleBag(
+	chain: readonly RetryFallbackSelector[],
+	candidates: readonly string[],
+	random: () => number = Math.random,
+): readonly string[] {
+	const id = roundRobinChainId(chain);
+	const bag = shuffleBags.get(id);
+	if (bag && (candidates.length === 0 || bag.some(selector => candidates.includes(selector)))) return bag;
+	const refilled = chain.map(selector => selector.raw);
+	for (let i = refilled.length - 1; i > 0; i--) {
+		const j = Math.min(i, Math.floor(random() * (i + 1)));
+		[refilled[i], refilled[j]] = [refilled[j]!, refilled[i]!];
+	}
+	shuffleBags.set(id, refilled);
+	return refilled;
+}
+
+/**
+ * Records that `selector` was applied from `chain` under `strategy`: `round-robin` moves its
+ * position, `shuffle-bag` takes it out of the current bag; other strategies keep no state.
+ */
+export function recordRetryFallbackUse(
+	strategy: RetryFallbackStrategy,
+	chain: readonly RetryFallbackSelector[],
+	selector: RetryFallbackSelector,
+): void {
+	if (strategy === "round-robin") recordRetryFallbackRoundRobinPosition(chain, selector);
+	else if (strategy === "shuffle-bag") {
+		const bag = shuffleBags.get(roundRobinChainId(chain));
+		const index = bag?.indexOf(selector.raw) ?? -1;
+		if (index >= 0) bag?.splice(index, 1);
+	}
+}
+
+/** Forgets every recorded round-robin position and shuffle bag, so isolated tests start from configured order. */
 export function resetRetryFallbackRoundRobinPositions(): void {
 	roundRobinPositions.clear();
+	shuffleBags.clear();
 }

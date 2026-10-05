@@ -112,22 +112,44 @@ function echoKeys(keys: readonly string[]): string {
 }
 
 /** Strategies a group may use; each orders members as described at {@link GroupStrategy}. */
-export const GROUP_STRATEGIES = ["priority", "round-robin", "weighted-random", "random", "quota"] as const;
+export const GROUP_STRATEGIES = [
+	"priority",
+	"round-robin",
+	"weighted-random",
+	"random",
+	"quota",
+	"cheapest",
+	"least-used",
+	"least-loaded",
+	"p2c",
+	"shuffle-bag",
+] as const;
 export type GroupStrategyName = (typeof GROUP_STRATEGIES)[number];
 
 /** Billing classes in the only order funding may list them; `metered` is always last. */
 export const BILLING_CLASSES = ["included", "free", "metered"] as const;
 export type BillingClass = (typeof BILLING_CLASSES)[number];
 
+/** Window `least-used` counts requests over by default, in ms (24 hours). */
+export const DEFAULT_LEAST_USED_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /**
  * A strategy with exactly the options it consumes. `priority` and `round-robin` follow `order`;
  * `random` and `weighted-random` (by member `weight`) draw a new order per use; `quota` tries the
- * most remaining coding-plan quota first, balanced by remaining fraction.
+ * most remaining coding-plan quota first, balanced by remaining fraction. `cheapest` orders by
+ * input plus output price, `least-used` by requests recorded over the last `windowMs`,
+ * `least-loaded` by requests in flight in this process, `p2c` picks the less loaded of two random
+ * members, and `shuffle-bag` uses every member once per shuffled cycle.
  */
 export type GroupStrategy =
 	| { name: "random" }
 	| { name: "weighted-random" }
 	| { name: "quota" }
+	| { name: "cheapest" }
+	| { name: "least-loaded" }
+	| { name: "p2c" }
+	| { name: "shuffle-bag" }
+	| { name: "least-used"; windowMs: number }
 	/** `order` lists every member alias exactly once. */
 	| { name: "round-robin"; order: readonly string[] }
 	| { name: "priority"; order: readonly string[] };
@@ -515,8 +537,30 @@ function parseStrategy(
 	switch (strategy) {
 		case "random":
 		case "weighted-random":
+		case "cheapest":
+		case "least-loaded":
+		case "p2c":
+		case "shuffle-bag":
 			options([]);
 			return failed() ? undefined : { name: strategy };
+		case "least-used": {
+			const o = options(["window"]);
+			if (!o) return undefined;
+			let windowMs = DEFAULT_LEAST_USED_WINDOW_MS;
+			const windowPath = `${at}.window`;
+			if (present(o, "window") && checkFields(c, windowPath, o.window, ["type", "durationMs"])) {
+				const w = o.window;
+				if (w.type !== "rolling") c.add(`${windowPath}.type`, 'must be "rolling"');
+				if (w.durationMs === undefined) c.add(windowPath, "durationMs is required");
+				else {
+					const durationMs = readPositive(c, `${windowPath}.durationMs`, w.durationMs, true);
+					if (durationMs !== undefined && durationMs > MAX_BUDGET_WINDOW_MS) {
+						c.add(`${windowPath}.durationMs`, `must be at most ${MAX_BUDGET_WINDOW_MS} (365 days)`);
+					} else if (durationMs !== undefined) windowMs = durationMs;
+				}
+			}
+			return failed() ? undefined : { name: strategy, windowMs };
+		}
 		case "round-robin":
 		case "priority": {
 			const o = options(["order"]);
