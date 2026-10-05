@@ -1,6 +1,6 @@
 import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import {
-	ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX,
+	isPinnedAccountRefusalText,
 	isAccountPolicyError,
 	isClinePassSurfaceGateMessage,
 	isOAuthExpiry,
@@ -43,7 +43,7 @@ export function isInvalidatedOAuthTokenError(error: unknown): boolean {
  * 429s (`Too many requests`, per-minute caps) stay in the upstream-backoff lane.
  */
 export function isAuthRetryableError(error: unknown): boolean {
-	if (error instanceof Error && error.message.includes(ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX)) return false;
+	if (error instanceof Error && isPinnedAccountRefusalText(error.message)) return false;
 	if (error instanceof OAuthError && error.kind === "token-refresh") return true;
 	if (isUsageLimit(error)) return true;
 	if (isAccountPolicyError(error)) return true;

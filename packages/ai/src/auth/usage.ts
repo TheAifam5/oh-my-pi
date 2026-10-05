@@ -39,7 +39,14 @@ import { mergeRefreshedOrganizationScope, OAUTH_REFRESH_SKEW_MS } from "./refres
 import type { OAuthRefresher } from "./refresh";
 import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
-import type { AccountBillingSource, AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
+import type {
+	AccountBillingSource,
+	AccountLimitSource,
+	AuthCredential,
+	OAuthCredential,
+	ObservedUsageInput,
+	UsageApi,
+} from "./types";
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
@@ -121,6 +128,7 @@ export class UsageService implements UsageApi {
 	#usageHeaderIngestAt: Map<string, number> = new Map();
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#billingSource: AccountBillingSource | undefined;
+	#limitSource: AccountLimitSource | undefined;
 	readonly fetch: typeof fetch;
 	readonly logger: UsageLogger;
 	readonly requestTimeoutMs: number;
@@ -161,10 +169,20 @@ export class UsageService implements UsageApi {
 		});
 		this.#deps.cache.invalidateForProvider(provider);
 	}
-	/** Carry runtime usage provider overrides and the billing source over from the service this one replaces (store swap). */
+	/** Carry runtime usage provider overrides and the billing and limit sources over from the service this one replaces (store swap). */
 	adoptRuntimeProviders(previous: UsageService): void {
 		this.#runtimeUsageProviderOverrides = previous.#runtimeUsageProviderOverrides;
 		this.#billingSource = previous.#billingSource;
+		this.#limitSource = previous.#limitSource;
+	}
+
+	setLimitSource(source: AccountLimitSource | undefined): void {
+		this.#limitSource = source;
+	}
+
+	/** The installed {@link AccountLimitSource}, if any. */
+	get limitSource(): AccountLimitSource | undefined {
+		return this.#limitSource;
 	}
 
 	setBillingSource(source: AccountBillingSource | undefined): void {

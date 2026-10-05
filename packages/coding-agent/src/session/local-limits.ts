@@ -8,7 +8,8 @@ import {
 	localLimitWindowStart,
 	type LocalLimitWindow,
 } from "@oh-my-pi/pi-ai/usage/limits";
-import { formatDuration, logger } from "@oh-my-pi/pi-utils";
+import type { AccountLimitSource } from "@oh-my-pi/pi-ai/auth-storage";
+import { formatDuration, isSqliteBusyError, logger } from "@oh-my-pi/pi-utils";
 import { limitKeyScope, parseLimitsSetting, withoutSharedIdConflicts } from "../config/local-limits";
 import { cfgLimits } from "../config/model-settings";
 import type { Settings } from "../config/settings";
@@ -126,7 +127,8 @@ function windowLabel(window: LocalLimitWindow): string {
 	return window.type === "calendar" ? window.period : formatDuration(window.durationMs);
 }
 
-function limitLabel(key: string, limit: LocalLimit): string {
+/** User-facing name of `limit` configured under `key`: its `id`, else the key, cap, and window. */
+export function localLimitLabel(key: string, limit: LocalLimit): string {
 	if (limit.id !== undefined) return limit.id;
 	const unit = limit.metric === "usd" ? "USD" : limit.metric;
 	return `${key}: ${limit.max} ${unit} per ${windowLabel(limit.window)}`;
@@ -157,7 +159,7 @@ export function limitTargets(settings: Settings, provider: string, modelId: stri
 				limit.id === undefined
 					? [scope]
 					: configured.flatMap(other => (other.limits.some(entry => entry.id === limit.id) ? [other.scope] : []));
-			targets.set(targetKey, { key: targetKey, label: limitLabel(key, limit), limit, scopes });
+			targets.set(targetKey, { key: targetKey, label: localLimitLabel(key, limit), limit, scopes });
 		});
 	}
 	return [...targets.values()];
@@ -165,6 +167,19 @@ export function limitTargets(settings: Settings, provider: string, modelId: stri
 
 function metricTotal(totals: UsageTotals, limit: LocalLimit): bigint {
 	return limit.metric === "usd" ? totals.costNanos : limit.metric === "requests" ? totals.requests : totals.tokens;
+}
+
+/** Attempts at reading one total while agent.db is busy; reads are synchronous, so retries are immediate. */
+const TOTALS_READ_ATTEMPTS = 3;
+
+function readTotals(ledger: UsageLedger, scopes: readonly UsageScope[], sinceMs: number): UsageTotals {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return ledger.totals(scopes, sinceMs);
+		} catch (error) {
+			if (!isSqliteBusyError(error) || attempt >= TOTALS_READ_ATTEMPTS) throw error;
+		}
+	}
 }
 
 /**
@@ -187,7 +202,7 @@ export function evaluateLimits(
 			const { window } = target.limit;
 			const start = localLimitWindowStart(window, nowMs);
 			// The ledger counts calls after `sinceMs`; a calendar window includes its first millisecond.
-			const totals = ledger.totals(target.scopes, window.type === "calendar" ? start - 1 : start);
+			const totals = readTotals(ledger, target.scopes, window.type === "calendar" ? start - 1 : start);
 			reached = metricTotal(totals, target.limit) >= localLimitCap(target.limit);
 		} catch (error) {
 			if (target.limit.onLimit === "skip") {
@@ -218,4 +233,44 @@ export function describeLimitRefusal(refusal: LimitRefusal): string {
 export function limitWarningKey(target: LimitTarget, nowMs: number): string {
 	const { window } = target.limit;
 	return window.type === "calendar" ? `${target.key}\0${localLimitWindowStart(window, nowMs)}` : target.key;
+}
+
+/**
+ * The account limit source the auth store consults ({@link AccountLimitSource}): each limit counts
+ * the calls `account` made to `provider` in the usage `ledger()`. A reached `warn` limit is logged
+ * once per calendar period, or for a rolling window once until it drops below its cap; usage that
+ * cannot be read refuses with `unreadable`, logged once per account.
+ */
+export function createAccountLimitSource(ledger: () => UsageLedger | undefined): AccountLimitSource {
+	const warnedWindows = new Set<string>();
+	const warnedUnreadable = new Set<string>();
+	return {
+		refuses(provider, account, limits, nowMs) {
+			const subject = `${provider} account ${account}`;
+			const targets = limits.map((limit, index) => ({
+				key: `account:${provider}/${account}#${index}`,
+				label: localLimitLabel(subject, limit),
+				limit,
+				scopes: [{ provider, account }],
+			}));
+			const { refused, warned, quiet } = evaluateLimits(ledger(), targets, nowMs);
+			for (const target of quiet) {
+				if (target.limit.window.type === "rolling") warnedWindows.delete(limitWarningKey(target, nowMs));
+			}
+			for (const target of warned) {
+				const key = limitWarningKey(target, nowMs);
+				if (warnedWindows.has(key)) continue;
+				warnedWindows.add(key);
+				logger.warn("Local account limit reached", { limit: target.label });
+			}
+			if (refused.some(refusal => refusal.reason === "reached")) return "reached";
+			if (refused.length === 0) return undefined;
+			const accountKey = `${provider}\0${account}`;
+			if (!warnedUnreadable.has(accountKey)) {
+				warnedUnreadable.add(accountKey);
+				logger.warn("Local account limit usage could not be read; the account is not used", { provider, account });
+			}
+			return "unreadable";
+		},
+	};
 }

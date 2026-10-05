@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { parseLimitsSetting } from "@oh-my-pi/pi-coding-agent/config/local-limits";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { evaluateLimits, limitTargets } from "@oh-my-pi/pi-coding-agent/session/local-limits";
+import { createAccountLimitSource, evaluateLimits, limitTargets } from "@oh-my-pi/pi-coding-agent/session/local-limits";
+import { cfgAuthAccountPolicies } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
+import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
+import { AccountPolicies } from "@oh-my-pi/pi-ai/auth/policy";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
@@ -209,5 +213,128 @@ describe("local limits setting", () => {
 		const child = parent.overlay();
 		child.setProjectModelRole("engineer", "openai/gpt-4o-mini");
 		expect(labels(child, "role:engineer")).toEqual(["role:engineer: 5 requests per day"]);
+	});
+
+	it("counts an account limit against that account's calls to the provider and logs a warn limit once", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const source = createAccountLimitSource(() => storage.usageLedger);
+		const now = Date.now();
+		const call = (provider: string, account: string) =>
+			storage.usageLedger.record({
+				atMs: now,
+				provider,
+				model: "m",
+				account,
+				costNanos: 0,
+				inputTokens: 1,
+				outputTokens: 1,
+			});
+		const skip: LocalLimit[] = [
+			{ metric: "requests", max: 1, window: { type: "calendar", period: "day" }, onLimit: "skip" },
+		];
+		call("openai", "home");
+		call("anthropic", "work");
+		expect(source.refuses("openai", "work", skip, now)).toBeUndefined();
+
+		call("openai", "work");
+		expect(source.refuses("openai", "work", skip, now)).toBe("reached");
+		expect(createAccountLimitSource(() => undefined).refuses("openai", "work", skip, now)).toBe("unreadable");
+		const busy = vi.spyOn(storage.usageLedger, "totals").mockImplementationOnce(() => {
+			throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+		});
+		expect(source.refuses("openai", "work", skip, now)).toBe("reached");
+		expect(busy).toHaveBeenCalledTimes(2);
+
+		const warn = vi.spyOn(logger, "warn");
+		const warnOnly: LocalLimit[] = [{ ...skip[0]!, onLimit: "warn" }];
+		expect(source.refuses("openai", "work", warnOnly, now)).toBeUndefined();
+		expect(source.refuses("openai", "work", warnOnly, now)).toBeUndefined();
+		expect(warn.mock.calls.filter(([message]) => message === "Local account limit reached")).toHaveLength(1);
+	});
+
+	it("keeps global account limits when project account policies replace the global ones", async () => {
+		const limits = [{ metric: "requests", max: 1, window: DAY }];
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({
+				auth: {
+					accountPolicies: [
+						{ provider: "openai", name: "work", account: { email: "w@example.com" }, limits },
+						{ provider: "openai", account: { email: "h@example.com" }, limits },
+					],
+				},
+			}),
+		);
+		const projectSettings = path.join(getProjectAgentDir(project), "settings.json");
+		const policies = async (projectPolicies: unknown[]) => {
+			fs.writeFileSync(projectSettings, JSON.stringify({ auth: { accountPolicies: projectPolicies } }));
+			// Raw policies as configured; AccountPolicies fills in `onLimit` when it loads them.
+			const merged: unknown = cfgAuthAccountPolicies.get(await Settings.loadIsolated({ cwd: project, agentDir }));
+			return merged;
+		};
+		const warn = vi.spyOn(logger, "warn");
+
+		expect(await policies([])).toEqual([
+			{ provider: "openai", account: { email: "w@example.com" }, limits },
+			{ provider: "openai", account: { email: "h@example.com" }, limits },
+		]);
+		expect(
+			await policies([{ provider: "openai", name: "work", account: { email: "w@example.com" }, priority: 5 }]),
+		).toEqual([
+			{ provider: "openai", name: "work", account: { email: "w@example.com" }, priority: 5, limits },
+			{ provider: "openai", account: { email: "h@example.com" }, limits },
+		]);
+		expect(warn.mock.calls.some(([message]) => String(message).includes("their account limits are kept"))).toBe(true);
+	});
+
+	it("matches project account policies to global ones by selector only and keeps the merged list valid", async () => {
+		const limits = [{ metric: "requests", max: 1, window: DAY }];
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({
+				auth: {
+					accountPolicies: [
+						{ provider: "openai", name: "work", account: { email: "w@example.com" }, drain: true, limits },
+					],
+				},
+			}),
+		);
+		const projectSettings = path.join(getProjectAgentDir(project), "settings.json");
+		const policies = async (projectPolicies: unknown[]) => {
+			fs.writeFileSync(projectSettings, JSON.stringify({ auth: { accountPolicies: projectPolicies } }));
+			const merged: unknown = cfgAuthAccountPolicies.get(await Settings.loadIsolated({ cwd: project, agentDir }));
+			expect(() => new AccountPolicies(merged as AuthAccountPolicies, undefined)).not.toThrow();
+			return merged;
+		};
+		const appended = { provider: "openai", account: { email: "w@example.com" }, limits };
+
+		// Same name, other selector: no limits inherited, and the name or drain cannot collide.
+		expect(
+			await policies([{ provider: "openai", name: "work", account: { accountId: "acc-w" }, drain: true }]),
+		).toEqual([{ provider: "openai", name: "work", account: { accountId: "acc-w" }, drain: true }, appended]);
+		// The same account under other identity fields stays a separate entry.
+		expect(await policies([{ provider: "openai", account: { accountId: "acc-w" }, priority: 2 }])).toEqual([
+			{ provider: "openai", account: { accountId: "acc-w" }, priority: 2 },
+			appended,
+		]);
+	});
+
+	it("strips limits from project account policies and keeps the rest of each entry", async () => {
+		const limits = [{ metric: "requests", max: 1, window: DAY }];
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(project), "settings.json"),
+			JSON.stringify({
+				auth: {
+					accountPolicies: [{ provider: "openai", name: "work", account: { email: "w@example.com" }, limits }],
+				},
+			}),
+		);
+		const warn = vi.spyOn(logger, "warn");
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{ provider: "openai", name: "work", account: { email: "w@example.com" } },
+		]);
+		expect(warn.mock.calls.some(([message]) => String(message).includes("accountPolicies[0].limits"))).toBe(true);
 	});
 });

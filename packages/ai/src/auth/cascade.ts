@@ -256,6 +256,8 @@ export class KeyCascade implements KeysApi {
 	 * credential to reach the correct host. With several stored accounts every
 	 * peek returns the same one, so credential-scoped discovery caches stay on
 	 * one namespace.
+	 * Local account limits are not consulted: peek and selectByType are best-effort lookups
+	 * that send no request.
 	 */
 	async peek(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
@@ -420,6 +422,8 @@ export class KeyCascade implements KeysApi {
 			const apiKey = await this.#resolveAccount(provider, sessionId, target, options, onCredentialId, false);
 			if (apiKey !== undefined) return apiKey;
 		}
+		// With every stored account over a local limit the request fails instead of reaching an env key.
+		this.#deps.selector.refuseIfAllLimited(provider, sessionId, options);
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
@@ -523,6 +527,11 @@ export class KeyCascade implements KeysApi {
 				onCredentialId(resolved.credentialId, { orgId, region, inferenceRegion });
 			}
 			return resolved.apiKey;
+		}
+		const refusal = this.#deps.selector.accountLimit(provider, target.index);
+		if (refusal) {
+			if (exclusive) throw new AIError.AccountLimitError(provider, refusal);
+			return undefined;
 		}
 		if (!exclusive && !this.#deps.selector.isUnblocked(provider, "api_key", target.index, options)) return undefined;
 		const apiKey = await this.#deps.overrides.resolve(target.credential.key);
