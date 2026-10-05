@@ -507,7 +507,7 @@ interface ModelGroupLayerPolicy {
 	allowProjectMetered: boolean;
 	/** Group names the global layer, a `--config` overlay, a runtime override, or an overlay parent defines. */
 	definedBelow?: ReadonlySet<string>;
-	/** The global layer, whose pool limits a project entry may only tighten. */
+	/** The layers below and above the project ({@link lowerPoolRecords}), whose pool limits a project entry may only tighten. */
 	lower?: RawSettings;
 }
 
@@ -625,27 +625,36 @@ function acceptsAccountPolicies(policies: unknown[]): boolean {
 }
 
 /**
- * `global` with the overlay parent's merged `modelRoles`, `retry.fallbackChains`, and
- * `modelGroups` layered under it, entry by entry, and the parent's `auth.accountPolicies` when
- * `global` has none: the view a project layer of this instance may only tighten.
+ * `global` with the `modelRoles`, `retry.fallbackChains`, and `modelGroups` entries of `above`
+ * (the `--config` overlay, then runtime overrides) layered over it and the overlay parent's merged
+ * ones under it, entry by entry, and the parent's `auth.accountPolicies` when `global` has none: the
+ * view a project layer of this instance may only tighten.
  */
-function withParentPoolRecords(global: RawSettings, parent: Settings): RawSettings {
+function lowerPoolRecords(
+	global: RawSettings,
+	above: readonly RawSettings[],
+	parent: Settings | undefined,
+): RawSettings {
 	let result = global;
 	for (const [segments, inherited] of [
-		[["modelRoles"], cfgModelRoles.get(parent)],
-		[["retry", "fallbackChains"], cfgRetryFallbackChains.get(parent)],
-		[["modelGroups"], cfgModelGroups.get(parent)],
+		[["modelRoles"], parent && cfgModelRoles.get(parent)],
+		[["retry", "fallbackChains"], parent && cfgRetryFallbackChains.get(parent)],
+		[["modelGroups"], parent && cfgModelGroups.get(parent)],
 	] as const) {
-		const own = getByPath(global, segments);
-		result = withLayerValue(result, segments, { ...inherited, ...(isRecord(own) ? own : {}) });
+		let entries: RawSettings = { ...inherited };
+		for (const layer of [global, ...above]) {
+			const own = getByPath(layer, segments);
+			if (isRecord(own)) entries = { ...entries, ...own };
+		}
+		result = withLayerValue(result, segments, entries);
 	}
-	if (getByPath(global, cfgAuthAccountPolicies.segments) === undefined) {
+	if (parent && getByPath(global, cfgAuthAccountPolicies.segments) === undefined) {
 		result = withLayerValue(result, cfgAuthAccountPolicies.segments, cfgAuthAccountPolicies.get(parent));
 	}
 	return result;
 }
 
-/** The `routing.limits` of the group `section.key` defines or references in `layer` (global). */
+/** The `routing.limits` of the group `section.key` defines or references in `layer` ({@link lowerPoolRecords}). */
 function lowerPoolLimits(
 	section: (typeof MODEL_GROUP_RECORDS)[number]["section"],
 	segments: readonly string[],
@@ -666,7 +675,7 @@ function lowerPoolLimits(
 }
 
 /**
- * Whether the project entry `value` would replace a global pool that has `routing.limits` with a
+ * Whether the project entry `value` would replace a `lower` pool that has `routing.limits` with a
  * different value (a selector string or list, another reference, or another inline pool).
  */
 function replacesLimitedPool(
@@ -682,7 +691,7 @@ function replacesLimitedPool(
 }
 
 /**
- * The inline project pool `value` (defining `group`) with the global pool limits of the same entry
+ * The inline project pool `value` (defining `group`) with the `lower` pool limits of the same entry
  * kept and its own limits added; limits are ANDed, so a project can only tighten them. A project
  * limit carrying an `id` is ignored with a warning: shared counters are set in the user config only.
  */
@@ -773,11 +782,11 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 				continue;
 			}
 			if (value === null || value === undefined) continue;
-			// Any project form, legacy selectors included, may not replace a pool the global config limits.
+			// Any project form, legacy selectors included, may not replace a pool another layer limits.
 			if (project && policy.lower && replacesLimitedPool(section, segments, key, value, policy.lower)) {
 				const group = isModelGroupForm(value) ? parseModelGroupEntry(section, key, value) : undefined;
 				if (!group?.ok || !definedGroup(section, group.value)) {
-					warn(path, "would replace a pool with global routing.limits; ignored in project settings");
+					warn(path, "would replace a pool with routing.limits; ignored in project settings");
 					drop(key);
 					continue;
 				}
@@ -4878,7 +4887,7 @@ export class Settings {
 				source: "project",
 				allowProjectMetered: this.#allowProjectMeteredPools(layers),
 				definedBelow,
-				lower: this.#parent ? withParentPoolRecords(global, this.#parent) : global,
+				lower: lowerPoolRecords(global, [configOverlay, overrides], this.#parent),
 			},
 			warn("project"),
 		);

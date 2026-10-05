@@ -97,6 +97,15 @@ describe("local limits setting", () => {
 		);
 	});
 
+	it("rejects a key spelled as a pool id", () => {
+		expect(() => parseLimitsSetting({ "role:engineer": [{ metric: "requests", max: 1, window: DAY }] })).toThrow(
+			'limits key "role:engineer" names a pool',
+		);
+		expect(() => parseLimitsSetting({ "chain:default/x": [{ metric: "requests", max: 1, window: DAY }] })).toThrow(
+			'limits key "chain:default/x" names a pool',
+		);
+	});
+
 	it("drops a key from a later layer whose shared id differs, with one warning", async () => {
 		fs.writeFileSync(
 			path.join(agentDir, "config.yml"),
@@ -154,6 +163,32 @@ describe("local limits setting", () => {
 		});
 		expect(evaluateLimits(storage.usageLedger, targets, now).refused.map(entry => entry.reason)).toEqual(["reached"]);
 		expect(limitTargets(settings, "anthropic", "claude-opus-4-5")).toEqual([]);
+	});
+
+	it("keeps the surviving shared-id limit of two pools when a project tightens the second", async () => {
+		const pool = (max: number) => ({
+			strategy: "random",
+			routing: { limits: [{ id: "cap", metric: "requests", max, window: DAY }] as unknown[] },
+			models: { opus: { model: "anthropic/claude-opus-4-5" } },
+		});
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ modelRoles: { architect: pool(1), reviewer: pool(2) } }),
+		);
+		const survivor = async () => {
+			const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+			return limitTargets(settings, "anthropic", "claude-opus-4-5", "role:architect").find(t => t.label === "cap")
+				?.limit.max;
+		};
+		expect(await survivor()).toBe(1);
+
+		const tighter = pool(2);
+		tighter.routing.limits = [{ metric: "requests", max: 1, window: DAY }];
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(project), "settings.json"),
+			JSON.stringify({ modelRoles: { reviewer: tighter } }),
+		);
+		expect(await survivor()).toBe(1);
 	});
 
 	it("lets project settings only add to a global pool's limits", async () => {
@@ -220,6 +255,50 @@ describe("local limits setting", () => {
 		const child = parent.overlay();
 		child.setProjectModelRole("engineer", "openai/gpt-4o-mini");
 		expect(labels(child, "role:engineer")).toEqual(["role:engineer: 5 requests per day"]);
+	});
+
+	it("keeps pool limits defined only in a --config overlay or runtime override under a project entry", async () => {
+		const requests = (max: number) => ({ metric: "requests", max, window: DAY });
+		const shared = {
+			modelGroups: {
+				shared: {
+					strategy: "random",
+					routing: { limits: [requests(5)] },
+					models: { opus: { model: "anthropic/claude-opus-4-5" } },
+				},
+			},
+		};
+		fs.writeFileSync(path.join(agentDir, "config.yml"), YAML.stringify({ modelRoles: { engineer: "+shared" } }));
+		const overlay = tempDir.join("overlay.yml");
+		fs.writeFileSync(overlay, YAML.stringify(shared));
+		const projectSettings = path.join(getProjectAgentDir(project), "settings.json");
+		const labels = (settings: Settings) =>
+			limitTargets(settings, "anthropic", "claude-opus-4-5", "role:engineer").map(entry => entry.label);
+
+		fs.writeFileSync(projectSettings, JSON.stringify({ modelRoles: { engineer: "openai/gpt-4o-mini" } }));
+		expect(labels(await Settings.loadIsolated({ cwd: project, agentDir, configFiles: [overlay] }))).toEqual([
+			"role:engineer: 5 requests per day",
+		]);
+		expect(labels(await Settings.loadIsolated({ cwd: project, agentDir, overrides: shared }))).toEqual([
+			"role:engineer: 5 requests per day",
+		]);
+
+		fs.writeFileSync(
+			projectSettings,
+			JSON.stringify({
+				modelRoles: {
+					engineer: {
+						strategy: "random",
+						routing: { limits: [requests(2)] },
+						models: { opus: { model: "anthropic/claude-opus-4-5" } },
+					},
+				},
+			}),
+		);
+		expect(labels(await Settings.loadIsolated({ cwd: project, agentDir, configFiles: [overlay] }))).toEqual([
+			"role:engineer: 5 requests per day",
+			"role:engineer: 2 requests per day",
+		]);
 	});
 
 	it("counts an account limit against that account's calls to the provider and logs a warn limit once", async () => {

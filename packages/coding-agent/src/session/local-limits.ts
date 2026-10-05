@@ -83,21 +83,25 @@ function topLevelLimits(settings: Settings): Map<string, LocalLimit[]> {
 	return limits;
 }
 
-/** `routing.limits` of every role and chain pool, by pool id. */
+/**
+ * `routing.limits` of every role and chain pool, by pool id: role pools before chain pools, each
+ * sorted by name, so the merged layers' key order (which a project entry changes) cannot reorder them.
+ */
 function poolLimits(settings: Settings): Map<string, LocalLimit[]> {
 	const limits = new Map<string, LocalLimit[]>();
 	const add = (pool: GroupFallbackChain | undefined) => {
 		const configured = pool?.group.routing?.limits;
 		if (pool && configured && configured.length > 0) limits.set(pool.poolId, [...configured]);
 	};
-	for (const role of Object.keys(settings.getModelRoleEntries())) add(resolveRolePoolGroup(settings, role));
-	for (const key of Object.keys(cfgRetryFallbackChains.get(settings))) add(resolveGroupFallbackChain(settings, key));
+	for (const role of Object.keys(settings.getModelRoleEntries()).sort()) add(resolveRolePoolGroup(settings, role));
+	for (const key of Object.keys(cfgRetryFallbackChains.get(settings)).sort()) {
+		add(resolveGroupFallbackChain(settings, key));
+	}
 	return limits;
 }
 
 /**
- * Every configured scope with limits: top-level keys first, then pools, role pools before chain
- * pools. A limit that gives a shared `id` a different limit than an earlier scope does is dropped
+ * Every configured scope with limits: top-level keys first, then pools in {@link poolLimits} order. A limit that gives a shared `id` a different limit than an earlier scope does is dropped
  * with one warning per settings revision; the rest of its scope stays.
  */
 function configuredLimits(settings: Settings): ScopedLimits[] {
