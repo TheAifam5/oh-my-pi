@@ -89,6 +89,8 @@ export interface ModelControlsHost {
 	onThinkingLevelSelected?(level: ThinkingLevel, previousLevel: ThinkingLevel): void;
 	clearActiveRetryFallback(): void;
 	clearInheritedProviderPromptCacheKey(): void;
+	/** Whether `model`'s prompt cache is warm for this session at `nowMs`; absent: never. */
+	promptCacheWarm?(model: Model, nowMs: number): boolean;
 	magicKeywordEnabled(keyword: MagicKeywordId): boolean;
 	emit(event: AgentSessionEvent): void;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
@@ -127,6 +129,7 @@ export class ModelControls {
 			modelRegistry: host.modelRegistry,
 			sessionId: () => host.sessionId(),
 			emitNotice: async message => host.emitNotice("warning", message, "model-role"),
+			promptCacheWarm: (model, nowMs) => host.promptCacheWarm?.(model, nowMs) ?? false,
 		});
 		this.#scopedModels = options.scopedModels ?? [];
 		this.#serviceTierByFamily = options.serviceTierByFamily ?? {};

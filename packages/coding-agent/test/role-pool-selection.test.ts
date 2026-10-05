@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { type BillingSource, knownBilling, type Model } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, type BillingSource, knownBilling, type Model, type Usage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -15,11 +15,13 @@ import {
 	notePoolPickApplied,
 	PoolSelection,
 	type RolePoolDeps,
+	type RolePoolPick,
 	RolePoolUnavailableError,
 	resolveRolePool,
 	rolePoolPolicyBlocked,
 } from "@oh-my-pi/pi-coding-agent/session/pool-selection";
 import { trackInFlightRequest } from "@oh-my-pi/pi-coding-agent/session/in-flight-requests";
+import { PromptCacheAffinity } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-affinity";
 import { resetRetryFallbackRoundRobinPositions } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -488,6 +490,204 @@ describe("model role pools", () => {
 				});
 			expect((await ordered(true)).candidates).toEqual(chain);
 			expect((await ordered(false)).candidates).not.toEqual(chain);
+		});
+	});
+
+	describe("cache affinity", () => {
+		// Wall-clock based so the funding filter reads freshly stubbed billing reports as current.
+		const T0 = Date.now();
+
+		/** A response of `model` whose request started at `atMs`. */
+		function response(
+			model: Model,
+			atMs: number,
+			usage: Partial<Usage> = {},
+			stopReason: AssistantMessage["stopReason"] = "stop",
+		): AssistantMessage {
+			return {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 10,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 20,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					...usage,
+				},
+				stopReason,
+				timestamp: atMs,
+			};
+		}
+
+		/** The pick the pool makes at `nowMs` with `affinity`'s record, or with `affinity` as the warm check. */
+		async function pickAt(
+			settings: Settings,
+			affinity: PromptCacheAffinity | ((model: Model) => boolean),
+			nowMs: number,
+			extra: Partial<RolePoolDeps> = {},
+		): Promise<RolePoolPick> {
+			const promptCacheWarm =
+				affinity instanceof PromptCacheAffinity
+					? (model: Model, at: number) => affinity.isWarm(model, at)
+					: affinity;
+			const resolution = await resolveRolePool(
+				"engineer",
+				deps(settings, { now: () => nowMs, promptCacheWarm, ...extra }),
+			);
+			if (resolution?.kind !== "picked") throw new Error("expected a pick");
+			return resolution.pick;
+		}
+
+		async function pickedAt(...args: Parameters<typeof pickAt>): Promise<string> {
+			return selectorOf((await pickAt(...args)).model);
+		}
+
+		const affinityPool = (strategy: string, models: Model[], routing: Record<string, unknown> = {}) =>
+			Settings.isolated({
+				modelRoles: { engineer: pool(strategy, models, { cache: { affinity: true }, ...routing }) },
+			});
+
+		it("prefers a warm member over a better-ranked cold one for the declared lifetime from the request start", async () => {
+			const settings = affinityPool("priority", [OPENAI, ANTHROPIC]);
+			const affinity = new PromptCacheAffinity();
+			// A read without a per-tier breakdown keeps the shortest declared lifetime (300 s), from the request start.
+			affinity.observe(response(ANTHROPIC, T0, { cacheRead: 5000 }), ANTHROPIC, T0 + 60_000);
+			expect(await pickedAt(settings, affinity, T0 + 299_000)).toBe(selectorOf(ANTHROPIC));
+			expect(await pickedAt(settings, affinity, T0 + 300_000)).toBe(selectorOf(OPENAI));
+
+			// A one-hour write is remembered, so a later read without a breakdown stays on the long tier.
+			affinity.observe(response(ANTHROPIC, T0, { cacheWrite: 5000, cttl: { ephemeral1h: 5000 } }), ANTHROPIC, T0);
+			affinity.observe(response(ANTHROPIC, T0 + 600_000, { cacheRead: 5000 }), ANTHROPIC, T0 + 600_000);
+			expect(await pickedAt(settings, affinity, T0 + 600_000 + 3_599_000)).toBe(selectorOf(ANTHROPIC));
+
+			// A later five-minute write shortens the window.
+			affinity.observe(
+				response(ANTHROPIC, T0 + 700_000, { cacheWrite: 5000, cttl: { ephemeral5m: 5000 } }),
+				ANTHROPIC,
+				T0 + 700_000,
+			);
+			expect(await pickedAt(settings, affinity, T0 + 1_000_000)).toBe(selectorOf(OPENAI));
+
+			// A reported tier without a declared lifetime falls back to the shortest declared one.
+			const shortOnly = { ...ANTHROPIC, promptCache: { short: 300 } };
+			affinity.observe(
+				response(ANTHROPIC, T0 + 2_000_000, { cacheWrite: 5000, cttl: { ephemeral1h: 5000 } }),
+				shortOnly,
+				T0 + 2_000_000,
+			);
+			expect(await pickedAt(settings, affinity, T0 + 2_299_000)).toBe(selectorOf(ANTHROPIC));
+			expect(await pickedAt(settings, affinity, T0 + 2_300_000)).toBe(selectorOf(OPENAI));
+		});
+
+		it("returns to strategy order once a completed response neither reads nor writes the cache", async () => {
+			const settings = affinityPool("priority", [OPENAI, ANTHROPIC]);
+			const affinity = new PromptCacheAffinity();
+			affinity.observe(response(ANTHROPIC, T0, { cacheWrite: 5000 }), ANTHROPIC, T0);
+			// An errored response with no cache usage says nothing about the cache.
+			affinity.observe(response(ANTHROPIC, T0 + 1000, {}, "error"), ANTHROPIC, T0 + 1000);
+			expect(await pickedAt(settings, affinity, T0 + 2000)).toBe(selectorOf(ANTHROPIC));
+			// An aborted or errored response that read the cache extends the window.
+			affinity.observe(response(ANTHROPIC, T0 + 200_000, { cacheRead: 5000 }, "aborted"), ANTHROPIC, T0 + 200_000);
+			expect(await pickedAt(settings, affinity, T0 + 450_000)).toBe(selectorOf(ANTHROPIC));
+			affinity.observe(response(ANTHROPIC, T0 + 400_000, { cacheRead: 5000 }, "error"), ANTHROPIC, T0 + 400_000);
+			expect(await pickedAt(settings, affinity, T0 + 650_000)).toBe(selectorOf(ANTHROPIC));
+
+			affinity.observe(response(ANTHROPIC, T0 + 660_000), ANTHROPIC, T0 + 660_000);
+			expect(await pickedAt(settings, affinity, T0 + 661_000)).toBe(selectorOf(OPENAI));
+		});
+
+		it("keeps warmth apart for the same model on another base URL", async () => {
+			const affinity = new PromptCacheAffinity();
+			const elsewhere = { ...ANTHROPIC, baseUrl: "https://anthropic-proxy.example.com" };
+			affinity.observe(response(ANTHROPIC, T0, { cacheRead: 5000 }), elsewhere, T0);
+			expect(await pickedAt(affinityPool("priority", [OPENAI, ANTHROPIC]), affinity, T0 + 1000)).toBe(
+				selectorOf(OPENAI),
+			);
+		});
+
+		it("moves a round-robin position to the promoted member and keeps a shuffle-bag's other members", async () => {
+			const affinity = new PromptCacheAffinity();
+			const robin = affinityPool("round-robin", [OPENAI, GOOGLE, ANTHROPIC]);
+			const applied = async (settings: Settings, nowMs: number, extra: Partial<RolePoolDeps> = {}) => {
+				const pick = await pickAt(settings, affinity, nowMs, extra);
+				notePoolPickApplied(pick);
+				return selectorOf(pick.model);
+			};
+			expect(await applied(robin, T0)).toBe(selectorOf(OPENAI));
+			affinity.observe(response(ANTHROPIC, T0, { cacheRead: 5000 }), ANTHROPIC, T0);
+			expect(await applied(robin, T0 + 1000)).toBe(selectorOf(ANTHROPIC));
+			// After expiry the rotation continues after the promoted member, so GOOGLE waits a turn.
+			expect(await applied(robin, T0 + 300_000)).toBe(selectorOf(OPENAI));
+			expect(await applied(robin, T0 + 300_000)).toBe(selectorOf(GOOGLE));
+
+			const bag = affinityPool("shuffle-bag", [OPENAI, GOOGLE, ANTHROPIC]);
+			const random = () => 0.5;
+			expect(await applied(bag, T0 + 1000, { random })).toBe(selectorOf(ANTHROPIC));
+			const rest = [await applied(bag, T0 + 300_000, { random }), await applied(bag, T0 + 300_000, { random })];
+			expect(rest.sort()).toEqual([OPENAI, GOOGLE].map(selectorOf).sort());
+		});
+
+		it("keeps strategy order without affinity or for a model that declares no cache lifetime", async () => {
+			const affinity = new PromptCacheAffinity();
+			affinity.observe(response(ANTHROPIC, T0, { cacheRead: 5000 }), ANTHROPIC, T0);
+			affinity.observe(response(GOOGLE, T0, { cacheRead: 5000 }), GOOGLE, T0);
+			const off = Settings.isolated({ modelRoles: { engineer: pool("priority", [OPENAI, ANTHROPIC]) } });
+			expect(await pickedAt(off, affinity, T0 + 1000)).toBe(selectorOf(OPENAI));
+			expect(await pickedAt(affinityPool("priority", [OPENAI, GOOGLE]), affinity, T0 + 1000)).toBe(
+				selectorOf(OPENAI),
+			);
+		});
+
+		it("never promotes a warm member that is cooling down, limited, or funded only by a later stage", async () => {
+			const affinity = new PromptCacheAffinity();
+			affinity.observe(response(ANTHROPIC, T0, { cacheRead: 5000 }), ANTHROPIC, T0);
+
+			modelRegistry.suppressSelector(selectorOf(ANTHROPIC), Date.now() + 60_000);
+			expect(await pickedAt(affinityPool("priority", [OPENAI, ANTHROPIC]), affinity, T0 + 1000)).toBe(
+				selectorOf(OPENAI),
+			);
+			modelRegistry.clearSuppressedSelectors();
+
+			stubBilling({
+				openai: { mode: "subscription-included", state: "available" },
+				google: { mode: "metered", state: "available" },
+			});
+			const staged = affinityPool("priority", [GOOGLE, OPENAI], {
+				funding: { order: ["included", "metered"] },
+				spending: { policy: "provider-managed" },
+			});
+			expect(await pickedAt(staged, model => model.provider === "google", T0 + 1000)).toBe(selectorOf(OPENAI));
+
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "affinity-limits.db"));
+			try {
+				const limited = Settings.isolated(
+					{
+						modelRoles: { engineer: pool("priority", [OPENAI, ANTHROPIC], { cache: { affinity: true } }) },
+						limits: {
+							[selectorOf(ANTHROPIC)]: [
+								{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } },
+							],
+						},
+					},
+					{ storage },
+				);
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: ANTHROPIC.provider,
+					model: ANTHROPIC.id,
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				expect(await pickedAt(limited, affinity, T0 + 1000)).toBe(selectorOf(OPENAI));
+			} finally {
+				AgentStorage.close();
+			}
 		});
 	});
 

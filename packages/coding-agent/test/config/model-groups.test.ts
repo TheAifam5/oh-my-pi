@@ -146,9 +146,24 @@ describe("modelRoles values (strict)", () => {
 			[
 				{
 					path: "modelRoles.engineer.routing.maxPoolAttempts",
-					message: "unsupported field; supported: funding, quota, spending, accounts, limits",
+					message: "unsupported field; supported: funding, quota, spending, accounts, limits, cache",
 				},
 			],
+		],
+		[
+			"an unsupported cache field",
+			pool({ routing: { cache: { affinity: true, ttlMs: 300_000 } } }),
+			[{ path: "modelRoles.engineer.routing.cache.ttlMs", message: "unsupported field; supported: affinity" }],
+		],
+		[
+			"cache routing without affinity",
+			pool({ routing: { cache: {} } }),
+			[{ path: "modelRoles.engineer.routing.cache", message: "affinity is required" }],
+		],
+		[
+			"a cache affinity that is not a boolean",
+			pool({ routing: { cache: { affinity: "yes" } } }),
+			[{ path: "modelRoles.engineer.routing.cache.affinity", message: "must be true or false" }],
 		],
 		...(
 			[
@@ -284,6 +299,15 @@ describe("modelRoles values (strict)", () => {
 			spend: ["credits"],
 			returnWhen: ["credits-added"],
 		});
+	});
+
+	it("parses cache affinity on a role pool and a model group", () => {
+		expect(roleGroup("engineer", pool({ routing: { cache: { affinity: true } } })).routing?.cache).toEqual({
+			affinity: true,
+		});
+		const result = parseModelGroupDefinition("frontier", pool({ routing: { cache: { affinity: false } } }));
+		if (!result.ok) throw new Error(JSON.stringify(result.issues));
+		expect(result.value.routing?.cache).toEqual({ affinity: false });
 	});
 
 	it("reports every problem of one value, not just the first", () => {
