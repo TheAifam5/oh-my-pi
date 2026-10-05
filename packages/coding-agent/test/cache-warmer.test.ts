@@ -313,6 +313,8 @@ describe("cache warmer lifecycle", () => {
 		await advance(SHORT_DELAY_MS);
 		expect(h.replays).toHaveLength(1);
 		expect(h.replays[0]?.options?.maxTokens).toBe(1);
+		// Marks the replay so the stream usage observer keeps it out of the cache ledger.
+		expect(h.replays[0]?.options?.cacheWarm).toBe(true);
 		// The replay's signal is aborted at `thinking_start`; the delta after it is never read.
 		expect(h.replays[0]?.cutOff).toBe(true);
 		expect(h.replays[0]?.consumed).toEqual(["start", "thinking_start"]);

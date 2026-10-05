@@ -186,8 +186,11 @@ export interface GroupRouting {
 	accounts?: AccountRouting;
 	/** Local limits on the calls made through this pool (`routing.limits`); see `session/local-limits.ts`. */
 	limits?: readonly LocalLimit[];
-	/** `affinity`: an eligible member whose prompt cache is warm for the session goes first (`routing.cache`). */
-	cache?: { affinity: boolean };
+	/**
+	 * `affinity`: an eligible member whose prompt cache is warm for the session goes first. `pricing`:
+	 * `cheapest` prices a member's input at its expected prompt-cache hit rate (`routing.cache`).
+	 */
+	cache?: { affinity?: boolean; pricing?: boolean };
 }
 
 /** A concrete `provider/model-id` member. */
@@ -780,12 +783,20 @@ function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | 
 		const accounts = parseAccountRouting(c, `${path}.accounts`, raw.accounts);
 		if (accounts) routing.accounts = accounts;
 	}
-	if (present(raw, "cache") && checkFields(c, `${path}.cache`, raw.cache, ["affinity"])) {
-		const affinity = raw.cache.affinity;
-		// An explicit null is already reported by checkFields.
-		if (typeof affinity === "boolean") routing.cache = { affinity };
-		else if (affinity === undefined) c.add(`${path}.cache`, "affinity is required");
-		else if (affinity !== null) c.add(`${path}.cache.affinity`, "must be true or false");
+	if (present(raw, "cache") && checkFields(c, `${path}.cache`, raw.cache, ["affinity", "pricing"])) {
+		const fields = raw.cache;
+		const cache: { affinity?: boolean; pricing?: boolean } = {};
+		for (const key of ["affinity", "pricing"] as const) {
+			const value = fields[key];
+			// An explicit null is already reported by checkFields.
+			if (typeof value === "boolean") cache[key] = value;
+			else if (value !== undefined && value !== null) c.add(`${path}.cache.${key}`, "must be true or false");
+		}
+		if (fields.affinity === undefined && fields.pricing === undefined) {
+			c.add(`${path}.cache`, "set at least one of affinity or pricing");
+		} else {
+			routing.cache = cache;
+		}
 	}
 	return c.issues.length > before ? undefined : routing;
 }

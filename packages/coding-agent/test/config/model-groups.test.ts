@@ -153,17 +153,27 @@ describe("modelRoles values (strict)", () => {
 		[
 			"an unsupported cache field",
 			pool({ routing: { cache: { affinity: true, ttlMs: 300_000 } } }),
-			[{ path: "modelRoles.engineer.routing.cache.ttlMs", message: "unsupported field; supported: affinity" }],
+			[
+				{
+					path: "modelRoles.engineer.routing.cache.ttlMs",
+					message: "unsupported field; supported: affinity, pricing",
+				},
+			],
 		],
 		[
-			"cache routing without affinity",
+			"cache routing without affinity or pricing",
 			pool({ routing: { cache: {} } }),
-			[{ path: "modelRoles.engineer.routing.cache", message: "affinity is required" }],
+			[{ path: "modelRoles.engineer.routing.cache", message: "set at least one of affinity or pricing" }],
 		],
 		[
 			"a cache affinity that is not a boolean",
 			pool({ routing: { cache: { affinity: "yes" } } }),
 			[{ path: "modelRoles.engineer.routing.cache.affinity", message: "must be true or false" }],
+		],
+		[
+			"a cache pricing that is not a boolean",
+			pool({ routing: { cache: { affinity: true, pricing: 1 } } }),
+			[{ path: "modelRoles.engineer.routing.cache.pricing", message: "must be true or false" }],
 		],
 		...(
 			[
@@ -301,13 +311,16 @@ describe("modelRoles values (strict)", () => {
 		});
 	});
 
-	it("parses cache affinity on a role pool and a model group", () => {
+	it("parses cache affinity and pricing on a role pool and a model group", () => {
 		expect(roleGroup("engineer", pool({ routing: { cache: { affinity: true } } })).routing?.cache).toEqual({
 			affinity: true,
 		});
 		const result = parseModelGroupDefinition("frontier", pool({ routing: { cache: { affinity: false } } }));
 		if (!result.ok) throw new Error(JSON.stringify(result.issues));
 		expect(result.value.routing?.cache).toEqual({ affinity: false });
+		expect(roleGroup("engineer", pool({ routing: { cache: { pricing: true } } })).routing?.cache).toEqual({
+			pricing: true,
+		});
 	});
 
 	it("reports every problem of one value, not just the first", () => {

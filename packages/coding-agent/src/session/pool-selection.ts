@@ -73,6 +73,8 @@ export interface PoolSelectionHost {
 	usageReports?(options: { signal: AbortSignal }): Promise<UsageReport[] | null>;
 	/** Whether `model`'s prompt cache is warm for this session at `nowMs`; absent: never. */
 	promptCacheWarm?(model: Model, nowMs: number): boolean;
+	/** Expected prompt-cache hit rate of `model` at `nowMs`, in [0, 1]; undefined or absent: unknown. */
+	cacheHitRate?(model: Model, nowMs: number): number | undefined;
 }
 
 /** Inputs of one {@link PoolSelection.order} call. */
@@ -134,9 +136,11 @@ export class PoolSelection {
 	 * `round-robin` starts a new walk (`walkActive` false) after the entry last recorded for
 	 * `options.chain()`; a walk under way keeps the given order. `random` and `weighted-random` draw a
 	 * fresh order per call, `weighted-random` by each member's `weight`. `cheapest` ranks by the
-	 * resolved model's input plus output price (unresolved or non-finite price last), `least-used` by
-	 * the model's requests in the usage ledger over the strategy's window (an unreadable ledger keeps
-	 * given order), and `least-loaded` and `p2c` by the model's requests in flight in this process
+	 * resolved model's input plus output price (unresolved or non-finite price last); under
+	 * `routing.cache.pricing`, a model with a finite non-negative cache-read price and a known hit rate
+	 * `r` ({@link PoolSelectionHost.cacheHitRate}) has its input priced `r * cacheRead + (1 - r) * input`.
+	 * `least-used` ranks by the model's requests in the usage ledger over the strategy's window (an
+	 * unreadable ledger keeps given order), and `least-loaded` and `p2c` by the model's requests in flight in this process
 	 * (unresolved last). `p2c` draws only among members not cooling down, which follow in given order.
 	 * `shuffle-bag` puts the members left in its current bag first, refilling a bag that holds none of
 	 * the members not cooling down with a fresh shuffle; a walk under way keeps the given order.
@@ -329,13 +333,23 @@ export class PoolSelection {
 	): Map<string, number> | undefined {
 		const ranks = new Map<string, number>();
 		switch (strategy) {
-			case "cheapest":
+			case "cheapest": {
+				const hitRate = policy?.group.routing?.cache?.pricing ? this.#host.cacheHitRate : undefined;
 				for (const candidate of candidates) {
-					const cost = options.resolveCandidate(candidate)?.cost;
-					const price = cost ? cost.input + cost.output : Number.NaN;
+					const model = options.resolveCandidate(candidate);
+					const cost = model?.cost;
+					let input = cost?.input ?? Number.NaN;
+					if (model && cost && hitRate && Number.isFinite(cost.cacheRead) && cost.cacheRead >= 0) {
+						const rate = hitRate(model, nowMs);
+						if (rate !== undefined && rate >= 0 && rate <= 1) {
+							input = rate * cost.cacheRead + (1 - rate) * cost.input;
+						}
+					}
+					const price = cost ? input + cost.output : Number.NaN;
 					if (Number.isFinite(price) && price >= 0) ranks.set(candidate.raw, price);
 				}
 				return ranks;
+			}
 			case "least-loaded":
 			case "p2c":
 				for (const candidate of candidates) {
