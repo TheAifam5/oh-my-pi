@@ -97,6 +97,8 @@ export class SessionAffinity implements SessionsApi {
 	#pinSource: AccountPinSource | undefined;
 	/** `provider\0sessionId` whose pin a restriction overrode and was already logged; one bounded LRU. */
 	#restrictedPinWarnings = new LRUCache<string, true>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
+	/** Session drain overrides by `provider\0sessionId`: the drained row id, or `null` for no drain target. */
+	#drainOverrides: Map<string, number | null> = new Map();
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
@@ -172,10 +174,11 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
-	 * Take over the pin source and the live exclusive pins of the affinity this
-	 * one replaces (credential store swap). Row ids are store-specific, so each
-	 * pin moves to the stored credential with the same identity (OAuth account or
-	 * API key fingerprint); a pin with no such credential fails closed.
+	 * Take over the pin source, the live exclusive pins, and the session drain
+	 * overrides of the affinity this one replaces (credential store swap). Row
+	 * ids are store-specific, so each moves to the stored credential with the
+	 * same identity (OAuth account or API key fingerprint); a pin with no such
+	 * credential fails closed, a drain override falls back to the account policy.
 	 */
 	adoptPins(previous: SessionAffinity): void {
 		this.#pinSource = previous.#pinSource;
@@ -188,6 +191,19 @@ export class SessionAffinity implements SessionsApi {
 				? this.#pool.entries(pin.provider).find(entry => sameAccount(entry.credential, credential))
 				: undefined;
 			this.#writeSessionPin(pin.provider, pin.sessionId, match?.id ?? null);
+		}
+		for (const [key, credentialId] of previous.#drainOverrides) {
+			if (credentialId === null) {
+				this.#drainOverrides.set(key, null);
+				continue;
+			}
+			const [provider = ""] = key.split("\0");
+			const credential = previous.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
+			const match = credential
+				? this.#pool.entries(provider).find(entry => sameAccount(entry.credential, credential))
+				: undefined;
+			// A drain target missing from the new store falls back to the account policy.
+			if (match) this.#drainOverrides.set(key, match.id);
 		}
 	}
 
@@ -228,6 +244,25 @@ export class SessionAffinity implements SessionsApi {
 		} catch (err) {
 			logger.debug("Failed to write exclusive session pin to persistent store cache", { err });
 		}
+	}
+
+	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean {
+		if (!sessionId) return false;
+		const key = `${provider}\0${sessionId}`;
+		if (credentialId === undefined || credentialId === null) {
+			if (credentialId === undefined) this.#drainOverrides.delete(key);
+			else this.#drainOverrides.set(key, null);
+			return true;
+		}
+		const target = this.#pool.entries(provider).find(entry => entry.id === credentialId);
+		if (target?.credential.type !== "oauth") return false;
+		this.#drainOverrides.set(key, credentialId);
+		return true;
+	}
+
+	/** The session's drain override: a row id, `null` for no drain target, `undefined` to follow account policy. */
+	drainOverride(provider: string, sessionId: string | undefined): number | null | undefined {
+		return sessionId ? this.#drainOverrides.get(`${provider}\0${sessionId}`) : undefined;
 	}
 
 	/** Whether a session or project pin exists for `provider`, ignoring key overrides. */
@@ -601,6 +636,10 @@ export class SessionAffinity implements SessionsApi {
 		for (const provider of this.#pool.providers()) this.#sessionPin(provider, sourceSessionId);
 		for (const pin of [...this.#exclusivePins.values()]) {
 			if (pin.sessionId === sourceSessionId) this.#writeSessionPin(pin.provider, targetSessionId, pin.credentialId);
+		}
+		for (const [key, credentialId] of [...this.#drainOverrides]) {
+			const [provider, sessionId] = key.split("\0");
+			if (sessionId === sourceSessionId) this.#drainOverrides.set(`${provider}\0${targetSessionId}`, credentialId);
 		}
 		for (const provider of this.#pool.providers()) {
 			const credential = this.get(provider, sourceSessionId);

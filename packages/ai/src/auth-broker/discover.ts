@@ -109,6 +109,17 @@ function readDottedString(record: Record<string, unknown>, dottedKey: string): s
 	return typeof value === "string" ? value : undefined;
 }
 
+const POLICY_FIELDS = [
+	"provider",
+	"account",
+	"name",
+	"priority",
+	"reservePct",
+	"drain",
+	"returnMargin",
+	"returnCooldownMs",
+];
+
 function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) {
@@ -121,9 +132,7 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			throw new AIError.ConfigurationError(`${path} must be an object`);
 		}
 		const policy = entry as Record<string, unknown>;
-		const unknownPolicyFields = Object.keys(policy).filter(
-			key => key !== "provider" && key !== "account" && key !== "name" && key !== "priority" && key !== "reservePct",
-		);
+		const unknownPolicyFields = Object.keys(policy).filter(key => !POLICY_FIELDS.includes(key));
 		if (unknownPolicyFields.length > 0) {
 			throw new AIError.ConfigurationError(`${path} has unknown fields: ${unknownPolicyFields.join(", ")}`);
 		}
@@ -162,6 +171,15 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 		if (policy.name !== undefined && typeof policy.name !== "string") {
 			throw new AIError.ConfigurationError(`${path}.name must be a string`);
 		}
+		if (policy.drain !== undefined && typeof policy.drain !== "boolean") {
+			throw new AIError.ConfigurationError(`${path}.drain must be a boolean`);
+		}
+		for (const field of ["returnMargin", "returnCooldownMs"] as const) {
+			const fieldValue = policy[field];
+			if (fieldValue !== undefined && (typeof fieldValue !== "number" || !Number.isFinite(fieldValue))) {
+				throw new AIError.ConfigurationError(`${path}.${field} must be a finite number`);
+			}
+		}
 		if (policy.priority !== undefined && (typeof policy.priority !== "number" || !Number.isFinite(policy.priority))) {
 			throw new AIError.ConfigurationError(`${path}.priority must be a finite number`);
 		}
@@ -187,6 +205,9 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			...(typeof policy.name === "string" ? { name: policy.name } : {}),
 			...(typeof policy.priority === "number" ? { priority: policy.priority } : {}),
 			...(typeof policy.reservePct === "number" ? { reservePct: policy.reservePct } : {}),
+			...(typeof policy.drain === "boolean" ? { drain: policy.drain } : {}),
+			...(typeof policy.returnMargin === "number" ? { returnMargin: policy.returnMargin } : {}),
+			...(typeof policy.returnCooldownMs === "number" ? { returnCooldownMs: policy.returnCooldownMs } : {}),
 		};
 	});
 }

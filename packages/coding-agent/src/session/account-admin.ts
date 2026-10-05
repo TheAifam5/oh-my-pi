@@ -39,6 +39,8 @@ export interface AccountListing extends AccountRef {
 	label: string;
 	priority?: number;
 	reservePct?: number;
+	/** True when the account policy drains this account first. */
+	drain: boolean;
 	/** True when `auth.accountPins` pins this account for the working directory's project. */
 	projectPinned: boolean;
 }
@@ -141,30 +143,79 @@ export interface AccountWriteResult {
 	warning?: string;
 }
 
-function writePolicy(
-	settings: Settings,
+/** `policies` with `patch` applied to the entry for `ref`, created when missing. */
+function patchedPolicies(
 	authStorage: AuthStorage,
+	policies: AuthAccountPolicies,
 	ref: AccountRef,
-	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct">>,
-): AccountWriteResult {
-	const current = userPolicies(settings);
-	const index = current.findIndex(policy => matchesPolicy(policy, ref));
-	const next = [...current];
-	const base = index === -1 ? { provider: ref.provider, account: selectorFor(authStorage, ref) } : current[index]!;
+	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct" | "drain">>,
+): AuthAccountPolicy[] {
+	const index = policies.findIndex(policy => matchesPolicy(policy, ref));
+	const next = [...policies];
+	const base = index === -1 ? { provider: ref.provider, account: selectorFor(authStorage, ref) } : policies[index]!;
 	const updated = { ...base, ...patch };
 	if (index === -1) next.push(updated);
 	else next[index] = updated;
+	return next;
+}
+
+/** Validates `next` against `provider`'s stored credentials, then writes it to the user config. */
+function commitPolicies(
+	settings: Settings,
+	authStorage: AuthStorage,
+	provider: string,
+	next: AuthAccountPolicies,
+): AccountWriteResult {
 	try {
 		const policies = new AccountPolicies(next, cfgRetryUsageReservePct.get(settings));
 		policies.validateFor(
-			ref.provider,
-			authStorage.credentials.list(ref.provider).map(row => row.credential),
+			provider,
+			authStorage.credentials.list(provider).map(row => row.credential),
 		);
 	} catch (error) {
 		throw new AccountAdminError(error instanceof Error ? error.message : String(error));
 	}
 	cfgAuthAccountPolicies.set(settings, next);
 	return { warning: shadowWarning(settings) };
+}
+
+function writePolicy(
+	settings: Settings,
+	authStorage: AuthStorage,
+	ref: AccountRef,
+	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct">>,
+): AccountWriteResult {
+	return commitPolicies(
+		settings,
+		authStorage,
+		ref.provider,
+		patchedPolicies(authStorage, userPolicies(settings), ref, patch),
+	);
+}
+
+/**
+ * Make `ref` the OAuth account `provider` drains first, or with `ref`
+ * undefined, drain none; the other accounts of the provider lose `drain`.
+ */
+export function setAccountDrain(
+	settings: Settings,
+	authStorage: AuthStorage,
+	provider: string,
+	ref: AccountRef | undefined,
+): AccountWriteResult {
+	if (ref && ref.account.type !== "oauth") throw new AccountAdminError("Only OAuth accounts can be drained.");
+	// An entry left with only its provider and account would still switch on the policy reserve; drop it.
+	const cleared = userPolicies(settings).flatMap(policy => {
+		if (policy.provider !== provider || policy.drain === undefined) return [policy];
+		const { drain: _drain, ...rest } = policy;
+		return Object.keys(rest).every(key => key === "provider" || key === "account") ? [] : [rest];
+	});
+	return commitPolicies(
+		settings,
+		authStorage,
+		provider,
+		ref ? patchedPolicies(authStorage, cleared, ref, { drain: true }) : cleared,
+	);
 }
 
 /** Name an account (`auth.accountPolicies[].name`); names are unique per provider. */
@@ -367,6 +418,7 @@ export function listAccounts(settings: Settings, authStorage: AuthStorage, cwd: 
 				label: accountLabel(account),
 				...(policy?.priority !== undefined ? { priority: policy.priority } : {}),
 				...(policy?.reservePct !== undefined ? { reservePct: policy.reservePct } : {}),
+				drain: policy?.drain === true,
 				projectPinned: pinnedName !== undefined && account.name === pinnedName,
 			});
 		}

@@ -2,7 +2,9 @@ import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
+import { setAccountDrain } from "../session/account-admin";
 import type { SessionAccountList } from "../session/agent-session-types";
+import type { AuthAccountSummary } from "../session/auth-storage";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -186,6 +188,74 @@ async function handleSessionPinCommand(
 	);
 }
 
+/** `/session drain <account|off> [--save]`: one drain target per provider, session-only unless saved. */
+async function handleSessionDrainCommand(
+	arg: string,
+	session: AgentSession,
+	output: SlashCommandRuntime["output"],
+): Promise<void> {
+	const words = arg.split(/\s+/).filter(Boolean);
+	const save = words.includes("--save");
+	const selector = words.filter(word => word !== "--save").join(" ");
+	if (!selector) {
+		await output("Usage: /session drain <account|off> [--save]");
+		return;
+	}
+	let accountList: SessionAccountList | undefined;
+	try {
+		accountList = await session.listCurrentProviderAccounts();
+	} catch (error) {
+		await output(`Could not load provider accounts: ${errorMessage(error)}`);
+		return;
+	}
+	if (!accountList) {
+		await output("Select a model before draining a provider account.");
+		return;
+	}
+	const { provider, accounts } = accountList;
+	let target: AuthAccountSummary | undefined;
+	if (selector !== "off") {
+		const matches = matchSessionPinAccounts(toSessionPinAccounts(accounts), selector);
+		const summaries = matches.map(match => accounts.find(account => account.credentialId === match.credentialId));
+		const oauth = summaries.filter((account): account is AuthAccountSummary => account?.type === "oauth");
+		if (oauth.length !== 1) {
+			await output(
+				oauth.length === 0
+					? `No stored ${provider} OAuth account matches that selector.`
+					: `That matches several ${provider} accounts; use the account number.`,
+			);
+			return;
+		}
+		target = oauth[0];
+	}
+	if (!session.drainCurrentProviderAccount(target?.credentialId ?? null)) {
+		await output("Cannot change the drained account right now.");
+		return;
+	}
+	const subject = target ? `${provider} account #${target.credentialId}` : undefined;
+	const lines = [
+		subject
+			? `This session uses ${subject} first until it is drained.`
+			: `This session drains no ${provider} account.`,
+	];
+	if (save) {
+		try {
+			const result = setAccountDrain(
+				session.settings,
+				session.modelRegistry.authStorage,
+				provider,
+				target ? { provider, account: target } : undefined,
+			);
+			lines.push(subject ? `Saved: ${subject} is drained first in every session.` : "Saved: no account is drained.");
+			if (result.warning) lines.push(result.warning);
+		} catch (error) {
+			lines.push(`Not saved: ${errorMessage(error)}`);
+		}
+	}
+	if (accounts.some(account => account.pinned)) lines.push("A pinned account still serves this session exclusively.");
+	await output(lines.join("\n"));
+}
+
 async function handleSessionUnpinCommand(session: AgentSession, output: SlashCommandRuntime["output"]): Promise<void> {
 	await output(describeSessionUnpinOutcome(session.unpinCurrentProviderAccount(), session.model?.provider ?? ""));
 }
@@ -255,7 +325,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "session",
 		description: "Session management commands",
 		acpDescription: "Show or configure the current session",
-		acpInputHint: "[info|delete|pin [account]|unpin]",
+		acpInputHint: "[info|delete|pin [account]|unpin|drain <account|off>]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
@@ -265,6 +335,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				usage: "[account]",
 			},
 			{ name: "unpin", description: "Remove this session's account pin for the current provider" },
+			{
+				name: "drain",
+				description: "Use one OAuth account first until it is drained (--save keeps it for every session)",
+				usage: "<account|off> [--save]",
+			},
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -306,7 +381,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await handleSessionUnpinCommand(runtime.session, runtime.output);
 				return commandConsumed();
 			}
-			return usage("Usage: /session [info|delete|pin [account]|unpin]", runtime);
+			if (verb === "drain") {
+				await handleSessionDrainCommand(rest, runtime.session, runtime.output);
+				return commandConsumed();
+			}
+			return usage("Usage: /session [info|delete|pin [account]|unpin|drain <account|off>]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -331,10 +410,16 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				clearSubmittedText(runtime);
 				return;
 			}
+			if (verb === "drain") {
+				await handleSessionDrainCommand(rest, runtime.ctx.session, text => runtime.ctx.showStatus(text));
+				refreshStatusLine(runtime.ctx);
+				clearSubmittedText(runtime);
+				return;
+			}
 			if (!verb || (verb === "info" && !rest)) {
 				await runtime.ctx.handleSessionCommand();
 			} else {
-				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|unpin]");
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|unpin|drain <account|off>]");
 			}
 			clearSubmittedText(runtime);
 		},

@@ -85,6 +85,7 @@ export class AccountPolicies {
 	static #validateAccountPolicyConfiguration(accountPolicies: AuthAccountPolicies): void {
 		const namesByProvider = new Map<string, Map<string, number>>();
 		const fingerprintsByProvider = new Map<string, Map<string, number>>();
+		const drainByProvider = new Map<string, number>();
 		for (let index = 0; index < accountPolicies.length; index += 1) {
 			const policy = accountPolicies[index]!;
 			const path = `auth.accountPolicies[${index}]`;
@@ -165,6 +166,33 @@ export class AccountPolicies {
 			) {
 				throw new AIError.ConfigurationError(`${path}.reservePct must be a finite number between 0 and 100`);
 			}
+			if (policy.drain !== undefined && typeof policy.drain !== "boolean") {
+				throw new AIError.ConfigurationError(`${path}.drain must be a boolean`);
+			}
+			if (policy.drain === true) {
+				if (policy.account.keyFingerprint !== undefined) {
+					throw new AIError.ConfigurationError(`${path}.drain applies to OAuth accounts only`);
+				}
+				const previousIndex = drainByProvider.get(policy.provider);
+				if (previousIndex !== undefined) {
+					throw new AIError.ConfigurationError(
+						`auth.accountPolicies[${previousIndex}] and auth.accountPolicies[${index}] both drain a ${policy.provider} account; only one may`,
+					);
+				}
+				drainByProvider.set(policy.provider, index);
+			}
+			if (
+				policy.returnMargin !== undefined &&
+				(!Number.isFinite(policy.returnMargin) || policy.returnMargin < 0 || policy.returnMargin > 100)
+			) {
+				throw new AIError.ConfigurationError(`${path}.returnMargin must be a finite number between 0 and 100`);
+			}
+			if (
+				policy.returnCooldownMs !== undefined &&
+				(!Number.isFinite(policy.returnCooldownMs) || policy.returnCooldownMs < 0)
+			) {
+				throw new AIError.ConfigurationError(`${path}.returnCooldownMs must be a non-negative number`);
+			}
 		}
 	}
 
@@ -230,6 +258,19 @@ export class AccountPolicies {
 		return this.#accountPolicies.find(
 			policy => policy.provider === provider && AccountPolicies.#matchesStored(policy, credential),
 		);
+	}
+
+	/** The OAuth credential in `credentials` an account policy drains for `provider`, with its index and policy. */
+	drainTarget(
+		provider: string,
+		credentials: readonly AuthCredential[],
+	): { index: number; policy: AuthAccountPolicy } | undefined {
+		const policy = this.#accountPolicies.find(entry => entry.provider === provider && entry.drain === true);
+		if (!policy) return undefined;
+		const index = credentials.findIndex(
+			credential => credential.type === "oauth" && AccountPolicies.#matchesStored(policy, credential),
+		);
+		return index === -1 ? undefined : { index, policy };
 	}
 
 	/**

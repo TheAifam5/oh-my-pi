@@ -2183,6 +2183,7 @@ export class SelectorController {
 				row.account.keyFingerprint !== undefined ? `key ${row.account.keyFingerprint}` : undefined,
 				row.priority !== undefined ? `priority ${row.priority}` : undefined,
 				row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
+				row.drain ? "drained first" : undefined,
 				sessionPinned.has(row.account.credentialId) ? "pinned" : undefined,
 				row.projectPinned ? "project pin" : undefined,
 			].filter((fact): fact is string => fact !== undefined);

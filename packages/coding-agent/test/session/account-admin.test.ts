@@ -11,6 +11,7 @@ import {
 	logoutAccount,
 	pinProjectAccount,
 	resolveAccount,
+	setAccountDrain,
 	setAccountPriority,
 	setAccountReserve,
 	unpinProjectAccount,
@@ -167,5 +168,16 @@ describe("account administration", () => {
 			process.exitCode = previousExitCode;
 			vi.restoreAllMocks();
 		}
+	});
+
+	it("saves one drain target per provider", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		setAccountDrain(settings, authStorage, "anthropic", resolveAccount(authStorage, "a@example.com"));
+		setAccountDrain(settings, authStorage, "anthropic", resolveAccount(authStorage, "b@example.com"));
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{ provider: "anthropic", account: { accountId: "acc-b" }, drain: true },
+		]);
+		setAccountDrain(settings, authStorage, "anthropic", undefined);
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
 	});
 });

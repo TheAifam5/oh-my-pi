@@ -62,6 +62,7 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 			label: row.label,
 			priority: row.priority ?? null,
 			reservePct: row.reservePct ?? null,
+			drain: row.drain,
 			keyFingerprint: row.account.keyFingerprint ?? null,
 			projectPinned: row.projectPinned,
 		}));
@@ -81,6 +82,7 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 		const facts = [
 			row.priority !== undefined ? `priority ${row.priority}` : undefined,
 			row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
+			row.drain ? "drained first" : undefined,
 			row.projectPinned ? chalk.green("pinned for this project") : undefined,
 		].filter(Boolean);
 		const name = row.account.name ? chalk.cyan(row.account.name) : chalk.dim("(unnamed)");

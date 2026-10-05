@@ -70,7 +70,22 @@ export interface AuthAccountPolicy {
 	readonly priority?: number;
 	/** Protected remaining quota percentage for this account. */
 	readonly reservePct?: number;
+	/**
+	 * Use this OAuth account before every other account of the provider until any
+	 * of its usage windows is exhausted or its plan allowance is spent; at most one
+	 * per provider. It ignores reserve and the hot-window demotion while serving.
+	 */
+	readonly drain?: boolean;
+	/** Remaining quota percentage (0–100) a drained account needs before it is used first again; default 5. */
+	readonly returnMargin?: number;
+	/** Shortest time a drained account stays behind its siblings, in ms; default 600000. */
+	readonly returnCooldownMs?: number;
 }
+
+/** Default {@link AuthAccountPolicy.returnMargin}, in percent. */
+export const DEFAULT_DRAIN_RETURN_MARGIN_PCT = 5;
+/** Default {@link AuthAccountPolicy.returnCooldownMs}. */
+export const DEFAULT_DRAIN_RETURN_COOLDOWN_MS = 10 * 60 * 1000;
 
 /** Read-only set of per-account routing policies. */
 export type AuthAccountPolicies = readonly AuthAccountPolicy[];
@@ -1225,6 +1240,13 @@ export interface SessionsApi {
 	release(provider: string, sessionId: string): boolean;
 	/** Remove the session's exclusive pin for `provider`; returns false when the session had none. */
 	unpin(provider: string, sessionId: string): boolean;
+	/**
+	 * Override, for this session only, which OAuth account of `provider` is
+	 * drained first: a stored row id, `null` for none, or `undefined` to follow
+	 * `auth.accountPolicies`. Returns false when the row is not a stored OAuth
+	 * account. Exclusive pins take precedence.
+	 */
+	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean;
 }
 
 /** Usage reporting, observation, and provider configuration. */

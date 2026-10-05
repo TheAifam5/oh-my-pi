@@ -28,12 +28,15 @@ import {
 } from "./rank";
 import { mergeRefreshedCredential, OAUTH_REFRESH_SKEW_MS, type OAuthRefresher } from "./refresh";
 import type { AuthCredentialStore } from "./store";
-import type {
-	ApiKeyCredential,
-	AuthApiKeyOptions,
-	AuthCredential,
-	OAuthCredential,
-	StoredAuthCredential,
+import {
+	type ApiKeyCredential,
+	type AuthAccountPolicy,
+	type AuthApiKeyOptions,
+	type AuthCredential,
+	DEFAULT_DRAIN_RETURN_COOLDOWN_MS,
+	DEFAULT_DRAIN_RETURN_MARGIN_PCT,
+	type OAuthCredential,
+	type StoredAuthCredential,
 } from "./types";
 import type { UsageService } from "./usage";
 import {
@@ -69,6 +72,9 @@ export type TryOAuthOptions = {
 	onTransientRefreshFailure?: (error: unknown) => void;
 };
 
+/** The account a session drains first, with its return hysteresis. */
+type DrainTarget = { index: number; credentialId: number; returnFraction: number; cooldownMs: number };
+
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
 export interface CredentialSelectorDeps {
 	store: AuthCredentialStore;
@@ -85,6 +91,8 @@ export interface CredentialSelectorDeps {
 export class CredentialSelector {
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
+	/** When each drain target last drained, by `rowId\0blockScope`; cleared once it returns. Process-local. */
+	#drainedSince: Map<string, number> = new Map();
 	#deps: CredentialSelectorDeps;
 
 	constructor(deps: CredentialSelectorDeps) {
@@ -275,6 +283,7 @@ export class CredentialSelector {
 				blockedUntil,
 				inReserve: false,
 				accountPriority: 0,
+				drainTarget: false,
 				allowanceSpent: remainingUsageFraction(strategy, usage, args.rankingContext, nowMs) === 0,
 				usageMeasured,
 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
@@ -348,6 +357,7 @@ export class CredentialSelector {
 		options?: AuthApiKeyOptions;
 		strategy?: CredentialRankingStrategy;
 		defaultReservePct?: number;
+		drain?: DrainTarget;
 		rankingContext: CredentialRankingContext;
 		blockScope?: string;
 		/** Scopes a block may live under for this request; reads honour all of them. */
@@ -463,7 +473,21 @@ export class CredentialSelector {
 				strategy === undefined ? remainingFraction !== undefined : primary !== undefined || secondary !== undefined;
 			const primaryUncapped = primary === undefined && secondary !== undefined;
 			const policy = this.#deps.policies.forCredential(args.provider, selection.credential);
-			const reservePct = policy?.reservePct ?? args.defaultReservePct;
+			const drainTarget =
+				args.drain?.index === selection.index &&
+				this.#drainServing(
+					args.drain,
+					args.blockScope,
+					this.#usageBlocked(
+						args.provider,
+						args.providerKey,
+						selection.index,
+						args.blockScopes ?? (args.blockScope ? [args.blockScope] : []),
+					) || remainingFraction === 0,
+					remainingFraction,
+					nowMs,
+				);
+			const reservePct = drainTarget ? undefined : (policy?.reservePct ?? args.defaultReservePct);
 			const reserveFraction =
 				reservePct === undefined || !Number.isFinite(reservePct)
 					? undefined
@@ -478,6 +502,7 @@ export class CredentialSelector {
 					reserveFraction !== undefined && remainingFraction !== undefined && remainingFraction <= reserveFraction,
 				reserveMeasured: reserveFraction !== undefined && remainingFraction !== undefined,
 				accountPriority: policy?.priority === undefined || !Number.isFinite(policy.priority) ? 0 : policy.priority,
+				drainTarget,
 				allowanceSpent: remainingFraction === 0,
 				usageMeasured,
 				hasPriorityBoost: strategy?.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
@@ -492,6 +517,72 @@ export class CredentialSelector {
 			});
 		}
 		return orderUsageRankedCandidates(ranked, args.planGate !== undefined);
+	}
+
+	/** The OAuth account `sessionId` drains first for `provider`: the session override, else the account policy. */
+	#drainTarget(provider: string, sessionId: string | undefined): DrainTarget | undefined {
+		const override = this.#deps.affinity.drainOverride(provider, sessionId);
+		if (override === null) return undefined;
+		const entries = this.#deps.pool.entries(provider);
+		let index = override === undefined ? -1 : entries.findIndex(entry => entry.id === override);
+		let policy: AuthAccountPolicy | undefined;
+		const overridden = entries[index]?.credential;
+		if (overridden?.type === "oauth") {
+			policy = this.#deps.policies.forCredential(provider, overridden);
+		} else {
+			// An override whose account is gone falls back to the account policy.
+			if (override !== undefined && sessionId) this.#deps.affinity.drain(provider, sessionId, undefined);
+			const found = this.#deps.policies.drainTarget(
+				provider,
+				entries.map(entry => entry.credential),
+			);
+			if (!found) return undefined;
+			({ index, policy } = found);
+		}
+		return {
+			index,
+			credentialId: entries[index]!.id,
+			returnFraction: (policy?.returnMargin ?? DEFAULT_DRAIN_RETURN_MARGIN_PCT) / 100,
+			cooldownMs: policy?.returnCooldownMs ?? DEFAULT_DRAIN_RETURN_COOLDOWN_MS,
+		};
+	}
+
+	/**
+	 * Whether the drain target serves first now. A drained target (any window
+	 * exhausted or plan allowance spent) stays behind its siblings until
+	 * `cooldownMs` has passed since it drained and, when measured, at least
+	 * `returnFraction` of its quota is left again.
+	 */
+	#drainServing(
+		target: DrainTarget,
+		blockScope: string | undefined,
+		drained: boolean,
+		remainingFraction: number | undefined,
+		nowMs: number,
+	): boolean {
+		const key = `${target.credentialId}\0${blockScope ?? ""}`;
+		let since = this.#drainedSince.get(key);
+		// A clock that stepped back restarts the cooldown instead of ending it early or never.
+		if (since !== undefined && nowMs < since) {
+			since = nowMs;
+			this.#drainedSince.set(key, since);
+		}
+		if (drained) {
+			if (since === undefined) this.#drainedSince.set(key, nowMs);
+			return false;
+		}
+		if (since === undefined) return true;
+		if (nowMs - since < target.cooldownMs) return false;
+		if (remainingFraction !== undefined && remainingFraction < target.returnFraction) return false;
+		this.#drainedSince.delete(key);
+		return true;
+	}
+
+	/** Whether a usage-limit block (not an auth or policy block) holds the credential for this request. */
+	#usageBlocked(provider: string, providerKey: string, index: number, blockScopes: readonly string[]): boolean {
+		return (
+			this.#deps.blocks.blockedUntil(provider, providerKey, index, blockScopes, { usageOnly: true }) !== undefined
+		);
 	}
 
 	/**
@@ -560,6 +651,7 @@ export class CredentialSelector {
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
 			(strategy !== undefined || policyReserveEnabled) && (credentials.length > 1 || hasPlanRequirement);
+		const drain = credentials.length > 1 ? this.#drainTarget(provider, sessionId) : undefined;
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
 		const sessionPreferredCredential =
@@ -590,6 +682,7 @@ export class CredentialSelector {
 			!sessionPreferredIsAvailable ||
 			!sessionPreferredIsWarm ||
 			hasPlanRequirement ||
+			drain !== undefined ||
 			(policyReserveEnabled && !sessionPinIsExplicit);
 		// A warm automatic pin whose allowance is spent keeps serving on paid overage
 		// (Codex credits) and is never blocked, so check it and rank when spent: a
@@ -642,6 +735,7 @@ export class CredentialSelector {
 					options,
 					strategy,
 					defaultReservePct: policyReserveEnabled ? this.#deps.policies.defaultReservePct : undefined,
+					drain,
 					rankingContext,
 					blockScope,
 					blockScopes,
@@ -654,6 +748,23 @@ export class CredentialSelector {
 							? { selection, usage: sessionPreferredUsage, usageChecked: true }
 							: { selection, usage: null, usageChecked: false },
 					);
+		// Without usage ranking, only a block can drain the target.
+		const drainIndex = shouldRank
+			? candidates.find(candidate => candidate.drainTarget)?.selection.index
+			: drain &&
+				  this.#drainServing(
+						drain,
+						blockScope,
+						this.#usageBlocked(provider, providerKey, drain.index, blockScopes),
+						undefined,
+						Date.now(),
+				  )
+				? drain.index
+				: undefined;
+		if (!shouldRank && drainIndex !== undefined) {
+			const drainPosition = candidates.findIndex(candidate => candidate.selection.index === drainIndex);
+			if (drainPosition > 0) candidates.unshift(...candidates.splice(drainPosition, 1));
+		}
 		const preflightFailures = new Set<OAuthCandidate>();
 		// The last retryable refresh error (network, timeout, 5xx) that removed a candidate.
 		// When no candidate resolves, it is rethrown so callers retry instead of reporting
@@ -679,6 +790,7 @@ export class CredentialSelector {
 			candidates.some(candidate => {
 				if (candidate === preferredCandidate) return false;
 				if (excludePreflightFailures && preflightFailures.has(candidate)) return false;
+				if (candidate.selection.index === drainIndex) return true;
 				if (
 					preferredCandidate.inReserve === true &&
 					candidate.reserveMeasured === true &&
@@ -697,7 +809,9 @@ export class CredentialSelector {
 		if (
 			!hasPlanRequirement &&
 			sessionPreferredCandidate > 0 &&
-			(!shouldRank || sessionPinIsExplicit || (sessionPreferredIsWarm && !pinEvictedBeforePreflight))
+			((!shouldRank && !pinEvictedBeforePreflight) ||
+				sessionPinIsExplicit ||
+				(sessionPreferredIsWarm && !pinEvictedBeforePreflight))
 		) {
 			const [preferred] = candidates.splice(sessionPreferredCandidate, 1);
 			candidates.unshift(preferred);

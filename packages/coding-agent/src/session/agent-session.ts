@@ -13225,6 +13225,18 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Drain `credentialId` first for the current model provider in this session
+	 * only, or with `null` drain no account, overriding `auth.accountPolicies`.
+	 * Returns false without a model, while streaming, or when the row is not a
+	 * stored OAuth account.
+	 */
+	drainCurrentProviderAccount(credentialId: number | null): boolean {
+		const provider = this.model?.provider;
+		if (!provider || this.isStreaming) return false;
+		return this.#modelRegistry.authStorage.sessions.drain(provider, this.sessionId, credentialId);
+	}
+
+	/**
 	 * Remove this session's pin for the current model provider, in the auth
 	 * store and the session file. A project pin is not removed (`project-pin`).
 	 */
