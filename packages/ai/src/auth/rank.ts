@@ -29,6 +29,8 @@ export type UsageCandidate<T extends AuthCredential> = {
 	accountPriority?: number;
 	/** Present after policy-aware ranking: unblocked and measured at or above its `reclaimAbovePct`. */
 	reclaimReady?: boolean;
+	/** Present after ranking: this is the provider's drain target and it is serving first now. */
+	drainTarget?: boolean;
 };
 
 /** OAuth credential eligible for usage ranking. */
@@ -47,6 +49,8 @@ export type UsageRankedCandidate<T extends AuthCredential> = UsageCandidate<T> &
 	inReserve: boolean;
 	reserveMeasured?: boolean;
 	accountPriority: number;
+	/** The drain target while it serves first; ranks ahead of every unblocked, plan-eligible sibling. */
+	drainTarget: boolean;
 	hasPriorityBoost: boolean;
 	allowanceSpent: boolean;
 	usageMeasured: boolean;
@@ -100,6 +104,7 @@ function compareUsageRankedCandidatePriority(
 	if (planGated && left.planPriority !== right.planPriority) {
 		return left.planPriority - right.planPriority;
 	}
+	if (left.drainTarget !== right.drainTarget) return left.drainTarget ? -1 : 1;
 	// Paid overage (Codex credits) never renews, so an account serving past its
 	// allowance yields to any sibling whose renewable allowance is left (#13889).
 	if (left.allowanceSpent !== right.allowanceSpent) return left.allowanceSpent ? 1 : -1;
@@ -143,7 +148,7 @@ function compareUsageRankedCandidates(
 	return priority !== 0 ? priority : left.orderPos - right.orderPos;
 }
 
-/** Sort ranked candidates by blocks, plan, spent allowance, reserve, boost, hot window, usage and drain. */
+/** Sort ranked candidates by blocks, plan, drain target, spent allowance, reserve, boost, hot window, usage and required drain. */
 export function orderUsageRankedCandidates<T extends AuthCredential>(
 	candidates: UsageRankedCandidate<T>[],
 	planGated: boolean,
@@ -158,5 +163,6 @@ export function orderUsageRankedCandidates<T extends AuthCredential>(
 		allowanceSpent: candidate.allowanceSpent,
 		accountPriority: candidate.accountPriority,
 		reclaimReady: candidate.reclaimReady,
+		drainTarget: candidate.drainTarget,
 	}));
 }

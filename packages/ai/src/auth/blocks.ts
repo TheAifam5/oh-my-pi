@@ -270,12 +270,17 @@ export class CredentialBlocks implements BlocksApi {
 		return memory === undefined ? persisted : persisted === undefined ? memory : Math.max(memory, persisted);
 	}
 
-	/** Returns block expiry timestamp for a credential, checking unscoped and scoped blocks. */
+	/**
+	 * Returns block expiry timestamp for a credential, checking unscoped and scoped blocks.
+	 * `options.usageOnly` ignores auth, account-policy, and model-policy blocks, leaving
+	 * only usage-limit blocks.
+	 */
 	blockedUntil(
 		provider: string,
 		providerKey: string,
 		credentialIndex: number,
 		blockScopeOrScopes: string | readonly string[] | undefined = undefined,
+		options?: { usageOnly?: boolean },
 	): number | undefined {
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return undefined;
@@ -284,6 +289,7 @@ export class CredentialBlocks implements BlocksApi {
 			providerKey,
 			blockScopeOrScopes,
 			this.#readPersistedCredentialBlockScopes(credentialId, providerKey),
+			options,
 		);
 	}
 
@@ -292,14 +298,21 @@ export class CredentialBlocks implements BlocksApi {
 		providerKey: string,
 		blockScopeOrScopes: string | readonly string[] | undefined,
 		persistedScopes: PersistedBlockScopes,
+		options?: { usageOnly?: boolean },
 	): number | undefined {
 		const nowMs = Date.now();
+		const requested = typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? []);
 		// A request honours its own scope plus any legacy catch-all scope, so a
 		// block written before backoff was scoped still applies to everything.
-		const scopes = [
-			...PROTECTED_BLOCK_SCOPES,
-			...(typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])),
-		].filter(scope => scope.length > 0);
+		const scopes = (
+			options?.usageOnly
+				? requested.filter(
+						scope =>
+							!(PROTECTED_BLOCK_SCOPES as readonly string[]).includes(scope) &&
+							!scope.startsWith(MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX),
+					)
+				: [...PROTECTED_BLOCK_SCOPES, ...requested]
+		).filter(scope => scope.length > 0);
 		let blockedUntil = this.#getCredentialBlockedUntilForKey(providerKey, credentialId, nowMs, persistedScopes);
 		for (const blockScope of scopes) {
 			const scopedBlockedUntil = this.#getCredentialBlockedUntilForKey(
