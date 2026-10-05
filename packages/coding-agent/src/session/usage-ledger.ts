@@ -7,10 +7,10 @@ import { usdToNanos } from "./spend-ledger";
 export const USAGE_RETENTION_MS = 400 * 24 * 60 * 60 * 1000;
 
 /** Writes between two prunes of one ledger handle. */
-const PRUNE_EVERY_WRITES = 64;
+export const PRUNE_EVERY_WRITES = 64;
 
 /** Most entries one prune deletes, bounding the write transaction it runs in. */
-const PRUNE_MAX_ROWS = 1_000;
+export const PRUNE_MAX_ROWS = 1_000;
 
 /** One completed model call. */
 export interface UsageEntry {
@@ -29,8 +29,8 @@ export interface UsageEntry {
 }
 
 /** Attempts at appending one entry while agent.db is busy, and the first retry delay in ms (doubling). */
-const RECORD_MAX_ATTEMPTS = 3;
-const RECORD_RETRY_BASE_MS = 50;
+export const RECORD_MAX_ATTEMPTS = 3;
+export const RECORD_RETRY_BASE_MS = 50;
 
 /**
  * The ledger entry of the completed call `message`, or undefined for a call that reported no
