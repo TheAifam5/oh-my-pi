@@ -1,5 +1,6 @@
 import type { Provider } from "../types";
 import type { CredentialRankingStrategy, UsageProvider } from "../usage";
+import { aimlapiBilling, aimlapiUsageProvider } from "./aimlapi";
 import { alibabaTokenPlanRankingStrategy, alibabaTokenPlanUsageProvider } from "./alibaba-token-plan";
 import { type ProviderBilling, ProviderBillingRegistry } from "./billing";
 import { charmHyperBilling, charmHyperUsageProvider } from "./charm-hyper";
@@ -7,6 +8,7 @@ import { claudeBilling, claudeRankingStrategy, claudeUsageProvider } from "./cla
 import { clinePassUsageProvider } from "./cline-pass";
 import { commandCodeBilling, commandCodeRankingStrategy, commandCodeUsageProvider } from "./commandcode";
 import { cursorBilling, cursorRankingStrategy, cursorUsageProvider } from "./cursor";
+import { deepseekBilling, deepseekUsageProvider } from "./deepseek";
 import { devinBilling, devinUsageProvider } from "./devin";
 import { factoryDroidBilling, factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
 import { googleGeminiCliUsageProvider } from "./gemini";
@@ -15,12 +17,17 @@ import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-a
 import { kimiRankingStrategy, kimiUsageProvider } from "./kimi";
 import { museCodeUsageProvider } from "./muse-code";
 import { minimaxCodeUsageProvider } from "./minimax-code";
+import { moonshotBilling, moonshotUsageProvider } from "./moonshot";
+import { nanogptBilling, nanogptUsageProvider } from "./nanogpt";
+import { novitaBilling, novitaUsageProvider } from "./novita";
 import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
 import { opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
 import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
 import { syntheticBilling, syntheticUsageProvider } from "./synthetic";
 import { umansUsageProvider } from "./umans";
+import { veniceBilling, veniceUsageProvider } from "./venice";
+import { vercelAiGatewayBilling, vercelAiGatewayUsageProvider } from "./vercel-ai-gateway";
 import { xaiOauthRankingStrategy, xaiOauthUsageProvider } from "./xai-oauth";
 import { zaiRankingStrategy, zaiUsageProvider } from "./zai";
 
@@ -52,6 +59,13 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	charmHyperUsageProvider,
 	commandCodeUsageProvider,
 	openrouterUsageProvider,
+	deepseekUsageProvider,
+	moonshotUsageProvider,
+	novitaUsageProvider,
+	aimlapiUsageProvider,
+	nanogptUsageProvider,
+	vercelAiGatewayUsageProvider,
+	veniceUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -94,6 +108,13 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	syntheticBilling,
 	devinBilling,
 	openrouterBilling,
+	deepseekBilling,
+	moonshotBilling,
+	novitaBilling,
+	aimlapiBilling,
+	nanogptBilling,
+	vercelAiGatewayBilling,
+	veniceBilling,
 ];
 
 const DEFAULT_BILLING_READER_MAP = new Map<Provider, ProviderBilling>(
