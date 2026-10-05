@@ -15,6 +15,8 @@ import {
 	cfgModelProviderOrder,
 	cfgModelRoleStorage,
 } from "../config/model-settings";
+import { poolLimitsSummary } from "../session/local-limits";
+import { chainPoolId, rolePoolId } from "../session/retry-fallback-groups";
 import {
 	cfgDefaultThinkingLevel,
 	cfgRetryFallbackChains,
@@ -93,7 +95,7 @@ export function createModelBrowserSource(
 		resolveRoleValue: (value, models, roleLookup) => resolveModelRoleValue(value, models, { settings, roleLookup }),
 		getModelPresets: () => ({ names: getModelPresetNames(settings), active: findActiveModelPreset(settings) }),
 		compactionPointFor: model => describeModelCompactionPoint(settings, model),
-		getPool: target => modelHubPool(settings, target),
+		getPool: target => withPoolLimits(settings, target, modelHubPool(settings, target)),
 		roleAcceptsPools: role => roleAcceptsGroups(role),
 		poolWriteBlocker: target => poolWriteBlocker(settings, target),
 	};
@@ -156,6 +158,18 @@ function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubP
 			: (cfgRetryFallbackChains.get(settings) as Record<string, unknown>)[target.key];
 	if (!isRecord(raw)) return { ...view, readOnly: "not an inline group" };
 	return { ...view, raw };
+}
+
+/** `pool` with its local limits summary ({@link poolLimitsSummary}) when it has any. */
+function withPoolLimits(
+	settings: Settings,
+	target: ModelHubPoolTarget,
+	pool: ModelHubPool | undefined,
+): ModelHubPool | undefined {
+	if (!pool) return pool;
+	const poolId = target.kind === "role" ? rolePoolId(target.key) : chainPoolId(target.key);
+	const limits = poolLimitsSummary(settings, poolId, settings.getStorage()?.usageLedger, Date.now());
+	return limits ? { ...pool, limits } : pool;
 }
 
 /**

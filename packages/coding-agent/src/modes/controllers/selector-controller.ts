@@ -8,7 +8,7 @@ import type {
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
-import { Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { Loader, Spacer, Text, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import {
@@ -62,6 +62,7 @@ import type {
 import { labelAccount, listAccounts, logoutAccount, pinProjectAccount } from "../../session/account-admin";
 import type { SessionAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import { localLimitsReport } from "../../session/local-limits";
 import {
 	createForeignSessionStore,
 	foreignSessionInfoToSessionInfo,
@@ -467,16 +468,26 @@ export class SelectorController {
 		const dashboard = new UsageDashboardComponent({
 			reports,
 			unavailableAccounts,
-			renderDetail: (width, current) =>
-				renderUsageReports(
+			renderDetail: (width, current) => {
+				const nowMs = Date.now();
+				const report = renderUsageReports(
 					current,
 					theme,
-					Date.now(),
+					nowMs,
 					width,
 					provider => (provider === currentProvider ? activeAccount : undefined),
 					usageModelSelectors,
 					unavailableAccounts,
-				),
+				);
+				const [heading, ...limits] = localLimitsReport(
+					this.ctx.session.settings,
+					this.ctx.session.settings.getStorage()?.usageLedger,
+					nowMs,
+				);
+				if (heading === undefined) return report;
+				const lines = limits.map(line => truncateToWidth(sanitizeText(line), width));
+				return `${report}\n\n${theme.bold(heading)}\n${lines.join("\n")}`;
+			},
 			loadActivity: loadDailyActivity,
 			refresh: () => this.ctx.session.fetchUsageReports(),
 			requestRender: () => this.ctx.ui.requestRender(),

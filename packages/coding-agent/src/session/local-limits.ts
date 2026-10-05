@@ -5,6 +5,7 @@
 import {
 	type LocalLimit,
 	localLimitCap,
+	localLimitWindowResetAt,
 	localLimitWindowStart,
 	type LocalLimitWindow,
 } from "@oh-my-pi/pi-ai/usage/limits";
@@ -25,6 +26,8 @@ export interface LimitTarget {
 	label: string;
 	limit: LocalLimit;
 	scopes: UsageScope[];
+	/** The `limits` key or pool id the limit is configured under; unset outside the configured scopes. */
+	scopeKey?: string;
 }
 
 /** A limit that refuses the next call, and why. */
@@ -147,11 +150,20 @@ function scopeMatches(scope: UsageScope, provider: string, modelId: string, pool
  * a pool), a shared `id` once with every scope that declares it.
  */
 export function limitTargets(settings: Settings, provider: string, modelId: string, poolId?: string): LimitTarget[] {
+	return targetsWhere(settings, scope => scopeMatches(scope, provider, modelId, poolId));
+}
+
+/** Every configured limit (top-level keys, then pools), a shared `id` once; `poolId` keeps one pool's. */
+export function configuredLimitTargets(settings: Settings, poolId?: string): LimitTarget[] {
+	return targetsWhere(settings, scope => poolId === undefined || scope.pool === poolId);
+}
+
+function targetsWhere(settings: Settings, include: (scope: UsageScope) => boolean): LimitTarget[] {
 	const configured = configuredLimits(settings);
 	if (configured.length === 0) return [];
 	const targets = new Map<string, LimitTarget>();
 	for (const { key, scope, limits } of configured) {
-		if (!scopeMatches(scope, provider, modelId, poolId)) continue;
+		if (!include(scope)) continue;
 		limits.forEach((limit, index) => {
 			const targetKey = limit.id !== undefined ? `id:${limit.id}` : `${key}#${index}`;
 			if (targets.has(targetKey)) return;
@@ -159,7 +171,7 @@ export function limitTargets(settings: Settings, provider: string, modelId: stri
 				limit.id === undefined
 					? [scope]
 					: configured.flatMap(other => (other.limits.some(entry => entry.id === limit.id) ? [other.scope] : []));
-			targets.set(targetKey, { key: targetKey, label: localLimitLabel(key, limit), limit, scopes });
+			targets.set(targetKey, { key: targetKey, label: localLimitLabel(key, limit), limit, scopes, scopeKey: key });
 		});
 	}
 	return [...targets.values()];
@@ -183,6 +195,149 @@ function readTotals(ledger: UsageLedger, scopes: readonly UsageScope[], sinceMs:
 }
 
 /**
+ * What `target` has counted in its window at `nowMs`, in counter units (nano-USD for `usd`).
+ *
+ * @throws Error when no ledger is open or the read fails.
+ */
+function countedUsage(ledger: UsageLedger | undefined, target: LimitTarget, nowMs: number): bigint {
+	if (!ledger) throw new Error("no usage ledger is open");
+	const { window } = target.limit;
+	const start = localLimitWindowStart(window, nowMs);
+	// The ledger counts calls after `sinceMs`; a calendar window includes its first millisecond.
+	return metricTotal(readTotals(ledger, target.scopes, window.type === "calendar" ? start - 1 : start), target.limit);
+}
+
+/** A limit and what its counter holds now, for display. */
+export interface LimitStatus {
+	/** The limit's `id`, else the scope it is configured under (`limits` key, pool id, or account). */
+	name: string;
+	metric: LocalLimit["metric"];
+	max: string | number;
+	window: LocalLimitWindow;
+	onLimit: LocalLimit["onLimit"];
+	/** Counted so far: a decimal USD string for `usd`, a count otherwise; undefined when unreadable. */
+	used?: string | number;
+	/** Epoch ms a calendar window resets; undefined for a rolling window. */
+	resetsAt?: number;
+}
+
+/** {@link LimitStatus} of `target` named `name`, read from `ledger` at `nowMs`. */
+export function limitStatus(
+	ledger: UsageLedger | undefined,
+	target: LimitTarget,
+	name: string,
+	nowMs: number,
+): LimitStatus {
+	const { limit } = target;
+	let used: string | number | undefined;
+	try {
+		const counted = countedUsage(ledger, target, nowMs);
+		used = limit.metric === "usd" ? formatNanoUsd(counted) : Number(counted);
+	} catch {
+		used = undefined;
+	}
+	const resetsAt = localLimitWindowResetAt(limit.window, nowMs);
+	return {
+		name: limit.id ?? name,
+		metric: limit.metric,
+		max: limit.max,
+		window: limit.window,
+		onLimit: limit.onLimit,
+		...(used !== undefined ? { used } : {}),
+		...(resetsAt !== undefined ? { resetsAt } : {}),
+	};
+}
+
+/** Statuses of every configured top-level and pool limit, or of one pool's (`poolId`). */
+export function configuredLimitStatuses(
+	settings: Settings,
+	ledger: UsageLedger | undefined,
+	nowMs: number,
+	poolId?: string,
+): LimitStatus[] {
+	return configuredLimitTargets(settings, poolId).map(target =>
+		limitStatus(ledger, target, target.scopeKey ?? target.key, nowMs),
+	);
+}
+
+/** Nano-USD as a decimal USD string with at least two and at most nine fractional digits. */
+function formatNanoUsd(nanos: bigint): string {
+	const whole = nanos / 1_000_000_000n;
+	const fraction = (nanos % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "").padEnd(2, "0");
+	return `${whole}.${fraction}`;
+}
+
+/** A status as `<used> / <max> <unit> per <window>`, then the reset or `rolling`; `?` for unreadable usage. */
+export function formatLimitUsage(status: LimitStatus, nowMs: number): string {
+	const unit = status.metric === "usd" ? "USD" : status.metric;
+	const reset =
+		status.resetsAt !== undefined ? `resets in ${formatDuration(Math.max(0, status.resetsAt - nowMs))}` : "rolling";
+	const warn = status.onLimit === "warn" ? " · warn only" : "";
+	return `${status.used ?? "?"} / ${status.max} ${unit} per ${windowLabel(status.window)} · ${reset}${warn}`;
+}
+
+/** Lines of a "Local limits" report section for every configured top-level and pool limit; empty without any. */
+export function localLimitsReport(settings: Settings, ledger: UsageLedger | undefined, nowMs: number): string[] {
+	const statuses = configuredLimitStatuses(settings, ledger, nowMs);
+	return statuses.length === 0
+		? []
+		: ["Local limits", ...statuses.map(status => `  ${formatLimitStatus(status, nowMs)}`)];
+}
+
+/**
+ * One-line summary of a pool's limits for the model hub: how many, then the one closest to its
+ * cap ({@link formatLimitUsage}), `skip` limits before warn-only ones; undefined for a pool
+ * without limits.
+ */
+export function poolLimitsSummary(
+	settings: Settings,
+	poolId: string,
+	ledger: UsageLedger | undefined,
+	nowMs: number,
+): string | undefined {
+	const statuses = configuredLimitStatuses(settings, ledger, nowMs, poolId);
+	if (statuses.length === 0) return undefined;
+	const share = (status: LimitStatus) => (status.used === undefined ? -1 : Number(status.used) / Number(status.max));
+	const rank = (status: LimitStatus) => (status.onLimit === "skip" ? 1 : 0);
+	const closest = statuses.reduce((best, status) =>
+		rank(status) > rank(best) || (rank(status) === rank(best) && share(status) > share(best)) ? status : best,
+	);
+	const count = `${statuses.length} limit${statuses.length === 1 ? "" : "s"}`;
+	return `${count}, closest ${formatLimitUsage(closest, nowMs)}`;
+}
+
+/**
+ * The JSON shape of a listed limit: `metric`, `max`, `used` (a decimal USD string for `usd`, a
+ * count otherwise), `window`, and `resetsAt` (epoch ms), each `null` when unknown or not applicable.
+ */
+export function localLimitJson(limit: {
+	metric: string;
+	max: string | number;
+	used?: string | number;
+	window?: LocalLimitWindow;
+	resetsAt?: number;
+}): {
+	metric: string;
+	max: string | number;
+	used: string | number | null;
+	window: LocalLimitWindow | null;
+	resetsAt: number | null;
+} {
+	return {
+		metric: limit.metric,
+		max: limit.max,
+		used: limit.used ?? null,
+		window: limit.window ?? null,
+		resetsAt: limit.resetsAt ?? null,
+	};
+}
+
+/** {@link formatLimitUsage} prefixed with the status name. */
+export function formatLimitStatus(status: LimitStatus, nowMs: number): string {
+	return `${status.name}: ${formatLimitUsage(status, nowMs)}`;
+}
+
+/**
  * Of `targets`, the limits whose counted calls reached their cap at `nowMs`: `skip` limits that
  * refuse the next call, and `warn` limits that only notify. A `skip` limit whose usage cannot be
  * read (no ledger, or a failed read) refuses too; a `warn` limit then stays quiet.
@@ -198,12 +353,7 @@ export function evaluateLimits(
 	for (const target of targets) {
 		let reached: boolean;
 		try {
-			if (!ledger) throw new Error("no usage ledger is open");
-			const { window } = target.limit;
-			const start = localLimitWindowStart(window, nowMs);
-			// The ledger counts calls after `sinceMs`; a calendar window includes its first millisecond.
-			const totals = readTotals(ledger, target.scopes, window.type === "calendar" ? start - 1 : start);
-			reached = metricTotal(totals, target.limit) >= localLimitCap(target.limit);
+			reached = countedUsage(ledger, target, nowMs) >= localLimitCap(target.limit);
 		} catch (error) {
 			if (target.limit.onLimit === "skip") {
 				logger.debug("Local limit usage could not be read", { limit: target.label, error: String(error) });

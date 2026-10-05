@@ -23,6 +23,8 @@ import type { TUI } from "@oh-my-pi/pi-tui";
 
 import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 function normalize(lines: readonly string[]): string {
 	return stripVTControlCharacters(lines.join("\n")).replace(/\s+/g, " ").trim();
@@ -1277,6 +1279,59 @@ describe("ModelHub", () => {
 			return spec.group;
 		}
 
+		test("the source summarises a pool's local limits", () => {
+			const settings = Settings.isolated({
+				modelRoles: {
+					smol: {
+						strategy: "random",
+						routing: {
+							limits: [{ metric: "requests", max: 4, window: { type: "rolling", durationMs: 3_600_000 } }],
+						},
+						models: { a: { model: "test/model-a" } },
+					},
+				},
+			});
+			expect(createModelBrowserSource(settings).getPool?.({ kind: "role", key: "smol" })?.limits).toBe(
+				"1 limit, closest ? / 4 requests per 1h · rolling",
+			);
+		});
+
+		test("the source counts a pool's recorded calls in its limits summary", async () => {
+			const tmp = TempDir.createSync("@pi-hub-limits-");
+			try {
+				const storage = await AgentStorage.open(tmp.join("agent.db"));
+				const settings = Settings.isolated(
+					{
+						modelRoles: {
+							smol: {
+								strategy: "random",
+								routing: {
+									limits: [{ metric: "requests", max: 4, window: { type: "rolling", durationMs: 3_600_000 } }],
+								},
+								models: { a: { model: "test/model-a" } },
+							},
+						},
+					},
+					{ storage },
+				);
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: "test",
+					model: "model-a",
+					pool: "role:smol",
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				expect(createModelBrowserSource(settings).getPool?.({ kind: "role", key: "smol" })?.limits).toBe(
+					"1 limit, closest 1 / 4 requests per 1h · rolling",
+				);
+			} finally {
+				AgentStorage.close();
+				tmp.removeSync();
+			}
+		});
+
 		test("the source maps pools to scheduling-ordered members with routing text, and gates writes by layer", () => {
 			const settings = Settings.isolated({ modelRoles: { slow: "+fast@deep" } });
 			settings.setModelRoleSpec("smol", {
@@ -1310,6 +1365,7 @@ describe("ModelHub", () => {
 				spending: "provider-managed",
 			});
 			expect(pool?.readOnly).toBeUndefined();
+			expect(pool?.limits).toBeUndefined();
 			expect(pool?.raw).toEqual(settings.getModelRoleEntries().smol as Record<string, unknown>);
 
 			// A reference shows the shared group through its profile and is never written from the hub.

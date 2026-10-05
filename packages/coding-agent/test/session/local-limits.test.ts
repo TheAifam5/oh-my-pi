@@ -4,7 +4,14 @@ import * as path from "node:path";
 import { parseLimitsSetting } from "@oh-my-pi/pi-coding-agent/config/local-limits";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { createAccountLimitSource, evaluateLimits, limitTargets } from "@oh-my-pi/pi-coding-agent/session/local-limits";
+import {
+	configuredLimitStatuses,
+	createAccountLimitSource,
+	evaluateLimits,
+	formatLimitStatus,
+	limitTargets,
+	poolLimitsSummary,
+} from "@oh-my-pi/pi-coding-agent/session/local-limits";
 import { cfgAuthAccountPolicies } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
@@ -336,5 +343,89 @@ describe("local limits setting", () => {
 			{ provider: "openai", name: "work", account: { email: "w@example.com" } },
 		]);
 		expect(warn.mock.calls.some(([message]) => String(message).includes("accountPolicies[0].limits"))).toBe(true);
+	});
+
+	it("reports configured limits with counted usage, reset, and the pool limit closest to its cap", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const now = new Date(2026, 9, 7, 15, 0).getTime();
+		const settings = Settings.isolated(
+			{
+				limits: { "*": [{ metric: "usd", max: "5.00", window: DAY }] },
+				modelRoles: {
+					engineer: {
+						strategy: "random",
+						routing: {
+							limits: [
+								{ metric: "requests", max: 4, window: { type: "rolling", durationMs: 3_600_000 } },
+								{ metric: "tokens", max: 100, window: DAY, onLimit: "warn" },
+							],
+						},
+						models: { opus: { model: "anthropic/claude-opus-4-5" } },
+					},
+				},
+			},
+			{ storage },
+		);
+		storage.usageLedger.record({
+			atMs: now - 60_000,
+			provider: "anthropic",
+			model: "claude-opus-4-5",
+			pool: "role:engineer",
+			costNanos: 1_250_000_000,
+			inputTokens: 10,
+			outputTokens: 5,
+		});
+
+		expect(
+			configuredLimitStatuses(settings, storage.usageLedger, now).map(status => formatLimitStatus(status, now)),
+		).toEqual([
+			"*: 1.25 / 5.00 USD per day · resets in 9h",
+			"role:engineer: 1 / 4 requests per 1h · rolling",
+			"role:engineer: 15 / 100 tokens per day · resets in 9h · warn only",
+		]);
+		expect(poolLimitsSummary(settings, "role:engineer", storage.usageLedger, now)).toBe(
+			"2 limits, closest 1 / 4 requests per 1h · rolling",
+		);
+		expect(poolLimitsSummary(settings, "role:engineer", undefined, now)).toBe(
+			"2 limits, closest ? / 4 requests per 1h · rolling",
+		);
+	});
+
+	it("prints USD usage exactly at its boundaries and lists a shared id once across a key and a pool", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const now = Date.now();
+		const shared = { id: "frontier", metric: "usd", max: "9.00", window: DAY };
+		const settings = Settings.isolated(
+			{
+				limits: { "openai/gpt-4o": [shared] },
+				modelRoles: {
+					engineer: {
+						strategy: "random",
+						routing: { limits: [shared] },
+						models: { opus: { model: "anthropic/claude-opus-4-5" } },
+					},
+				},
+			},
+			{ storage },
+		);
+		const used = () =>
+			configuredLimitStatuses(settings, storage.usageLedger, now).map(status => [status.name, status.used]);
+		const spend = (costNanos: number) =>
+			storage.usageLedger.record({
+				atMs: now,
+				provider: "openai",
+				model: "gpt-4o",
+				costNanos,
+				inputTokens: 1,
+				outputTokens: 0,
+			});
+
+		expect(used()).toEqual([["frontier", "0.00"]]);
+		spend(1);
+		expect(used()).toEqual([["frontier", "0.000000001"]]);
+		spend(999_999_999);
+		expect(used()).toEqual([["frontier", "1.00"]]);
+		spend(1_234_000_000);
+		expect(used()).toEqual([["frontier", "2.234"]]);
 	});
 });

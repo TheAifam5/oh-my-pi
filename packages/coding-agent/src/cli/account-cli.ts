@@ -21,6 +21,7 @@ import {
 	unpinProjectAccount,
 } from "../session/account-admin";
 import type { AuthStorage } from "../session/auth-storage";
+import { formatLimitUsage, localLimitJson } from "../session/local-limits";
 
 export type AccountAction = "list" | "label" | "priority" | "reserve" | "pin" | "unpin" | "logout";
 
@@ -63,6 +64,7 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 			priority: row.priority ?? null,
 			reservePct: row.reservePct ?? null,
 			drain: row.drain,
+			limits: row.limits.map(localLimitJson),
 			keyFingerprint: row.account.keyFingerprint ?? null,
 			projectPinned: row.projectPinned,
 		}));
@@ -83,6 +85,9 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 			row.priority !== undefined ? `priority ${row.priority}` : undefined,
 			row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
 			row.drain ? "drained first" : undefined,
+			...row.limits.map(limit =>
+				"window" in limit ? `limit ${formatLimitUsage(limit, Date.now())}` : `limit ${limit.metric} ${limit.max}`,
+			),
 			row.projectPinned ? chalk.green("pinned for this project") : undefined,
 		].filter(Boolean);
 		const name = row.account.name ? chalk.cyan(row.account.name) : chalk.dim("(unnamed)");
