@@ -186,6 +186,7 @@ import { settingsAccountPinSource } from "./session/account-pins";
 import type { AccountLimitSource } from "@oh-my-pi/pi-ai/auth-storage";
 import type { AgentStorage } from "./session/agent-storage";
 import { createAccountLimitSource } from "./session/local-limits";
+import { installStreamUsageObserver } from "./session/stream-usage-observer";
 import {
 	AgentSession,
 	type InitialRetryFallbackState,
@@ -4917,6 +4918,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				};
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
+					// The session records and limits its own turns (TurnRecovery); the stream observer skips them.
+					usageRecorded: true,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
 				});
 				// Every request through this streamFn is this session's own main
@@ -5273,6 +5276,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 		// A caller-supplied store belongs to the caller (the CLI keeps it in sync itself).
 		if (ownsAuthStorage) createAuthStorageSettingsSync(session, authStorage);
+		// Background one-shot requests are recorded and limited while this session lives.
+		if (settings.getStorage()) session.addDisposer(installStreamUsageObserver(settings, authStorage));
 		// One coalesced prompt rebuild for every prompt input (rule bucketing, the
 		// `tools.format` catalog dialect, personality, …), so a bulk change rebuilds once.
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier

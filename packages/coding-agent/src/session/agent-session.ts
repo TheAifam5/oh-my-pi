@@ -576,6 +576,7 @@ import {
 	cfgToolsApproval,
 } from "../tools/settings";
 import { cfgTtsrJudge } from "../export/ttsr-settings";
+import { sideRequestSessionId } from "./request-session-ids";
 
 /** Advisor settings whose edit toggles or rebuilds a running advisor. */
 const cfgAdvisorRuntimeInputs = combine({
@@ -12863,9 +12864,10 @@ export class AgentSession implements SettingsScope {
 		// inference and queueing output nobody reads. Abort the request ourselves when
 		// we stop consuming it, without touching the caller's signal.
 		const streamAbort = new AbortController();
-		const sideSessionId = args.conversationKey
-			? `${cacheSessionId}:side:conversation:${args.conversationKey}`
-			: `${cacheSessionId}:side:${Snowflake.next()}`;
+		const sideSessionId = sideRequestSessionId(
+			cacheSessionId,
+			args.conversationKey ? `conversation:${args.conversationKey}` : Snowflake.next(),
+		);
 		const options = this.prepareSimpleStreamOptions(
 			{
 				apiKey: this.#modelRegistry.resolver(model, cacheSessionId),

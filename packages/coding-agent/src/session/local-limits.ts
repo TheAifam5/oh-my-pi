@@ -18,6 +18,9 @@ import { type GroupFallbackChain, resolveGroupFallbackChain, resolveRolePoolGrou
 import { cfgRetryFallbackChains } from "./settings";
 import type { UsageLedger, UsageScope, UsageTotals } from "./usage-ledger";
 
+/** Prefix of the error a request fails with when a local budget, limit, or usage reserve refuses it. */
+export const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
+
 /** One limit governing a model, with every scope its counter covers. */
 export interface LimitTarget {
 	/** Stable identity: `id:<id>` for a shared limit, else `<key>#<index>`. */

@@ -1,5 +1,7 @@
 import type { Database, Statement } from "bun:sqlite";
-import { logger } from "@oh-my-pi/pi-utils";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { isSqliteBusyError, logger } from "@oh-my-pi/pi-utils";
+import { usdToNanos } from "./spend-ledger";
 
 /** How long usage entries are kept, in ms (400 days); longer than the longest limit window. */
 export const USAGE_RETENTION_MS = 400 * 24 * 60 * 60 * 1000;
@@ -24,6 +26,47 @@ export interface UsageEntry {
 	costNanos: number;
 	inputTokens: number;
 	outputTokens: number;
+}
+
+/** Attempts at appending one entry while agent.db is busy, and the first retry delay in ms (doubling). */
+const RECORD_MAX_ATTEMPTS = 3;
+const RECORD_RETRY_BASE_MS = 50;
+
+/**
+ * The ledger entry of the completed call `message`, or undefined for a call that reported no
+ * usage at all (a failed request). An invalid cost (non-finite or negative) records as zero.
+ */
+export function usageEntryOf(
+	message: AssistantMessage,
+	atMs: number,
+	attribution: { account?: string; pool?: string } = {},
+): UsageEntry | undefined {
+	const { input, output, cacheRead, cacheWrite, cost } = message.usage;
+	const costNanos = usdToNanos(cost.total) ?? 0;
+	if (input + output + cacheRead + cacheWrite <= 0 && costNanos === 0) return undefined;
+	return {
+		atMs,
+		provider: message.provider,
+		model: message.model,
+		...(attribution.account !== undefined ? { account: attribution.account } : {}),
+		...(attribution.pool !== undefined ? { pool: attribution.pool } : {}),
+		costNanos,
+		inputTokens: input,
+		outputTokens: output,
+	};
+}
+
+/** Appends `entry` to `ledger`, retrying while agent.db is busy; rejects with the last error otherwise. */
+export async function recordUsageEntry(ledger: UsageLedger, entry: UsageEntry): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			ledger.record(entry, USAGE_RETENTION_MS);
+			return;
+		} catch (error) {
+			if (!isSqliteBusyError(error) || attempt >= RECORD_MAX_ATTEMPTS) throw error;
+		}
+		await Bun.sleep(RECORD_RETRY_BASE_MS * 2 ** (attempt - 1));
+	}
 }
 
 /** Calls a total covers: every set field must match; an empty scope matches every call. */
