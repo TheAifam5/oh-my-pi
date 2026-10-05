@@ -22,9 +22,9 @@ export type BillingMode =
 /**
  * Whether a funding source can pay for requests right now.
  *
- * `unknown` means the report carries no verdict for the source. Subscription
- * windows are usually model-scoped, so their exhaustion stays with the usage
- * ranking strategy and their source reads `unknown`.
+ * `unknown` means the report carries no verdict for the source. A subscription
+ * source reads `exhausted` only when an account-wide quota window is spent;
+ * model-scoped windows stay with the usage ranking strategy.
  */
 export type BillingSourceState = "available" | "exhausted" | "disabled" | "unknown";
 
@@ -515,4 +515,55 @@ export function sourceFromLimit(
 			? { resetsAt: limit.window.resetsAt }
 			: {}),
 	};
+}
+
+/** Whether a limit meters the whole account rather than one model. */
+export function isAccountWideLimit(limit: UsageLimit): boolean {
+	return limit.scope.modelId === undefined;
+}
+
+/**
+ * Funding state of a subscription bounded by concurrent quota windows.
+ *
+ * `exhausted` when any window is exhausted, since every window must have room
+ * for a request; `available` when every window reports `ok` or `warning`;
+ * otherwise, including for no windows, `unknown`.
+ */
+export function subscriptionStateFromLimits(limits: readonly UsageLimit[]): BillingSourceState {
+	if (limits.some(limit => limit.status === "exhausted")) return "exhausted";
+	if (limits.length > 0 && limits.every(limit => limit.status === "ok" || limit.status === "warning")) {
+		return "available";
+	}
+	return "unknown";
+}
+
+/** Account-wide limits of `report`; the default plan-window selection of {@link subscriptionQuotaBilling}. */
+export function accountWideLimits(report: UsageReport): UsageLimit[] {
+	return report.limits.filter(isAccountWideLimit);
+}
+
+/**
+ * Billing reader for a subscription whose reports carry quota windows but no
+ * money or credit amounts: one `subscription-included` source without an
+ * allowance, whose state comes from the plan windows `selectLimits` returns.
+ * A report without plan windows yields `no-evidence`. Paid fallbacks the
+ * report does not mention are left out rather than reported as absent.
+ */
+export function subscriptionQuotaBilling(
+	id: Provider,
+	selectLimits: (report: UsageReport) => readonly UsageLimit[] = accountWideLimits,
+): ProviderBilling {
+	return {
+		id,
+		readBilling(report) {
+			const limits = selectLimits(report);
+			if (limits.length === 0) return unknownBilling(report, "no-evidence");
+			return knownBilling(report, [{ mode: "subscription-included", state: subscriptionStateFromLimits(limits) }]);
+		},
+	};
+}
+
+/** Billing reader for a provider whose usage reports carry no billing evidence; always `no-evidence`. */
+export function noEvidenceBilling(id: Provider): ProviderBilling {
+	return { id, readBilling: report => unknownBilling(report, "no-evidence") };
 }

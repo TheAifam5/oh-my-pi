@@ -13,6 +13,7 @@ import type {
 	UsageUnit,
 } from "../usage";
 import { isRecord } from "../utils";
+import { type ProviderBilling, subscriptionQuotaBilling } from "./billing";
 import { parseIsoTimestamp, usageStatus } from "./shared";
 
 // (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
@@ -337,15 +338,22 @@ export const kimiUsageProvider: UsageProvider = {
 	},
 };
 
+function kimiPlanLimits(report: UsageReport): UsageLimit[] {
+	return report.limits.filter(limit => limit.window?.id === "5h" || limit.window?.id === "7d");
+}
+
 /** Ranks Kimi OAuth accounts by the canonical 5-hour and 7-day quota windows. */
 export const kimiRankingStrategy: CredentialRankingStrategy = {
 	findWindowLimits: report => ({
 		primary: report.limits.find(limit => limit.window?.id === "5h"),
 		secondary: report.limits.find(limit => limit.window?.id === "7d"),
 	}),
-	scopeLimits: report => report.limits.filter(limit => limit.window?.id === "5h" || limit.window?.id === "7d"),
+	scopeLimits: kimiPlanLimits,
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: 7 * DAY_MS,
 	},
 };
+
+/** Kimi Code billing: the plan allowance from the 5-hour and 7-day windows; monthly aggregates are ignored. */
+export const kimiBilling: ProviderBilling = subscriptionQuotaBilling("kimi-code", kimiPlanLimits);

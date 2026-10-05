@@ -3,6 +3,7 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import {
 	addMoney,
+	type BillingAllowance,
 	type BillingResult,
 	compareMoney,
 	MAX_BILLING_CLOCK_SKEW_MS,
@@ -20,9 +21,16 @@ import { cursorBilling, parseCursorIndividualUsage } from "@oh-my-pi/pi-ai/usage
 import { devinBilling } from "@oh-my-pi/pi-ai/usage/devin";
 import { factoryDroidBilling, parseFactoryDroidUsage } from "@oh-my-pi/pi-ai/usage/factory-droid";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "@oh-my-pi/pi-ai/usage/github-copilot";
+import { googleGeminiCliUsageProvider } from "@oh-my-pi/pi-ai/usage/gemini";
+import { minimaxCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/minimax-code";
+import { ollamaUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 import { codexBilling, openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
+import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
 import { openrouterBilling, openrouterUsageProvider } from "@oh-my-pi/pi-ai/usage/openrouter";
+import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { syntheticBilling, syntheticUsageProvider } from "@oh-my-pi/pi-ai/usage/synthetic";
+import { xaiOauthBilling } from "@oh-my-pi/pi-ai/usage/xai-oauth";
+import { zaiBilling, zaiUsageProvider } from "@oh-my-pi/pi-ai/usage/zai";
 
 const usd = (amountMinor: number) => ({ amountMinor, currency: "USD" });
 
@@ -536,5 +544,250 @@ describe("credit-balance billing", () => {
 			reason: "no-evidence",
 			fetchedAt: 1,
 		});
+	});
+});
+
+describe("subscription coding-plan billing", () => {
+	function readDefault(report: UsageReport): BillingResult {
+		const reader = defaultBillingReader(report.provider);
+		if (!reader) throw new Error(`no billing reader for ${report.provider}`);
+		return reader.readBilling(report);
+	}
+
+	async function zaiReport(limits: unknown[]): Promise<UsageReport> {
+		const report = await zaiUsageProvider.fetchUsage(
+			{ provider: "zai", credential: { type: "api_key", apiKey: "key" } },
+			{ fetch: jsonFetch({ success: true, data: { limits, level: "pro" } }) },
+		);
+		if (!report) throw new Error("fixture did not parse");
+		return overWire(report);
+	}
+
+	it("reads the ZAI credit allowance from the longest window and exhausts it with any spent window", async () => {
+		const weekly = {
+			type: "CREDIT_LIMIT",
+			unit: 6,
+			number: 1,
+			usage: 60000,
+			currentValue: 2254,
+			remaining: 57745,
+			percentage: 3,
+			nextResetTime: 1788223121997,
+		};
+		const fiveHour = { type: "CREDIT_LIMIT", unit: 3, number: 5, usage: 12000, nextResetTime: 1787804173065 };
+		const weeklyAllowance: BillingAllowance = {
+			kind: "credits",
+			used: { amountMinor: 2254, exponent: 0 },
+			limit: { amountMinor: 60000, exponent: 0 },
+			remaining: { amountMinor: 57745, exponent: 0 },
+		};
+
+		const fresh = await zaiReport([{ ...fiveHour, currentValue: 1438, remaining: 10561 }, weekly]);
+		expect(sources(zaiBilling.readBilling(fresh))).toEqual([
+			{ mode: "subscription-included", state: "available", allowance: weeklyAllowance, resetsAt: 1788223121997 },
+		]);
+
+		const spent = await zaiReport([{ ...fiveHour, currentValue: 12000, remaining: 0 }, weekly]);
+		expect(sources(zaiBilling.readBilling(spent))).toEqual([
+			{ mode: "subscription-included", state: "exhausted", allowance: weeklyAllowance, resetsAt: 1788223121997 },
+		]);
+	});
+
+	it("leaves the ZAI plan unknown while a quota window has no status, and reads no plan windows as no evidence", async () => {
+		const tokens = { type: "TOKENS_LIMIT", percentage: 82, nextResetTime: 1782656863894, unit: 3 };
+		const report = await zaiReport([tokens]);
+		expect(sources(zaiBilling.readBilling(report))).toEqual([{ mode: "subscription-included", state: "available" }]);
+
+		const statusless = await zaiReport([tokens, { type: "TOKENS_LIMIT", nextResetTime: 1788223121997, unit: 6 }]);
+		expect(sources(zaiBilling.readBilling(statusless))).toEqual([
+			{ mode: "subscription-included", state: "unknown" },
+		]);
+		expect(zaiBilling.readBilling({ ...report, limits: [] })).toMatchObject({
+			status: "unknown",
+			reason: "no-evidence",
+		});
+	});
+
+	it("derives MiniMax plan state from the shared bucket, not per-model buckets", async () => {
+		const bucket = (model_name: string, status: number) => ({
+			model_name,
+			start_time: 1_785_009_600_000,
+			end_time: 1_785_024_000_000,
+			current_interval_total_count: 0,
+			current_interval_usage_count: 0,
+			current_interval_remaining_percent: 90,
+			current_interval_status: status,
+			weekly_start_time: 1_784_505_600_000,
+			weekly_end_time: 1_785_110_400_000,
+			current_weekly_total_count: 0,
+			current_weekly_usage_count: 0,
+			current_weekly_remaining_percent: 78,
+			current_weekly_status: 1,
+		});
+		const read = async (...buckets: unknown[]) => {
+			const report = await minimaxCodeUsageProvider.fetchUsage(
+				{ provider: "minimax-code", credential: { type: "api_key", apiKey: "sk-cp-test" } },
+				{ fetch: jsonFetch({ model_remains: buckets, base_resp: { status_code: 0, status_msg: "success" } }) },
+			);
+			if (!report) throw new Error("fixture did not parse");
+			return readDefault(overWire(report));
+		};
+
+		expect(sources(await read(bucket("general", 1), bucket("video", 2)))).toEqual([
+			{ mode: "subscription-included", state: "available" },
+		]);
+		expect(sources(await read(bucket("general", 2), bucket("video", 1)))).toEqual([
+			{ mode: "subscription-included", state: "exhausted" },
+		]);
+		// A report with only model buckets carries no plan-wide window.
+		expect(await read(bucket("video", 1))).toMatchObject({ status: "unknown", reason: "no-evidence" });
+	});
+
+	it("does not let an OpenCode Go monthly window exhaust the plan", async () => {
+		const window = (status: string, percent: number, resetsAt: string) => ({ status, percent, resetsAt });
+		const report = await opencodeGoUsageProvider.fetchUsage(
+			{ provider: "opencode-go", credential: { type: "api_key", apiKey: "sk-test" } },
+			{
+				fetch: jsonFetch({
+					usage: {
+						rolling: window("ok", 12, "2026-08-12T15:09:04.847Z"),
+						weekly: window("ok", 8, "2026-08-17T00:00:00.847Z"),
+						monthly: window("rate-limited", 100, "2026-08-19T00:31:53.847Z"),
+					},
+				}),
+			},
+		);
+		if (!report) throw new Error("fixture did not parse");
+		expect(sources(readDefault(overWire(report)))).toEqual([{ mode: "subscription-included", state: "available" }]);
+	});
+
+	it("reads the SuperGrok plan from its overall window and on-demand usage as paid extra usage", () => {
+		const scope = { provider: "xai-oauth", windowId: "1w", shared: true as const };
+		const row = (id: string, usedFraction: number): UsageLimit => ({
+			id,
+			label: id,
+			scope,
+			amount: { used: usedFraction * 100, usedFraction, unit: "percent" },
+			status: usedFraction >= 1 ? "exhausted" : "ok",
+		});
+		const onDemand = (used: number): UsageLimit => ({
+			id: "xai-oauth:on-demand",
+			label: "On-demand",
+			scope: { provider: "xai-oauth", shared: true },
+			amount: { used, limit: 50, remaining: 50 - used, usedFraction: used / 50, unit: "unknown" },
+			status: used >= 50 ? "exhausted" : "ok",
+		});
+		const report = (overall: number, ...extra: UsageLimit[]): UsageReport => ({
+			provider: "xai-oauth",
+			fetchedAt: 1,
+			limits: [row("xai-oauth:credits:1w", overall), row("xai-oauth:product:api:1w", 1), ...extra],
+		});
+
+		expect(sources(xaiOauthBilling.readBilling(report(0.2)))).toEqual([
+			{ mode: "subscription-included", state: "available" },
+		]);
+		expect(sources(xaiOauthBilling.readBilling(report(1, onDemand(10))))).toEqual([
+			{ mode: "subscription-included", state: "exhausted" },
+			{ mode: "paid-extra-usage", state: "available" },
+		]);
+		expect(sources(xaiOauthBilling.readBilling(report(1, onDemand(50))))).toEqual([
+			{ mode: "subscription-included", state: "exhausted" },
+			{ mode: "paid-extra-usage", state: "exhausted" },
+		]);
+	});
+
+	it("reads Kimi Code plan state from the 5-hour and 7-day windows only", () => {
+		const limit = (index: number, windowId: string, usedFraction: number | undefined): UsageLimit => ({
+			id: `kimi-code:${index}`,
+			label: windowId,
+			scope: { provider: "kimi-code", windowId, shared: true },
+			window: { id: windowId, label: windowId, resetsAt: 2_000 },
+			amount: { ...(usedFraction === undefined ? {} : { usedFraction }), unit: "unknown" },
+			status: usedFraction === undefined ? "unknown" : usedFraction >= 1 ? "exhausted" : "ok",
+		});
+		const report = (fiveHour: number | undefined): UsageReport => ({
+			provider: "kimi-code",
+			fetchedAt: 1,
+			limits: [limit(0, "7d", 0.4), limit(1, "5h", fiveHour), limit(2, "limit_month_total", 1)],
+		});
+
+		expect(sources(readDefault(report(0.1)))).toEqual([{ mode: "subscription-included", state: "available" }]);
+		expect(sources(readDefault(report(1)))).toEqual([{ mode: "subscription-included", state: "exhausted" }]);
+		expect(sources(readDefault(report(undefined)))).toEqual([{ mode: "subscription-included", state: "unknown" }]);
+	});
+
+	it("reads Gemini CLI billing from the Code Assist tier", async () => {
+		const read = async (currentTier: { id: string; name: string } | undefined) => {
+			const report = await googleGeminiCliUsageProvider.fetchUsage(
+				{ provider: "google-gemini-cli", credential: { type: "oauth", accessToken: "token", projectId: "proj" } },
+				{
+					fetch: jsonFetch({
+						...(currentTier ? { currentTier } : {}),
+						buckets: [{ modelId: "gemini-2.5-pro", remainingFraction: 0, resetTime: "2026-10-06T00:00:00Z" }],
+					}),
+				},
+			);
+			if (!report) throw new Error("fixture did not parse");
+			return readDefault(overWire(report));
+		};
+
+		expect(sources(await read({ id: "free-tier", name: "Gemini Code Assist for individuals" }))).toEqual([
+			{ mode: "free", state: "unknown" },
+		]);
+		expect(sources(await read({ id: "standard-tier", name: "Gemini Code Assist Standard" }))).toEqual([
+			{ mode: "subscription-included", state: "unknown" },
+		]);
+		expect(await read({ id: "legacy-tier", name: "Legacy" })).toMatchObject({
+			status: "unknown",
+			reason: "no-evidence",
+		});
+		expect(await read(undefined)).toMatchObject({ status: "unknown", reason: "no-evidence" });
+	});
+
+	it("reads an Alibaba window without a shared flag as account-wide", () => {
+		const report: UsageReport = {
+			provider: "alibaba-token-plan",
+			fetchedAt: 1,
+			limits: [
+				{
+					id: "credits:5h",
+					label: "5 Hour",
+					scope: { provider: "alibaba-token-plan", windowId: "5h" },
+					amount: { used: 100, usedFraction: 1, unit: "percent" },
+					status: "exhausted",
+				},
+			],
+		};
+		expect(sources(readDefault(report))).toEqual([{ mode: "subscription-included", state: "exhausted" }]);
+	});
+
+	it("reports no evidence for providers whose usage reports carry no funding fields", async () => {
+		const ollama = await ollamaUsageProvider.fetchUsage(
+			{ provider: "ollama", credential: { type: "api_key", apiKey: "key" } },
+			{ fetch: jsonFetch({}) },
+		);
+		if (!ollama) throw new Error("fixture did not parse");
+		expect(readDefault(ollama)).toEqual({
+			status: "unknown",
+			provider: "ollama",
+			reason: "no-evidence",
+			fetchedAt: ollama.fetchedAt,
+		});
+		expect(readDefault({ ...ollama, provider: "ollama-cloud" })).toMatchObject({ reason: "no-evidence" });
+		// Umans request windows meter throughput; its prepaid token wallet is not in the report.
+		const umans: UsageReport = {
+			provider: "umans",
+			fetchedAt: 1,
+			limits: [
+				{
+					id: "umans:requests",
+					label: "Requests",
+					scope: { provider: "umans", windowId: "5h", shared: true },
+					amount: { used: 20, limit: 200, usedFraction: 0.1, unit: "requests" },
+					status: "ok",
+				},
+			],
+		};
+		expect(readDefault(umans)).toMatchObject({ status: "unknown", reason: "no-evidence" });
 	});
 });

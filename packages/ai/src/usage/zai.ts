@@ -10,6 +10,13 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import {
+	knownBilling,
+	type ProviderBilling,
+	sourceFromLimit,
+	subscriptionStateFromLimits,
+	unknownBilling,
+} from "./billing";
 import { buildUsageAmount, DAY_MS, HOUR_MS, usageStatus, WEEK_MS } from "./shared";
 
 const DEFAULT_ENDPOINT = "https://api.z.ai";
@@ -403,5 +410,30 @@ export const zaiRankingStrategy: CredentialRankingStrategy = {
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: WEEK_MS,
+	},
+};
+
+/**
+ * ZAI billing: the GLM Coding Plan allowance, which has no pay-as-you-go
+ * fallback once a quota window is spent. Credit plans carry the allowance of
+ * their longest credit window. The state follows every request, token, and
+ * credit window ({@link subscriptionStateFromLimits}), except that an allowance
+ * with nothing remaining exhausts the plan even without a window status. A
+ * report without such windows yields `no-evidence`.
+ */
+export const zaiBilling: ProviderBilling = {
+	id: "zai",
+	readBilling(report) {
+		const quotaLimits = getZaiCredentialLimits(report);
+		if (quotaLimits.length === 0) return unknownBilling(report, "no-evidence");
+		const longest = quotaLimits
+			.filter(limit => limit.id.startsWith("zai:credits:"))
+			.reduce<UsageLimit | undefined>(
+				(best, limit) => (best && (best.window?.durationMs ?? 0) >= (limit.window?.durationMs ?? 0) ? best : limit),
+				undefined,
+			);
+		const credit = longest && sourceFromLimit("subscription-included", longest);
+		const state = credit?.state === "exhausted" ? "exhausted" : subscriptionStateFromLimits(quotaLimits);
+		return knownBilling(report, [{ ...credit, mode: "subscription-included", state }]);
 	},
 };
