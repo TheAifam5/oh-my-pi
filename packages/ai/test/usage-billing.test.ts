@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
-import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import {
 	addMoney,
 	type BillingResult,
@@ -17,9 +17,11 @@ import {
 import { charmHyperBilling } from "@oh-my-pi/pi-ai/usage/charm-hyper";
 import { claudeBilling, parseClaudeUsagePayload } from "@oh-my-pi/pi-ai/usage/claude";
 import { cursorBilling, parseCursorIndividualUsage } from "@oh-my-pi/pi-ai/usage/cursor";
+import { devinBilling } from "@oh-my-pi/pi-ai/usage/devin";
 import { factoryDroidBilling, parseFactoryDroidUsage } from "@oh-my-pi/pi-ai/usage/factory-droid";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "@oh-my-pi/pi-ai/usage/github-copilot";
 import { codexBilling, openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
+import { openrouterBilling, openrouterUsageProvider } from "@oh-my-pi/pi-ai/usage/openrouter";
 import { syntheticBilling, syntheticUsageProvider } from "@oh-my-pi/pi-ai/usage/synthetic";
 
 const usd = (amountMinor: number) => ({ amountMinor, currency: "USD" });
@@ -347,6 +349,163 @@ describe("Synthetic billing", () => {
 			state: "available",
 			allowance: { kind: "money", limit: usd(2400), remaining: usd(182) },
 		});
+	});
+});
+
+describe("Devin billing", () => {
+	/** A `devin:credits:*` limit shaped as the seat-management usage provider reports it. */
+	function devinCredits(bucket: string, used: number, remaining: number, limit: number): UsageLimit {
+		return {
+			id: `devin:credits:${bucket}`,
+			label: "Credits",
+			scope: { provider: "devin", windowId: "monthly" },
+			window: { id: "monthly", label: "Plan Period", resetsAt: 2_000 },
+			amount: {
+				used,
+				remaining,
+				limit,
+				usedFraction: used / limit,
+				remainingFraction: 1 - used / limit,
+				unit: "unknown",
+			},
+			status: "ok",
+		};
+	}
+	const credits = (amountMinor: number) => ({ amountMinor, exponent: 0 });
+
+	it("reads plan credit grants before purchased flex credits", () => {
+		const report: UsageReport = {
+			provider: "devin",
+			fetchedAt: 1,
+			limits: [
+				devinCredits("flex", 200, 0, 200),
+				devinCredits("prompt", 125, 375, 500),
+				devinCredits("flow", 250, 800, 1000),
+			],
+		};
+		expect(sources(devinBilling.readBilling(report))).toEqual([
+			{
+				mode: "subscription-included",
+				state: "available",
+				allowance: { kind: "credits", used: credits(125), limit: credits(500), remaining: credits(375) },
+				resetsAt: 2_000,
+			},
+			{
+				mode: "subscription-included",
+				state: "available",
+				allowance: { kind: "credits", used: credits(250), limit: credits(1000), remaining: credits(800) },
+				resetsAt: 2_000,
+			},
+			{
+				mode: "prepaid-credits",
+				state: "exhausted",
+				allowance: { kind: "credits", used: credits(200), limit: credits(200), remaining: credits(0) },
+			},
+		]);
+	});
+
+	it("reports no evidence for a quota-only report", () => {
+		const daily: UsageLimit = {
+			id: "devin:quota:daily",
+			label: "Daily Quota",
+			scope: { provider: "devin", windowId: "1d" },
+			amount: { used: 60, limit: 100, remaining: 40, usedFraction: 0.6, remainingFraction: 0.4, unit: "percent" },
+			status: "ok",
+		};
+		expect(devinBilling.readBilling({ provider: "devin", fetchedAt: 1, limits: [daily] })).toMatchObject({
+			status: "unknown",
+			reason: "no-evidence",
+		});
+	});
+});
+
+describe("OpenRouter billing", () => {
+	/** The documented `GET /key` example response (documentation-derived fixture). */
+	const documentedKey = {
+		label: "sk-or-v1-au7...890",
+		limit: 100,
+		limit_remaining: 74.5,
+		limit_reset: "monthly",
+		usage: 25.5,
+		usage_daily: 25.5,
+		usage_weekly: 25.5,
+		usage_monthly: 25.5,
+		is_free_tier: false,
+		is_management_key: false,
+		include_byok_in_limit: false,
+	};
+
+	type Seen = { url: string; authorization: string | null };
+
+	async function openrouterReport(body: unknown, options: { status?: number; baseUrl?: string } = {}) {
+		const seen: Seen[] = [];
+		const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			seen.push({ url: String(input), authorization: new Headers(init?.headers).get("authorization") });
+			return new Response(JSON.stringify(body), { status: options.status ?? 200 });
+		}) as unknown as FetchImpl;
+		const report = await openrouterUsageProvider.fetchUsage(
+			{
+				provider: "openrouter",
+				credential: { type: "api_key", apiKey: "sk-or-v1-test" },
+				...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+			},
+			{ fetch },
+		);
+		return { report: report ? overWire(report) : null, seen };
+	}
+
+	async function keyReport(data: Record<string, unknown>) {
+		const { report } = await openrouterReport({ data });
+		if (!report) throw new Error("fixture did not parse");
+		return report;
+	}
+
+	it("keeps the documented key cap as a usage limit but not as a funding source", async () => {
+		const { report, seen } = await openrouterReport({ data: documentedKey });
+		if (!report) throw new Error("fixture did not parse");
+		expect(seen).toEqual([{ url: "https://openrouter.ai/api/v1/key", authorization: "Bearer sk-or-v1-test" }]);
+		expect(report.limits).toMatchObject([
+			{
+				id: "openrouter:key-limit",
+				window: { id: "monthly" },
+				amount: { limit: 100, remaining: 74.5, unit: "usd" },
+				status: "ok",
+			},
+		]);
+		expect(openrouterBilling.readBilling(report)).toMatchObject({ status: "unknown", reason: "no-evidence" });
+		const { is_free_tier: _tier, ...unreported } = documentedKey;
+		expect(openrouterBilling.readBilling(await keyReport(unreported))).toMatchObject({ reason: "no-evidence" });
+	});
+
+	it("reads a capped free-tier key as free only, even with the cap exhausted", async () => {
+		const capped = await keyReport({ ...documentedKey, is_free_tier: true });
+		const spent = await keyReport({ ...documentedKey, is_free_tier: true, limit_remaining: -3 });
+		expect(sources(openrouterBilling.readBilling(capped))).toEqual([{ mode: "free", state: "unknown" }]);
+		expect(sources(openrouterBilling.readBilling(spent))).toEqual([{ mode: "free", state: "unknown" }]);
+		expect(spent.limits[0]).toMatchObject({ amount: { remaining: 0 }, status: "exhausted" });
+	});
+
+	it("leaves an unlisted limit_reset windowless", async () => {
+		const report = await keyReport({ ...documentedKey, limit_reset: "hourly" });
+		expect(report.limits[0]?.window).toBeUndefined();
+		expect(report.limits[0]?.scope.windowId).toBe("lifetime");
+	});
+
+	it("purges a key OpenRouter rejects but treats a proxy's 401 as transient", async () => {
+		await expect(openrouterReport({ error: { code: 401 } }, { status: 401 })).rejects.toThrow(/401/);
+		const proxied = await openrouterReport(
+			{ error: { code: 401 } },
+			{ status: 401, baseUrl: "https://proxy.example/openrouter/v1/" },
+		);
+		expect(proxied.report).toBeNull();
+		expect(proxied.seen).toEqual([
+			{ url: "https://proxy.example/openrouter/v1/key", authorization: "Bearer sk-or-v1-test" },
+		]);
+	});
+
+	it("returns no report for a payload without data or a server error", async () => {
+		expect((await openrouterReport({ label: "no envelope" })).report).toBeNull();
+		expect((await openrouterReport({ data: documentedKey }, { status: 500 })).report).toBeNull();
 	});
 });
 
