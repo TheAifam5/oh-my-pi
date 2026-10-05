@@ -107,7 +107,9 @@ export function parseLocalLimit(raw: unknown, path: string): { limit?: LocalLimi
 	) {
 		issues.push({ path: `${path}.id`, message: `must match ${LIMIT_ID.source}` });
 	}
-	if (!oneOf(LOCAL_LIMIT_METRICS, raw.metric)) {
+	if (oneOf(ACCOUNT_EVIDENCE_METRICS, raw.metric)) {
+		issues.push({ path: `${path}.metric`, message: `${raw.metric} is only allowed on auth.accountPolicies limits` });
+	} else if (!oneOf(LOCAL_LIMIT_METRICS, raw.metric)) {
 		issues.push({ path: `${path}.metric`, message: `must be one of: ${LOCAL_LIMIT_METRICS.join(", ")}` });
 	} else if (raw.metric === "usd") {
 		const nanos = usdNanos(raw.max);
@@ -180,4 +182,90 @@ export function localLimitWindowResetAt(window: LocalLimitWindow, nowMs: number)
 	if (window.period === "week") end.setDate(end.getDate() + 7);
 	if (window.period === "month") end.setMonth(end.getMonth() + 1);
 	return end.getTime();
+}
+
+/**
+ * Account-only metrics read from the provider instead of the usage ledger: `usage` (the used
+ * fraction of the account's plan windows), `credits` (the remaining prepaid credit balance), and
+ * `extra-usd` (paid extra usage the provider reports as used, in USD).
+ */
+export const ACCOUNT_EVIDENCE_METRICS = ["usage", "credits", "extra-usd"] as const;
+export type AccountEvidenceMetric = (typeof ACCOUNT_EVIDENCE_METRICS)[number];
+
+/**
+ * A limit on provider-reported evidence, over the provider's own windows. `usage` caps the used
+ * fraction at `max` (0 < max <= 1); `credits` is a floor: the account is held back while fewer
+ * than `max` credits remain; `extra-usd` caps reported paid extra usage at `max` USD.
+ */
+export interface AccountEvidenceLimit {
+	metric: AccountEvidenceMetric;
+	/** `usage`: a fraction; `credits` and `extra-usd`: a quoted decimal amount such as `"5.00"`. */
+	max: number | string;
+	onLimit: LocalLimitAction;
+}
+
+/** A limit an account policy may set: on the usage ledger, or on provider evidence. */
+export type AccountLimit = LocalLimit | AccountEvidenceLimit;
+
+/** Whether `limit` is counted from provider evidence rather than the usage ledger. */
+export function isAccountEvidenceLimit(limit: AccountLimit): limit is AccountEvidenceLimit {
+	return oneOf(ACCOUNT_EVIDENCE_METRICS, limit.metric);
+}
+
+const DECIMAL_AMOUNT = /^\d{1,12}(?:\.\d{1,9})?$/;
+
+function parseEvidenceLimit(
+	raw: Record<string, unknown>,
+	path: string,
+): { limit?: AccountEvidenceLimit; issues: LocalLimitIssue[] } {
+	const issues: LocalLimitIssue[] = [];
+	const unknown = Object.keys(raw).filter(key => !["metric", "max", "onLimit"].includes(key));
+	if (unknown.length > 0) {
+		issues.push({
+			path,
+			message: `has unknown fields: ${unknown.join(", ")} (provider evidence uses its own windows)`,
+		});
+	}
+	if (raw.metric === "usage") {
+		if (typeof raw.max !== "number" || !Number.isFinite(raw.max) || raw.max <= 0 || raw.max > 1) {
+			issues.push({ path: `${path}.max`, message: "must be a used fraction above 0 and at most 1" });
+		}
+	} else if (typeof raw.max !== "string" || !DECIMAL_AMOUNT.test(raw.max)) {
+		issues.push({ path: `${path}.max`, message: 'must be a quoted decimal amount, such as "5.00"' });
+	}
+	if (raw.onLimit !== undefined && !oneOf(LOCAL_LIMIT_ACTIONS, raw.onLimit)) {
+		issues.push({ path: `${path}.onLimit`, message: `must be one of: ${LOCAL_LIMIT_ACTIONS.join(", ")}` });
+	}
+	if (issues.length > 0) return { issues };
+	return {
+		limit: {
+			metric: raw.metric as AccountEvidenceMetric,
+			max: raw.max as number | string,
+			onLimit: (raw.onLimit as LocalLimitAction | undefined) ?? "skip",
+		},
+		issues,
+	};
+}
+
+const ACCOUNT_METRIC_MESSAGE = `must be one of: ${[...LOCAL_LIMIT_METRICS, ...ACCOUNT_EVIDENCE_METRICS].join(", ")}`;
+
+/** `raw` as a non-empty list of account limits (ledger or evidence metrics), with every issue. */
+export function parseAccountLimits(raw: unknown, path: string): { limits: AccountLimit[]; issues: LocalLimitIssue[] } {
+	if (!Array.isArray(raw) || raw.length === 0) {
+		return { limits: [], issues: [{ path, message: "must be a non-empty list of limits" }] };
+	}
+	const limits: AccountLimit[] = [];
+	const issues: LocalLimitIssue[] = [];
+	raw.forEach((entry, index) => {
+		const at = `${path}[${index}]`;
+		const parsed =
+			isRecord(entry) && oneOf(ACCOUNT_EVIDENCE_METRICS, entry.metric)
+				? parseEvidenceLimit(entry, at)
+				: parseLocalLimit(entry, at);
+		for (const issue of parsed.issues) {
+			issues.push(issue.path === `${at}.metric` ? { path: issue.path, message: ACCOUNT_METRIC_MESSAGE } : issue);
+		}
+		if (parsed.limit) limits.push(parsed.limit);
+	});
+	return { limits, issues };
 }
