@@ -1451,6 +1451,24 @@ function storageAccountLimitSource(storage: AgentStorage): AccountLimitSource {
 	return createAccountLimitSource(() => storage.usageLedger);
 }
 
+/**
+ * The session's settings-bound image URL service. Its callbacks are created here rather than in
+ * {@link createAgentSessionScoped}, so whatever still reaches the service retains only the session
+ * manager and model registry, never the session.
+ */
+function createSessionImageUrlService(
+	settings: Settings,
+	sessionManager: SessionManager,
+	modelRegistry: ModelRegistry,
+	providerSessionId: string,
+): LiveImageUrlService {
+	return new LiveImageUrlService(
+		settings,
+		() => sessionManager.getCwd(),
+		model => modelRegistry.getApiKey(model, providerSessionId),
+	);
+}
+
 function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boolean {
 	return !isCustomTool(tool) && "__ompLegacyBuiltinTool" in tool && tool.__ompLegacyBuiltinTool === true;
 }
@@ -4456,11 +4474,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// instead of inline base64. Decoration runs LAST among image transforms so
 		// the served bytes are exactly the bytes that would have shipped inline.
 		// Live-bound: `images.urls.*` changes rebuild the service between requests.
-		const blobBroker = new LiveImageUrlService(
-			settings,
-			() => sessionManager.getCwd(),
-			model => modelRegistry.getApiKey(model, providerSessionId),
-		);
+		const blobBroker = createSessionImageUrlService(settings, sessionManager, modelRegistry, providerSessionId);
 		disposeCallbacks.add(() => blobBroker.dispose());
 		const dateCwdReminder = new DateCwdReminderInjector();
 		// Always installed; the getter-backed options are snapshotted per request,
