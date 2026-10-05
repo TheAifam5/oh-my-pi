@@ -238,6 +238,42 @@ describe("model role pools", () => {
 				AgentStorage.close();
 			}
 		});
+		it("counts a pool limit only against calls made through that pool", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "pool-limits.db"));
+			try {
+				const limits = [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }];
+				const settings = Settings.isolated(
+					{
+						modelRoles: {
+							engineer: pool("priority", [OPENAI, GOOGLE], { limits }),
+							reviewer: pool("priority", [OPENAI, GOOGLE]),
+						},
+					},
+					{ storage },
+				);
+				const call = (poolId: string) =>
+					storage.usageLedger.record({
+						atMs: Date.now(),
+						provider: OPENAI.provider,
+						model: OPENAI.id,
+						pool: poolId,
+						costNanos: 0,
+						inputTokens: 1,
+						outputTokens: 1,
+					});
+				call("role:reviewer");
+				expect((await resolveRolePool("engineer", deps(settings)))?.kind).toBe("picked");
+
+				call("role:engineer");
+				const resolution = await resolveRolePool("engineer", deps(settings));
+				expect(resolution?.kind).toBe("none");
+				if (resolution?.kind !== "none") return;
+				expect(resolution.skipped.map(entry => entry.reason.kind)).toEqual(["limit-reached", "limit-reached"]);
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
 		it("passes over a member whose skip limit cannot be read and ignores an unreadable warn limit", async () => {
 			const day = { type: "calendar", period: "day" };
 			const settings = Settings.isolated({

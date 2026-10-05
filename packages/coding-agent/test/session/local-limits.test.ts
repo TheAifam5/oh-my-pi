@@ -100,6 +100,114 @@ describe("local limits setting", () => {
 
 		expect(limitTargets(settings, "openai", "gpt-4o").map(target => target.label)).toEqual(["cap"]);
 		expect(limitTargets(settings, "anthropic", "claude-opus-4-5")).toEqual([]);
-		expect(warn.mock.calls.filter(([message]) => String(message).startsWith("Ignoring limits key"))).toHaveLength(1);
+		expect(
+			warn.mock.calls.filter(([message]) => String(message).startsWith("Ignoring a limit whose shared id")),
+		).toHaveLength(1);
+	});
+
+	it("counts a shared id once across a top-level key and a pool", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const shared = { id: "frontier", metric: "requests", max: 2, window: DAY };
+		const settings = Settings.isolated(
+			{
+				limits: { "openai/gpt-4o": [shared] },
+				modelRoles: {
+					engineer: {
+						strategy: "random",
+						routing: { limits: [shared] },
+						models: { opus: { model: "anthropic/claude-opus-4-5" } },
+					},
+				},
+			},
+			{ storage },
+		);
+		const now = Date.now();
+		const targets = limitTargets(settings, "anthropic", "claude-opus-4-5", "role:engineer");
+		expect(targets.map(target => target.label)).toEqual(["frontier"]);
+		storage.usageLedger.record({
+			atMs: now,
+			provider: "openai",
+			model: "gpt-4o",
+			costNanos: 0,
+			inputTokens: 1,
+			outputTokens: 1,
+		});
+		storage.usageLedger.record({
+			atMs: now,
+			provider: "anthropic",
+			model: "claude-opus-4-5",
+			pool: "role:engineer",
+			costNanos: 0,
+			inputTokens: 1,
+			outputTokens: 1,
+		});
+		expect(evaluateLimits(storage.usageLedger, targets, now).refused.map(entry => entry.reason)).toEqual(["reached"]);
+		expect(limitTargets(settings, "anthropic", "claude-opus-4-5")).toEqual([]);
+	});
+
+	it("lets project settings only add to a global pool's limits", async () => {
+		const requests = (max: number) => ({ metric: "requests", max, window: DAY });
+		const pool = (limits?: unknown[]) => ({
+			strategy: "random",
+			...(limits ? { routing: { limits } } : {}),
+			models: { opus: { model: "anthropic/claude-opus-4-5" } },
+		});
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({
+				modelRoles: { engineer: pool([requests(5)]), reviewer: pool([requests(3)]) },
+				modelGroups: { other: pool() },
+			}),
+		);
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(project), "settings.json"),
+			JSON.stringify({
+				modelRoles: {
+					engineer: pool([requests(10), { ...requests(1), id: "mine" }]),
+					reviewer: "+other",
+				},
+			}),
+		);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+
+		expect(
+			limitTargets(settings, "anthropic", "claude-opus-4-5", "role:engineer").map(target => target.label),
+		).toEqual(["role:engineer: 5 requests per day", "role:engineer: 10 requests per day"]);
+		expect(
+			limitTargets(settings, "anthropic", "claude-opus-4-5", "role:reviewer").map(target => target.label),
+		).toEqual(["role:reviewer: 3 requests per day"]);
+	});
+
+	it("ignores a project selector or list that would replace a limited pool, also under an overlay parent", async () => {
+		const limited = {
+			strategy: "random",
+			routing: { limits: [{ metric: "requests", max: 5, window: DAY }] },
+			models: { opus: { model: "anthropic/claude-opus-4-5" } },
+		};
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ modelRoles: { engineer: limited }, retry: { fallbackChains: { default: limited } } }),
+		);
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(project), "settings.json"),
+			JSON.stringify({
+				modelRoles: { engineer: "openai/gpt-4o-mini" },
+				retry: { fallbackChains: { default: ["openai/gpt-4o-mini"] } },
+			}),
+		);
+		const warn = vi.spyOn(logger, "warn");
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const labels = (target: Settings, pool: string) =>
+			limitTargets(target, "anthropic", "claude-opus-4-5", pool).map(entry => entry.label);
+
+		expect(labels(settings, "role:engineer")).toEqual(["role:engineer: 5 requests per day"]);
+		expect(labels(settings, "chain:default")).toEqual(["chain:default: 5 requests per day"]);
+		expect(warn.mock.calls.filter(([message]) => String(message).includes("would replace a pool"))).toHaveLength(2);
+
+		fs.rmSync(path.join(getProjectAgentDir(project), "settings.json"));
+		const parent = await Settings.loadIsolated({ cwd: project, agentDir });
+		const child = parent.overlay();
+		child.setProjectModelRole("engineer", "openai/gpt-4o-mini");
+		expect(labels(child, "role:engineer")).toEqual(["role:engineer: 5 requests per day"]);
 	});
 });

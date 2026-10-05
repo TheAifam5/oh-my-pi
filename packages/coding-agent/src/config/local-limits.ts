@@ -43,8 +43,9 @@ export function parseLimitsSetting(raw: unknown): Map<string, LocalLimit[]> {
 }
 
 /**
- * `limits` without each key that gives a shared `id` a different limit than an earlier key does,
- * with the dropped keys and the ids they conflicted on.
+ * `limits` (in key order) without each limit that gives a shared `id` a different limit than an
+ * earlier key does, with the keys and ids of the dropped limits; a key left with no limits is
+ * dropped too.
  */
 export function withoutSharedIdConflicts(limits: ReadonlyMap<string, LocalLimit[]>): {
 	limits: Map<string, LocalLimit[]>;
@@ -54,16 +55,18 @@ export function withoutSharedIdConflicts(limits: ReadonlyMap<string, LocalLimit[
 	const dropped: { key: string; id: string }[] = [];
 	const byId = new Map<string, LocalLimit>();
 	for (const [key, entries] of limits) {
-		const conflict = entries.find(limit => {
-			const previous = limit.id === undefined ? undefined : byId.get(limit.id);
-			return previous !== undefined && !Bun.deepEquals(previous, limit);
+		const agreeing = entries.filter(limit => {
+			if (limit.id === undefined) return true;
+			const previous = byId.get(limit.id);
+			if (previous === undefined) {
+				byId.set(limit.id, limit);
+				return true;
+			}
+			if (Bun.deepEquals(previous, limit)) return true;
+			dropped.push({ key, id: limit.id });
+			return false;
 		});
-		if (conflict?.id !== undefined) {
-			dropped.push({ key, id: conflict.id });
-			continue;
-		}
-		for (const limit of entries) if (limit.id !== undefined && !byId.has(limit.id)) byId.set(limit.id, limit);
-		kept.set(key, entries);
+		if (agreeing.length > 0) kept.set(key, agreeing);
 	}
 	return { limits: kept, dropped };
 }
