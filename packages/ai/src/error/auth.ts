@@ -1,4 +1,4 @@
-import { ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX, attach, create, Flag } from "./flags";
+import { ACCOUNT_LIMIT_MESSAGE_PREFIX, ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX, attach, create, Flag } from "./flags";
 
 /**
  * No API key / credential was available to dispatch a request.
@@ -58,6 +58,29 @@ export class AccountUnavailableError extends Error {
 		this.name = "AccountUnavailableError";
 		this.provider = provider;
 		this.account = account;
+	}
+}
+
+/**
+ * A `skip` limit of an account policy refuses the request: the session's exclusively pinned
+ * account is over it, or every stored account of the provider is. The request fails instead of
+ * switching accounts or falling back to an environment key. Classifies as no failure kind at
+ * all, like {@link AccountUnavailableError}; the account is kept out of the message.
+ */
+export class AccountLimitError extends Error {
+	readonly provider: string;
+	readonly account: string | undefined;
+	/** `reached` when a cap is reached, `unreadable` when the counted usage could not be read. */
+	readonly reason: "reached" | "unreadable";
+
+	constructor(provider: string, reason: "reached" | "unreadable" = "reached", account?: string) {
+		super(
+			`${ACCOUNT_LIMIT_MESSAGE_PREFIX}${provider}${reason === "unreadable" ? " (limit usage could not be read)" : ""}`,
+		);
+		this.name = "AccountLimitError";
+		this.provider = provider;
+		this.account = account;
+		this.reason = reason;
 	}
 }
 

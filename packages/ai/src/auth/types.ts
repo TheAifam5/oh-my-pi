@@ -21,6 +21,7 @@ import type {
 	UsageResetCredits,
 } from "../usage";
 import type { BillingResult } from "../usage/billing";
+import type { LocalLimit } from "../usage/limits";
 
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
@@ -97,6 +98,11 @@ export interface AuthAccountPolicy {
 	 * `spend` class and a billing reader for the provider).
 	 */
 	readonly returnWhen?: DrainReturnTrigger | readonly DrainReturnTrigger[];
+	/**
+	 * Local limits on this account's spend, requests, and tokens, counted by the host's
+	 * {@link AccountLimitSource}; an account over a `skip` limit is not selected. No `id`.
+	 */
+	readonly limits?: readonly LocalLimit[];
 }
 
 /** Funding classes a drain target may spend ({@link AuthAccountPolicy.spend}). */
@@ -119,6 +125,25 @@ export const DEFAULT_DRAIN_RETURN_COOLDOWN_MS = 10 * 60 * 1000;
  */
 export interface AccountBillingSource {
 	read(provider: Provider, report: UsageReport): BillingResult;
+}
+
+/** Why a `skip` account limit refuses another call: its cap is reached, or its usage cannot be read. */
+export type AccountLimitRefusal = "reached" | "unreadable";
+
+/**
+ * Host source of account limit verdicts, consulted on credential selection for accounts with
+ * {@link AuthAccountPolicy.limits}; it counts the calls `account` ({@link accountUsageKey}) made
+ * to `provider` and handles `warn` limits itself. Synchronous; a source that cannot read its
+ * counts refuses with `unreadable`.
+ */
+export interface AccountLimitSource {
+	/** The refusal of a `skip` limit of `limits` for another call on the account at `nowMs`, if any. */
+	refuses(
+		provider: string,
+		account: string,
+		limits: readonly LocalLimit[],
+		nowMs: number,
+	): AccountLimitRefusal | undefined;
 }
 
 /** Read-only set of per-account routing policies. */
@@ -1366,6 +1391,11 @@ export interface UsageApi {
 	 * `money`, `credits-added`, and `money-available` never apply.
 	 */
 	setBillingSource(source: AccountBillingSource | undefined): void;
+	/**
+	 * Install (or with `undefined`, remove) the source that decides whether an account's
+	 * `auth.accountPolicies[].limits` refuse another call. Without one, account limits never apply.
+	 */
+	setLimitSource(source: AccountLimitSource | undefined): void;
 }
 
 /** Credential and model-level health probes. */

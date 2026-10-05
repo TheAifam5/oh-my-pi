@@ -1,7 +1,9 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { type LocalLimitIssue, parseLocalLimits } from "../usage/limits";
 import type {
 	AuthAccountPolicies,
+	AuthAccountSummary,
 	AuthAccountPolicy,
 	AuthAccountSelector,
 	AuthCredential,
@@ -70,6 +72,29 @@ export function drainFundingIssue(
 	return undefined;
 }
 
+/**
+ * The first problem with an account's `limits`: not a valid list of local limits, or a limit
+ * with an `id` (account limits never share a counter).
+ */
+export function accountLimitsIssue(limits: unknown, path: string): LocalLimitIssue | undefined {
+	const parsed = parseLocalLimits(limits, path);
+	if (parsed.issues.length > 0) return parsed.issues[0];
+	const index = parsed.limits.findIndex(limit => limit.id !== undefined);
+	return index === -1 ? undefined : { path: `${path}[${index}].id`, message: "is not allowed on an account limit" };
+}
+
+/**
+ * The key under which an account's calls are counted for local limits, from its stable identity:
+ * `key:<fingerprint>` for a stored API key, else its account id, email, or project id. Never the
+ * policy name, so naming an account keeps its history.
+ */
+export function accountUsageKey(
+	account: Pick<AuthAccountSummary, "keyFingerprint" | "email" | "accountId" | "projectId">,
+): string | undefined {
+	if (account.keyFingerprint !== undefined) return `key:${account.keyFingerprint}`;
+	return account.accountId ?? account.email ?? account.projectId;
+}
+
 /** Validated per-account routing policies (priority/reserve) plus the global reserve fallback. */
 export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
@@ -79,7 +104,10 @@ export class AccountPolicies {
 
 	constructor(policies: AuthAccountPolicies, defaultReservePct: number | undefined) {
 		AccountPolicies.#validateAccountPolicyConfiguration(policies);
-		this.#accountPolicies = policies;
+		// Parsed again so `onLimit` defaults for embedders that pass limits untyped.
+		this.#accountPolicies = policies.map(policy =>
+			policy.limits ? { ...policy, limits: parseLocalLimits(policy.limits, "limits").limits } : policy,
+		);
 		this.#defaultReservePct =
 			typeof defaultReservePct === "number" && Number.isFinite(defaultReservePct)
 				? Math.max(0, Math.min(100, defaultReservePct))
@@ -229,6 +257,10 @@ export class AccountPolicies {
 			}
 			if (policy.spend !== undefined || policy.returnWhen !== undefined) {
 				AccountPolicies.#validateDrainFunding(policy, path);
+			}
+			if (policy.limits !== undefined) {
+				const issue = accountLimitsIssue(policy.limits, `${path}.limits`);
+				if (issue) throw new AIError.ConfigurationError(`${issue.path} ${issue.message}`);
 			}
 		}
 	}

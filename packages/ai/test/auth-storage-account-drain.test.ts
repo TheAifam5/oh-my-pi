@@ -5,6 +5,7 @@ import {
 	type AuthAccountPolicies,
 	type AuthAccountPolicy,
 	AuthStorage,
+	apiKeyFingerprint,
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
@@ -15,6 +16,8 @@ import {
 	knownBilling,
 	unknownBilling,
 } from "@oh-my-pi/pi-ai/usage/billing";
+import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { logger } from "@oh-my-pi/pi-utils";
 
 const PROVIDER = "unit-drain";
@@ -437,6 +440,146 @@ describe("AuthStorage account drain", () => {
 		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-a");
 	});
 
+	describe("account limits", () => {
+		const limited = new Set<string>();
+		const once = [
+			{
+				metric: "requests" as const,
+				max: 1,
+				window: { type: "calendar" as const, period: "day" as const },
+				onLimit: "skip" as const,
+			},
+		];
+
+		beforeEach(() => {
+			limited.clear();
+			storage.usage.setLimitSource({
+				refuses: (_provider, account) => (limited.has(account) ? "reached" : undefined),
+			});
+		});
+
+		test("skips an account over a skip limit and counts a limited drain target as drained", async () => {
+			storage.setAccountPolicies({
+				accountPolicies: [POLICIES[0]!, { ...POLICIES[1]!, limits: once }],
+				defaultReservePct: 10,
+			});
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 0.5);
+			limited.add("acc-b");
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+			limited.clear();
+			expect(await advance(5 * MINUTE)).toBe("access-a");
+			expect(await advance(6 * MINUTE)).toBe("access-b");
+		});
+
+		test("lets a member account fall through and fails an exclusive pin with AccountLimitError", async () => {
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, name: "unauthorized", limits: once },
+					{ ...POLICIES[1]!, drain: false },
+				],
+				defaultReservePct: 10,
+			});
+			used.set("acc-a", 0.5);
+			used.set("acc-b", 0.2);
+			storage.sessions.setAccountPinSource({ member: () => "unauthorized" });
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+			limited.add("acc-a");
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+
+			const pinned = storage.sessions.accounts(PROVIDER).find(account => account.name === "unauthorized");
+			expect(storage.sessions.pin(PROVIDER, SESSION, pinned?.credentialId ?? -1)).toBe(true);
+			const error = await storage.keys.get(PROVIDER, SESSION).then(
+				() => undefined,
+				(failure: unknown) => failure,
+			);
+			expect(error).toBeInstanceOf(AIError.AccountLimitError);
+			expect(String((error as Error).message)).not.toContain("unauthorized");
+			expect(AIError.classify(error)).toBe(0);
+			expect(AIError.isAuthRetryableError(error)).toBe(false);
+			expect(AIError.isProviderRetryableError(error)).toBe(false);
+			// A provider id that spells an auth or quota failure still classifies as nothing.
+			expect(AIError.classify(new AIError.AccountLimitError("401 unauthorized: usage limit reached"))).toBe(0);
+		});
+
+		test("fails instead of reaching a fallback key when every stored account is limited", async () => {
+			storage.setAccountPolicies({
+				accountPolicies: [
+					{ ...POLICIES[0]!, limits: once },
+					{ ...POLICIES[1]!, limits: once },
+				],
+				defaultReservePct: 10,
+			});
+			storage.keys.setConfig(PROVIDER, "fallback-key", { fallback: true });
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 0.5);
+			limited.add("acc-a");
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+
+			limited.add("acc-b");
+			await expect(storage.keys.get(PROVIDER, SESSION)).rejects.toBeInstanceOf(AIError.AccountLimitError);
+		});
+
+		test("counts calls under the same key the recorder uses, whether or not the account is named", async () => {
+			const seen: string[] = [];
+			storage.usage.setLimitSource({
+				refuses: (_provider, account) => {
+					seen.push(account);
+					return undefined;
+				},
+			});
+			const policies = (named: boolean): AuthAccountPolicies => [
+				{ provider: PROVIDER, account: { accountId: "acc-a" }, ...(named ? { name: "cool" } : {}), limits: once },
+				{ provider: PROVIDER, account: { accountId: "acc-b" }, limits: once },
+			];
+			storage.setAccountPolicies({ accountPolicies: policies(false), defaultReservePct: 10 });
+			await storage.keys.get(PROVIDER, SESSION);
+			const recorded = storage.sessions.accounts(PROVIDER).flatMap(account => accountUsageKey(account) ?? []);
+			expect(new Set(seen)).toEqual(new Set(recorded));
+
+			seen.length = 0;
+			storage.setAccountPolicies({ accountPolicies: policies(true), defaultReservePct: 10 });
+			await storage.keys.get(PROVIDER, "session-named");
+			expect(new Set(seen)).toEqual(new Set(recorded));
+			expect(storage.sessions.accounts(PROVIDER).flatMap(account => accountUsageKey(account) ?? [])).toEqual(
+				recorded,
+			);
+		});
+
+		test("skips a limited API key and fails a pin on it", async () => {
+			const keyed = "unit-drain-keys";
+			const keys = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+				accountPolicies: [
+					{
+						provider: keyed,
+						name: "capped",
+						account: { keyFingerprint: apiKeyFingerprint("sk-capped") },
+						limits: once,
+					},
+				],
+			});
+			try {
+				const capped = `key:${apiKeyFingerprint("sk-capped")}`;
+				keys.usage.setLimitSource({
+					refuses: (_provider, account) => (account === capped ? "reached" : undefined),
+				});
+				await keys.credentials.set(keyed, [
+					{ type: "api_key", key: "sk-capped" },
+					{ type: "api_key", key: "sk-open" },
+				]);
+				for (const session of ["s1", "s2", "s3"]) expect(await keys.keys.get(keyed, session)).toBe("sk-open");
+				const cappedRow = keys.sessions.accounts(keyed).find(account => account.name === "capped");
+				expect(cappedRow && accountUsageKey(cappedRow)).toBe(capped);
+				expect(keys.sessions.pin(keyed, SESSION, cappedRow?.credentialId ?? -1)).toBe(true);
+				await expect(keys.keys.get(keyed, SESSION)).rejects.toBeInstanceOf(AIError.AccountLimitError);
+			} finally {
+				keys.close();
+			}
+		});
+	});
+
 	test("rejects spend and returnWhen without drain, unknown values, and triggers without their spend class", async () => {
 		const store = () => new SqliteAuthCredentialStore(new Database(":memory:"));
 		const build = (policy: Partial<AuthAccountPolicy>) => () =>
@@ -458,6 +601,14 @@ describe("AuthStorage account drain", () => {
 		await expect(parse({ drain: true, returnWhen: "later" })).rejects.toThrow(/returnWhen must be/);
 		await expect(parse({ drain: true, returnWhen: [] })).rejects.toThrow(/returnWhen must be/);
 		await expect(parse({ returnWhen: "reset" })).rejects.toThrow(/require drain: true/);
+		const limit = { metric: "requests", max: 1, window: { type: "calendar", period: "day" } } as const;
+		expect(build({ limits: [{ ...limit, id: "shared" }] as never })).toThrow(
+			"auth.accountPolicies[0].limits[0].id is not allowed on an account limit",
+		);
+		await expect(parse({ limits: [{ ...limit, id: "shared" }] })).rejects.toThrow(
+			"auth.accountPolicies[0].limits[0].id is not allowed on an account limit",
+		);
+		expect((await parse({ limits: [limit] })).accountPolicies[0]?.limits).toEqual([{ ...limit, onLimit: "skip" }]);
 		await expect(parse({ drain: true, spend: ["credits"], returnWhen: ["money-available"] })).rejects.toThrow(
 			"auth.accountPolicies[0].returnWhen money-available requires spend to include money",
 		);

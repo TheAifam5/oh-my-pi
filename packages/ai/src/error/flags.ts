@@ -526,6 +526,14 @@ function isTerminalClientErrorStatus(status: number | undefined): boolean {
  */
 export const ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX = "Pinned account is unavailable for provider: ";
 
+/** Message prefix of `AccountLimitError`, followed by the provider id; classified like {@link ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX}. */
+export const ACCOUNT_LIMIT_MESSAGE_PREFIX = "Account is held back by a local limit for provider: ";
+
+/** Whether `text` carries a pinned-account refusal, which never classifies as any failure kind. */
+export function isPinnedAccountRefusalText(text: string): boolean {
+	return text.includes(ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX) || text.includes(ACCOUNT_LIMIT_MESSAGE_PREFIX);
+}
+
 function classifyText(
 	errorMessage: string | undefined,
 	errorStatus: number | undefined,
@@ -535,7 +543,7 @@ function classifyText(
 	modelId?: string,
 ): number {
 	let kinds = 0;
-	if (errorMessage?.includes(ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX)) return kinds;
+	if (errorMessage !== undefined && isPinnedAccountRefusalText(errorMessage)) return kinds;
 	if (errorMessage) {
 		if (matchesOverflowText(errorMessage)) kinds |= Flag.ContextOverflow;
 		if (matchesPayloadRejectionText(errorMessage)) kinds |= Flag.PayloadRejected;

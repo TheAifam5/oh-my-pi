@@ -110,6 +110,7 @@ import { journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { SPEND_RETENTION_MS, type SpendEntry, type SpendLedger, usdToNanos } from "./spend-ledger";
 import { USAGE_RETENTION_MS, type UsageEntry } from "./usage-ledger";
+import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import {
 	describeLimitRefusal,
 	evaluateLimits,
@@ -2232,15 +2233,12 @@ export class TurnRecovery {
 		}
 	}
 
-	/** The session's account for `provider`: its policy name, else a stable identity; unset without one. */
+	/** The session's account for `provider` ({@link accountUsageKey}); unset without one. */
 	#servingAccount(provider: string): string | undefined {
 		const active = this.#host.modelRegistry.authStorage.sessions
 			.accounts(provider, this.#host.sessionId())
 			.find(account => account.active);
-		if (!active) return undefined;
-		if (active.name !== undefined) return active.name;
-		if (active.keyFingerprint !== undefined) return `key:${active.keyFingerprint}`;
-		return active.email ?? active.accountId ?? active.projectId;
+		return active ? accountUsageKey(active) : undefined;
 	}
 
 	#warnUnpricedLimitModel(message: AssistantMessage): void {

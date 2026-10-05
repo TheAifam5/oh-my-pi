@@ -65,6 +65,7 @@ afterEach(async () => {
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
 	unregisterCustomApis(MOCK_API_SOURCE);
+	AgentStorage.close();
 	vi.restoreAllMocks();
 	for (const key of ENV_KEYS) restoreEnvValue(key, savedEnv[key]);
 	__resetDirsFromEnvForTests();
@@ -99,8 +100,11 @@ function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
 	return new WeakRef(session.settings);
 }
 
-/** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
-async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void }> {
+/**
+ * Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings.
+ * `storage` backs the run's settings, which installs the storage-only hooks on the shared auth storage.
+ */
+async function runKeptAliveSubagent(storage?: AgentStorage): Promise<{ release(): void; close(): void }> {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -133,17 +137,20 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 			modelOverride: "mock/mock-model",
 			authStorage,
 			modelRegistry,
-			settings: Settings.isolated({
-				// No TTL timer: the test parks explicitly through the same path the timer takes.
-				"task.agentIdleTtlMs": 0,
-				"async.enabled": false,
-				"compaction.enabled": false,
-				"retry.enabled": false,
-				"todo.enabled": false,
-				"todo.reminders": false,
-				"advisor.enabled": false,
-				modelRoles: { default: "mock/mock-model" },
-			}),
+			settings: Settings.isolated(
+				{
+					// No TTL timer: the test parks explicitly through the same path the timer takes.
+					"task.agentIdleTtlMs": 0,
+					"async.enabled": false,
+					"compaction.enabled": false,
+					"retry.enabled": false,
+					"todo.enabled": false,
+					"todo.reminders": false,
+					"advisor.enabled": false,
+					modelRoles: { default: "mock/mock-model" },
+				},
+				{ storage },
+			),
 			enableLsp: false,
 			enableMCP: false,
 			enableIrc: false,
@@ -194,6 +201,18 @@ it("parks without retaining the run's settings overlay and revives with the sett
 
 		const revived = await AgentLifecycleManager.global().ensureLive(AGENT_ID);
 		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
+	} finally {
+		run.close();
+	}
+}, 30_000);
+
+it("releases a parked keep-alive subagent's session when its settings are storage-backed", async () => {
+	const run = await runKeptAliveSubagent(await AgentStorage.open(path.join(root, "agent.db")));
+	try {
+		const sessionRef = weakRefToLiveSession(AGENT_ID);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+		expect(await collected(sessionRef, COLLECT_DEADLINE_MS)).toBe(true);
 	} finally {
 		run.close();
 	}

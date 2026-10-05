@@ -42,6 +42,8 @@ import { sanitizeNoticeLine } from "../utils/notice-text";
 import { isRegisteredSearchEngine } from "../web/search/provider";
 import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
+import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
+import { AccountPolicies } from "@oh-my-pi/pi-ai/auth/policy";
 import {
 	type AnySetting,
 	all as allSettings,
@@ -71,7 +73,13 @@ import {
 	parseModelGroupDefinition,
 	parseModelRoleValue,
 } from "./model-groups";
-import { cfgAllowProjectMeteredPools, cfgModelGroups, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import {
+	cfgAllowProjectMeteredPools,
+	cfgAuthAccountPolicies,
+	cfgModelGroups,
+	cfgModelRoles,
+	cfgModelRoleStorage,
+} from "./model-settings";
 import { cfgRetryFallbackChains } from "../session/settings";
 import { cfgShellPath } from "../exec/settings";
 
@@ -557,9 +565,69 @@ function withoutAccountChoices(group: unknown, path: string, warn: ModelGroupWar
 }
 
 /**
+ * Project `auth.accountPolicies` (replacing the lower array whole) with account limits kept
+ * global-only: a project entry's own `limits` are dropped with a warning, a project entry with the
+ * same provider and `account` selector as a lower entry carries that entry's limits, and lower
+ * entries with limits no project entry matches are appended as `{ provider, account, limits }`.
+ * An appended entry that would make the list fail {@link AccountPolicies} validation is left out
+ * with a warning. Returns `project` itself when nothing changes.
+ */
+function withGlobalAccountLimits(project: unknown[], lower: unknown[], warn: ModelGroupWarn): unknown[] {
+	const limited = lower.filter(
+		(entry): entry is RawSettings => isRecord(entry) && Array.isArray(entry.limits) && entry.limits.length > 0,
+	);
+	const sameSelector = (left: RawSettings, right: RawSettings) =>
+		left.provider === right.provider && Bun.deepEquals(left.account, right.account);
+	let changed = false;
+	const matched = new Set<RawSettings>();
+	const kept = project.map((entry, index) => {
+		if (!isRecord(entry)) return entry;
+		let next = entry;
+		if (Object.hasOwn(entry, "limits")) {
+			warn(
+				`auth.accountPolicies[${index}].limits`,
+				"is read from the global config only; ignored in project settings",
+			);
+			const { limits: _limits, ...rest } = entry;
+			next = rest;
+			changed = true;
+		}
+		const global = limited.find(candidate => sameSelector(candidate, next));
+		if (global) {
+			matched.add(global);
+			next = { ...next, limits: global.limits };
+			changed = true;
+		}
+		return next;
+	});
+	const unmatched = limited
+		.filter(entry => !matched.has(entry))
+		.map(entry => ({ provider: entry.provider, account: entry.account, limits: entry.limits }));
+	if (unmatched.length === 0) return changed ? kept : project;
+	warn("auth.accountPolicies", "replaces the global account policies; their account limits are kept");
+	if (!acceptsAccountPolicies(kept)) return kept;
+	const appended: unknown[] = [];
+	for (const entry of unmatched) {
+		if (acceptsAccountPolicies([...kept, ...appended, entry])) appended.push(entry);
+		else warn("auth.accountPolicies", "a global account limit conflicts with the project policies; left out");
+	}
+	return [...kept, ...appended];
+}
+
+/** Whether `policies` passes {@link AccountPolicies} validation. */
+function acceptsAccountPolicies(policies: unknown[]): boolean {
+	try {
+		new AccountPolicies(policies as AuthAccountPolicies, undefined);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * `global` with the overlay parent's merged `modelRoles`, `retry.fallbackChains`, and
- * `modelGroups` layered under it, entry by entry: the view a project layer of this instance
- * tightens.
+ * `modelGroups` layered under it, entry by entry, and the parent's `auth.accountPolicies` when
+ * `global` has none: the view a project layer of this instance may only tighten.
  */
 function withParentPoolRecords(global: RawSettings, parent: Settings): RawSettings {
 	let result = global;
@@ -570,6 +638,9 @@ function withParentPoolRecords(global: RawSettings, parent: Settings): RawSettin
 	] as const) {
 		const own = getByPath(global, segments);
 		result = withLayerValue(result, segments, { ...inherited, ...(isRecord(own) ? own : {}) });
+	}
+	if (getByPath(global, cfgAuthAccountPolicies.segments) === undefined) {
+		result = withLayerValue(result, cfgAuthAccountPolicies.segments, cfgAuthAccountPolicies.get(parent));
 	}
 	return result;
 }
@@ -651,7 +722,8 @@ function withGlobalPoolLimits(
  *   and lists pass unchanged.
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
  *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
- *   to global), and `allowProjectMeteredPools`, pool member `account` fields, and `routing.accounts` are dropped.
+ *   to global), and `allowProjectMeteredPools`, pool member `account` fields, `routing.accounts`, and
+ *   `auth.accountPolicies[].limits` are dropped.
  *   Unless `allowProjectMetered`, a `modelGroups` entry named in `definedBelow` and an inline
  *   group whose funding includes `metered` are dropped too.
  *
@@ -661,6 +733,12 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 	const project = policy.source === "project";
 	const restricted = project && !policy.allowProjectMetered;
 	let result = layer;
+	const accountPolicies = project ? getByPath(layer, cfgAuthAccountPolicies.segments) : undefined;
+	if (Array.isArray(accountPolicies)) {
+		const lower = policy.lower ? getByPath(policy.lower, cfgAuthAccountPolicies.segments) : undefined;
+		const kept = withGlobalAccountLimits(accountPolicies, Array.isArray(lower) ? lower : [], warn);
+		if (kept !== accountPolicies) result = withLayerValue(result, cfgAuthAccountPolicies.segments, kept);
+	}
 	if (project && Object.hasOwn(layer, cfgAllowProjectMeteredPools.id)) {
 		warn(cfgAllowProjectMeteredPools.id, "is read from the global config only; ignored in project settings");
 		result = withLayerValue(result, cfgAllowProjectMeteredPools.segments, undefined);

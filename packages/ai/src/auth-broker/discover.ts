@@ -29,7 +29,9 @@ import {
 	type DrainReturnTrigger,
 	SqliteAuthCredentialStore,
 } from "../auth-storage";
+import { accountLimitsIssue } from "../auth/policy";
 import * as AIError from "../error";
+import { parseLocalLimits } from "../usage/limits";
 import { AuthBrokerClient, AuthBrokerError } from "./client";
 import { type AuthBrokerAccountPool, RemoteAuthCredentialStore } from "./remote-store";
 import { readAuthBrokerSnapshotCache, scheduleAuthBrokerSnapshotCacheWrite } from "./snapshot-cache";
@@ -124,6 +126,7 @@ const POLICY_FIELDS = [
 	"returnCooldownMs",
 	"spend",
 	"returnWhen",
+	"limits",
 ];
 
 /** Whether `value` is a list of members of `allowed`. */
@@ -214,6 +217,8 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 				);
 			}
 		}
+		const limitsIssue = policy.limits === undefined ? undefined : accountLimitsIssue(policy.limits, `${path}.limits`);
+		if (limitsIssue) throw new AIError.ConfigurationError(`${limitsIssue.path} ${limitsIssue.message}`);
 		if (policy.priority !== undefined && (typeof policy.priority !== "number" || !Number.isFinite(policy.priority))) {
 			throw new AIError.ConfigurationError(`${path}.priority must be a finite number`);
 		}
@@ -243,6 +248,7 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			...(typeof policy.returnMargin === "number" ? { returnMargin: policy.returnMargin } : {}),
 			...(typeof policy.returnCooldownMs === "number" ? { returnCooldownMs: policy.returnCooldownMs } : {}),
 			...(spend !== undefined ? { spend } : {}),
+			...(policy.limits !== undefined ? { limits: parseLocalLimits(policy.limits, `${path}.limits`).limits } : {}),
 			...(returnWhen !== undefined
 				? { returnWhen: returnWhen as DrainReturnTrigger | readonly DrainReturnTrigger[] }
 				: {}),

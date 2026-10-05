@@ -14,7 +14,7 @@ import {
 	providerTypeKey,
 	type CredentialBlocks,
 } from "./blocks";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, accountUsageKey, apiKeyFingerprint } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
 	orderUsageRankedCandidates,
@@ -30,6 +30,7 @@ import {
 import { mergeRefreshedCredential, OAUTH_REFRESH_SKEW_MS, type OAuthRefresher } from "./refresh";
 import type { AuthCredentialStore } from "./store";
 import {
+	type AccountLimitRefusal,
 	type ApiKeyCredential,
 	type AuthAccountPolicy,
 	type AuthApiKeyOptions,
@@ -365,6 +366,54 @@ export class CredentialSelector {
 		return orderUsageRankedCandidates(ranked, false);
 	}
 
+	/**
+	 * Why a `skip` limit of the stored credential's account policy refuses another call, as the
+	 * installed {@link AccountLimitSource} reports; never without a source or limits.
+	 */
+	accountLimit(provider: string, index: number): AccountLimitRefusal | undefined {
+		const source = this.#deps.usage.limitSource;
+		const credential = this.#deps.pool.credentials(provider)[index];
+		if (!source || !credential) return undefined;
+		const policy = this.#deps.policies.forStored(provider, credential);
+		if (!policy?.limits?.length) return undefined;
+		const account = accountUsageKey(
+			credential.type === "api_key"
+				? { keyFingerprint: apiKeyFingerprint(credential.key) }
+				: { email: credential.email, accountId: credential.accountId, projectId: credential.projectId },
+		);
+		return account === undefined ? undefined : source.refuses(provider, account, policy.limits, Date.now());
+	}
+
+	/**
+	 * Fails when every stored account of `provider` is over a local limit, so the request never
+	 * falls back to an environment or fallback key; a limited drain target is recorded as drained.
+	 *
+	 * @throws AIError.AccountLimitError naming only the provider.
+	 */
+	refuseIfAllLimited(provider: string, sessionId: string | undefined, options: AuthApiKeyOptions | undefined): void {
+		const stored = this.#deps.pool.credentials(provider);
+		if (stored.length === 0) return;
+		const refusals = stored.map((_credential, index) => this.accountLimit(provider, index));
+		if (refusals.some(refusal => refusal === undefined)) return;
+		this.#noteLimitedDrain(provider, sessionId, options?.modelId, new Set(stored.map((_credential, index) => index)));
+		throw new AIError.AccountLimitError(provider, refusals.includes("unreadable") ? "unreadable" : "reached");
+	}
+
+	/** Records the drain target as drained when it is among `limited`, so its return waits out the cooldown. */
+	#noteLimitedDrain(
+		provider: string,
+		sessionId: string | undefined,
+		modelId: string | undefined,
+		limited: ReadonlySet<number>,
+	): boolean {
+		if (limited.size === 0) return false;
+		const drain = this.#drainTarget(provider, sessionId, modelId);
+		if (!drain || !limited.has(drain.index)) return false;
+		const blockScope = this.#deps.strategies(provider)?.blockScope?.({ modelId });
+		this.#drainServing(drain, blockScope, true, undefined, Date.now(), undefined);
+		return true;
+	}
+
 	async selectApiKey(
 		provider: string,
 		sessionId: string | undefined,
@@ -376,7 +425,8 @@ export class CredentialSelector {
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is ApiKeySelection => {
 				if (entry.credential.type !== "api_key") return false;
-				return filter?.(entry.credential) ?? true;
+				if (!(filter?.(entry.credential) ?? true)) return false;
+				return this.accountLimit(provider, entry.index) === undefined;
 			});
 
 		if (credentials.length === 0) return undefined;
@@ -762,9 +812,16 @@ export class CredentialSelector {
 			provider,
 			stored.map(entry => entry.credential),
 		);
+		// An account over a local limit is never selected, not even as a last resort.
+		const limited = new Set(
+			stored.filter(entry => this.accountLimit(provider, entry.index) !== undefined).map(entry => entry.index),
+		);
 		// A session restriction drops every other account before ranking, pins,
 		// and the fallback passes below, so none of them can route back to it.
-		const credentials = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
+		const credentials = stored.filter(
+			entry => !limited.has(entry.index) && this.#deps.affinity.allows(provider, sessionId, entry.credential),
+		);
+		const limitedDrain = this.#noteLimitedDrain(provider, sessionId, options?.modelId, limited);
 
 		if (credentials.length === 0) return undefined;
 		this.#deps.policies.validateUsageCapability(provider, this.#deps.usage.canFetchOAuthUsage(provider));
@@ -796,7 +853,8 @@ export class CredentialSelector {
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
 			(strategy !== undefined || policyReserveEnabled) && (credentials.length > 1 || hasPlanRequirement);
-		const drain = credentials.length > 1 ? this.#drainTarget(provider, sessionId, options?.modelId) : undefined;
+		const drain =
+			credentials.length > 1 && !limitedDrain ? this.#drainTarget(provider, sessionId, options?.modelId) : undefined;
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
 		const sessionPreferredCredential =
@@ -1192,6 +1250,17 @@ export class CredentialSelector {
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (credential?.type !== "oauth" || !this.#deps.affinity.allows(provider, sessionId, credential))
 			return undefined;
+		const refusal = this.accountLimit(provider, index);
+		if (refusal) {
+			if (exclusive) {
+				throw new AIError.AccountLimitError(
+					provider,
+					refusal,
+					this.#deps.policies.forStored(provider, credential)?.name,
+				);
+			}
+			return undefined;
+		}
 		const selection: OAuthSelection = { credential, index };
 		if (options?.forceRefresh) {
 			const credentialId = this.#deps.pool.entries(provider)[index]?.id;

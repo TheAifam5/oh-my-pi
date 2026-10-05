@@ -7070,7 +7070,7 @@ describe("AgentSession retry fallback", () => {
 				const fallback = getBundledModel("google", "gemini-2.5-flash");
 				if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
 				vi.spyOn(modelRegistry.authStorage.sessions, "accounts").mockReturnValue([
-					{ credentialId: 1, type: "oauth", name: "work", active: true, pinned: false },
+					{ credentialId: 1, type: "oauth", name: "work", accountId: "acc-work", active: true, pinned: false },
 				]);
 				const { requestedModels } = await limitSession(
 					{ "openai/gpt-4o-mini": [{ metric: "requests", max: 1, window: DAY }] },
@@ -7084,7 +7084,7 @@ describe("AgentSession retry fallback", () => {
 				await session!.waitForIdle();
 
 				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "google/gemini-2.5-flash"]);
-				expect(storage!.usageLedger.totals([{ provider: "openai", account: "work" }], 0).requests).toBe(1n);
+				expect(storage!.usageLedger.totals([{ provider: "openai", account: "acc-work" }], 0).requests).toBe(1n);
 			});
 
 			it("skips a fallback whose own limit is reached", async () => {
