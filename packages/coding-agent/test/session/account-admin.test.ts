@@ -8,6 +8,7 @@ import { runAccountCommand } from "@oh-my-pi/pi-coding-agent/cli/account-cli";
 import {
 	AccountAdminError,
 	labelAccount,
+	listAccounts,
 	logoutAccount,
 	pinProjectAccount,
 	resolveAccount,
@@ -16,7 +17,11 @@ import {
 	setAccountReserve,
 	unpinProjectAccount,
 } from "@oh-my-pi/pi-coding-agent/session/account-admin";
-import { projectAccountPin } from "@oh-my-pi/pi-coding-agent/session/account-pins";
+import {
+	projectAccountPin,
+	registerSessionAccountPins,
+	settingsAccountPinSource,
+} from "@oh-my-pi/pi-coding-agent/session/account-pins";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -101,6 +106,32 @@ describe("account administration", () => {
 		expect(result.pinnedProjects).toHaveLength(1);
 		expect(authStorage.sessions.accounts("anthropic").map(account => account.email)).toEqual(["b@example.com"]);
 		expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+	});
+
+	it("marks a project pin in listings before the session makes a request", async () => {
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({
+				auth: {
+					accountPolicies: [{ provider: "anthropic", name: "work", account: { email: "b@example.com" } }],
+					accountPins: { [project]: { anthropic: "work" } },
+				},
+			}),
+		);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		authStorage.setAccountPolicies({ accountPolicies: cfgAuthAccountPolicies.get(settings), defaultReservePct: 10 });
+		authStorage.sessions.setAccountPinSource(settingsAccountPinSource);
+		const unregister = registerSessionAccountPins("session-1", settings, () => project);
+		try {
+			const pinned = authStorage.sessions.accounts("anthropic", "session-1").filter(account => account.pinned);
+			expect(pinned.map(account => account.email)).toEqual(["b@example.com"]);
+			expect(listAccounts(settings, authStorage, project).map(row => [row.label, row.projectPinned])).toEqual([
+				["a@example.com", false],
+				["b@example.com", true],
+			]);
+		} finally {
+			unregister();
+		}
 	});
 
 	it("keeps user policies when logout is refused by a project policy or fails in the store", async () => {

@@ -64,7 +64,7 @@ describe("LogoutAccountSelectorComponent", () => {
 			{ id: 21, provider: "openai", disabledCause: null, credential: { type: "api_key", key: "sk-test" } },
 		];
 		const accounts = toLogoutAccounts("openai", rows, {
-			annotations: new Map([[21, { name: "work", facts: ["key 1234abcd"] }]]),
+			annotations: new Map([[21, { name: "work", facts: ["key 1234abcd5678ef90"] }]]),
 		});
 		const actions: string[] = [];
 		const loggedOut: number[] = [];
