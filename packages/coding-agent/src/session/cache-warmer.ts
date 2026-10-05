@@ -8,7 +8,8 @@
  * cache-miss cost minus the refresh cost clears a savings floor. Warming runs
  * in two phases — "streaming" while the agent run that sent the request is
  * still active, "idle" after it settles — and stops on context change, mode
- * change, a refresh that misses the cache, or fixed safety windows (60 min
+ * change, a change of the session's account for the provider, a refresh that
+ * misses the cache, or fixed safety windows (60 min
  * streaming / 30 min idle). An entry whose lifetime outlasts the idle window
  * (Anthropic's 1h tier) is therefore only warmed while a run is active.
  *
@@ -259,6 +260,8 @@ interface ActiveRun extends CacheWarmRequest {
 	warmingStopReason?: string;
 	/** Cache entry this run's request writes; a refresh hit confirms and extends it. */
 	entry: TrackedCacheEntry;
+	/** Account the warmed entry was written under; undefined when it could not be resolved. */
+	account?: string;
 }
 
 /** Lifetime of the prompt cache entry the latest request wrote, independent of whether it is warmed. */
@@ -295,6 +298,11 @@ export interface CacheWarmerDeps {
 	getMode: () => CacheWarmingMode;
 	/** Extension override hook; failures fall back to the warmer's own decision. */
 	decide?: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
+	/**
+	 * Usage key of the session's active account for `provider`, read live.
+	 * Undefined when the account cannot be resolved; warming then ignores account changes.
+	 */
+	getAccount?: (provider: string) => string | undefined;
 }
 
 /**
@@ -397,6 +405,7 @@ export class CacheWarmer {
 			phase: "streaming",
 			nextWarmAt: 0,
 			extensionOverride: false,
+			account: this.#deps.getAccount?.(request.model.provider),
 		};
 		this.#schedule(this.#run);
 	}
@@ -420,6 +429,8 @@ export class CacheWarmer {
 		const run = this.#run;
 		if (!run || run.timer === undefined) return;
 		if (message.provider !== run.model.provider || message.model !== run.model.id) return;
+		// The request may have rotated accounts while it ran; the response's account owns the entry.
+		run.account = this.#deps.getAccount?.(run.model.provider);
 		if (observed === undefined || observed === run.tier) return;
 		const delayMs = this.#delayFor(run.model, observed);
 		if (delayMs === undefined) return;
@@ -655,10 +666,20 @@ export class CacheWarmer {
 
 	#validateRun(run: ActiveRun): boolean {
 		if (this.#run !== run) return false;
-		const reason = this.#getModeStopReason(run) ?? (!run.isCurrent() ? "conversation context changed" : undefined);
+		const reason =
+			this.#getModeStopReason(run) ??
+			(!run.isCurrent() ? "conversation context changed" : undefined) ??
+			(this.#accountChanged(run) ? "account changed" : undefined);
 		if (!reason) return true;
 		this.#stop(reason);
 		return false;
+	}
+
+	/** A replay resolves the session's current account; on another account it misses the entry and pays a full write. */
+	#accountChanged(run: ActiveRun): boolean {
+		if (run.account === undefined) return false;
+		const current = this.#deps.getAccount?.(run.model.provider);
+		return current !== undefined && current !== run.account;
 	}
 
 	#getModeStopReason(run: ActiveRun): string | undefined {
