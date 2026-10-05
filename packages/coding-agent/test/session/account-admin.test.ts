@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { cfgAuthAccountPolicies } from "@oh-my-pi/pi-coding-agent/config/model-settings";
@@ -166,6 +166,55 @@ describe("account administration", () => {
 			expect(process.exitCode).toBe(1);
 		} finally {
 			process.exitCode = previousExitCode;
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("lists account limits with their counted usage and reset in JSON", async () => {
+		setSystemTime(new Date(2026, 9, 7, 15, 0));
+		try {
+			const storage = await AgentStorage.open(tempDir.join("limits.db"));
+			const day = { type: "calendar", period: "day" };
+			const settings = Settings.isolated(
+				{
+					auth: {
+						accountPolicies: [
+							{
+								provider: "anthropic",
+								account: { accountId: "acc-a" },
+								limits: [
+									{ metric: "requests", max: 5, window: day },
+									{ metric: "usage", max: 0.8 },
+								],
+							},
+						],
+					},
+				},
+				{ storage },
+			);
+			storage.usageLedger.record({
+				atMs: Date.now(),
+				provider: "anthropic",
+				model: "claude",
+				account: "acc-a",
+				costNanos: 0,
+				inputTokens: 1,
+				outputTokens: 1,
+			});
+			const stdout: string[] = [];
+			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				stdout.push(String(chunk));
+				return true;
+			});
+			await runAccountCommand({ action: "list", json: true }, { settings, authStorage, cwd: project });
+			const rows = JSON.parse(stdout.join("")) as Array<{ label: string; limits: unknown[] }>;
+			expect(rows.find(row => row.label === "a@example.com")?.limits).toEqual([
+				{ metric: "requests", max: 5, used: 1, window: day, resetsAt: new Date(2026, 9, 8).getTime() },
+				{ metric: "usage", max: 0.8, used: null, window: null, resetsAt: null },
+			]);
+			expect(rows.find(row => row.label === "b@example.com")?.limits).toEqual([]);
+		} finally {
+			setSystemTime();
 			vi.restoreAllMocks();
 		}
 	});

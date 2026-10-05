@@ -10,14 +10,17 @@
 
 import * as path from "node:path";
 import type { AuthAccountPolicies, AuthAccountPolicy, AuthAccountSelector } from "@oh-my-pi/pi-ai/auth-storage";
-import { AccountPolicies, matchesAuthAccountSelector } from "@oh-my-pi/pi-ai/auth/policy";
+import { AccountPolicies, accountUsageKey, matchesAuthAccountSelector } from "@oh-my-pi/pi-ai/auth/policy";
+import { type AccountEvidenceMetric, isAccountEvidenceLimit, parseAccountLimits } from "@oh-my-pi/pi-ai/usage/limits";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { cfgAuthAccountPins, cfgAuthAccountPolicies } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import { canonicalDir, projectAccountPin } from "./account-pins";
 import { loadEffectiveAuthAccountPolicyConfig } from "./auth-broker-config";
 import type { AuthAccountSummary, AuthStorage } from "./auth-storage";
+import { type LimitStatus, limitStatus } from "./local-limits";
 import { cfgRetryUsageReservePct } from "./settings";
+import type { UsageLedger } from "./usage-ledger";
 
 /** A rejected account operation; the message is meant for the user. */
 export class AccountAdminError extends Error {
@@ -41,9 +44,19 @@ export interface AccountListing extends AccountRef {
 	reservePct?: number;
 	/** True when the account policy drains this account first. */
 	drain: boolean;
+	/**
+	 * The account policy's limits with their counted usage; a provider-evidence limit
+	 * (`usage`, `credits`, `extra-usd`) carries no `window` or `used`.
+	 */
+	limits: AccountLimitView[];
 	/** True when `auth.accountPins` pins this account for the working directory's project. */
 	projectPinned: boolean;
 }
+
+/** One account limit as listed: a ledger limit's {@link LimitStatus}, or a provider-evidence limit. */
+export type AccountLimitView =
+	| LimitStatus
+	| { name: string; metric: AccountEvidenceMetric; max: string | number; onLimit: "skip" | "warn" };
 
 /** Human identity of a stored account; never includes key material. */
 export function accountLabel(account: AuthAccountSummary): string {
@@ -420,9 +433,34 @@ export function unpinProjectAccount(settings: Settings, cwd: string, provider?: 
 	return { removed, ...(location ? { projectDir: location.dir } : {}), shadowedBy };
 }
 
+/** The views of an account policy's `configured` limits, ledger limits counted under the account's usage key. */
+function accountLimitViews(
+	provider: string,
+	account: AuthAccountSummary,
+	configured: unknown,
+	ledger: UsageLedger | undefined,
+	nowMs: number,
+): AccountLimitView[] {
+	if (configured === undefined) return [];
+	const key = accountUsageKey(account);
+	const name = account.name ?? accountLabel(account);
+	return parseAccountLimits(configured, "limits").limits.map(limit =>
+		isAccountEvidenceLimit(limit)
+			? { name, metric: limit.metric, max: limit.max, onLimit: limit.onLimit }
+			: limitStatus(
+					key === undefined ? undefined : ledger,
+					{ key: name, label: name, limit, scopes: [{ provider, account: key ?? "" }] },
+					name,
+					nowMs,
+				),
+	);
+}
+
 /** Every stored account with its name, policy, label, and project pin mark for `cwd`. */
 export function listAccounts(settings: Settings, authStorage: AuthStorage, cwd: string): AccountListing[] {
 	const policies = cfgAuthAccountPolicies.get(settings);
+	const ledger = settings.getStorage()?.usageLedger;
+	const nowMs = Date.now();
 	const rows: AccountListing[] = [];
 	for (const provider of storedProviders(authStorage)) {
 		const pinnedName = projectAccountPin(settings, cwd, provider);
@@ -435,6 +473,7 @@ export function listAccounts(settings: Settings, authStorage: AuthStorage, cwd: 
 				...(policy?.priority !== undefined ? { priority: policy.priority } : {}),
 				...(policy?.reservePct !== undefined ? { reservePct: policy.reservePct } : {}),
 				drain: policy?.drain === true,
+				limits: accountLimitViews(provider, account, policy?.limits, ledger, nowMs),
 				projectPinned: pinnedName !== undefined && account.name === pinnedName,
 			});
 		}

@@ -141,6 +141,8 @@ export interface ModelHubPool {
 	funding: readonly string[];
 	/** Spending policy as display text; never edited by the hub. */
 	spending?: string;
+	/** Local limits as display text (how many, and the one closest to its cap); never edited by the hub. */
+	limits?: string;
 	/** Why the hub must not edit this pool; undefined when it may. */
 	readOnly?: string;
 	/** The entry exactly as configured, present only when the hub may edit it; edits round-trip through a copy. */
@@ -2290,6 +2292,7 @@ export class ModelHubComponent implements Component {
 			pool.strategy,
 			pool.funding.length > 0 ? `funding ${pool.funding.join(" → ")}` : undefined,
 			pool.spending ? `spending ${pool.spending}` : undefined,
+			pool.limits ? `limits ${pool.limits}` : undefined,
 			pool.readOnly ? `read-only: ${pool.readOnly}` : undefined,
 		];
 		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
@@ -4573,6 +4576,7 @@ export class ModelHubComponent implements Component {
 				? row("Group", `${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`)
 				: undefined,
 			pool.spending ? row("Spending", pool.spending) : undefined,
+			pool.limits ? row("Limits", pool.limits) : undefined,
 			pool.readOnly ? row("Read-only", pool.readOnly) : undefined,
 		];
 		const members = pool.members.map(member => {

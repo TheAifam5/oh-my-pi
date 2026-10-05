@@ -23,7 +23,7 @@ import {
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ClientUsageClientSummary } from "@oh-my-pi/pi-ai/usage";
 import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
-import { formatDuration, formatNumber, getProjectDir, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatNumber, getAgentDbPath, getProjectDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
@@ -40,6 +40,9 @@ import {
 } from "../slash-commands/helpers/usage-accounts";
 
 import { cfgRetryUsageReservePct } from "../session/settings";
+import { AgentStorage } from "../session/agent-storage";
+import { configuredLimitStatuses, hasLocalLimits, localLimitJson, localLimitsReport } from "../session/local-limits";
+import type { UsageLedger } from "../session/usage-ledger";
 
 const BAR_WIDTH = 28;
 
@@ -1031,6 +1034,22 @@ function formatOAuthIdentityKeys(rows: readonly OAuthIdentityKeyRow[]): string {
 	return lines.join("\n");
 }
 
+/**
+ * The usage ledger local limits count, opened only when a limit is configured and agent.db
+ * already exists (reading never creates it); undefined when it cannot be read.
+ */
+async function limitsLedger(settings: Settings): Promise<UsageLedger | undefined> {
+	if (!hasLocalLimits(settings)) return undefined;
+	const dbPath = getAgentDbPath();
+	try {
+		if (!(await Bun.file(dbPath).exists())) return undefined;
+		return (await AgentStorage.open(dbPath)).usageLedger;
+	} catch (error) {
+		logger.debug("Usage ledger could not be opened for local limits", { error: String(error) });
+		return undefined;
+	}
+}
+
 export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 	const settings = await Settings.loadReadOnly();
 	const authStorage = await discoverAuthStorage(undefined, { settings });
@@ -1231,6 +1250,10 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				accountsWithoutUsage: unreportedAccounts,
 				disabledCredentials: disabledForJson,
 				capacity,
+				localLimits: configuredLimitStatuses(settings, await limitsLedger(settings), Date.now()).map(status => ({
+					name: status.name,
+					...localLimitJson(status),
+				})),
 			};
 			process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 			return;
@@ -1252,6 +1275,8 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		process.stdout.write(
 			`${formatUsageBreakdown(filteredReports, accounts, Date.now(), redaction, disabled, policyOptions)}\n`,
 		);
+		const limits = localLimitsReport(settings, await limitsLedger(settings), Date.now());
+		if (limits.length > 0) process.stdout.write(`\n${chalk.bold(limits[0]!)}\n${limits.slice(1).join("\n")}\n`);
 	} finally {
 		authStorage.close();
 	}
