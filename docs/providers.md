@@ -69,9 +69,11 @@ Logins are **provider-scoped**: authenticating `anthropic` does not authenticate
 Use the interactive slash commands inside a session:
 
 - `/login` — opens the OAuth/key selector. `/login <provider>` jumps straight to one provider (e.g. `/login anthropic`); for an OAuth flow that needs a pasted callback, run `/login <redirect-url>` to complete it.
-- `/logout` — opens the provider selector to remove stored credentials.
+- `/account` (alias `/logout`) — opens the provider selector, then that provider's stored accounts with their names, priorities, reserves, and pins. Enter logs the selected account out; `s` pins it to this session, `p` pins it to the current project (naming it first if needed), and `l` names it.
 
 Outside a session, `omp login [<provider>]` runs the same login from the terminal, including extension-registered providers: it prints the auth URL (and opens it in your browser), reads any prompts from stdin, and saves to the same store sessions use — local `agent.db`, or the configured auth broker. Without a provider it shows a numbered picker. Successful login refreshes that provider's model catalog online so newly unlocked models are visible.
+
+`omp account` manages stored accounts from the terminal: `list` (provider, name, identity, priority, reserve, API key fingerprint, project pin; keys are never printed), `label <account> <name>`, `priority <account> <n>`, `reserve <account> <pct>` (OAuth accounts), `pin [provider/]<name>` and `unpin [provider]` for the nearest pinned project at or above the current directory (pin creates one at the current directory when none exists), and `logout <account>` (refused while a project or overlay policy names the account). A negative priority goes after `--` (`omp account priority work -- -5`). An `<account>` is `[provider/]` followed by a name, email, account id, key fingerprint, or `#<credential id>`. Names, priorities, and reserves are written to `auth.accountPolicies` and project pins to `auth.accountPins` in the user config. Session pins are per session and are managed with `/session pin` or `/account`.
 
 For headless or remote setups backed by a shared auth broker, the CLI exposes `omp auth-broker login <provider>` / `omp auth-broker logout` (and `status`, `list`, `import`, `migrate`). See [Secrets and credentials](./secrets.md) for the broker model.
 

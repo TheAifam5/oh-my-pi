@@ -58,4 +58,36 @@ describe("LogoutAccountSelectorComponent", () => {
 
 		expect(selected).toEqual([12]);
 	});
+
+	it("runs an action key on the highlighted account and keeps Enter as log out", () => {
+		const rows: StoredAuthCredential[] = [
+			{ id: 21, provider: "openai", disabledCause: null, credential: { type: "api_key", key: "sk-test" } },
+		];
+		const accounts = toLogoutAccounts("openai", rows, {
+			annotations: new Map([[21, { name: "work", facts: ["key 1234abcd"] }]]),
+		});
+		const actions: string[] = [];
+		const loggedOut: number[] = [];
+		const component = new LogoutAccountSelectorComponent(
+			"OpenAI",
+			accounts,
+			account => loggedOut.push(account.credentialId),
+			() => {},
+			{
+				actions: [{ id: "pin-project", label: "pin project", key: "p" }],
+				onAction: (account, actionId) => actions.push(`${actionId}:${account.credentialId}`),
+			},
+		);
+
+		const rendered = component
+			.render(120)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(rendered).toContain("work (API key #21)");
+		component.handleInput("p");
+		component.handleInput("\n");
+
+		expect(actions).toEqual(["pin-project:21"]);
+		expect(loggedOut).toEqual([21]);
+	});
 });

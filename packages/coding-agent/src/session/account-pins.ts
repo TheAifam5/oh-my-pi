@@ -26,7 +26,7 @@ function warnProjectPinsIgnored(settings: Settings): void {
 }
 
 /** Real path of `dir`, or its resolved path when it cannot be resolved (missing directory, permissions). */
-function canonicalDir(dir: string): string {
+export function canonicalDir(dir: string): string {
 	try {
 		return fs.realpathSync(dir);
 	} catch {
