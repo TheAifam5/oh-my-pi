@@ -10,6 +10,7 @@
  */
 
 import type { AccountRouting, DrainReturnTrigger } from "@oh-my-pi/pi-ai/auth-storage";
+import { type LocalLimit, parseLocalLimits } from "@oh-my-pi/pi-ai/usage/limits";
 import { ACCOUNT_NAME, drainFundingIssue, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isRecord } from "@oh-my-pi/pi-utils";
@@ -161,6 +162,8 @@ export interface GroupRouting {
 	spending?: GroupSpendingPolicy;
 	/** Account order, drain target, and drain funding for requests to this group's members (`routing.accounts`). */
 	accounts?: AccountRouting;
+	/** Local limits on the calls made through this pool (`routing.limits`); see `session/local-limits.ts`. */
+	limits?: readonly LocalLimit[];
 }
 
 /** A concrete `provider/model-id` member. */
@@ -689,7 +692,7 @@ function parseAccountRouting(c: Collector, path: string, raw: unknown): AccountR
 
 function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | undefined {
 	const before = c.issues.length;
-	if (!checkFields(c, path, raw, ["funding", "quota", "spending", "accounts"])) return undefined;
+	if (!checkFields(c, path, raw, ["funding", "quota", "spending", "accounts", "limits"])) return undefined;
 	const routing: GroupRouting = {};
 	const funding = present(raw, "funding") ? parseFunding(c, `${path}.funding`, raw.funding) : undefined;
 	const spendingRaw = present(raw, "spending") ? raw.spending : undefined;
@@ -721,6 +724,11 @@ function parseRouting(c: Collector, path: string, raw: unknown): GroupRouting | 
 		if (present(q, "unknown"))
 			quota.unknown = readOneOf(c, `${path}.quota.unknown`, ["exclude", "allow"] as const, q.unknown);
 		routing.quota = quota;
+	}
+	if (present(raw, "limits")) {
+		const { limits, issues } = parseLocalLimits(raw.limits, `${path}.limits`);
+		for (const issue of issues) c.add(issue.path, issue.message);
+		if (issues.length === 0) routing.limits = limits;
 	}
 	if (present(raw, "accounts")) {
 		const accounts = parseAccountRouting(c, `${path}.accounts`, raw.accounts);

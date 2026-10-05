@@ -1,6 +1,6 @@
 /**
- * Local limits of the top-level `limits` setting: which limits govern a model, and whether the
- * calls counted in the usage ledger have reached them.
+ * Local limits of the top-level `limits` setting and of pools' `routing.limits`: which limits
+ * govern a call, and whether the calls counted in the usage ledger have reached them.
  */
 import {
 	type LocalLimit,
@@ -12,6 +12,8 @@ import { formatDuration, logger } from "@oh-my-pi/pi-utils";
 import { limitKeyScope, parseLimitsSetting, withoutSharedIdConflicts } from "../config/local-limits";
 import { cfgLimits } from "../config/model-settings";
 import type { Settings } from "../config/settings";
+import { type GroupFallbackChain, resolveGroupFallbackChain, resolveRolePoolGroup } from "./retry-fallback-groups";
+import { cfgRetryFallbackChains } from "./settings";
 import type { UsageLedger, UsageScope, UsageTotals } from "./usage-ledger";
 
 /** One limit governing a model, with every scope its counter covers. */
@@ -37,17 +39,22 @@ export interface LimitEvaluation {
 	quiet: LimitTarget[];
 }
 
-const configuredCache = new WeakMap<Settings, { revision: number; limits: Map<string, LocalLimit[]> }>();
+/** Limits configured for one scope: a top-level `limits` key, or a pool's `routing.limits`. */
+interface ScopedLimits {
+	/** The `limits` key, or the pool id. */
+	key: string;
+	scope: UsageScope;
+	limits: LocalLimit[];
+}
+
+const configuredCache = new WeakMap<Settings, { revision: number; scoped: ScopedLimits[] }>();
 const projectWarnings = new WeakMap<Settings, number>();
 
 /**
- * Merged `limits` of the global config, `--config` overlays, and runtime overrides, a later layer
- * replacing a key whole. The project layer is skipped, and a key whose shared `id` conflicts with
- * an earlier key is dropped, each with one warning per settings revision.
+ * Merged top-level `limits` of the global config, `--config` overlays, and runtime overrides, a
+ * later layer replacing a key whole; the project layer is skipped with one warning per revision.
  */
-function configuredLimits(settings: Settings): Map<string, LocalLimit[]> {
-	const cached = configuredCache.get(settings);
-	if (cached?.revision === settings.revision) return cached.limits;
+function topLevelLimits(settings: Settings): Map<string, LocalLimit[]> {
 	const limits = new Map<string, LocalLimit[]>();
 	for (const { source, value } of settings.getLayerValues(cfgLimits)) {
 		if (source === "project") {
@@ -66,17 +73,53 @@ function configuredLimits(settings: Settings): Map<string, LocalLimit[]> {
 			logger.warn("Ignoring invalid limits layer", { source, error: String(error) });
 		}
 	}
-	const checked = withoutSharedIdConflicts(limits);
-	for (const { key, id } of checked.dropped) {
-		logger.warn("Ignoring limits key whose shared id differs from another key's", { key, id });
-	}
-	configuredCache.set(settings, { revision: settings.revision, limits: checked.limits });
-	return checked.limits;
+	return limits;
 }
 
-/** Whether `settings` configures any local limit. */
+/** `routing.limits` of every role and chain pool, by pool id. */
+function poolLimits(settings: Settings): Map<string, LocalLimit[]> {
+	const limits = new Map<string, LocalLimit[]>();
+	const add = (pool: GroupFallbackChain | undefined) => {
+		const configured = pool?.group.routing?.limits;
+		if (pool && configured && configured.length > 0) limits.set(pool.poolId, [...configured]);
+	};
+	for (const role of Object.keys(settings.getModelRoleEntries())) add(resolveRolePoolGroup(settings, role));
+	for (const key of Object.keys(cfgRetryFallbackChains.get(settings))) add(resolveGroupFallbackChain(settings, key));
+	return limits;
+}
+
+/**
+ * Every configured scope with limits: top-level keys first, then pools, role pools before chain
+ * pools. A limit that gives a shared `id` a different limit than an earlier scope does is dropped
+ * with one warning per settings revision; the rest of its scope stays.
+ */
+function configuredLimits(settings: Settings): ScopedLimits[] {
+	const cached = configuredCache.get(settings);
+	if (cached?.revision === settings.revision) return cached.scoped;
+	const scopes = new Map<string, UsageScope>();
+	const all = new Map<string, LocalLimit[]>();
+	for (const [key, limits] of topLevelLimits(settings)) {
+		const scope = limitKeyScope(key);
+		if (!scope) continue;
+		scopes.set(key, scope);
+		all.set(key, limits);
+	}
+	for (const [poolId, limits] of poolLimits(settings)) {
+		scopes.set(poolId, { pool: poolId });
+		all.set(poolId, limits);
+	}
+	const checked = withoutSharedIdConflicts(all);
+	for (const { key, id } of checked.dropped) {
+		logger.warn("Ignoring a limit whose shared id differs from an earlier scope's", { scope: key, id });
+	}
+	const scoped = [...checked.limits].map(([key, limits]) => ({ key, scope: scopes.get(key)!, limits }));
+	configuredCache.set(settings, { revision: settings.revision, scoped });
+	return scoped;
+}
+
+/** Whether `settings` configures any local limit, top-level or on a pool. */
 export function hasLocalLimits(settings: Settings): boolean {
-	return configuredLimits(settings).size > 0;
+	return configuredLimits(settings).length > 0;
 }
 
 function windowLabel(window: LocalLimitWindow): string {
@@ -89,31 +132,31 @@ function limitLabel(key: string, limit: LocalLimit): string {
 	return `${key}: ${limit.max} ${unit} per ${windowLabel(limit.window)}`;
 }
 
-function scopeMatches(scope: UsageScope, provider: string, modelId: string): boolean {
+function scopeMatches(scope: UsageScope, provider: string, modelId: string, poolId: string | undefined): boolean {
+	if (scope.pool !== undefined) return scope.pool === poolId;
 	return (
 		(scope.provider === undefined || scope.provider === provider) &&
 		(scope.model === undefined || scope.model === modelId)
 	);
 }
 
-/** The limits governing calls to `provider/modelId`, a shared `id` once. */
-export function limitTargets(settings: Settings, provider: string, modelId: string): LimitTarget[] {
+/**
+ * The limits governing a call to `provider/modelId` made through the pool `poolId` (unset outside
+ * a pool), a shared `id` once with every scope that declares it.
+ */
+export function limitTargets(settings: Settings, provider: string, modelId: string, poolId?: string): LimitTarget[] {
 	const configured = configuredLimits(settings);
-	if (configured.size === 0) return [];
+	if (configured.length === 0) return [];
 	const targets = new Map<string, LimitTarget>();
-	for (const [key, limits] of configured) {
-		const scope = limitKeyScope(key);
-		if (!scope || !scopeMatches(scope, provider, modelId)) continue;
+	for (const { key, scope, limits } of configured) {
+		if (!scopeMatches(scope, provider, modelId, poolId)) continue;
 		limits.forEach((limit, index) => {
 			const targetKey = limit.id !== undefined ? `id:${limit.id}` : `${key}#${index}`;
 			if (targets.has(targetKey)) return;
 			const scopes =
 				limit.id === undefined
 					? [scope]
-					: [...configured].flatMap(([otherKey, others]) => {
-							const other = limitKeyScope(otherKey);
-							return other && others.some(entry => entry.id === limit.id) ? [other] : [];
-						});
+					: configured.flatMap(other => (other.limits.some(entry => entry.id === limit.id) ? [other.scope] : []));
 			targets.set(targetKey, { key: targetKey, label: limitLabel(key, limit), limit, scopes });
 		});
 	}

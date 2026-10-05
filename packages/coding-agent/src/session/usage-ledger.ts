@@ -18,7 +18,7 @@ export interface UsageEntry {
 	model: string;
 	/** The account that served the call: its policy name, else a stable identity; unset when unknown. */
 	account?: string;
-	/** Role or chain key whose pool selected the model; unset outside a pool. */
+	/** Pool id (`role:<role>` or `chain:<key>`) of the pool that selected the model; unset outside a pool. */
 	pool?: string;
 	/** Cost in nano-USD; a non-negative safe integer. */
 	costNanos: number;

@@ -7022,7 +7022,7 @@ describe("AgentSession retry fallback", () => {
 			async function limitSession(
 				limits: Record<string, unknown>,
 				primary: Model,
-				fallbacks: Model[],
+				fallbacks: Model[] | Record<string, unknown>,
 				options: { ledger?: boolean; responses?: MockResponse[] } = {},
 			) {
 				storage =
@@ -7035,7 +7035,11 @@ describe("AgentSession retry fallback", () => {
 						"compaction.enabled": false,
 						"retry.maxRetries": 0,
 						limits,
-						"retry.fallbackChains": { default: fallbacks.map(model => `${model.provider}/${model.id}`) },
+						"retry.fallbackChains": {
+							default: Array.isArray(fallbacks)
+								? fallbacks.map(model => `${model.provider}/${model.id}`)
+								: fallbacks,
+						},
 					},
 					storage ? { storage } : {},
 				);
@@ -7108,6 +7112,90 @@ describe("AgentSession retry fallback", () => {
 				await session!.waitForIdle();
 
 				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "anthropic/claude-sonnet-4-5"]);
+			});
+
+			it("records calls through a role pool under its pool id and enforces the strictest of its pool and model limits", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels } = await limitSession(
+					{ openai: [{ metric: "requests", max: 5, window: DAY }] },
+					primary,
+					[],
+				);
+				session!.settings.setModelRoleSpec("default", {
+					strategy: "priority",
+					strategyOptions: { order: ["mini"] },
+					routing: { limits: [{ metric: "requests", max: 1, window: DAY }] },
+					models: { mini: { model: "openai/gpt-4o-mini" } },
+				});
+
+				await session!.prompt("First call fits the pool limit");
+				await session!.waitForIdle();
+				await session!.prompt("Second call would pass it");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini"]);
+				expect(storage!.usageLedger.totals([{ pool: "role:default" }], 0).requests).toBe(1n);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain(
+					"role:default: 1 requests per day: local limit reached",
+				);
+			});
+
+			it("attributes a fallback call to its chain pool and refuses a fallback whose pool limit is reached", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels } = await limitSession(
+					{ "openai/gpt-4o-mini": [{ metric: "requests", max: 1, window: DAY }] },
+					primary,
+					{
+						strategy: "priority",
+						strategyOptions: { order: ["flash"] },
+						routing: { limits: [{ metric: "requests", max: 1, window: DAY }] },
+						models: { flash: { model: "google/gemini-2.5-flash" } },
+					},
+				);
+
+				for (const text of ["primary", "falls back", "pool spent"]) {
+					await session!.prompt(text);
+					await session!.waitForIdle();
+				}
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "google/gemini-2.5-flash"]);
+				expect(storage!.usageLedger.totals([{ pool: "chain:default" }], 0).requests).toBe(1n);
+				expect(storage!.usageLedger.totals([{ provider: "openai" }], 0).requests).toBe(1n);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain("chain:default: 1 requests per day");
+			});
+
+			it("passes over a fallback candidate whose chain pool limit is reached", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels } = await limitSession(
+					{ "openai/gpt-4o-mini": [{ metric: "requests", max: 1, window: DAY }] },
+					primary,
+					{
+						strategy: "priority",
+						strategyOptions: { order: ["flash"] },
+						routing: { limits: [{ metric: "requests", max: 1, window: DAY }] },
+						models: { flash: { model: "google/gemini-2.5-flash" } },
+					},
+				);
+				storage!.usageLedger.record({
+					atMs: Date.now(),
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					pool: "chain:default",
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+
+				await session!.prompt("primary");
+				await session!.waitForIdle();
+				await session!.prompt("no eligible fallback");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini"]);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain("no fallback model is eligible");
 			});
 
 			it("fails the request when a global spend limit is reached and no fallback is eligible", async () => {

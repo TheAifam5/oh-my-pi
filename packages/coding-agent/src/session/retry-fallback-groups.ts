@@ -41,6 +41,22 @@ export interface GroupFallbackChain {
 	profile?: string;
 	/** Members in configured order; never empty. */
 	members: GroupMemberSelector[];
+	/**
+	 * Identity of the pool in the usage ledger and for `routing.limits`: `role:<role>` for a
+	 * `modelRoles` pool, `chain:<key>` for a `retry.fallbackChains` pool, whether the entry is
+	 * inline or references `modelGroups`.
+	 */
+	poolId: string;
+}
+
+/** {@link GroupFallbackChain.poolId} of the `modelRoles.<role>` pool. */
+export function rolePoolId(role: string): string {
+	return `role:${role}`;
+}
+
+/** {@link GroupFallbackChain.poolId} of the `retry.fallbackChains.<key>` pool. */
+export function chainPoolId(key: string): string {
+	return `chain:${key}`;
 }
 
 /**
@@ -50,7 +66,7 @@ export interface GroupFallbackChain {
  * reference to a missing group (which settings loading already reports).
  */
 export function resolveGroupFallbackChain(settings: Settings, key: string): GroupFallbackChain | undefined {
-	return groupOfSpec(settings, settings.getFallbackChainSpec(key));
+	return groupOfSpec(settings, settings.getFallbackChainSpec(key), chainPoolId(key));
 }
 
 /**
@@ -60,7 +76,7 @@ export function resolveGroupFallbackChain(settings: Settings, key: string): Grou
  */
 export function resolveRolePoolGroup(settings: Settings, role: string): GroupFallbackChain | undefined {
 	if (role.includes("/")) return undefined;
-	return groupOfSpec(settings, settings.getModelRoleSpec(role));
+	return groupOfSpec(settings, settings.getModelRoleSpec(role), rolePoolId(role));
 }
 
 /** Member selectors of `role`'s pool in configured order ({@link resolveRolePoolGroup}); `undefined` for a legacy role. */
@@ -83,7 +99,11 @@ export function withRolePoolChainKeys(chains: Record<string, string[]>, settings
 	return result;
 }
 
-function groupOfSpec(settings: Settings, spec: ParsedModelValue | undefined): GroupFallbackChain | undefined {
+function groupOfSpec(
+	settings: Settings,
+	spec: ParsedModelValue | undefined,
+	poolId: string,
+): GroupFallbackChain | undefined {
 	let group: ModelGroup | undefined;
 	let profile: string | undefined;
 	if (spec?.kind === "group") {
@@ -96,7 +116,7 @@ function groupOfSpec(settings: Settings, spec: ParsedModelValue | undefined): Gr
 	if (!group) return undefined;
 	const members = groupMemberSelectors(group, profile);
 	if (members.length === 0) return undefined;
-	return { group, ...(profile !== undefined ? { profile } : {}), members };
+	return { group, ...(profile !== undefined ? { profile } : {}), members, poolId };
 }
 
 /**

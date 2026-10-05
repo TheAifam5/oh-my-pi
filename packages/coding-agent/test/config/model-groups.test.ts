@@ -97,12 +97,24 @@ describe("modelRoles values (strict)", () => {
 			],
 		],
 		[
-			"routing limits",
-			pool({ routing: { limits: { maxPoolAttempts: 2 } } }),
+			"a routing limit with a numeric usd max",
+			pool({
+				routing: { limits: [{ metric: "usd", max: 5, window: { type: "calendar", period: "day" } }] },
+			}),
 			[
 				{
-					path: "modelRoles.engineer.routing.limits",
-					message: "unsupported field; supported: funding, quota, spending, accounts",
+					path: "modelRoles.engineer.routing.limits[0].max",
+					message: 'must be a positive quoted decimal amount, such as "5.00"',
+				},
+			],
+		],
+		[
+			"an unsupported routing field",
+			pool({ routing: { maxPoolAttempts: 2 } }),
+			[
+				{
+					path: "modelRoles.engineer.routing.maxPoolAttempts",
+					message: "unsupported field; supported: funding, quota, spending, accounts, limits",
 				},
 			],
 		],

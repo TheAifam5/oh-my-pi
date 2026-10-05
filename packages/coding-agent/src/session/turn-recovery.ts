@@ -2190,19 +2190,21 @@ export class TurnRecovery {
 			if (input + output + cacheRead + cacheWrite <= 0 && costNanos === 0) return;
 			const ledger = this.#host.settings.getStorage()?.usageLedger;
 			if (!ledger) return;
+			const model = this.#host.modelRegistry.find(message.provider, message.model);
+			const pool = model ? this.#servingPoolId(model) : undefined;
 			if (validCost === undefined) {
 				logger.warn("Usage ledger recorded a call at zero cost: its cost is not a valid amount", {
 					provider: message.provider,
 					model: message.model,
 				});
 			} else if (costNanos === 0) {
-				const pricing = this.#host.modelRegistry.find(message.provider, message.model)?.cost;
+				const pricing = model?.cost;
 				const priced =
 					pricing !== undefined &&
 					(pricing.input > 0 || pricing.output > 0 || pricing.cacheRead > 0 || pricing.cacheWrite > 0);
 				if (
 					priced &&
-					limitTargets(this.#host.settings, message.provider, message.model).some(
+					limitTargets(this.#host.settings, message.provider, message.model, pool).some(
 						target => target.limit.metric === "usd",
 					)
 				) {
@@ -2215,6 +2217,7 @@ export class TurnRecovery {
 				provider: message.provider,
 				model: message.model,
 				...(account !== undefined ? { account } : {}),
+				...(pool !== undefined ? { pool } : {}),
 				costNanos,
 				inputTokens: input,
 				outputTokens: output,
@@ -2384,10 +2387,38 @@ export class TurnRecovery {
 		return refused;
 	}
 
-	/** The local limits ({@link limitTargets}) governing `model` that refuse or warn about another call. */
-	#evaluateLimits(model: Model, nowMs: number): LimitEvaluation {
-		const targets = limitTargets(this.#host.settings, model.provider, model.id);
+	/**
+	 * The local limits ({@link limitTargets}) governing a call on `model` through the pool `poolId`
+	 * that refuse or warn about another call.
+	 */
+	#evaluateLimits(model: Model, nowMs: number, poolId: string | undefined): LimitEvaluation {
+		const targets = limitTargets(this.#host.settings, model.provider, model.id, poolId);
 		return evaluateLimits(this.#host.settings.getStorage()?.usageLedger, targets, nowMs);
+	}
+
+	/** The pool of `owner`'s walk with `model` as a member: its role pool, else its chain group. */
+	#poolFor(owner: string, model: Model): GroupFallbackChain | undefined {
+		const settings = this.#host.settings;
+		for (const pool of [resolveRolePoolGroup(settings, owner), resolveChainGroupPolicy(settings, owner)]) {
+			if (!pool) continue;
+			const member = pool.members.some(entry => {
+				const parsed = parseRetryFallbackSelector(entry.selector, this.#host.modelRegistry);
+				const resolved = parsed ? this.resolveRetryFallbackCandidate(owner, parsed) : undefined;
+				return resolved !== undefined && modelsAreEqual(resolved, model);
+			});
+			if (member) return pool;
+		}
+		return undefined;
+	}
+
+	/** Pool id of the role or chain whose pool selected the running `model`; unset outside a pool. */
+	#servingPoolId(model: Model): string | undefined {
+		const selector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
+		for (const owner of this.retryFallbackChainKeys(selector, model)) {
+			const pool = this.#poolFor(owner, model);
+			if (pool) return pool.poolId;
+		}
+		return undefined;
 	}
 
 	/**
@@ -2424,7 +2455,7 @@ export class TurnRecovery {
 		if (!model || signal?.aborted) return;
 		const nowMs = Date.now();
 		const refused = await this.#refusedLocalBudgets(model, nowMs);
-		const limits = this.#evaluateLimits(model, nowMs);
+		const limits = this.#evaluateLimits(model, nowMs, this.#servingPoolId(model));
 		this.#noteWarnedLimits(limits, nowMs);
 		if (refused.length === 0 && limits.refused.length === 0) return;
 		if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
@@ -2452,7 +2483,8 @@ export class TurnRecovery {
 					if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 					if (!this.#host.contextFitsModel(candidateModel)) continue;
 					if ((await this.#refusedLocalBudgets(candidateModel, nowMs)).length > 0) continue;
-					if (this.#evaluateLimits(candidateModel, nowMs).refused.length > 0) continue;
+					const candidatePool = this.#poolFor(role, candidateModel)?.poolId;
+					if (this.#evaluateLimits(candidateModel, nowMs, candidatePool).refused.length > 0) continue;
 					if (signal?.aborted || !modelsAreEqual(this.#host.model(), model)) return;
 					try {
 						if (

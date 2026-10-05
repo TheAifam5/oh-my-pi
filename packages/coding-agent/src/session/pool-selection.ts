@@ -615,7 +615,8 @@ export async function resolveRolePool(
 		eligible = eligible.filter(candidate => {
 			const model = resolve(candidate).model;
 			if (!model) return true;
-			const [refusal] = evaluateLimits(ledger, limitTargets(deps.settings, model.provider, model.id), nowMs).refused;
+			const targets = limitTargets(deps.settings, model.provider, model.id, policy.poolId);
+			const [refusal] = evaluateLimits(ledger, targets, nowMs).refused;
 			if (!refusal) return true;
 			const kind = refusal.reason === "reached" ? "limit-reached" : "limit-unreadable";
 			skipped.push({ selector: candidate.raw, reason: { kind, limit: refusal.target.label } });
