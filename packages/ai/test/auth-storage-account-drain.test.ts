@@ -348,6 +348,95 @@ describe("AuthStorage account drain", () => {
 		}
 	});
 
+	test("pool account order runs after the member account and before the drain target; unknown names are skipped", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		used.set("acc-a", 0.2);
+		used.set("acc-b", 0.5);
+		const pool: { member?: string } = {};
+		storage.sessions.setAccountPinSource({
+			member: () => pool.member,
+			routing: () => ({ order: ["ghost", "cool"] }),
+		});
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+		expect((await storage.oauth.access(PROVIDER, SESSION))?.accountId).toBe("acc-a");
+		expect(warn.mock.calls.filter(([, meta]) => (meta as { account?: string })?.account === "ghost")).toHaveLength(1);
+
+		pool.member = "first";
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+	});
+
+	/** Adds a third stored account named `third` (`acc-c`). */
+	async function withThird(): Promise<number> {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		storage.setAccountPolicies({
+			accountPolicies: [...POLICIES, { provider: PROVIDER, name: "third", account: { accountId: "acc-c" } }],
+			defaultReservePct: 10,
+		});
+		return storage.sessions.accounts(PROVIDER).find(account => account.name === "third")?.credentialId ?? -1;
+	}
+
+	test("an exhausted pool order account falls through to the next one, then to normal selection", async () => {
+		await withThird();
+		used.set("acc-a", 1);
+		used.set("acc-b", 0.5);
+		used.set("acc-c", 0.3);
+		storage.sessions.setAccountPinSource({ routing: () => ({ order: ["cool", "third"] }) });
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-c");
+
+		used.set("acc-c", 1);
+		expect(await advance(MINUTE)).toBe("access-b");
+	});
+
+	test("an exclusive pin beats the pool order and drain", async () => {
+		const third = await withThird();
+		used.set("acc-a", 0.2);
+		used.set("acc-b", 0.5);
+		used.set("acc-c", 0.3);
+		storage.sessions.setAccountPinSource({ routing: () => ({ order: ["cool"], drain: "cool" }) });
+		expect(storage.sessions.pin(PROVIDER, SESSION, third)).toBe(true);
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-c");
+	});
+
+	test("pool drain and spend replace the policy's, and a session drain override beats the pool", async () => {
+		const third = await withThird();
+		installBilling();
+		used.set("acc-a", 1);
+		used.set("acc-b", 0.5);
+		used.set("acc-c", 0.5);
+		credits.set("acc-a", "10");
+		storage.sessions.setAccountPinSource({ routing: () => ({ drain: "cool", spend: ["credits"] }) });
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+		storage.sessions.drain(PROVIDER, SESSION, third);
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-c");
+	});
+
+	test("pool-funded and policy-funded requests on one drain target keep separate cooldowns", async () => {
+		installBilling();
+		const policySession = "session-policy";
+		const poolSession = "session-pool";
+		storage.sessions.setAccountPinSource({
+			routing: (_provider, sessionId) => (sessionId === poolSession ? { spend: ["credits"] } : undefined),
+		});
+		used.set("acc-a", 0.2);
+		used.set("acc-b", 1);
+		overage.add("acc-b");
+		credits.set("acc-b", "10");
+		expect(await storage.keys.get(PROVIDER, policySession)).toBe("access-a");
+		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-b");
+
+		credits.set("acc-b", "0");
+		setSystemTime(new Date(Date.now() + 5 * MINUTE));
+		await storage.usage.invalidate(PROVIDER);
+		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-a");
+
+		used.set("acc-b", 0.5);
+		setSystemTime(new Date(Date.now() + 6 * MINUTE));
+		await storage.usage.invalidate(PROVIDER);
+		expect(await storage.keys.get(PROVIDER, policySession)).toBe("access-b");
+		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-a");
+	});
+
 	test("rejects spend and returnWhen without drain, unknown values, and triggers without their spend class", async () => {
 		const store = () => new SqliteAuthCredentialStore(new Database(":memory:"));
 		const build = (policy: Partial<AuthAccountPolicy>) => () =>

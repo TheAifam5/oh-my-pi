@@ -1,13 +1,14 @@
 /**
  * Settings-backed account pins for a session: the project pin from
- * `auth.accountPins` and the pool member `account` preference. The auth store
- * reads both through {@link settingsAccountPinSource} on every credential
- * resolution, so settings changes apply to the next request.
+ * `auth.accountPins`, the pool member `account` preference, and pool
+ * `routing.accounts`. The auth store reads them through
+ * {@link settingsAccountPinSource} on every credential resolution, so settings
+ * changes apply to the next request.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AccountPinSource } from "@oh-my-pi/pi-ai/auth-storage";
+import type { AccountPinSource, AccountRouting } from "@oh-my-pi/pi-ai/auth-storage";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { ModelGroup, ParsedModelValue } from "../config/model-groups";
 import { cfgAuthAccountPins, cfgModelGroups } from "../config/model-settings";
@@ -144,6 +145,58 @@ export function memberAccount(settings: Settings, provider: string, modelId: str
 	return cached.accounts.get(`${provider}/${modelId}`) ?? undefined;
 }
 
+/** Pool account routing by `provider/model-id`; `null` marks a model whose pools disagree. */
+type AccountRoutings = Map<string, AccountRouting | null>;
+
+const accountRoutingsCache = new WeakMap<Settings, { revision: number; routings: AccountRoutings }>();
+
+function collectAccountRoutings(settings: Settings): AccountRoutings {
+	const routings: AccountRoutings = new Map();
+	const add = (group: ModelGroup | undefined) => {
+		const routing = group?.routing?.accounts;
+		if (!routing) return;
+		for (const member of group.models) {
+			const previous = routings.get(member.model);
+			routings.set(
+				member.model,
+				previous === undefined || (previous !== null && Bun.deepEquals(previous, routing)) ? routing : null,
+			);
+		}
+	};
+	const addSpec = (spec: ParsedModelValue | undefined) => {
+		if (spec?.kind === "group") add(spec.group);
+	};
+	for (const role of Object.keys(settings.getModelRoleEntries())) addSpec(settings.getModelRoleSpec(role));
+	for (const key of Object.keys(cfgRetryFallbackChains.get(settings))) addSpec(settings.getFallbackChainSpec(key));
+	for (const name of Object.keys(cfgModelGroups.get(settings))) add(settings.getModelGroup(name));
+	const conflicting = [...routings].filter(([, routing]) => routing === null).map(([model]) => model);
+	if (conflicting.length > 0) {
+		logger.warn("Pools of one model set different routing.accounts; ignoring them for that model", {
+			models: conflicting,
+		});
+	}
+	return routings;
+}
+
+/**
+ * `routing.accounts` of the pools whose members serve `provider/modelId`,
+ * from every configured group. Pools of the same model that set different
+ * values cancel out, so neither applies.
+ */
+export function poolAccountRouting(
+	settings: Settings,
+	provider: string,
+	modelId: string | undefined,
+): AccountRouting | undefined {
+	if (modelId === undefined) return undefined;
+	let cached = accountRoutingsCache.get(settings);
+	if (cached?.revision !== settings.revision) {
+		cached = { revision: settings.revision, routings: collectAccountRoutings(settings) };
+		accountRoutingsCache.set(settings, cached);
+	}
+	return cached.routings.get(`${provider}/${modelId}`) ?? undefined;
+}
+
 /** Settings and working directory of every live session, by provider session id. */
 const sessionScopes = new Map<string, { settings: Settings; cwd: () => string }>();
 
@@ -183,5 +236,9 @@ export const settingsAccountPinSource: AccountPinSource = {
 	member: (provider, sessionId, modelId) => {
 		const scope = sessionScopes.get(sessionId);
 		return scope ? memberAccount(scope.settings, provider, modelId) : undefined;
+	},
+	routing: (provider, sessionId, modelId) => {
+		const scope = sessionScopes.get(sessionId);
+		return scope ? poolAccountRouting(scope.settings, provider, modelId) : undefined;
 	},
 };

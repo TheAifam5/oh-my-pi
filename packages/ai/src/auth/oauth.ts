@@ -9,7 +9,7 @@ import type { KeyOverrides } from "./cascade";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { OAuthRefresher } from "./refresh";
-import type { CredentialSelector } from "./select";
+import type { CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
 	AuthAccountPolicy,
 	AuthApiKeyOptions,
@@ -148,17 +148,27 @@ export class OAuthAccounts implements OAuthApi {
 		const preferred = pinned
 			? undefined
 			: this.#deps.affinity.preferredAccount(provider, sessionId, options?.modelId);
-		const target = pinned ?? preferred;
-		let resolved =
-			target?.credential.type === "oauth"
-				? await this.#deps.selector.resolveOneOAuth(
-						provider,
-						target.index,
-						sessionId,
-						options,
-						pinned !== undefined,
-					)
-				: undefined;
+		// The pool's account order follows the member preference, as in API-key resolution.
+		const targets = pinned
+			? [pinned]
+			: [
+					...(preferred ? [preferred] : []),
+					...this.#deps.affinity
+						.orderedAccounts(provider, sessionId, options?.modelId)
+						.filter(target => target.index !== preferred?.index),
+				];
+		let resolved: OAuthResolutionResult | undefined;
+		for (const target of targets) {
+			if (target.credential.type !== "oauth") continue;
+			resolved = await this.#deps.selector.resolveOneOAuth(
+				provider,
+				target.index,
+				sessionId,
+				options,
+				pinned !== undefined,
+			);
+			if (resolved) break;
+		}
 		if (!resolved && !pinned) resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
 		if (!resolved) return undefined;
 		const { credential, credentialId } = resolved;
