@@ -69,7 +69,7 @@ import {
 	formatRetryFallbackBaseSelector,
 	formatRetryFallbackSelector,
 	getRetryFallbackChain,
-	recordRetryFallbackRoundRobinPosition,
+	recordRetryFallbackUse,
 	type RetryFallbackStrategy,
 	expandDefaultRetryFallbackChains,
 	getRetryFallbackRevertPolicy,
@@ -2165,9 +2165,9 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Records an applied fallback for its round-robin position: a pool role's member against the
-	 * pool's members (the cursor its role picks share), any other entry against its chain. Other
-	 * strategies ignore it.
+	 * Records an applied fallback for its strategy's state ({@link recordRetryFallbackUse}): a pool
+	 * role's member against the pool's members (the state its role picks share), any other entry
+	 * against its chain.
 	 */
 	noteRetryFallbackApplied(
 		role: string,
@@ -2177,15 +2177,14 @@ export class TurnRecovery {
 	): void {
 		const rolePool = this.#rolePoolMembers(role);
 		if (rolePool?.members.some(member => member.raw === selector.raw)) {
-			if (this.#poolSelection.strategy(rolePool.policy) === "round-robin") {
-				recordRetryFallbackRoundRobinPosition(rolePool.members, selector);
-			}
+			recordRetryFallbackUse(this.#poolSelection.strategy(rolePool.policy), rolePool.members, selector);
 			return;
 		}
 		const policy = rolePool ? resolveChainGroupPolicy(this.#host.settings, role) : undefined;
 		const strategy = rolePool ? this.#poolSelection.strategy(policy) : this.#retryFallbackStrategy(role);
-		if (strategy !== "round-robin") return;
-		recordRetryFallbackRoundRobinPosition(
+		if (strategy !== "round-robin" && strategy !== "shuffle-bag") return;
+		recordRetryFallbackUse(
+			strategy,
 			getRetryFallbackChain(this.#getRetryFallbackResolutionContext(), role, currentSelector, currentModel),
 			selector,
 		);

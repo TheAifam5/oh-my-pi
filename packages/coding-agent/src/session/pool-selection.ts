@@ -1,6 +1,6 @@
 import type { Model, ModelUsageHealth, UsageReport } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
-import type { BillingClass } from "../config/model-groups";
+import { type BillingClass, DEFAULT_LEAST_USED_WINDOW_MS } from "../config/model-groups";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelStringWithRouting,
@@ -13,11 +13,13 @@ import {
 import type { Settings } from "../config/settings";
 import { sanitizeNoticeLine } from "../utils/notice-text";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { inFlightRequests } from "./in-flight-requests";
 import {
 	getRetryFallbackRoundRobinPosition,
+	getRetryFallbackShuffleBag,
 	orderRetryFallbackCandidates,
 	parseRetryFallbackSelector,
-	recordRetryFallbackRoundRobinPosition,
+	recordRetryFallbackUse,
 	type RetryFallbackHealthLookups,
 	type RetryFallbackSelector,
 	type RetryFallbackStrategy,
@@ -65,7 +67,7 @@ export interface PoolSelectionHost {
 	emitNotice(message: string, purpose: PoolSelectionPurpose): Promise<void>;
 	/** Current epoch ms; read at each use. Default `Date.now`. */
 	now?(): number;
-	/** Uniform source in [0, 1) for `random` and `weighted-random`; read at each use. Default `Math.random`. */
+	/** Uniform source in [0, 1) for `random`, `weighted-random`, `p2c`, and `shuffle-bag`; read at each use. Default `Math.random`. */
 	random?(): number;
 	/** Usage reports funding filters read; default `modelRegistry.authStorage.usage.reports`. */
 	usageReports?(options: { signal: AbortSignal }): Promise<UsageReport[] | null>;
@@ -76,9 +78,9 @@ export interface PoolOrderOptions {
 	purpose: PoolSelectionPurpose;
 	/** Model a candidate resolves to; candidates resolving to none are not probed for quota. */
 	resolveCandidate(selector: RetryFallbackSelector): Model | undefined;
-	/** Full list whose positions `round-robin` reads and records. Read only by `round-robin`. */
+	/** Full list whose state `round-robin` and `shuffle-bag` read and record. Read only by those two. */
 	chain(): readonly RetryFallbackSelector[];
-	/** Whether a walk is under way; `round-robin` then keeps the given order. */
+	/** Whether a walk is under way; `round-robin` and `shuffle-bag` then keep the given order. */
 	walkActive: boolean;
 	signal?: AbortSignal;
 	lookups?: RetryFallbackHealthLookups;
@@ -129,7 +131,14 @@ export class PoolSelection {
 	 *
 	 * `round-robin` starts a new walk (`walkActive` false) after the entry last recorded for
 	 * `options.chain()`; a walk under way keeps the given order. `random` and `weighted-random` draw a
-	 * fresh order per call, `weighted-random` by each member's `weight`. `quota` reads usage health
+	 * fresh order per call, `weighted-random` by each member's `weight`. `cheapest` ranks by the
+	 * resolved model's input plus output price (unresolved or non-finite price last), `least-used` by
+	 * the model's requests in the usage ledger over the strategy's window (an unreadable ledger keeps
+	 * given order), and `least-loaded` and `p2c` by the model's requests in flight in this process
+	 * (unresolved last). `p2c` draws only among members not cooling down, which follow in given order.
+	 * `shuffle-bag` puts the members left in its current bag first, refilling a bag that holds none of
+	 * the members not cooling down with a fresh shuffle; a walk under way keeps the given order.
+	 * `quota` reads usage health
 	 * for each unsuppressed candidate with configured auth, concurrently, sharing one lookup per
 	 * routed model through `lookups`, and ages evidence by the group's
 	 * `routing.quota.maxObservationAgeMs`. When the lookups outlast {@link QUOTA_ORDERING_DEADLINE_MS}
@@ -167,6 +176,38 @@ export class PoolSelection {
 				}),
 				health: new Map(),
 			};
+		}
+		// p2c and shuffle-bag pick among members that can serve now; cooling-down members go last.
+		const suppressed = (candidate: RetryFallbackSelector) => host.modelRegistry.isSelectorSuppressed(candidate.raw);
+		const live =
+			strategy === "p2c" || strategy === "shuffle-bag" ? candidates.filter(candidate => !suppressed(candidate)) : [];
+		const cooling = candidates.filter(candidate => !live.includes(candidate));
+		const ranked = this.#rank(strategy === "p2c" ? live : candidates, strategy, policy, options, nowMs);
+		if (ranked) {
+			const ordered = orderRetryFallbackCandidates(strategy === "p2c" ? live : candidates, strategy, {
+				nowMs,
+				maxAgeMs,
+				random,
+				rank: candidate => ranked.get(candidate.raw),
+			});
+			return { candidates: strategy === "p2c" ? [...ordered, ...cooling] : ordered, health: new Map() };
+		}
+		if (strategy === "shuffle-bag") {
+			if (options.walkActive) return { candidates, health: new Map() };
+			const bag = getRetryFallbackShuffleBag(
+				options.chain(),
+				live.map(candidate => candidate.raw),
+				random,
+			);
+			const ordered = orderRetryFallbackCandidates(live, strategy, {
+				nowMs,
+				maxAgeMs,
+				bagPosition: candidate => {
+					const position = bag.indexOf(candidate.raw);
+					return position >= 0 ? position : undefined;
+				},
+			});
+			return { candidates: [...ordered, ...cooling], health: new Map() };
 		}
 		if (strategy === "round-robin") {
 			const chain = options.chain();
@@ -242,6 +283,61 @@ export class PoolSelection {
 			}),
 			health,
 		};
+	}
+
+	/**
+	 * Rank of each candidate for `cheapest`, `least-used`, `least-loaded`, and `p2c`, keyed by
+	 * selector; a candidate without a rank has no entry. `undefined` for any other strategy, and for
+	 * `least-used` when the usage ledger cannot be read.
+	 */
+	#rank(
+		candidates: readonly RetryFallbackSelector[],
+		strategy: RetryFallbackStrategy,
+		policy: GroupFallbackChain | undefined,
+		options: PoolOrderOptions,
+		nowMs: number,
+	): Map<string, number> | undefined {
+		const ranks = new Map<string, number>();
+		switch (strategy) {
+			case "cheapest":
+				for (const candidate of candidates) {
+					const cost = options.resolveCandidate(candidate)?.cost;
+					const price = cost ? cost.input + cost.output : Number.NaN;
+					if (Number.isFinite(price) && price >= 0) ranks.set(candidate.raw, price);
+				}
+				return ranks;
+			case "least-loaded":
+			case "p2c":
+				for (const candidate of candidates) {
+					const model = options.resolveCandidate(candidate);
+					if (model) ranks.set(candidate.raw, inFlightRequests(model.provider, model.id));
+				}
+				return ranks;
+			case "least-used": {
+				const windowMs =
+					policy?.group.strategy.name === "least-used"
+						? policy.group.strategy.windowMs
+						: DEFAULT_LEAST_USED_WINDOW_MS;
+				const ledger = this.#host.settings.getStorage()?.usageLedger;
+				if (!ledger) return undefined;
+				try {
+					for (const candidate of candidates) {
+						const model = options.resolveCandidate(candidate);
+						if (!model) continue;
+						const { requests } = ledger.totals([{ provider: model.provider, model: model.id }], nowMs - windowMs);
+						ranks.set(candidate.raw, Number(requests));
+					}
+				} catch (error) {
+					logger.debug("Least-used ordering could not read the usage ledger; keeping member order", {
+						error: String(error),
+					});
+					return undefined;
+				}
+				return ranks;
+			}
+			default:
+				return undefined;
+		}
 	}
 
 	/**
@@ -650,11 +746,12 @@ export async function resolveRolePool(
 }
 
 /**
- * Records that `pick` was applied, advancing its pool's round-robin position; other strategies
- * ignore it. Retry fallback walking the same members reads and moves the same position.
+ * Records that `pick` was applied ({@link recordRetryFallbackUse}): it advances a round-robin
+ * pool's position and takes the member out of a shuffle-bag pool's bag. Retry fallback walking the
+ * same members reads and moves the same state.
  */
 export function notePoolPickApplied(pick: RolePoolPick): void {
-	if (pick.strategy === "round-robin") recordRetryFallbackRoundRobinPosition(pick.members, pick.selector);
+	recordRetryFallbackUse(pick.strategy, pick.members, pick.selector);
 }
 
 /** The pool role a selection resolves through, and the effort a role-alias suffix asks for. */
