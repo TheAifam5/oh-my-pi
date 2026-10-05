@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { isUsageLimitReached } from "@oh-my-pi/pi-ai/auth/usage-report";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageProvider } from "@oh-my-pi/pi-ai/usage";
 import { aimlapiBilling, aimlapiUsageProvider } from "@oh-my-pi/pi-ai/usage/aimlapi";
 import type { BillingResult, ProviderBilling } from "@oh-my-pi/pi-ai/usage/billing";
+import { deepinfraBilling, deepinfraUsageProvider } from "@oh-my-pi/pi-ai/usage/deepinfra";
 import { deepseekBilling, deepseekUsageProvider } from "@oh-my-pi/pi-ai/usage/deepseek";
 import { moonshotBilling, moonshotUsageProvider } from "@oh-my-pi/pi-ai/usage/moonshot";
 import { nanogptBilling, nanogptUsageProvider } from "@oh-my-pi/pi-ai/usage/nanogpt";
 import { novitaBilling, novitaUsageProvider } from "@oh-my-pi/pi-ai/usage/novita";
+import { siliconflowBilling, siliconflowUsageProvider } from "@oh-my-pi/pi-ai/usage/siliconflow";
 import { veniceBilling, veniceUsageProvider } from "@oh-my-pi/pi-ai/usage/venice";
 import { vercelAiGatewayBilling, vercelAiGatewayUsageProvider } from "@oh-my-pi/pi-ai/usage/vercel-ai-gateway";
 
@@ -354,6 +357,161 @@ describe("Venice balance", () => {
 		expect((await fetchReport(veniceUsageProvider, noVerdict)).report).toBeNull();
 		const noBalance = { ...documented, balances: { diem: null, usd: null } };
 		expect((await fetchReport(veniceUsageProvider, noBalance)).report).toBeNull();
+	});
+});
+
+describe("SiliconFlow balance", () => {
+	/** Documentation-derived: https://docs.siliconflow.com/en/api-reference/userinfo/get-user-info */
+	const documented = {
+		code: 20000,
+		message: "OK",
+		status: true,
+		data: { id: "userid", balance: "0.88", status: "normal", chargeBalance: "88.00", totalBalance: "88.88" },
+	};
+
+	it("reads the total balance as exact credits, never as money", async () => {
+		const { report, seen } = await fetchReport(siliconflowUsageProvider, documented);
+		expect(bearer(seen)).toEqual([
+			{ url: "https://api.siliconflow.com/v1/user/info", method: "GET", authorization: `Bearer ${KEY}` },
+		]);
+		expect(report?.metadata).toEqual({});
+		expect(await billingOf(siliconflowUsageProvider, siliconflowBilling, documented)).toEqual([
+			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(8888, 2) } },
+		]);
+		const debt = { ...documented, data: { ...documented.data, totalBalance: "-1.50" } };
+		expect(await billingOf(siliconflowUsageProvider, siliconflowBilling, debt)).toEqual([
+			{ mode: "prepaid-credits", state: "exhausted", allowance: { kind: "credits", remaining: credits(0) } },
+		]);
+	});
+
+	it("keeps a zero balance from blocking the credential while billing reads it as exhausted", async () => {
+		const zero = { ...documented, data: { ...documented.data, totalBalance: "0.00" } };
+		const { report } = await fetchReport(siliconflowUsageProvider, zero);
+		if (!report) throw new Error("fixture did not parse");
+		expect(isUsageLimitReached(report.limits)).toBe(false);
+		expect(sources(siliconflowBilling.readBilling(report))).toEqual([
+			{ mode: "prepaid-credits", state: "exhausted", allowance: { kind: "credits", remaining: credits(0) } },
+		]);
+	});
+
+	it("rejects an error envelope or a non-decimal balance", async () => {
+		const rejected = [
+			{ ...documented, code: 20001 },
+			{ ...documented, status: false },
+			{ ...documented, data: { ...documented.data, totalBalance: 88.88 } },
+			{ ...documented, data: { ...documented.data, totalBalance: "abc" } },
+		];
+		for (const body of rejected) expect((await fetchReport(siliconflowUsageProvider, body)).report).toBeNull();
+	});
+
+	it("never sends the key to the China platform, which does not document the endpoint", async () => {
+		const { report, seen } = await fetchReport(siliconflowUsageProvider, documented, {
+			baseUrl: "https://api.siliconflow.cn/v1",
+		});
+		expect(report).toBeNull();
+		expect(seen).toEqual([]);
+	});
+
+	it("purges a rejected key", async () => {
+		await expect(fetchReport(siliconflowUsageProvider, { code: 401 }, { status: 401 })).rejects.toThrow(
+			"SiliconFlow api.siliconflow.com/v1/user/info returned 401",
+		);
+	});
+});
+
+describe("DeepInfra account state", () => {
+	/** Documentation-derived schema with illustrative values (no example given): https://docs.deepinfra.com/api-reference/billing/get-checklist.md */
+	const documented = {
+		email: true,
+		payment_method: true,
+		suspended: false,
+		overdue_invoices: 0,
+		stripe_balance: -2500,
+		recent: 120,
+		limit: 5000,
+		suspend_reason: null,
+		topup: false,
+		scoped_credits: [
+			{ name: "launch", granted_cents: 1000, remaining_cents: 250, granted_ts: 1700000000, expired: false },
+			{ name: "old", granted_cents: 500, remaining_cents: 0, granted_ts: 1600000000, expired: true },
+		],
+	};
+
+	it("reads ready funds as a prepaid source of unreported size and keeps scoped credits out of it", async () => {
+		const { report, seen } = await fetchReport(deepinfraUsageProvider, documented);
+		expect(bearer(seen)).toEqual([
+			{ url: "https://api.deepinfra.com/payment/checklist", method: "GET", authorization: `Bearer ${KEY}` },
+		]);
+		expect(report?.limits).toEqual([]);
+		expect(report?.metadata).toEqual({
+			suspended: false,
+			fundsReady: true,
+			scopedCredits: [{ grantedCents: 1000, remainingCents: 250 }],
+		});
+		expect(await billingOf(deepinfraUsageProvider, deepinfraBilling, documented)).toEqual([
+			{ mode: "prepaid-credits", state: "available" },
+		]);
+	});
+
+	it("reports an active account without ready funds as no evidence", async () => {
+		for (const stripe_balance of [0, 42]) {
+			const { report } = await fetchReport(deepinfraUsageProvider, { ...documented, stripe_balance });
+			if (!report) throw new Error("fixture did not parse");
+			expect(deepinfraBilling.readBilling(report)).toMatchObject({ status: "unknown", reason: "no-evidence" });
+		}
+	});
+
+	it("maps a suspension to an exhausted or disabled source and an exhausted account limit", async () => {
+		const overLimit = { ...documented, suspended: true, suspend_reason: "limit-reached" };
+		const { report } = await fetchReport(deepinfraUsageProvider, overLimit);
+		expect(report?.limits).toMatchObject([
+			{ id: "deepinfra:account", status: "exhausted", notes: ["suspended: limit-reached"] },
+		]);
+		expect(await billingOf(deepinfraUsageProvider, deepinfraBilling, overLimit)).toEqual([
+			{ mode: "prepaid-credits", state: "exhausted" },
+		]);
+		const banned = { ...documented, stripe_balance: 10, suspended: true, suspend_reason: "admin" };
+		expect(await billingOf(deepinfraUsageProvider, deepinfraBilling, banned)).toEqual([
+			{ mode: "unknown", state: "disabled" },
+		]);
+		const unexplained = { ...documented, suspended: true, suspend_reason: null };
+		expect(await billingOf(deepinfraUsageProvider, deepinfraBilling, unexplained)).toEqual([
+			{ mode: "prepaid-credits", state: "disabled" },
+		]);
+	});
+
+	it("ignores the suspend reason and the spending limit while the account is active", async () => {
+		const stale = { ...documented, suspend_reason: "weird" };
+		expect((await fetchReport(deepinfraUsageProvider, stale)).report?.metadata).toMatchObject({ fundsReady: true });
+		// `limit` has no documented unit and only a suspension stops the account.
+		const overLimit = { ...documented, recent: 9000, limit: 10 };
+		expect(await billingOf(deepinfraUsageProvider, deepinfraBilling, overLimit)).toEqual([
+			{ mode: "prepaid-credits", state: "available" },
+		]);
+	});
+
+	it("skips an expired scoped credit without validating it", async () => {
+		const expired = {
+			...documented,
+			scoped_credits: [{ name: "old", granted_cents: null, remaining_cents: null, expired: true }],
+		};
+		const { report } = await fetchReport(deepinfraUsageProvider, expired);
+		expect(report?.metadata).toEqual({ suspended: false, fundsReady: true });
+	});
+
+	it("rejects an undocumented suspend reason or a malformed balance or credit", async () => {
+		const rejected = [
+			{ ...documented, suspended: true, suspend_reason: "weird" },
+			{ ...documented, suspended: "no" },
+			{ ...documented, stripe_balance: "-2500" },
+			{ ...documented, scoped_credits: [{ name: "x", granted_cents: 1, remaining_cents: null }] },
+		];
+		for (const body of rejected) expect((await fetchReport(deepinfraUsageProvider, body)).report).toBeNull();
+	});
+
+	it("treats a 401 as transient and stays out of credential health checks", async () => {
+		expect(deepinfraUsageProvider.validatesCredentials).toBe(false);
+		expect((await fetchReport(deepinfraUsageProvider, { detail: "x" }, { status: 401 })).report).toBeNull();
 	});
 });
 

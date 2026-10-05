@@ -8,6 +8,7 @@ import { claudeBilling, claudeRankingStrategy, claudeUsageProvider } from "./cla
 import { clinePassUsageProvider } from "./cline-pass";
 import { commandCodeBilling, commandCodeRankingStrategy, commandCodeUsageProvider } from "./commandcode";
 import { cursorBilling, cursorRankingStrategy, cursorUsageProvider } from "./cursor";
+import { deepinfraBilling, deepinfraUsageProvider } from "./deepinfra";
 import { deepseekBilling, deepseekUsageProvider } from "./deepseek";
 import { devinBilling, devinUsageProvider } from "./devin";
 import { factoryDroidBilling, factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
@@ -24,6 +25,7 @@ import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
 import { opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
 import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
+import { siliconflowBilling, siliconflowUsageProvider } from "./siliconflow";
 import { syntheticBilling, syntheticUsageProvider } from "./synthetic";
 import { umansUsageProvider } from "./umans";
 import { veniceBilling, veniceUsageProvider } from "./venice";
@@ -66,6 +68,8 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	nanogptUsageProvider,
 	vercelAiGatewayUsageProvider,
 	veniceUsageProvider,
+	siliconflowUsageProvider,
+	deepinfraUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -115,6 +119,8 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	nanogptBilling,
 	vercelAiGatewayBilling,
 	veniceBilling,
+	siliconflowBilling,
+	deepinfraBilling,
 ];
 
 const DEFAULT_BILLING_READER_MAP = new Map<Provider, ProviderBilling>(
