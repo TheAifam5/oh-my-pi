@@ -230,7 +230,7 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 		const [target, sibling] = store.listAuthCredentials(PROVIDER);
 		if (!target || sibling?.credential.type !== "oauth") throw new Error("expected two OAuth rows");
 		const sessionId = "routine-refresh-then-401";
-		authStorage.sessions.pin(PROVIDER, sessionId, target.id);
+		authStorage.sessions.pin(PROVIDER, sessionId, target.id, { restoredAtMs: Date.now() });
 
 		const refreshed = await authStorage.oauth.refresh(target.id);
 		expect(refreshed.credential).toMatchObject({ type: "oauth", access: "minted-access" });

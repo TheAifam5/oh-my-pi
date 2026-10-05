@@ -392,6 +392,9 @@ export class RateLimits implements LimitsApi {
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
 	 *
+	 * A session with an exclusive pin never switches: a usage-limit failure is
+	 * still marked, and the result is `{ switched: false }` without waiting.
+	 *
 	 * For usage-limit and account-policy failures with no free sibling, sleeps
 	 * until the earliest sibling unblocks when that is at most
 	 * {@link SIBLING_UNBLOCK_WAIT_MAX_MS} away, then reports `afterSiblingWait`.
@@ -408,7 +411,24 @@ export class RateLimits implements LimitsApi {
 		const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
 		const exactCursorModelPolicy = AIError.isCursorPlanAccountPolicyError(error, provider);
 		const accountPolicy = exactCursorModelPolicy || AIError.isAccountPolicyError(error);
-		if (!accountPolicy && (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message))) {
+		const usageLimit = !accountPolicy && (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message));
+		if (this.#deps.affinity.hasExclusivePin(provider, sessionId)) {
+			// A pinned session never leaves its account: record the block for status, keep the pin, and
+			// let the caller surface the provider's error instead of waiting for a sibling.
+			if (usageLimit) {
+				const retryAfterMs = extractProviderRetryHint(provider, message);
+				await this.markReached(provider, sessionId, {
+					retryAfterMs,
+					providerTimed: retryAfterMs !== undefined,
+					modelId: options?.modelId,
+					apiKey: options?.apiKey,
+					credentialId: options?.credentialId,
+					signal: options?.signal,
+				});
+			}
+			return { switched: false };
+		}
+		if (usageLimit) {
 			// Thread the provider-specified reset window (e.g. Devin "Your limit
 			// will reset in 13 minutes") into the block duration so the credential
 			// is not reselected and hammered while the cap remains active.

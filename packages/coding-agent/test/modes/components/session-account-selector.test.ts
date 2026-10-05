@@ -8,8 +8,8 @@ beforeAll(async () => {
 });
 
 const accounts = toSessionPinAccounts([
-	{ position: 0, credentialId: 11, email: "first@example.com", active: false },
-	{ position: 1, credentialId: 12, email: "second@example.com", active: true },
+	{ credentialId: 11, type: "oauth", email: "first@example.com", active: false, pinned: false },
+	{ credentialId: 12, type: "oauth", email: "second@example.com", active: true, pinned: false },
 ]);
 
 describe("SessionAccountSelectorComponent", () => {

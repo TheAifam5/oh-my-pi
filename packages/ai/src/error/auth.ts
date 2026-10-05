@@ -1,4 +1,4 @@
-import { attach, create, Flag } from "./flags";
+import { ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX, attach, create, Flag } from "./flags";
 
 /**
  * No API key / credential was available to dispatch a request.
@@ -36,6 +36,28 @@ export class OAuthRefreshUnavailableError extends Error {
 		this.name = "OAuthRefreshUnavailableError";
 		this.provider = provider;
 		attach(this, create(Flag.Transient));
+	}
+}
+
+/**
+ * A pinned or preferred account cannot serve the request: no stored credential
+ * carries that account name, or the pinned credential could not produce a key.
+ * Never falls back to another account.
+ *
+ * Classifies as no failure kind at all (see {@link ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX}):
+ * credential invalidation keyed on auth failures must not touch stored
+ * credentials for a configuration problem, and retrying cannot fix it.
+ */
+export class AccountUnavailableError extends Error {
+	readonly provider: string;
+	/** Account name that could not be resolved; kept out of the message so its text never drives classification. */
+	readonly account: string | undefined;
+
+	constructor(provider: string, account?: string) {
+		super(`${ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX}${provider}`);
+		this.name = "AccountUnavailableError";
+		this.provider = provider;
+		this.account = account;
 	}
 }
 

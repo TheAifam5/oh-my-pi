@@ -738,11 +738,14 @@ describe("ModelRegistry runtime discovery", () => {
 		// Bundled rows that no account serves stay pruned.
 		expect(registry.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
 
-		// A session pinned to account A moves to B for a model only B serves.
+		// A session sticky to account A moves to B for a model only B serves; an
+		// exclusive user pin would keep A.
 		const sessionId = "antigravity-claude-session";
 		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
 		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
-		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(
+			authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId, { restoredAtMs: Date.now() }),
+		).toBe(true);
 		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
 	});
 
@@ -790,7 +793,9 @@ describe("ModelRegistry runtime discovery", () => {
 		const sessionId = "antigravity-emailless-session";
 		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
 		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
-		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(
+			authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId, { restoredAtMs: Date.now() }),
+		).toBe(true);
 		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
 	});
 

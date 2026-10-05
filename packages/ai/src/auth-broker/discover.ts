@@ -125,6 +125,7 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			key =>
 				key !== "provider" &&
 				key !== "account" &&
+				key !== "name" &&
 				key !== "priority" &&
 				key !== "reservePct" &&
 				key !== "reclaimAbovePct",
@@ -145,8 +146,8 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 
 		const accountPath = `${path}.account`;
 		const rawAccount = policy.account as Record<string, unknown>;
-		const selectorFields = ["email", "accountId", "projectId", "orgId"] as const;
-		const baseIdentityFields = ["email", "accountId", "projectId"] as const;
+		const selectorFields = ["email", "accountId", "projectId", "orgId", "keyFingerprint"] as const;
+		const baseIdentityFields = ["email", "accountId", "projectId", "keyFingerprint"] as const;
 		const unknownAccountFields = Object.keys(rawAccount).filter(
 			key => !selectorFields.includes(key as (typeof selectorFields)[number]),
 		);
@@ -161,8 +162,11 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 		}
 		if (!baseIdentityFields.some(field => rawAccount[field] !== undefined)) {
 			throw new AIError.ConfigurationError(
-				`${accountPath} must include at least one of email, accountId, or projectId`,
+				`${accountPath} must include at least one of email, accountId, projectId, or keyFingerprint`,
 			);
+		}
+		if (policy.name !== undefined && typeof policy.name !== "string") {
+			throw new AIError.ConfigurationError(`${path}.name must be a string`);
 		}
 		if (policy.priority !== undefined && (typeof policy.priority !== "number" || !Number.isFinite(policy.priority))) {
 			throw new AIError.ConfigurationError(`${path}.priority must be a finite number`);
@@ -190,7 +194,9 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 				...(typeof rawAccount.accountId === "string" ? { accountId: rawAccount.accountId } : {}),
 				...(typeof rawAccount.projectId === "string" ? { projectId: rawAccount.projectId } : {}),
 				...(typeof rawAccount.orgId === "string" ? { orgId: rawAccount.orgId } : {}),
+				...(typeof rawAccount.keyFingerprint === "string" ? { keyFingerprint: rawAccount.keyFingerprint } : {}),
 			},
+			...(typeof policy.name === "string" ? { name: policy.name } : {}),
 			...(typeof policy.priority === "number" ? { priority: policy.priority } : {}),
 			...(typeof policy.reservePct === "number" ? { reservePct: policy.reservePct } : {}),
 			...(typeof policy.reclaimAbovePct === "number" ? { reclaimAbovePct: policy.reclaimAbovePct } : {}),

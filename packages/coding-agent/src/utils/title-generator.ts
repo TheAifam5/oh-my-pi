@@ -36,6 +36,7 @@ import { formatTitleUserMessage } from "../tiny/message-preproc";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
+import { shareSessionAccountPins } from "../session/account-pins";
 import { RolePoolUnavailableError, rolePoolTarget } from "../session/pool-selection";
 import { createRolePoolCall, noteRolePoolModelUsed, type RolePoolCall } from "../session/role-pool-resolution";
 import { cfgRetryModelFallback } from "../session/settings";
@@ -334,7 +335,10 @@ export async function generateTitleOnline(
 	);
 }
 
-/** Tries `models` in order; each model a request is sent to is recorded in `call` ({@link noteRolePoolModelUsed}). */
+/**
+ * Tries `models` in order; each model a request is sent to is recorded in `call` ({@link noteRolePoolModelUsed}).
+ * A distinct title session follows `credentialSourceSessionId`'s account pins and affinity.
+ */
 async function generateTitleOnlineWithModels(
 	firstMessage: string,
 	models: Model<Api>[],
@@ -345,6 +349,46 @@ async function generateTitleOnlineWithModels(
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
 	call?: RolePoolCall,
+): Promise<string | null> {
+	if (!credentialSourceSessionId || !sessionId || credentialSourceSessionId === sessionId) {
+		return generateTitleFromModels(
+			firstMessage,
+			models,
+			registry,
+			sessionId,
+			metadataResolver,
+			signal,
+			customSystemPrompt,
+			call,
+		);
+	}
+	registry.authStorage.sessions.inherit(credentialSourceSessionId, sessionId);
+	const unshareAccountPins = shareSessionAccountPins(credentialSourceSessionId, sessionId);
+	try {
+		return await generateTitleFromModels(
+			firstMessage,
+			models,
+			registry,
+			sessionId,
+			metadataResolver,
+			signal,
+			customSystemPrompt,
+			call,
+		);
+	} finally {
+		unshareAccountPins();
+	}
+}
+
+async function generateTitleFromModels(
+	firstMessage: string,
+	models: Model<Api>[],
+	registry: ModelRegistry,
+	sessionId: string | undefined,
+	metadataResolver: ((provider: string) => Record<string, unknown> | undefined) | undefined,
+	signal: AbortSignal | undefined,
+	customSystemPrompt: string | undefined,
+	call: RolePoolCall | undefined,
 ): Promise<string | null> {
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	// The model is always asked to wrap the title in `<title>...</title>` and
@@ -374,14 +418,6 @@ async function generateTitleOnlineWithModels(
 		}
 
 		try {
-			if (credentialSourceSessionId && sessionId && credentialSourceSessionId !== sessionId) {
-				const foregroundCredential = registry.authStorage.oauth
-					.accounts(model.provider, credentialSourceSessionId)
-					.find(account => account.active);
-				if (foregroundCredential) {
-					registry.authStorage.sessions.pin(model.provider, sessionId, foregroundCredential.credentialId);
-				}
-			}
 			const apiKey = await registry.getApiKey(model, sessionId);
 			if (!apiKey) {
 				logger.warn("title-generator: no API key", { ...modelContext, reason: "missing-api-key" });

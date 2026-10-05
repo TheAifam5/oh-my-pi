@@ -103,7 +103,9 @@ describe("AuthStorage OAuth account selection", () => {
 		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
 		const accountB = storage.oauth.accounts(PROVIDER)[1];
 		if (!accountB) throw new Error("expected second OAuth account");
-		expect(storage.sessions.pin(PROVIDER, "parent-session", accountB.credentialId)).toBe(true);
+		expect(
+			storage.sessions.pin(PROVIDER, "parent-session", accountB.credentialId, { restoredAtMs: Date.now() }),
+		).toBe(true);
 
 		expect(storage.sessions.inherit("parent-session", "child-session")).toBe(1);
 		expect(storage.oauth.accounts(PROVIDER, "child-session").find(account => account.active)?.email).toBe(

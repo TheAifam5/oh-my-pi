@@ -1,5 +1,6 @@
 import { isRetryableError, isUnexpectedSocketCloseMessage } from "@oh-my-pi/pi-utils";
 import {
+	ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX,
 	CODEX_HTTP_BODY_READ_ERROR_PATTERN,
 	isRetryableStreamEnvelopeError,
 	isTransientStreamDropError,
@@ -43,6 +44,7 @@ function isTransientTransportMessage(message: string): boolean {
  */
 export function isProviderRetryableError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
+	if (error.message.includes(ACCOUNT_UNAVAILABLE_MESSAGE_PREFIX)) return false;
 	if (isUsageLimit(error)) return false;
 	const httpStatus = status(error);
 	if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429) {

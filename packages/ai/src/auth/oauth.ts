@@ -128,10 +128,12 @@ export class OAuthAccounts implements OAuthApi {
 	 * scenarios, prefer API-key resolution.
 	 *
 	 * Returns `undefined` when no usable OAuth credential is available
-	 * (none stored, or every one definitively failed to refresh) or
-	 * runtime/config overrides have replaced OAuth with an explicit API key.
-	 * Rejects with {@link AIError.OAuthRefreshUnavailableError} (transient,
-	 * retryable) when a retryable refresh failure left no usable credential.
+	 * (none stored, or every one definitively failed to refresh),
+	 * runtime/config overrides have replaced OAuth with an explicit API key,
+	 * or the session's exclusive pin is an API key or an account that cannot
+	 * refresh. Session and project pins and pool member preferences apply as
+	 * in API-key resolution. Rejects with {@link AIError.OAuthRefreshUnavailableError}
+	 * (transient, retryable) when a retryable refresh failure left no usable credential.
 	 */
 	async access(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<OAuthAccess | undefined> {
 		// Runtime / config overrides intentionally short-circuit OAuth: when the
@@ -141,7 +143,23 @@ export class OAuthAccounts implements OAuthApi {
 		if (this.#deps.overrides.suppressesOAuth(provider, this.#deps.affinity.isRestricted(provider, sessionId))) {
 			return undefined;
 		}
-		const resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
+		// Account pins and preferences apply as in API-key resolution; a session pinned to an API key has no OAuth identity.
+		const pinned = this.#deps.affinity.exclusivePin(provider, sessionId);
+		const preferred = pinned
+			? undefined
+			: this.#deps.affinity.preferredAccount(provider, sessionId, options?.modelId);
+		const target = pinned ?? preferred;
+		let resolved =
+			target?.credential.type === "oauth"
+				? await this.#deps.selector.resolveOneOAuth(
+						provider,
+						target.index,
+						sessionId,
+						options,
+						pinned !== undefined,
+					)
+				: undefined;
+		if (!resolved && !pinned) resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
 		if (!resolved) return undefined;
 		const { credential, credentialId } = resolved;
 		return {

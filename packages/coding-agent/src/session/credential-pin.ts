@@ -17,15 +17,18 @@
  * stick or re-rank.
  */
 
+import { logger } from "@oh-my-pi/pi-utils";
 import type { AuthStorage } from "./auth-storage";
 import type { SessionManager } from "./session-manager";
 
-/** Account fields shared by `OAuthAccountIdentity` and `OAuthAccountSummary`. */
+/** Account fields shared by `OAuthAccountIdentity`, `OAuthAccountSummary`, and `AuthAccountSummary`. */
 interface CredentialPinIdentity {
 	accountId?: string;
 	email?: string;
 	projectId?: string;
 	orgId?: string;
+	/** Set for a stored API key; the digest then covers only the provider and fingerprint. */
+	keyFingerprint?: string;
 }
 
 /**
@@ -42,6 +45,11 @@ interface CredentialPinIdentity {
  * Returns `undefined` when the identity carries no account key at all.
  */
 export function credentialPinHash(provider: string, identity: CredentialPinIdentity): string | undefined {
+	if (identity.keyFingerprint) {
+		return new Bun.CryptoHasher("sha256")
+			.update([provider, "api_key", identity.keyFingerprint].join("\0"))
+			.digest("hex");
+	}
 	if (!identity.accountId && !identity.email) return undefined;
 	const key = [
 		provider,
@@ -74,17 +82,60 @@ export function recordCredentialPin(
 }
 
 /**
- * Re-pin the accounts recorded in the session file onto the auth store's
- * session stickiness. No-op per provider when the account is gone (logged out)
- * or when a live sticky for another account exists (same-process
- * branch/session switches must not clobber fresher routing). A sticky for the
- * same account whose last use predates the pin is advanced to the pin's time:
- * the persisted sticky is written lazily, so the session file can be newer.
- * Seeds with the session's effective last-use time so stale resumes still fall
- * through to usage ranking.
+ * Record a user pin (`/session pin`) of the stored credential `credentialId`
+ * so resume restores it as the session's only account for `provider`, or with
+ * `exclusive: false` record that the user removed it. Returns false, recording
+ * nothing, when the credential is gone or carries no identity to hash.
  */
-export function seedCredentialPins(authStorage: AuthStorage, sessionManager: SessionManager, sessionId: string): void {
+export function recordExclusiveCredentialPin(
+	authStorage: AuthStorage,
+	sessionManager: SessionManager,
+	provider: string,
+	credentialId: number,
+	exclusive: boolean,
+): boolean {
+	const account = authStorage.sessions.accounts(provider).find(entry => entry.credentialId === credentialId);
+	const hash = account ? credentialPinHash(provider, account) : undefined;
+	if (!hash) return false;
+	sessionManager.appendCredentialPin(provider, hash, exclusive);
+	return true;
+}
+
+/**
+ * Re-pin the accounts recorded in the session file onto the auth store's
+ * session stickiness.
+ *
+ * A user pin is restored as the session's exclusive pin and overwrites any
+ * live sticky. When its account is no longer stored, or the pin is refused
+ * (a key override is active), the session fails closed for that provider and
+ * the provider is returned so the caller can tell the user.
+ *
+ * An automatic pin is a no-op when the account is gone (logged out) or when a
+ * live sticky for another account exists (same-process branch/session switches
+ * must not clobber fresher routing). A sticky for the same account whose last
+ * use predates the pin is advanced to the pin's time: the persisted sticky is
+ * written lazily, so the session file can be newer. It seeds with the
+ * session's effective last-use time so stale resumes still fall through to
+ * usage ranking.
+ */
+export function seedCredentialPins(
+	authStorage: AuthStorage,
+	sessionManager: SessionManager,
+	sessionId: string,
+): string[] {
+	const unavailable: string[] = [];
 	for (const [provider, pin] of sessionManager.getCredentialPins()) {
+		if (pin.exclusive) {
+			const pinned = authStorage.sessions
+				.accounts(provider, sessionId)
+				.find(account => credentialPinHash(provider, account) === pin.hash);
+			if (!pinned || !authStorage.sessions.pin(provider, sessionId, pinned.credentialId)) {
+				authStorage.sessions.pinMissing(provider, sessionId);
+				logger.warn("Pinned account of the resumed session is unavailable", { provider });
+				unavailable.push(provider);
+			}
+			continue;
+		}
 		const accounts = authStorage.oauth.accounts(provider, sessionId);
 		if (accounts.length === 0) continue;
 		const match = accounts.find(account => credentialPinHash(provider, account) === pin.hash);
@@ -95,4 +146,5 @@ export function seedCredentialPins(authStorage: AuthStorage, sessionManager: Ses
 			restoredAtMs: pin.lastUsedAt,
 		});
 	}
+	return unavailable;
 }

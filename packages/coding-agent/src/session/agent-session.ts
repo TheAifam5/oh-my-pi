@@ -314,8 +314,10 @@ import type {
 	RoleModelCycleResult,
 	SendUserMessageOptions,
 	SessionHandoffOptions,
-	SessionOAuthAccountList,
+	SessionAccountList,
+	SessionPinOutcome,
 	SessionStats,
+	SessionUnpinOutcome,
 	SteerOptions,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
@@ -365,7 +367,8 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
-import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
+import { registerSessionAccountPins } from "./account-pins";
+import { recordCredentialPin, recordExclusiveCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
@@ -970,6 +973,8 @@ export class AgentSession implements SettingsScope {
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<() => void>();
 	#observedSessionId: string | undefined;
+	/** Provider session id whose settings-backed account pins are registered, and their teardown. */
+	#accountPins: { sessionId: string; unregister: () => void } | undefined;
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -6415,6 +6420,14 @@ export class AgentSession implements SettingsScope {
 		}
 		const sid = this.#activeProviderSessionId(sessionId);
 		this.agent.sessionId = sid;
+		if (this.#accountPins?.sessionId !== sid) {
+			if (!this.#accountPins) this.addDisposer(() => this.#accountPins?.unregister());
+			this.#accountPins?.unregister();
+			this.#accountPins = {
+				sessionId: sid,
+				unregister: registerSessionAccountPins(sid, this.settings, () => this.sessionManager.getCwd()),
+			};
+		}
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
 		);
@@ -6427,7 +6440,13 @@ export class AgentSession implements SettingsScope {
 		// the account-scoped prompt cache. Skipped for fresh provider sessions —
 		// those explicitly want new routing identity.
 		if (!this.#freshProviderSessionId) {
-			seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid);
+			for (const provider of seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid)) {
+				this.emitNotice(
+					"warning",
+					`The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`,
+					"account-pin",
+				);
+			}
 		}
 		// Keep every live advisor's provider identity in lockstep with the primary's
 		// across every session-boundary transition — including branch paths that
@@ -14327,26 +14346,57 @@ export class AgentSession implements SettingsScope {
 		return [...selectors].sort((left, right) => left.localeCompare(right));
 	}
 
-	/** List stored OAuth accounts for the current model provider and mark this session's active account. */
-	async listCurrentProviderOAuthAccounts(): Promise<SessionOAuthAccountList | undefined> {
+	/** List stored accounts (OAuth and API key) for the current model provider with this session's active and pinned marks. */
+	async listCurrentProviderAccounts(): Promise<SessionAccountList | undefined> {
 		const provider = this.model?.provider;
 		if (!provider) return undefined;
 		const authStorage = this.#modelRegistry.authStorage;
 		await authStorage.credentials.reload();
 		return {
 			provider,
-			accounts: authStorage.oauth.accounts(provider, this.sessionId),
+			accounts: authStorage.sessions.accounts(provider, this.sessionId),
 		};
 	}
 
 	/**
-	 * Pin a stored OAuth account to the current model provider for this session.
-	 * Returns false while streaming or when the credential is no longer available.
+	 * Pin a stored account as the only account the current model provider uses
+	 * for this session, and record the pin in the session file so resume keeps
+	 * it. Nothing is pinned unless the outcome is `pinned`.
 	 */
-	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
+	pinCurrentProviderAccount(credentialId: number): SessionPinOutcome {
 		const provider = this.model?.provider;
-		if (!provider || this.isStreaming) return false;
-		return this.#modelRegistry.authStorage.sessions.pin(provider, this.sessionId, credentialId);
+		if (!provider) return "no-model";
+		if (this.isStreaming) return "streaming";
+		const authStorage = this.#modelRegistry.authStorage;
+		if (!authStorage.sessions.pin(provider, this.sessionId, credentialId)) {
+			// The auth store refuses a pin only for a missing row or an active runtime/config key override.
+			const stored = authStorage.sessions.accounts(provider).some(account => account.credentialId === credentialId);
+			return stored ? "overridden" : "unavailable";
+		}
+		if (!recordExclusiveCredentialPin(authStorage, this.sessionManager, provider, credentialId, true)) {
+			authStorage.sessions.unpin(provider, this.sessionId);
+			return "not-persistable";
+		}
+		return "pinned";
+	}
+
+	/**
+	 * Remove this session's pin for the current model provider, in the auth
+	 * store and the session file. A project pin is not removed (`project-pin`).
+	 */
+	unpinCurrentProviderAccount(): SessionUnpinOutcome {
+		const provider = this.model?.provider;
+		if (!provider) return "no-model";
+		if (this.isStreaming) return "streaming";
+		const authStorage = this.#modelRegistry.authStorage;
+		if (!authStorage.sessions.unpin(provider, this.sessionId)) {
+			return authStorage.sessions.accounts(provider, this.sessionId).some(account => account.pinned)
+				? "project-pin"
+				: "none";
+		}
+		const recorded = this.sessionManager.getCredentialPins().get(provider);
+		if (recorded?.exclusive) this.sessionManager.appendCredentialPin(provider, recorded.hash, false);
+		return "unpinned";
 	}
 
 	/**
