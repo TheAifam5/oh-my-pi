@@ -6,6 +6,7 @@ import type {
 	ProviderBillingRegistry,
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
+import { localEndpointUsageReport } from "@oh-my-pi/pi-ai/usage/local-endpoint";
 import { createDefaultBillingRegistry } from "@oh-my-pi/pi-ai/usage/registry";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
@@ -321,9 +322,18 @@ export function fundingVerdict(
 	return { kind: "skipped", reason: { kind: "unauthorized" } };
 }
 
+/** Options of {@link providerBillingResults}. */
+export interface ProviderBillingOptions {
+	/** Base URL of the model being judged, read as billing evidence by self-hosted providers. */
+	baseUrl?: string;
+	registry?: ProviderBillingRegistry;
+}
+
 /**
  * Billing results of `provider`'s accounts from `reports`, with known evidence older than
- * `maxAgeMs` turned `stale`. `reports` undefined means the reports could not be read. A provider
+ * `maxAgeMs` turned `stale`. `reports` undefined means the reports could not be read. A
+ * self-hosted provider without a report of its own is judged from `options.baseUrl`
+ * ({@link localEndpointUsageReport}), whether or not the reports could be read. Any other provider
  * with no report yields one `unknown` result naming why.
  */
 export function providerBillingResults(
@@ -331,26 +341,30 @@ export function providerBillingResults(
 	reports: readonly UsageReport[],
 	nowMs: number,
 	maxAgeMs: number,
-	registry?: ProviderBillingRegistry,
+	options?: ProviderBillingOptions,
 ): BillingResult[];
 export function providerBillingResults(
 	provider: Provider,
 	reports: readonly UsageReport[] | undefined,
 	nowMs: number,
 	maxAgeMs: number,
-	registry?: ProviderBillingRegistry,
+	options?: ProviderBillingOptions,
 ): BillingResult[] | "unavailable";
 export function providerBillingResults(
 	provider: Provider,
 	reports: readonly UsageReport[] | undefined,
 	nowMs: number,
 	maxAgeMs: number,
-	registry: ProviderBillingRegistry = retryFallbackBillingRegistry,
+	options: ProviderBillingOptions = {},
 ): BillingResult[] | "unavailable" {
+	const registry = options.registry ?? retryFallbackBillingRegistry;
+	const own = reports?.filter(report => report.provider === provider) ?? [];
+	if (own.length > 0) return own.map(report => registry.readFresh(provider, report, nowMs, maxAgeMs));
+	const endpoint =
+		options.baseUrl === undefined ? undefined : localEndpointUsageReport(provider, options.baseUrl, nowMs);
+	if (endpoint) return [registry.read(provider, endpoint)];
 	if (reports === undefined) return "unavailable";
-	const own = reports.filter(report => report.provider === provider);
-	if (own.length === 0) return [registry.read(provider, null)];
-	return own.map(report => registry.readFresh(provider, report, nowMs, maxAgeMs));
+	return [registry.read(provider, null)];
 }
 
 /** Short user-facing description of a skip reason. */

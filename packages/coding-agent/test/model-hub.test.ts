@@ -1420,6 +1420,20 @@ describe("ModelHub", () => {
 			}
 		});
 
+		test("the source reads a self-hosted model's billing from its resolved endpoint", () => {
+			const endpoints: Record<string, string> = {
+				"vllm/on-box": "http://127.0.0.1:8000/v1",
+				"vllm/lan-box": "http://192.168.1.20:8000/v1",
+			};
+			const source = createModelBrowserSource(Settings.isolated(), undefined, {
+				usageReports: () => [],
+				modelBaseUrl: (provider, id) => endpoints[`${provider}/${id}`],
+			});
+			expect(source.billingFor?.("vllm/on-box")).toBe("free available uncapped");
+			expect(source.billingFor?.("vllm/lan-box")).toBe("unknown (no-evidence)");
+			expect(source.billingFor?.("vllm/unresolved")).toBe("unknown (no-report)");
+		});
+
 		test("a pool member row shows the member's billing from held reports", () => {
 			const settings = pooledSettings({ a: { model: "charm-hyper/model-a" } });
 			const { hub } = createHub({

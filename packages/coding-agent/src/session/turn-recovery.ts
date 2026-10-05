@@ -2266,7 +2266,7 @@ export class TurnRecovery {
 				});
 				return;
 			}
-			const evidence = this.#billingEvidenceReader(message.provider, atMs);
+			const evidence = this.#billingEvidenceReader(message.provider, atMs, model?.baseUrl);
 			for (const target of targets) {
 				// Each budget is recorded on its own, so one failure never skips the others.
 				try {
@@ -2406,10 +2406,14 @@ export class TurnRecovery {
 			.catch(error => logger.debug("Local budget notice failed", { error: String(error) }));
 	}
 
-	/** Billing results of `provider` for funding classification, read at most once per reader. */
+	/**
+	 * Billing results of `provider` for funding classification, read at most once per reader.
+	 * `baseUrl` is the charged model's endpoint, the evidence of self-hosted providers.
+	 */
 	#billingEvidenceReader(
 		provider: string,
 		nowMs: number,
+		baseUrl: string | undefined,
 	): (maxAgeMs: number) => Promise<BillingResult[] | "unavailable"> {
 		let reports: Promise<UsageReport[] | undefined> | undefined;
 		return async maxAgeMs => {
@@ -2427,7 +2431,7 @@ export class TurnRecovery {
 					return undefined;
 				}
 			})();
-			return providerBillingResults(provider, await reports, nowMs, maxAgeMs);
+			return providerBillingResults(provider, await reports, nowMs, maxAgeMs, { baseUrl });
 		};
 	}
 
@@ -2491,7 +2495,7 @@ export class TurnRecovery {
 		const targets = this.#localBudgetTargets(model);
 		if (targets.length === 0) return [];
 		const budgetSpend = ledgerBudgetSpend(this.#host.settings.getStorage()?.spendLedger, nowMs);
-		const evidence = this.#billingEvidenceReader(model.provider, nowMs);
+		const evidence = this.#billingEvidenceReader(model.provider, nowMs, model.baseUrl);
 		const refused: { id: string; reason: FundingSkipReason }[] = [];
 		for (const target of targets) {
 			const reason = meteredSpendingRefusal(target.policy.group.routing?.spending, budgetSpend);

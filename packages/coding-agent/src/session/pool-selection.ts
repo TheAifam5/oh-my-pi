@@ -344,7 +344,8 @@ export class PoolSelection {
 	 * Candidates of `policy`'s group that their provider's billing evidence authorizes
 	 * ({@link fundingVerdict}), in funding-stage order and given order within a stage. Usage reports
 	 * are read once per call, bounded by {@link QUOTA_ORDERING_DEADLINE_MS}; reports that do not
-	 * arrive in time leave every candidate's billing unavailable, so none is authorized. Returns no
+	 * arrive in time leave billing unavailable, so only self-hosted candidates judged from their
+	 * endpoint ({@link providerBillingResults}) can be authorized. Returns no
 	 * candidates when `signal` aborts. Emits one notice naming the skipped candidates, unless it
 	 * repeats the last one for `purpose` and `label`.
 	 */
@@ -389,10 +390,11 @@ export class PoolSelection {
 		const skipped: FundingSkip[] = [];
 		const noticed: FundingSkip[] = [];
 		for (const [index, candidate] of candidates.entries()) {
-			const provider = options.resolveCandidate(candidate)?.provider ?? candidate.provider;
+			const model = options.resolveCandidate(candidate);
+			const provider = model?.provider ?? candidate.provider;
 			const verdict = fundingVerdict(
 				funding,
-				providerBillingResults(provider, reports, nowMs, maxAgeMs),
+				providerBillingResults(provider, reports, nowMs, maxAgeMs, { baseUrl: model?.baseUrl }),
 				routing?.spending,
 				budgetSpend,
 			);

@@ -6,8 +6,10 @@ import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
 import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	chargesLocalBudget,
 	fundingVerdict,
 	getRetryFallbackChainsWithGroups,
+	providerBillingResults,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 
 const NOW = 1_000_000_000;
@@ -176,6 +178,38 @@ describe("group funding verdicts from provider billing readers", () => {
 			kind: "skipped",
 			reason: { kind: "exhausted" },
 		});
+	});
+
+	it("funds a self-hosted model under free funding only from a loopback endpoint", () => {
+		const verdict = (provider: string, baseUrl: string, reports: UsageReport[] | undefined) =>
+			fundingVerdict(["free"], providerBillingResults(provider, reports, NOW, 60_000, { baseUrl }));
+
+		const funded = { kind: "funded", stage: 0, billingClass: "free" } as const;
+		const noEvidence = { kind: "skipped", reason: { kind: "unknown-evidence", reason: "no-evidence" } } as const;
+		expect(verdict("vllm", "http://127.0.0.1:8000/v1", [])).toEqual(funded);
+		// Endpoint evidence does not depend on usage reports that failed to arrive.
+		expect(verdict("lm-studio", "http://localhost:1234/v1", undefined)).toEqual(funded);
+		expect(verdict("vllm", "http://192.168.1.20:8000/v1", [])).toEqual(noEvidence);
+		expect(verdict("vllm", "https://inference.example.com/v1", [])).toEqual(noEvidence);
+		expect(verdict("openai", "http://localhost:8000/v1", [])).toEqual({
+			kind: "skipped",
+			reason: { kind: "unknown-evidence", reason: "no-reader" },
+		});
+		// A report of the provider's own wins over the model's endpoint.
+		const own: UsageReport = {
+			provider: "vllm",
+			fetchedAt: NOW,
+			limits: [],
+			metadata: { baseUrl: "https://gateway.example.com/v1" },
+		};
+		expect(verdict("vllm", "http://127.0.0.1:8000/v1", [own])).toEqual(noEvidence);
+	});
+
+	it("leaves a free-funded loopback call off the local budget and charges a LAN one", () => {
+		const charges = (baseUrl: string) =>
+			chargesLocalBudget(["free", "metered"], providerBillingResults("vllm", [], NOW, 60_000, { baseUrl }));
+		expect(charges("http://[::1]:8000/v1")).toBe(false);
+		expect(charges("http://10.0.0.1:8000/v1")).toBe(true);
 	});
 });
 

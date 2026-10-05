@@ -16,6 +16,7 @@ import { googleGeminiCliBilling, googleGeminiCliUsageProvider } from "./gemini";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "./github-copilot";
 import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
 import { kimiBilling, kimiRankingStrategy, kimiUsageProvider } from "./kimi";
+import { localEndpointBillingReaders } from "./local-endpoint";
 import { museCodeUsageProvider } from "./muse-code";
 import { minimaxCodeUsageProvider } from "./minimax-code";
 import { moonshotBilling, moonshotUsageProvider } from "./moonshot";
@@ -136,6 +137,7 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	noEvidenceBilling("umans"),
 	noEvidenceBilling("ollama"),
 	noEvidenceBilling("ollama-cloud"),
+	...localEndpointBillingReaders,
 ];
 
 const DEFAULT_BILLING_READER_MAP = new Map<Provider, ProviderBilling>(
