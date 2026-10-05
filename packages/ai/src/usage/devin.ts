@@ -34,6 +34,14 @@ import type {
 	UsageScope,
 	UsageWindow,
 } from "../usage";
+import {
+	type BillingMode,
+	type BillingSource,
+	knownBilling,
+	type ProviderBilling,
+	sourceFromLimit,
+	unknownBilling,
+} from "./billing";
 import { DAY_MS, parsePositiveTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const PROVIDER = "devin";
@@ -308,4 +316,35 @@ export const devinUsageProvider: UsageProvider = {
 	fetchUsage: fetchDevinUsage,
 	supports: params => params.provider === PROVIDER && devinCredential(params.credential) !== undefined,
 	validatesCredentials: true,
+};
+
+/** Credit buckets in draw order: monthly plan grants first, then purchased flex credits. */
+const DEVIN_BILLING_BUCKETS: readonly { id: string; mode: BillingMode }[] = [
+	{ id: "devin:credits:prompt", mode: "subscription-included" },
+	{ id: "devin:credits:flow", mode: "subscription-included" },
+	{ id: "devin:credits:flex", mode: "prepaid-credits" },
+];
+
+/**
+ * Devin billing: the plan's prompt and flow credit grants, then purchased flex
+ * credits. The overage balance is not a source because the report does not say
+ * whether it is owed or available.
+ */
+export const devinBilling: ProviderBilling = {
+	id: PROVIDER,
+	readBilling(report) {
+		const sources: BillingSource[] = [];
+		for (const bucket of DEVIN_BILLING_BUCKETS) {
+			const limit = report.limits.find(entry => entry.id === bucket.id);
+			if (!limit) continue;
+			// Credit buckets are reported in the `unknown` unit; their amounts are credit counts.
+			const credits: UsageLimit = { ...limit, amount: { ...limit.amount, unit: "credits" } };
+			// The bucket window is the plan period, which resets plan grants but not purchased credits.
+			if (bucket.mode === "prepaid-credits") delete credits.window;
+			const source = sourceFromLimit(bucket.mode, credits);
+			if (!source) return unknownBilling(report, "malformed");
+			sources.push(source);
+		}
+		return sources.length > 0 ? knownBilling(report, sources) : unknownBilling(report, "no-evidence");
+	},
 };

@@ -7,7 +7,7 @@ import { claudeBilling, claudeRankingStrategy, claudeUsageProvider } from "./cla
 import { clinePassUsageProvider } from "./cline-pass";
 import { commandCodeBilling, commandCodeRankingStrategy, commandCodeUsageProvider } from "./commandcode";
 import { cursorBilling, cursorRankingStrategy, cursorUsageProvider } from "./cursor";
-import { devinUsageProvider } from "./devin";
+import { devinBilling, devinUsageProvider } from "./devin";
 import { factoryDroidBilling, factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
 import { googleGeminiCliUsageProvider } from "./gemini";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "./github-copilot";
@@ -18,6 +18,7 @@ import { minimaxCodeUsageProvider } from "./minimax-code";
 import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
 import { opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
+import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
 import { syntheticBilling, syntheticUsageProvider } from "./synthetic";
 import { umansUsageProvider } from "./umans";
 import { xaiOauthRankingStrategy, xaiOauthUsageProvider } from "./xai-oauth";
@@ -50,6 +51,7 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	devinUsageProvider,
 	charmHyperUsageProvider,
 	commandCodeUsageProvider,
+	openrouterUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -90,6 +92,8 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	charmHyperBilling,
 	commandCodeBilling,
 	syntheticBilling,
+	devinBilling,
+	openrouterBilling,
 ];
 
 const DEFAULT_BILLING_READER_MAP = new Map<Provider, ProviderBilling>(
