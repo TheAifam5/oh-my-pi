@@ -33,6 +33,11 @@ export const commands: CommandEntry[] = [
 		},
 	},
 	{
+		name: "account",
+		load: () => import("./commands/account").then(m => m.default),
+		help: commandHelp.accountHelp,
+	},
+	{
 		name: "acp",
 		load: () => import("./commands/acp").then(m => m.default),
 		help: commandHelp.acpHelp,

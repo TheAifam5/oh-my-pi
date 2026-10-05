@@ -4,6 +4,10 @@ export const acpHelp = {
 	description: "Run omp as an ACP (Agent Client Protocol) server over stdio",
 } satisfies CommandMetadata;
 
+export const accountHelp = {
+	description: "List, name, prioritize, pin, and log out stored provider accounts",
+} satisfies CommandMetadata;
+
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;
 
 export const authBrokerHelp = {

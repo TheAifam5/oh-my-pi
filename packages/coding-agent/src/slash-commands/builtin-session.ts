@@ -689,9 +689,10 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "logout",
+		name: "account",
+		aliases: ["logout"],
 		icon: "signOut",
-		description: "Logout from OAuth provider",
+		description: "Manage stored provider accounts: log out, pin to this session or project, name",
 		inlineHint: "[provider]",
 		allowArgs: true,
 		handleTui: (command, runtime) => {

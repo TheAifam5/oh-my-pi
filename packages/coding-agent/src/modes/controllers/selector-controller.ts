@@ -53,6 +53,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import { labelAccount, listAccounts, logoutAccount, pinProjectAccount } from "../../session/account-admin";
 import type { SessionAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -70,8 +71,8 @@ import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
 import { FileSessionStorage } from "../../session/session-storage";
-import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
-import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
+import { type LogoutAccountAnnotation, listLogoutAccounts } from "../../slash-commands/helpers/logout";
+import type { AccountSelectorAction, LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
 import { describeSessionPinOutcome, toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
 import {
@@ -172,6 +173,13 @@ interface ProviderAuthUiModules {
 	LogoutAccountSelectorComponent: typeof LogoutAccountSelectorComponentType;
 	OAuthSelectorComponent: typeof OAuthSelectorComponentType;
 }
+
+/** `/account` selector actions besides Enter (log out). */
+const ACCOUNT_SELECTOR_ACTIONS: readonly AccountSelectorAction[] = [
+	{ id: "pin-session", label: "pin session", key: "s" },
+	{ id: "pin-project", label: "pin project", key: "p" },
+	{ id: "label", label: "name", key: "l" },
+];
 
 /** Synchronous first-use boundary for provider auth catalog and dialog components. */
 function loadProviderAuthUi(): ProviderAuthUiModules {
@@ -2054,17 +2062,27 @@ export class SelectorController {
 
 	async #handleCredentialLogout(providerId: string, account: LogoutAccount): Promise<void> {
 		try {
-			const { removed, remainingSource } = await logoutCredential(
-				this.ctx.session.modelRegistry,
-				providerId,
-				account.credentialId,
-				this.ctx.session.sessionId,
-			);
-			if (!removed) {
+			const session = this.ctx.session;
+			const authStorage = session.modelRegistry.authStorage;
+			const { getOAuthCredentialProvider } = loadProviderAuthUi();
+			const provider = getOAuthCredentialProvider(providerId);
+			// Reload so an id stored by another process is found, not reported missing.
+			await authStorage.credentials.reload();
+			const stored = authStorage.sessions
+				.accounts(provider)
+				.find(candidate => candidate.credentialId === account.credentialId);
+			if (!stored) {
 				this.ctx.showError(`Logout skipped: ${account.label} is no longer stored for ${providerId}.`);
 				return;
 			}
+			const result = await logoutAccount(session.settings, authStorage, { provider, account: stored });
 
+			// Provider-scoped online refresh so the removed credential's stale
+			// endpoint/deployment models are invalidated deterministically; the
+			// default all-provider `online-if-uncached` would reuse the fresh
+			// authoritative cache row and keep showing models the credential
+			// unlocked (#5780). Other providers are left untouched.
+			await session.modelRegistry.refreshProvider(provider, "online");
 			const block = new TranscriptBlock();
 			block.addChild(
 				new Text(
@@ -2077,6 +2095,16 @@ export class SelectorController {
 				),
 			);
 			block.addChild(new Text(theme.fg("dim", `Credential removed from ${getAgentDbPath()}`), 1, 0));
+			for (const warning of [
+				result.warning,
+				...result.pinnedProjects.map(
+					project =>
+						`${project} is still pinned to "${stored.name}"; its ${providerId} requests fail until unpinned`,
+				),
+			]) {
+				if (warning) block.addChild(new Text(theme.fg("warning", warning), 1, 0));
+			}
+			const remainingSource = authStorage.keys.describe(provider, session.sessionId);
 			if (remainingSource) {
 				block.addChild(
 					new Text(theme.fg("warning", `${providerId} is still authenticated via ${remainingSource}`), 1, 0),
@@ -2088,11 +2116,91 @@ export class SelectorController {
 		}
 	}
 
+	/** Runs one `/account` action on the selected account; failures surface as warnings, nothing partial is written. */
+	async #handleAccountAction(providerId: string, account: LogoutAccount, actionId: string): Promise<void> {
+		const session = this.ctx.session;
+		const authStorage = session.modelRegistry.authStorage;
+		const stored = authStorage.sessions
+			.accounts(providerId)
+			.find(candidate => candidate.credentialId === account.credentialId);
+		if (!stored) {
+			this.ctx.showWarning(`${account.label} is no longer stored for ${providerId}.`);
+			return;
+		}
+		const ref = { provider: providerId, account: stored };
+		try {
+			if (actionId === "pin-session") {
+				const outcome = session.pinProviderAccount(providerId, stored.credentialId);
+				const message = describeSessionPinOutcome(outcome, account.label, providerId);
+				if (outcome === "pinned") this.ctx.showStatus(message);
+				else this.ctx.showWarning(message);
+				return;
+			}
+			let name = stored.name;
+			if (actionId === "label" || (actionId === "pin-project" && name === undefined)) {
+				const entered = (await this.ctx.showHookInput(`Name for ${account.label}`, name ?? "work"))?.trim();
+				if (!entered) return;
+				const labeled = labelAccount(session.settings, authStorage, ref, entered);
+				if (labeled.warning) this.ctx.showWarning(labeled.warning);
+				name = entered;
+				if (actionId === "label") {
+					this.ctx.showStatus(`Named ${account.label} "${entered}".`);
+					return;
+				}
+			}
+			if (actionId === "pin-project") {
+				const pinned = pinProjectAccount(
+					session.settings,
+					authStorage,
+					session.sessionManager.getCwd(),
+					`${providerId}/${name}`,
+				);
+				if (pinned.warning) this.ctx.showWarning(pinned.warning);
+				this.ctx.showStatus(`Pinned ${providerId} to "${pinned.name}" for ${pinned.projectDir}.`);
+			}
+		} catch (error: unknown) {
+			this.ctx.showWarning(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.ctx.statusLine.invalidate();
+			this.ctx.ui.requestRender();
+		}
+	}
+
+	/** Names, priorities, reserves, and pin marks of `providerId`'s stored accounts, by credential id. */
+	#accountAnnotations(providerId: string): Map<number, LogoutAccountAnnotation> {
+		const session = this.ctx.session;
+		const authStorage = session.modelRegistry.authStorage;
+		const sessionPinned = new Set(
+			authStorage.sessions
+				.accounts(providerId, session.sessionId)
+				.filter(account => account.pinned)
+				.map(account => account.credentialId),
+		);
+		const annotations = new Map<number, LogoutAccountAnnotation>();
+		for (const row of listAccounts(session.settings, authStorage, session.sessionManager.getCwd())) {
+			if (row.provider !== providerId) continue;
+			const facts = [
+				row.account.keyFingerprint !== undefined ? `key ${row.account.keyFingerprint}` : undefined,
+				row.priority !== undefined ? `priority ${row.priority}` : undefined,
+				row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
+				sessionPinned.has(row.account.credentialId) ? "pinned" : undefined,
+				row.projectPinned ? "project pin" : undefined,
+			].filter((fact): fact is string => fact !== undefined);
+			annotations.set(row.account.credentialId, { ...(row.account.name ? { name: row.account.name } : {}), facts });
+		}
+		return annotations;
+	}
+
 	async #showOAuthLogoutAccountSelector(providerId: string): Promise<void> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let accounts: LogoutAccount[];
 		try {
-			accounts = await listLogoutAccounts(authStorage, providerId, this.ctx.session.sessionId);
+			accounts = await listLogoutAccounts(
+				authStorage,
+				providerId,
+				this.ctx.session.sessionId,
+				this.#accountAnnotations(providerId),
+			);
 		} catch (error: unknown) {
 			this.ctx.showError(
 				`Could not load stored credentials: ${error instanceof Error ? error.message : String(error)}`,
@@ -2111,9 +2219,10 @@ export class SelectorController {
 			return;
 		}
 
+		const providerName = provider?.name ?? providerId;
 		this.showSelector(done => {
 			const selector = new LogoutAccountSelectorComponent(
-				provider?.name ?? providerId,
+				providerName,
 				accounts,
 				account => {
 					done();
@@ -2122,6 +2231,14 @@ export class SelectorController {
 				() => {
 					done();
 					this.ctx.ui.requestRender();
+				},
+				{
+					title: `${providerName} accounts`,
+					actions: ACCOUNT_SELECTOR_ACTIONS,
+					onAction: (account, actionId) => {
+						done();
+						void this.#handleAccountAction(providerId, account, actionId);
+					},
 				},
 			);
 			return { component: selector, focus: selector };

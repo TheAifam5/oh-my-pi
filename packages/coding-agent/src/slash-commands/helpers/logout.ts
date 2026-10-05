@@ -4,9 +4,17 @@ import type { AuthStorage, OAuthAccountIdentity, StoredAuthCredential } from "..
 
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 
+/** Account name and extra facts (priority, reserve, pins) shown for one stored credential. */
+export interface LogoutAccountAnnotation {
+	name?: string;
+	facts: readonly string[];
+}
+
 interface LogoutAccountOptions {
 	activeIdentity?: OAuthAccountIdentity;
 	activeApiKey?: boolean;
+	/** Annotations by credential id; a named account leads its label with the name. */
+	annotations?: ReadonlyMap<number, LogoutAccountAnnotation>;
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -82,7 +90,10 @@ export function toLogoutAccounts(
 ): LogoutAccount[] {
 	return credentials
 		.map(row => {
-			const label = oauthLabel(row);
+			const annotation = options.annotations?.get(row.id);
+			const baseLabel = oauthLabel(row);
+			const label = annotation?.name ? `${annotation.name} (${baseLabel})` : baseLabel;
+			const detail = [oauthDetail(row, baseLabel), ...(annotation?.facts ?? [])].join(" · ");
 			const active =
 				row.credential.type === "oauth"
 					? oauthMatchesActiveIdentity(row, options.activeIdentity)
@@ -91,7 +102,7 @@ export function toLogoutAccounts(
 				credentialId: row.id,
 				provider,
 				label,
-				detail: oauthDetail(row, label),
+				detail,
 				type: row.credential.type,
 				active,
 			} satisfies LogoutAccount;
@@ -107,12 +118,14 @@ export async function listLogoutAccounts(
 	authStorage: AuthStorage,
 	loginProvider: string,
 	sessionId: string,
+	annotations?: ReadonlyMap<number, LogoutAccountAnnotation>,
 ): Promise<LogoutAccount[]> {
 	const provider = getOAuthCredentialProvider(loginProvider);
 	await authStorage.credentials.reload();
 	return toLogoutAccounts(provider, authStorage.credentials.list(provider), {
 		activeIdentity: authStorage.oauth.identity(provider, sessionId),
 		activeApiKey: authStorage.keys.source(provider)?.kind === "api_key",
+		annotations,
 	});
 }
 

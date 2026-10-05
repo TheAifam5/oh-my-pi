@@ -5,6 +5,7 @@ import { OverlayPanel } from "../chrome/overlay-box";
 import { MenuSelection } from "../components/menu-selection";
 import { centeredViewportRange } from "../components/scroll-viewport";
 import { formatKeyHint } from "../app-keybindings";
+import type { KeyId } from "../keys";
 import { editorKey, editorKeys } from "../chrome/keybinding-hints";
 import { node, span } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
@@ -23,7 +24,22 @@ export interface LogoutAccount {
 	active: boolean;
 }
 
-/** Account picker for `/logout` after the provider has been selected. */
+/** An extra action on the selected account, triggered by a single-character key. */
+export interface AccountSelectorAction {
+	id: string;
+	label: string;
+	/** A single printable character key, e.g. `s`. */
+	key: KeyId;
+}
+
+/** Optional title and per-account actions; Enter always logs the account out. */
+export interface LogoutAccountSelectorOptions {
+	title?: string;
+	actions?: readonly AccountSelectorAction[];
+	onAction?: (account: LogoutAccount, actionId: string) => void;
+}
+
+/** Account picker for `/account` and `/logout` after the provider has been selected. */
 export class LogoutAccountSelectorComponent extends OverlayPanel {
 	#listContainer: Container;
 	#menu: MenuSelection<LogoutAccount>;
@@ -36,14 +52,19 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 	#pickerItems: readonly TspPickerItem[] | undefined;
 	readonly #providerName: string;
 	readonly #accounts: readonly LogoutAccount[];
+	readonly #actions: readonly AccountSelectorAction[];
+	readonly #onAction: ((account: LogoutAccount, actionId: string) => void) | undefined;
 
 	constructor(
 		providerName: string,
 		accounts: LogoutAccount[],
 		onSelect: (account: LogoutAccount) => void,
 		onCancel: () => void,
+		options: LogoutAccountSelectorOptions = {},
 	) {
-		super(`Select ${providerName} account to log out`, "omp.overlay.logout");
+		super(options.title ?? `Select ${providerName} account to log out`, "omp.overlay.logout");
+		this.#actions = options.onAction ? (options.actions ?? []) : [];
+		this.#onAction = options.onAction;
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#providerName = providerName;
@@ -105,7 +126,7 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 			new TruncatedText(
 				theme.fg(
 					"muted",
-					`${editorKeys("tui.select.up", "tui.select.down")} select · ${formatKeyHint("enter")} log out account · ${editorKey("tui.select.cancel")} cancel`,
+					`${editorKeys("tui.select.up", "tui.select.down")} select · ${formatKeyHint("enter")} log out account · ${this.#actions.map(action => `${action.key} ${action.label} · `).join("")}${editorKey("tui.select.cancel")} cancel`,
 				),
 				0,
 				0,
@@ -116,6 +137,11 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 	handleInput(keyData: string): void {
 		if (matchesSelectCancel(keyData)) {
 			this.#onCancelCallback();
+			return;
+		}
+		const action = this.#actions.find(candidate => matchesKey(keyData, candidate.key));
+		if (action) {
+			this.#runAction(action.id);
 			return;
 		}
 
@@ -142,6 +168,11 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 		this.#onSelectCallback(account);
 	}
 
+	#runAction(actionId: string): void {
+		const account = this.#menu.selectedItem;
+		if (account) this.#onAction?.(account, actionId);
+	}
+
 	override describe(cx: DescribeContext): NativeNode {
 		if (cx.supports("picker")) {
 			this.#pickerRoot ??= dockedPicker({
@@ -162,7 +193,11 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 				current: this.#accounts.filter(account => account.active).map(account => String(account.credentialId)),
 				selected: this.#menu.selectedKey ?? null,
 				empty: "No stored accounts to log out",
-				actions: [pickerAction("confirm", "Sign out", "enter", { primary: true, danger: true }), CLOSE_ACTION],
+				actions: [
+					pickerAction("confirm", "Sign out", "enter", { primary: true, danger: true }),
+					...this.#actions.map(action => pickerAction(action.id, action.label, action.key)),
+					CLOSE_ACTION,
+				],
 			});
 			return this.#pickerRoot;
 		}
@@ -193,6 +228,7 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 			(this.#nativeHints ??= hintsRow([
 				actionHint(["tui.select.up", "tui.select.down"], "select"),
 				{ keys: ["enter"], label: "log out account" },
+				...this.#actions.map(action => ({ keys: [action.key], label: action.label })),
 				actionHint("tui.select.cancel", "cancel"),
 			])),
 		]);
@@ -205,6 +241,7 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 		if (ev?.kind === "action") {
 			if (ev.act === "confirm") this.#confirmSelection();
 			else if (ev.act === "close" || ev.act === "cancel") this.#onCancelCallback();
+			else if (this.#actions.some(action => action.id === ev.act)) this.#runAction(ev.act);
 			return;
 		}
 		if (ev?.kind === "select") {

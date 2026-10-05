@@ -13205,6 +13205,11 @@ export class AgentSession implements SettingsScope {
 	pinCurrentProviderAccount(credentialId: number): SessionPinOutcome {
 		const provider = this.model?.provider;
 		if (!provider) return "no-model";
+		return this.pinProviderAccount(provider, credentialId);
+	}
+
+	/** Like {@link pinCurrentProviderAccount}, for an explicit `provider` (the `/account` selector). */
+	pinProviderAccount(provider: string, credentialId: number): SessionPinOutcome {
 		if (this.isStreaming) return "streaming";
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.sessions.pin(provider, this.sessionId, credentialId)) {
