@@ -212,7 +212,7 @@ import {
 } from "./session/retry-fallback-chains";
 import { getSelectorFallbackChains } from "./session/retry-fallback-selector-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
-import { rolePoolMemberSelectors } from "./session/retry-fallback-groups";
+import { retryFallbackBillingRegistry, rolePoolMemberSelectors } from "./session/retry-fallback-groups";
 import { createRolePoolCall, pickRolePoolTarget } from "./session/role-pool-resolution";
 import {
 	notePoolPickApplied,
@@ -1843,6 +1843,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 	// Project pins and pool member accounts resolve from each session's own settings and cwd.
 	authStorage.sessions.setAccountPinSource(settingsAccountPinSource);
+	// Drain targets read billing evidence through the same readers as group funding filters. The
+	// shared auth storage outlives this session, so the source must not be a closure over this scope.
+	authStorage.usage.setBillingSource(retryFallbackBillingRegistry);
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
 	// listener set non-empty from construction, which defeats AuthStorage's no-listener

@@ -1,5 +1,11 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import {
+	DRAIN_RETURN_TRIGGERS,
+	DRAIN_SPEND_CLASSES,
+	type DrainReturnTrigger,
+	type DrainSpendClass,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
 import { setAccountDrain } from "../session/account-admin";
@@ -188,17 +194,49 @@ async function handleSessionPinCommand(
 	);
 }
 
-/** `/session drain <account|off> [--save]`: one drain target per provider, session-only unless saved. */
+const SESSION_DRAIN_USAGE =
+	"Usage: /session drain <account|off> [--save [--spend plan,credits,money] [--return-when reset,credits-added,money-available]]";
+
+/** Comma-separated members of `allowed`, or undefined when any entry is not one. */
+function parseDrainList<T extends string>(value: string | undefined, allowed: readonly T[]): T[] | undefined {
+	const entries = value?.split(",").filter(Boolean) ?? [];
+	if (entries.length === 0) return undefined;
+	return entries.every(entry => (allowed as readonly string[]).includes(entry)) ? (entries as T[]) : undefined;
+}
+
+/**
+ * `/session drain <account|off> [--save [--spend …] [--return-when …]]`: one
+ * drain target per provider, session-only unless saved; `--spend` and
+ * `--return-when` are written with `--save` only.
+ */
 async function handleSessionDrainCommand(
 	arg: string,
 	session: AgentSession,
 	output: SlashCommandRuntime["output"],
 ): Promise<void> {
 	const words = arg.split(/\s+/).filter(Boolean);
-	const save = words.includes("--save");
-	const selector = words.filter(word => word !== "--save").join(" ");
-	if (!selector) {
-		await output("Usage: /session drain <account|off> [--save]");
+	let save = false;
+	let spend: DrainSpendClass[] | undefined;
+	let returnWhen: DrainReturnTrigger[] | undefined;
+	let malformed = false;
+	const selectorWords: string[] = [];
+	for (let index = 0; index < words.length; index += 1) {
+		const word = words[index]!;
+		if (word === "--save") {
+			save = true;
+		} else if (word === "--spend") {
+			spend = parseDrainList(words[++index], DRAIN_SPEND_CLASSES);
+			malformed ||= !spend;
+		} else if (word === "--return-when") {
+			returnWhen = parseDrainList(words[++index], DRAIN_RETURN_TRIGGERS);
+			malformed ||= !returnWhen;
+		} else {
+			selectorWords.push(word);
+		}
+	}
+	const selector = selectorWords.join(" ");
+	if (malformed || !selector || ((spend || returnWhen) && (!save || selector === "off"))) {
+		await output(SESSION_DRAIN_USAGE);
 		return;
 	}
 	let accountList: SessionAccountList | undefined;
@@ -228,16 +266,13 @@ async function handleSessionDrainCommand(
 		}
 		target = oauth[0];
 	}
-	if (!session.drainCurrentProviderAccount(target?.credentialId ?? null)) {
+	if (session.isStreaming) {
 		await output("Cannot change the drained account right now.");
 		return;
 	}
 	const subject = target ? `${provider} account #${target.credentialId}` : undefined;
-	const lines = [
-		subject
-			? `This session uses ${subject} first until it is drained.`
-			: `This session drains no ${provider} account.`,
-	];
+	const lines: string[] = [];
+	// Save first: a rejected policy leaves the session drain unchanged too, so the two never diverge.
 	if (save) {
 		try {
 			const result = setAccountDrain(
@@ -245,13 +280,25 @@ async function handleSessionDrainCommand(
 				session.modelRegistry.authStorage,
 				provider,
 				target ? { provider, account: target } : undefined,
+				{ ...(spend ? { spend } : {}), ...(returnWhen ? { returnWhen } : {}) },
 			);
 			lines.push(subject ? `Saved: ${subject} is drained first in every session.` : "Saved: no account is drained.");
 			if (result.warning) lines.push(result.warning);
 		} catch (error) {
-			lines.push(`Not saved: ${errorMessage(error)}`);
+			await output(`Not saved: ${errorMessage(error)}`);
+			return;
 		}
 	}
+	if (!session.drainCurrentProviderAccount(target?.credentialId ?? null)) {
+		lines.push("Cannot change the drained account right now.");
+		await output(lines.join("\n"));
+		return;
+	}
+	lines.unshift(
+		subject
+			? `This session uses ${subject} first until it is drained.`
+			: `This session drains no ${provider} account.`,
+	);
 	if (accounts.some(account => account.pinned)) lines.push("A pinned account still serves this session exclusively.");
 	await output(lines.join("\n"));
 }
@@ -338,7 +385,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{
 				name: "drain",
 				description: "Use one OAuth account first until it is drained (--save keeps it for every session)",
-				usage: "<account|off> [--save]",
+				usage: "<account|off> [--save [--spend <classes>] [--return-when <triggers>]]",
 			},
 		],
 		allowArgs: true,

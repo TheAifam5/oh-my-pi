@@ -23,6 +23,10 @@ import {
 	AuthStorage,
 	type AuthStorageOptions,
 	DEFAULT_USAGE_RESERVE_PCT,
+	DRAIN_RETURN_TRIGGERS,
+	DRAIN_SPEND_CLASSES,
+	DRAIN_TRIGGER_SPEND_CLASS,
+	type DrainReturnTrigger,
 	SqliteAuthCredentialStore,
 } from "../auth-storage";
 import * as AIError from "../error";
@@ -118,7 +122,14 @@ const POLICY_FIELDS = [
 	"drain",
 	"returnMargin",
 	"returnCooldownMs",
+	"spend",
+	"returnWhen",
 ];
+
+/** Whether `value` is a list of members of `allowed`. */
+function isEnumList<T extends string>(value: unknown, allowed: readonly T[]): value is readonly T[] {
+	return Array.isArray(value) && value.every(entry => (allowed as readonly unknown[]).includes(entry));
+}
 
 function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 	if (value === undefined) return [];
@@ -180,6 +191,29 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 				throw new AIError.ConfigurationError(`${path}.${field} must be a finite number`);
 			}
 		}
+		const { spend, returnWhen } = policy;
+		if (spend !== undefined && !isEnumList(spend, DRAIN_SPEND_CLASSES)) {
+			throw new AIError.ConfigurationError(`${path}.spend must be a list of ${DRAIN_SPEND_CLASSES.join(", ")}`);
+		}
+		if (
+			returnWhen !== undefined &&
+			(!isEnumList([returnWhen].flat(), DRAIN_RETURN_TRIGGERS) ||
+				(Array.isArray(returnWhen) && returnWhen.length === 0))
+		) {
+			throw new AIError.ConfigurationError(
+				`${path}.returnWhen must be one or a non-empty list of ${DRAIN_RETURN_TRIGGERS.join(", ")}`,
+			);
+		}
+		if ((spend !== undefined || returnWhen !== undefined) && policy.drain !== true) {
+			throw new AIError.ConfigurationError(`${path}.spend and ${path}.returnWhen require drain: true`);
+		}
+		for (const [trigger, spendClass] of Object.entries(DRAIN_TRIGGER_SPEND_CLASS)) {
+			if ([returnWhen].flat().includes(trigger) && !spend?.includes(spendClass)) {
+				throw new AIError.ConfigurationError(
+					`${path}.returnWhen ${trigger} requires spend to include ${spendClass}`,
+				);
+			}
+		}
 		if (policy.priority !== undefined && (typeof policy.priority !== "number" || !Number.isFinite(policy.priority))) {
 			throw new AIError.ConfigurationError(`${path}.priority must be a finite number`);
 		}
@@ -208,6 +242,10 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			...(typeof policy.drain === "boolean" ? { drain: policy.drain } : {}),
 			...(typeof policy.returnMargin === "number" ? { returnMargin: policy.returnMargin } : {}),
 			...(typeof policy.returnCooldownMs === "number" ? { returnCooldownMs: policy.returnCooldownMs } : {}),
+			...(spend !== undefined ? { spend } : {}),
+			...(returnWhen !== undefined
+				? { returnWhen: returnWhen as DrainReturnTrigger | readonly DrainReturnTrigger[] }
+				: {}),
 		};
 	});
 }

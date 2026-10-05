@@ -27,6 +27,8 @@ export type UsageCandidate<T extends AuthCredential> = {
 	allowanceSpent?: boolean;
 	/** Present after ranking: this is the provider's drain target and it is serving first now. */
 	drainTarget?: boolean;
+	/** The drain target's spent plan is funded by an opted-in spend class, so its plan exhaustion is not a block. */
+	fundedOverage?: boolean;
 };
 
 /** OAuth credential eligible for usage ranking. */
@@ -158,5 +160,6 @@ export function orderUsageRankedCandidates<T extends AuthCredential>(
 		reserveMeasured: candidate.reserveMeasured,
 		allowanceSpent: candidate.allowanceSpent,
 		drainTarget: candidate.drainTarget,
+		...(candidate.fundedOverage ? { fundedOverage: true } : {}),
 	}));
 }

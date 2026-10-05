@@ -148,7 +148,7 @@ function patchedPolicies(
 	authStorage: AuthStorage,
 	policies: AuthAccountPolicies,
 	ref: AccountRef,
-	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct" | "drain">>,
+	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct" | "drain" | "spend" | "returnWhen">>,
 ): AuthAccountPolicy[] {
 	const index = policies.findIndex(policy => matchesPolicy(policy, ref));
 	const next = [...policies];
@@ -195,26 +195,42 @@ function writePolicy(
 
 /**
  * Make `ref` the OAuth account `provider` drains first, or with `ref`
- * undefined, drain none; the other accounts of the provider lose `drain`.
+ * undefined, drain none; the other accounts of the provider lose `drain`,
+ * `spend`, and `returnWhen`. `funding` fields replace those of `ref`'s entry;
+ * omitted ones keep the values it had while already drained, and the defaults
+ * (`spend` of only `plan`, `returnWhen` of only `reset`) remove the field.
  */
 export function setAccountDrain(
 	settings: Settings,
 	authStorage: AuthStorage,
 	provider: string,
 	ref: AccountRef | undefined,
+	funding: Partial<Pick<AuthAccountPolicy, "spend" | "returnWhen">> = {},
 ): AccountWriteResult {
 	if (ref && ref.account.type !== "oauth") throw new AccountAdminError("Only OAuth accounts can be drained.");
+	const current = userPolicies(settings);
+	const previous = ref ? current.find(policy => policy.drain === true && matchesPolicy(policy, ref)) : undefined;
 	// An entry left with only its provider and account would still switch on the policy reserve; drop it.
-	const cleared = userPolicies(settings).flatMap(policy => {
+	const cleared = current.flatMap(policy => {
 		if (policy.provider !== provider || policy.drain === undefined) return [policy];
-		const { drain: _drain, ...rest } = policy;
+		const { drain: _drain, spend: _spend, returnWhen: _returnWhen, ...rest } = policy;
 		return Object.keys(rest).every(key => key === "provider" || key === "account") ? [] : [rest];
 	});
+	const spend = funding.spend ?? previous?.spend;
+	const returnWhen = funding.returnWhen ?? previous?.returnWhen;
+	const keepSpend = spend?.some(spendClass => spendClass !== "plan") === true;
+	const keepReturnWhen = returnWhen !== undefined && [returnWhen].flat().some(trigger => trigger !== "reset");
 	return commitPolicies(
 		settings,
 		authStorage,
 		provider,
-		ref ? patchedPolicies(authStorage, cleared, ref, { drain: true }) : cleared,
+		ref
+			? patchedPolicies(authStorage, cleared, ref, {
+					drain: true,
+					...(keepSpend ? { spend } : {}),
+					...(keepReturnWhen ? { returnWhen } : {}),
+				})
+			: cleared,
 	);
 }
 

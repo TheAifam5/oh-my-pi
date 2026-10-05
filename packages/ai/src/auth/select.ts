@@ -4,6 +4,7 @@ import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
+import type { BillingMode, BillingSnapshot, BillingSource, DecimalQuantity } from "../usage/billing";
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
 import {
@@ -35,6 +36,8 @@ import {
 	type AuthCredential,
 	DEFAULT_DRAIN_RETURN_COOLDOWN_MS,
 	DEFAULT_DRAIN_RETURN_MARGIN_PCT,
+	type DrainReturnTrigger,
+	type DrainSpendClass,
 	type OAuthCredential,
 	type StoredAuthCredential,
 } from "./types";
@@ -70,10 +73,72 @@ export type TryOAuthOptions = {
 	allowFallback?: boolean;
 	/** Receives a non-definitive refresh failure that left this credential unusable; the caller filters for retryable ones. */
 	onTransientRefreshFailure?: (error: unknown) => void;
+	/** The drain target's spent plan is funded by an opted-in spend class: a reached usage limit in its report does not reject it. */
+	fundedOverage?: boolean;
 };
 
-/** The account a session drains first, with its return hysteresis. */
-type DrainTarget = { index: number; credentialId: number; returnFraction: number; cooldownMs: number };
+/** The account a session drains first, with what it may spend and its return hysteresis and triggers. */
+type DrainTarget = {
+	provider: string;
+	index: number;
+	credentialId: number;
+	returnFraction: number;
+	cooldownMs: number;
+	spend: readonly DrainSpendClass[];
+	returnWhen: readonly DrainReturnTrigger[];
+};
+
+/** Billing evidence of a drain target's usage report, or why there is none. */
+type DrainBilling = { snapshot?: BillingSnapshot; unavailable?: string };
+
+/** Drain state of one target and block scope: when it drained and its billing evidence then. */
+type DrainedState = { since: number; baseline?: BillingSnapshot };
+
+const SPEND_CLASS_MODES: Record<Exclude<DrainSpendClass, "plan">, readonly BillingMode[]> = {
+	credits: ["prepaid-credits"],
+	money: ["paid-extra-usage", "metered"],
+};
+
+function sourcesOf(snapshot: BillingSnapshot | undefined, spendClass: keyof typeof SPEND_CLASS_MODES): BillingSource[] {
+	return snapshot?.sources.filter(source => SPEND_CLASS_MODES[spendClass].includes(source.mode)) ?? [];
+}
+
+function classAvailable(snapshot: BillingSnapshot | undefined, spendClass: keyof typeof SPEND_CLASS_MODES): boolean {
+	return sourcesOf(snapshot, spendClass).some(source => source.state === "available");
+}
+
+/** Whether `snapshot` reports the class exhausted or disabled; `unknown` is no verdict. */
+function classSpent(snapshot: BillingSnapshot, spendClass: keyof typeof SPEND_CLASS_MODES): boolean {
+	const sources = sourcesOf(snapshot, spendClass);
+	return (
+		!sources.some(source => source.state === "available") &&
+		sources.some(source => source.state === "exhausted" || source.state === "disabled")
+	);
+}
+
+/** Reported remaining prepaid credit balances in `snapshot`. */
+function creditBalances(snapshot: BillingSnapshot): DecimalQuantity[] {
+	return sourcesOf(snapshot, "credits").flatMap(source =>
+		source.allowance?.kind === "credits" && source.allowance.remaining ? [source.allowance.remaining] : [],
+	);
+}
+
+/** Whether `current` shows prepaid credits added since `baseline`: a larger balance, or spent credits available again. */
+function creditsAdded(baseline: BillingSnapshot, current: BillingSnapshot): boolean {
+	if (!classAvailable(current, "credits")) return false;
+	if (classSpent(baseline, "credits")) return true;
+	if (!classAvailable(baseline, "credits")) return false;
+	const before = creditBalances(baseline);
+	const after = creditBalances(current);
+	if (before.length === 0 || after.length === 0) return false;
+	const exponent = Math.max(...[...before, ...after].map(quantity => quantity.exponent));
+	const total = (quantities: DecimalQuantity[]) =>
+		quantities.reduce(
+			(sum, quantity) => sum + BigInt(quantity.amountMinor) * 10n ** BigInt(exponent - quantity.exponent),
+			0n,
+		);
+	return total(after) > total(before);
+}
 
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
 export interface CredentialSelectorDeps {
@@ -92,7 +157,9 @@ export class CredentialSelector {
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** When each drain target last drained, by `rowId\0blockScope`; cleared once it returns. Process-local. */
-	#drainedSince: Map<string, number> = new Map();
+	#drainedSince: Map<string, DrainedState> = new Map();
+	/** Drain billing warnings already logged, by `provider\0kind`. */
+	#warnedNoBilling = new Set<string>();
 	#deps: CredentialSelectorDeps;
 
 	constructor(deps: CredentialSelectorDeps) {
@@ -451,8 +518,15 @@ export class CredentialSelector {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
+			const isDrainTarget = args.drain?.index === selection.index;
+			const billing = isDrainTarget && args.drain ? this.#drainBilling(args.provider, args.drain, usage) : undefined;
+			// The plan exhaustion an opted-in spend class still pays for is not a block; stored blocks (429s) still are.
+			const fundedOverage =
+				args.drain?.spend.some(
+					spendClass => spendClass !== "plan" && classAvailable(billing?.snapshot, spendClass),
+				) ?? false;
 			const scopedLimits = usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
-			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
+			if (!blocked && !fundedOverage && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
 				this.#deps.blocks.mark(
@@ -473,9 +547,9 @@ export class CredentialSelector {
 				strategy === undefined ? remainingFraction !== undefined : primary !== undefined || secondary !== undefined;
 			const primaryUncapped = primary === undefined && secondary !== undefined;
 			const policy = this.#deps.policies.forCredential(args.provider, selection.credential);
-			const drainTarget =
-				args.drain?.index === selection.index &&
-				this.#drainServing(
+			let drainTarget = false;
+			if (isDrainTarget && args.drain) {
+				drainTarget = this.#drainServing(
 					args.drain,
 					args.blockScope,
 					this.#usageBlocked(
@@ -483,10 +557,13 @@ export class CredentialSelector {
 						args.providerKey,
 						selection.index,
 						args.blockScopes ?? (args.blockScope ? [args.blockScope] : []),
-					) || remainingFraction === 0,
+					) ||
+						(remainingFraction === 0 && !fundedOverage),
 					remainingFraction,
 					nowMs,
+					billing,
 				);
+			}
 			const reservePct = drainTarget ? undefined : (policy?.reservePct ?? args.defaultReservePct);
 			const reserveFraction =
 				reservePct === undefined || !Number.isFinite(reservePct)
@@ -503,6 +580,7 @@ export class CredentialSelector {
 				reserveMeasured: reserveFraction !== undefined && remainingFraction !== undefined,
 				accountPriority: policy?.priority === undefined || !Number.isFinite(policy.priority) ? 0 : policy.priority,
 				drainTarget,
+				...(fundedOverage ? { fundedOverage } : {}),
 				allowanceSpent: remainingFraction === 0,
 				usageMeasured,
 				hasPriorityBoost: strategy?.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
@@ -544,14 +622,47 @@ export class CredentialSelector {
 			credentialId: entries[index]!.id,
 			returnFraction: (policy?.returnMargin ?? DEFAULT_DRAIN_RETURN_MARGIN_PCT) / 100,
 			cooldownMs: policy?.returnCooldownMs ?? DEFAULT_DRAIN_RETURN_COOLDOWN_MS,
+			provider,
+			spend: policy?.drain ? (policy.spend ?? []) : [],
+			returnWhen: policy?.drain && policy.returnWhen !== undefined ? [policy.returnWhen].flat() : ["reset"],
 		};
 	}
 
 	/**
+	 * Billing evidence of the drain target's usage `report`, read only when it
+	 * may spend credits or money (which every billing return trigger requires);
+	 * `undefined` when it may not. Warns once per provider without a billing reader.
+	 */
+	#drainBilling(provider: string, target: DrainTarget, report: UsageReport | null): DrainBilling | undefined {
+		if (target.spend.every(spendClass => spendClass === "plan")) return undefined;
+		if (!report) return { unavailable: "no-report" };
+		const result = this.#deps.usage.billing(provider, report);
+		if (result.status === "known") return { snapshot: result.snapshot };
+		if (result.reason === "no-reader") {
+			this.#warnOnce(
+				`${provider}\0no-reader`,
+				"Drain spend and return triggers need billing evidence this provider does not report; only plan and reset apply",
+				{ provider },
+			);
+		}
+		return { unavailable: result.reason };
+	}
+
+	#warnOnce(key: string, message: string, meta: Record<string, unknown>): void {
+		if (this.#warnedNoBilling.has(key)) return;
+		this.#warnedNoBilling.add(key);
+		logger.warn(message, meta);
+	}
+
+	/**
 	 * Whether the drain target serves first now. A drained target (any window
-	 * exhausted or plan allowance spent) stays behind its siblings until
-	 * `cooldownMs` has passed since it drained and, when measured, at least
-	 * `returnFraction` of its quota is left again.
+	 * exhausted, or plan allowance spent with no opted-in `spend` class
+	 * available) stays behind its siblings until `cooldownMs` has passed since
+	 * it drained and a `returnWhen` trigger holds: `reset` when, if measured, at
+	 * least `returnFraction` of its quota is left again; `credits-added` or
+	 * `money-available` against the billing evidence first seen after it drained.
+	 * Until a listed trigger holds it stays behind; a billing trigger without
+	 * evidence to compare is logged once per provider.
 	 */
 	#drainServing(
 		target: DrainTarget,
@@ -559,21 +670,44 @@ export class CredentialSelector {
 		drained: boolean,
 		remainingFraction: number | undefined,
 		nowMs: number,
+		billing: DrainBilling | undefined,
 	): boolean {
+		const snapshot = billing?.snapshot;
 		const key = `${target.credentialId}\0${blockScope ?? ""}`;
-		let since = this.#drainedSince.get(key);
+		const state = this.#drainedSince.get(key);
 		// A clock that stepped back restarts the cooldown instead of ending it early or never.
-		if (since !== undefined && nowMs < since) {
-			since = nowMs;
-			this.#drainedSince.set(key, since);
-		}
+		if (state !== undefined && nowMs < state.since) state.since = nowMs;
+		if (state) state.baseline ??= snapshot;
 		if (drained) {
-			if (since === undefined) this.#drainedSince.set(key, nowMs);
+			if (state === undefined) this.#drainedSince.set(key, { since: nowMs, baseline: snapshot });
 			return false;
 		}
-		if (since === undefined) return true;
-		if (nowMs - since < target.cooldownMs) return false;
-		if (remainingFraction !== undefined && remainingFraction < target.returnFraction) return false;
+		if (state === undefined) return true;
+		if (nowMs - state.since < target.cooldownMs) return false;
+		const { baseline } = state;
+		if (!snapshot && target.returnWhen.some(trigger => trigger !== "reset")) {
+			this.#warnOnce(
+				`${target.provider}\0unevaluated`,
+				"Drained account stays behind until a return trigger holds; billing evidence to evaluate it is missing",
+				{ provider: target.provider, reason: billing?.unavailable ?? "no-report" },
+			);
+		}
+		const returned = target.returnWhen.some(trigger => {
+			switch (trigger) {
+				case "reset":
+					return remainingFraction === undefined || remainingFraction >= target.returnFraction;
+				case "credits-added":
+					return baseline !== undefined && snapshot !== undefined && creditsAdded(baseline, snapshot);
+				case "money-available":
+					return (
+						baseline !== undefined &&
+						snapshot !== undefined &&
+						classSpent(baseline, "money") &&
+						classAvailable(snapshot, "money")
+					);
+			}
+		});
+		if (!returned) return false;
 		this.#drainedSince.delete(key);
 		return true;
 	}
@@ -758,6 +892,7 @@ export class CredentialSelector {
 						this.#usageBlocked(provider, providerKey, drain.index, blockScopes),
 						undefined,
 						Date.now(),
+						{ unavailable: "unranked" },
 				  )
 				? drain.index
 				: undefined;
@@ -1012,6 +1147,7 @@ export class CredentialSelector {
 					blockScope,
 					blockScopes,
 					onTransientRefreshFailure: recordTransientRefreshFailure,
+					fundedOverage: candidate.fundedOverage,
 				});
 				if (resolved) return resolved;
 			}
@@ -1172,6 +1308,7 @@ export class CredentialSelector {
 			blockScope,
 			blockScopes,
 			allowFallback = true,
+			fundedOverage = false,
 		} = usageOptions;
 		if (
 			!allowBlocked &&
@@ -1209,7 +1346,7 @@ export class CredentialSelector {
 			if (applyPlanFilter && planGate?.(usage) !== true) {
 				return undefined;
 			}
-			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
+			if (checkUsage && !allowBlocked && !fundedOverage && usage && strategy && rankingContext) {
 				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
@@ -1278,7 +1415,7 @@ export class CredentialSelector {
 				if (applyPlanFilter && planGate?.(usage) !== true) {
 					return undefined;
 				}
-				if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
+				if (checkUsage && !allowBlocked && !fundedOverage && usage && strategy && rankingContext) {
 					const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
 					if (isUsageLimitReached(scopedLimits)) {
 						const resetAtMs = usageResetAtMs(scopedLimits, Date.now());

@@ -8,7 +8,12 @@ import type {
 	OAuthAccountIdentity,
 	OAuthCredential,
 } from "./types";
-import { DEFAULT_USAGE_RESERVE_PCT } from "./types";
+import {
+	DEFAULT_USAGE_RESERVE_PCT,
+	DRAIN_RETURN_TRIGGERS,
+	DRAIN_SPEND_CLASSES,
+	DRAIN_TRIGGER_SPEND_CLASS,
+} from "./types";
 
 /** Grammar of account names: lowercase only, so names never differ by case alone. */
 export const ACCOUNT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
@@ -192,6 +197,38 @@ export class AccountPolicies {
 				(!Number.isFinite(policy.returnCooldownMs) || policy.returnCooldownMs < 0)
 			) {
 				throw new AIError.ConfigurationError(`${path}.returnCooldownMs must be a non-negative number`);
+			}
+			if (policy.spend !== undefined || policy.returnWhen !== undefined) {
+				AccountPolicies.#validateDrainFunding(policy, path);
+			}
+		}
+	}
+
+	static #validateDrainFunding(policy: AuthAccountPolicy, path: string): void {
+		if (policy.drain !== true) {
+			throw new AIError.ConfigurationError(`${path}.spend and ${path}.returnWhen require drain: true`);
+		}
+		const spend: unknown = policy.spend === undefined ? [] : policy.spend;
+		if (!Array.isArray(spend) || spend.some(entry => !(DRAIN_SPEND_CLASSES as readonly unknown[]).includes(entry))) {
+			throw new AIError.ConfigurationError(`${path}.spend must be a list of ${DRAIN_SPEND_CLASSES.join(", ")}`);
+		}
+		const triggers: readonly unknown[] =
+			policy.returnWhen === undefined || Array.isArray(policy.returnWhen)
+				? (policy.returnWhen ?? [])
+				: [policy.returnWhen];
+		if (
+			(Array.isArray(policy.returnWhen) && policy.returnWhen.length === 0) ||
+			triggers.some(entry => !(DRAIN_RETURN_TRIGGERS as readonly unknown[]).includes(entry))
+		) {
+			throw new AIError.ConfigurationError(
+				`${path}.returnWhen must be one or a non-empty list of ${DRAIN_RETURN_TRIGGERS.join(", ")}`,
+			);
+		}
+		for (const [trigger, spendClass] of Object.entries(DRAIN_TRIGGER_SPEND_CLASS)) {
+			if (triggers.includes(trigger) && !spend.includes(spendClass)) {
+				throw new AIError.ConfigurationError(
+					`${path}.returnWhen ${trigger} requires spend to include ${spendClass}`,
+				);
 			}
 		}
 	}

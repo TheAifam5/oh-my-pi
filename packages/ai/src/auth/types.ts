@@ -20,6 +20,7 @@ import type {
 	UsageResetCredit,
 	UsageResetCredits,
 } from "../usage";
+import type { BillingResult } from "../usage/billing";
 
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
@@ -80,12 +81,45 @@ export interface AuthAccountPolicy {
 	readonly returnMargin?: number;
 	/** Shortest time a drained account stays behind its siblings, in ms; default 600000. */
 	readonly returnCooldownMs?: number;
+	/**
+	 * What a drain target may spend before it counts as drained; `drain` only.
+	 * `plan` (subscription allowance and free use) is always spent; `credits`
+	 * (prepaid credits) and `money` (paid extra usage, metered spend) keep it
+	 * serving first past a spent plan allowance while the billing evidence of
+	 * its usage report shows that class available.
+	 */
+	readonly spend?: readonly DrainSpendClass[];
+	/**
+	 * What returns a drained account to first place, after `returnCooldownMs`;
+	 * `drain` only, default `reset`. `reset`: `returnMargin` percent of its quota
+	 * is back. `credits-added`: its prepaid credits grew, or `money-available`:
+	 * paid extra usage became available, since it drained (needs the matching
+	 * `spend` class and a billing reader for the provider).
+	 */
+	readonly returnWhen?: DrainReturnTrigger | readonly DrainReturnTrigger[];
 }
+
+/** Funding classes a drain target may spend ({@link AuthAccountPolicy.spend}). */
+export const DRAIN_SPEND_CLASSES = ["plan", "credits", "money"] as const;
+export type DrainSpendClass = (typeof DRAIN_SPEND_CLASSES)[number];
+/** Events that return a drained account ({@link AuthAccountPolicy.returnWhen}). */
+export const DRAIN_RETURN_TRIGGERS = ["reset", "credits-added", "money-available"] as const;
+export type DrainReturnTrigger = (typeof DRAIN_RETURN_TRIGGERS)[number];
+/** The `spend` class each billing return trigger requires; without it the account would return only to drain again. */
+export const DRAIN_TRIGGER_SPEND_CLASS = { "credits-added": "credits", "money-available": "money" } as const;
 
 /** Default {@link AuthAccountPolicy.returnMargin}, in percent. */
 export const DEFAULT_DRAIN_RETURN_MARGIN_PCT = 5;
 /** Default {@link AuthAccountPolicy.returnCooldownMs}. */
 export const DEFAULT_DRAIN_RETURN_COOLDOWN_MS = 10 * 60 * 1000;
+
+/**
+ * Host source of billing evidence for drain targets, read on credential
+ * resolution from the usage report ranking already fetched; performs no I/O.
+ */
+export interface AccountBillingSource {
+	read(provider: Provider, report: UsageReport): BillingResult;
+}
 
 /** Read-only set of per-account routing policies. */
 export type AuthAccountPolicies = readonly AuthAccountPolicy[];
@@ -1308,6 +1342,12 @@ export interface UsageApi {
 	setProvider(provider: Provider, usageProvider: UsageProvider, apiKey?: string): void;
 	/** Remove a runtime usage provider override and restore configured/default resolution. */
 	removeProvider(provider: Provider): void;
+	/**
+	 * Install (or with `undefined`, remove) the billing evidence source drain
+	 * targets consult for `spend` and `returnWhen`. Without one, `credits`,
+	 * `money`, `credits-added`, and `money-available` never apply.
+	 */
+	setBillingSource(source: AccountBillingSource | undefined): void;
 }
 
 /** Credential and model-level health probes. */
