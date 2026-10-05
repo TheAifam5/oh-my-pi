@@ -18,6 +18,7 @@ import type {
 	UsageProvider,
 	UsageReport,
 } from "../usage";
+import type { BillingResult } from "../usage/billing";
 import { DEFAULT_USAGE_PROVIDERS } from "../usage/registry";
 import { raceSignal } from "./abort";
 import type { SessionAffinity } from "./affinity";
@@ -38,7 +39,7 @@ import { mergeRefreshedOrganizationScope, OAUTH_REFRESH_SKEW_MS } from "./refres
 import type { OAuthRefresher } from "./refresh";
 import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
-import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
+import type { AccountBillingSource, AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
@@ -119,6 +120,7 @@ export class UsageService implements UsageApi {
 	#usageRequestInFlight: Map<string, { refreshEpoch: number; promise: Promise<UsageReport | null> }> = new Map();
 	#usageHeaderIngestAt: Map<string, number> = new Map();
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
+	#billingSource: AccountBillingSource | undefined;
 	readonly fetch: typeof fetch;
 	readonly logger: UsageLogger;
 	readonly requestTimeoutMs: number;
@@ -159,9 +161,19 @@ export class UsageService implements UsageApi {
 		});
 		this.#deps.cache.invalidateForProvider(provider);
 	}
-	/** Carry runtime usage provider overrides over from the service this one replaces (store swap). */
+	/** Carry runtime usage provider overrides and the billing source over from the service this one replaces (store swap). */
 	adoptRuntimeProviders(previous: UsageService): void {
 		this.#runtimeUsageProviderOverrides = previous.#runtimeUsageProviderOverrides;
+		this.#billingSource = previous.#billingSource;
+	}
+
+	setBillingSource(source: AccountBillingSource | undefined): void {
+		this.#billingSource = source;
+	}
+
+	/** Billing evidence of `report` from the installed billing source; `no-reader` without one. */
+	billing(provider: Provider, report: UsageReport): BillingResult {
+		return this.#billingSource?.read(provider, report) ?? { status: "unknown", provider, reason: "no-reader" };
 	}
 
 	/** Remove a runtime usage provider override and restore configured/default resolution. */

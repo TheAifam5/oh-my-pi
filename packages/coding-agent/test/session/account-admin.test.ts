@@ -180,4 +180,32 @@ describe("account administration", () => {
 		setAccountDrain(settings, authStorage, "anthropic", undefined);
 		expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
 	});
+
+	it("keeps a drain target's spend and returnWhen on re-save and drops them when the drain moves", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const a = resolveAccount(authStorage, "a@example.com");
+		setAccountDrain(settings, authStorage, "anthropic", a, { spend: ["credits"], returnWhen: "credits-added" });
+		setAccountDrain(settings, authStorage, "anthropic", a);
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{
+				provider: "anthropic",
+				account: { accountId: "acc-a" },
+				drain: true,
+				spend: ["credits"],
+				returnWhen: "credits-added",
+			},
+		]);
+		setAccountDrain(settings, authStorage, "anthropic", resolveAccount(authStorage, "b@example.com"));
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{ provider: "anthropic", account: { accountId: "acc-b" }, drain: true },
+		]);
+		expect(() => setAccountDrain(settings, authStorage, "anthropic", a, { returnWhen: ["money-available"] })).toThrow(
+			/requires spend to include money/,
+		);
+		setAccountDrain(settings, authStorage, "anthropic", a, { spend: ["credits"], returnWhen: "credits-added" });
+		setAccountDrain(settings, authStorage, "anthropic", a, { spend: ["plan"], returnWhen: ["reset"] });
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{ provider: "anthropic", account: { accountId: "acc-a" }, drain: true },
+		]);
+	});
 });

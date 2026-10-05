@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import * as accountAdmin from "@oh-my-pi/pi-coding-agent/session/account-admin";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 
 function createRuntimeHarness(options?: {
@@ -41,6 +42,55 @@ function createRuntimeHarness(options?: {
 }
 
 describe("/session slash command", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("writes --spend and --return-when only with --save and leaves the session drain alone when saving fails", async () => {
+		const account = { credentialId: 7, type: "oauth", accountId: "acc-b", active: false, pinned: false };
+		const session = {
+			listCurrentProviderAccounts: vi.fn(async () => ({ provider: "openai-codex", accounts: [account] })),
+			drainCurrentProviderAccount: vi.fn(() => true),
+			settings: {},
+			modelRegistry: { authStorage: {} },
+		};
+		const showStatus = vi.fn();
+		const save = vi.spyOn(accountAdmin, "setAccountDrain").mockReturnValue({});
+		const runtime = {
+			ctx: {
+				editor: { setText: vi.fn() },
+				session,
+				showStatus,
+				statusLine: { invalidate: vi.fn() },
+				ui: { requestRender: vi.fn() },
+			} as unknown as InteractiveModeContext,
+		};
+
+		await executeBuiltinSlashCommand("/session drain acc-b --spend credits", runtime);
+		expect(showStatus).toHaveBeenLastCalledWith(expect.stringMatching(/^Usage: \/session drain/));
+		expect(session.drainCurrentProviderAccount).not.toHaveBeenCalled();
+
+		await executeBuiltinSlashCommand(
+			"/session drain acc-b --save --spend credits --return-when reset,credits-added",
+			runtime,
+		);
+		expect(session.drainCurrentProviderAccount).toHaveBeenCalledWith(7);
+		expect(save).toHaveBeenCalledWith(
+			session.settings,
+			session.modelRegistry.authStorage,
+			"openai-codex",
+			{ provider: "openai-codex", account },
+			{ spend: ["credits"], returnWhen: ["reset", "credits-added"] },
+		);
+		session.drainCurrentProviderAccount.mockClear();
+		save.mockImplementation(() => {
+			throw new accountAdmin.AccountAdminError("rejected");
+		});
+		await executeBuiltinSlashCommand("/session drain acc-b --save --return-when credits-added", runtime);
+		expect(showStatus).toHaveBeenLastCalledWith("Not saved: rejected");
+		expect(session.drainCurrentProviderAccount).not.toHaveBeenCalled();
+	});
+
 	it("awaits session info before resolving the default command", async () => {
 		const deferred = Promise.withResolvers<void>();
 		const handleSessionCommand = vi.fn(() => deferred.promise);
