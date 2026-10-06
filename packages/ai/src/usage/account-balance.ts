@@ -24,6 +24,11 @@ export interface AccountBalanceEndpoint {
 	url: string;
 	/** Host of the provider's catalog default inference base URL. */
 	inferenceHost: string;
+	/**
+	 * `inferenceHost` is not the catalog default, so a credential without a
+	 * configured base URL or override belongs to another host and is never sent.
+	 */
+	requiresConfiguredBaseUrl?: boolean;
 	/** Inference base URL that overrides the configured one at request time (an environment variable). */
 	baseUrlOverride?: () => string | undefined;
 	/**
@@ -93,6 +98,7 @@ function onInferenceHost(endpoint: AccountBalanceEndpoint, params: UsageFetchPar
 	const configured = [params.baseUrl, endpoint.baseUrlOverride?.()]
 		.map(value => value?.trim())
 		.filter((value): value is string => !!value);
+	if (configured.length === 0) return endpoint.requiresConfiguredBaseUrl !== true;
 	return configured.every(baseUrl => sameHost(baseUrl, endpoint.inferenceHost));
 }
 
