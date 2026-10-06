@@ -105,6 +105,7 @@ import {
 	cfgDisplayShowTurnTime,
 	cfgTerminalShowImages,
 } from "../settings";
+import { resolveToolExecutionRenderers } from "../../extensibility/extensions/wrapper";
 import { cfgReadToolResultPreview } from "../../tools/settings";
 
 interface RenderInitialMessagesOptions {
@@ -724,6 +725,11 @@ export class UiHelpers {
 						{
 							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
 							showImages: cfgTerminalShowImages.get(settings),
+							renderers: resolveToolExecutionRenderers(
+								this.ctx.viewSession.extensionRunner,
+								renderToolName,
+								tool,
+							),
 						},
 						tool,
 						this.ctx.ui,

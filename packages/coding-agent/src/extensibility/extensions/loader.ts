@@ -57,6 +57,7 @@ import type {
 	SourceInfo,
 	ToolDefinition,
 	ToolInfo,
+	ToolRendererResolver,
 } from "./types";
 
 installLegacyPiSpecifierShim();
@@ -285,6 +286,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void {
 		this.extension.assistantThinkingRenderers.push(renderer);
+	}
+
+	registerToolRenderer(resolver: ToolRendererResolver): void {
+		(this.extension.toolRendererResolvers ??= []).push(resolver);
 	}
 
 	registerMarkdownTransformer(transformer: MarkdownTransformer): void {

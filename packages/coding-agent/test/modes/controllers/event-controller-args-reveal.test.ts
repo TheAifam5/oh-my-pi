@@ -48,6 +48,7 @@ function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	let approvalWaiter: ((toolCallId: string) => Promise<void>) | undefined;
 	const extensionRunner = {
+		hasToolRendererResolvers: () => false,
 		setToolApprovalPreviewWaiter(waiter: (toolCallId: string) => Promise<void>) {
 			approvalWaiter = waiter;
 			return () => {

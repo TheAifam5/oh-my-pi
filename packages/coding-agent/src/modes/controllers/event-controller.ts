@@ -83,6 +83,7 @@ import {
 	cfgTerminalShowProgress,
 } from "../settings";
 import { getCacheWarmingDelayMs } from "../../session/cache-warmer";
+import { resolveToolExecutionRenderers } from "../../extensibility/extensions/wrapper";
 import { cfgCompaction } from "../../session/context-settings";
 import { cfgReadToolResultPreview, cfgToolsApproval, cfgToolsApprovalMode } from "../../tools/settings";
 import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
@@ -1603,6 +1604,11 @@ export class EventController {
 						{
 							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
 							showImages: cfgTerminalShowImages.get(settings),
+							renderers: resolveToolExecutionRenderers(
+								this.ctx.viewSession.extensionRunner,
+								renderToolName,
+								tool,
+							),
 						},
 						tool,
 						this.ctx.ui,
@@ -1924,6 +1930,7 @@ export class EventController {
 				{
 					useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
 					showImages: cfgTerminalShowImages.get(settings),
+					renderers: resolveToolExecutionRenderers(this.ctx.viewSession.extensionRunner, renderToolName, tool),
 				},
 				tool,
 				this.ctx.ui,
