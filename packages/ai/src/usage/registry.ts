@@ -14,7 +14,7 @@ import { devinBilling, devinUsageProvider } from "./devin";
 import { factoryDroidBilling, factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
 import { googleGeminiCliBilling, googleGeminiCliUsageProvider } from "./gemini";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "./github-copilot";
-import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
+import { antigravityBilling, antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
 import { kimiBilling, kimiRankingStrategy, kimiUsageProvider } from "./kimi";
 import { localEndpointBillingReaders } from "./local-endpoint";
 import { museCodeUsageProvider } from "./muse-code";
@@ -130,6 +130,7 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	kimiBilling,
 	opencodeGoBilling,
 	googleGeminiCliBilling,
+	antigravityBilling,
 	subscriptionQuotaBilling("minimax-code"),
 	subscriptionQuotaBilling("muse-code"),
 	subscriptionQuotaBilling("alibaba-token-plan"),

@@ -23,6 +23,7 @@ import { devinBilling } from "@oh-my-pi/pi-ai/usage/devin";
 import { factoryDroidBilling, parseFactoryDroidUsage } from "@oh-my-pi/pi-ai/usage/factory-droid";
 import { githubCopilotBilling, githubCopilotUsageProvider } from "@oh-my-pi/pi-ai/usage/github-copilot";
 import { googleGeminiCliUsageProvider } from "@oh-my-pi/pi-ai/usage/gemini";
+import { antigravityBilling } from "@oh-my-pi/pi-ai/usage/google-antigravity";
 import { localEndpointUsageReport } from "@oh-my-pi/pi-ai/usage/local-endpoint";
 import { minimaxCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/minimax-code";
 import { ollamaUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
@@ -543,6 +544,83 @@ describe("OpenRouter billing", () => {
 	it("returns no report for a payload without data or a server error", async () => {
 		expect((await openrouterReport({ label: "no envelope" })).report).toBeNull();
 		expect((await openrouterReport({ data: documentedKey }, { status: 500 })).report).toBeNull();
+	});
+});
+
+describe("Antigravity billing", () => {
+	/** A per-counter limit shaped as the Antigravity usage provider reports it. */
+	function counterLimit(
+		counter: string,
+		window: string,
+		remainingFraction: number,
+		resetsAt: number,
+		tier = "default",
+	): UsageLimit {
+		return {
+			id: `google-antigravity:${counter}:${tier}:${window}`,
+			label: "Usage",
+			scope: { provider: "google-antigravity", tier, windowId: window },
+			window: { id: window, label: window, resetsAt },
+			amount: { remainingFraction, usedFraction: 1 - remainingFraction, unit: "percent" },
+			status: remainingFraction <= 0 ? "exhausted" : "ok",
+		};
+	}
+	const read = (limits: UsageLimit[]) =>
+		antigravityBilling.readBilling({ provider: "google-antigravity", fetchedAt: 1, limits });
+
+	it("keeps a counter with a healthy bucket in its window unexhausted", () => {
+		const oneBucketSpent = [
+			counterLimit("google", "daily", 0, 5_000, "free"),
+			counterLimit("google", "daily", 0.6, 6_000, "paid"),
+		];
+		expect(sources(read(oneBucketSpent))).toEqual([{ mode: "unknown", state: "unknown" }]);
+		expect(defaultBillingReader("google-antigravity")).toBe(antigravityBilling);
+	});
+
+	it("reads a single fully spent counter as exhausted until its windows reset", () => {
+		const spent = [
+			counterLimit("google", "daily", 0, 5_000, "free"),
+			counterLimit("google", "daily", 0, 4_000, "paid"),
+			counterLimit("google", "weekly", 0, 9_000),
+		];
+		expect(sources(read(spent))).toEqual([{ mode: "unknown", state: "exhausted", resetsAt: 9_000 }]);
+	});
+
+	it("keeps the account unknown while another counter has room", () => {
+		const oneCounterSpent = [
+			counterLimit("anthropic", "weekly", 0, 9_000),
+			counterLimit("google", "daily", 0.4, 5_000),
+		];
+		expect(sources(read(oneCounterSpent))).toEqual([{ mode: "unknown", state: "unknown" }]);
+		const bothSpent = [counterLimit("anthropic", "weekly", 0, 9_000), counterLimit("google", "daily", 0, 5_000)];
+		expect(sources(read(bothSpent))).toEqual([{ mode: "unknown", state: "exhausted", resetsAt: 5_000 }]);
+	});
+
+	it("treats windowless buckets of one counter as alternatives", () => {
+		/** A bucket reported without window info: the provider scopes it by bucket id. */
+		const windowless = (bucketId: string, remainingFraction: number): UsageLimit => ({
+			id: `google-antigravity:google:default:${bucketId}`,
+			label: "Gemini",
+			scope: { provider: "google-antigravity", windowId: bucketId },
+			amount: { remainingFraction, usedFraction: 1 - remainingFraction, unit: "percent" },
+			status: remainingFraction <= 0 ? "exhausted" : "ok",
+		});
+		expect(sources(read([windowless("a", 0), windowless("b", 0.5)]))).toEqual([
+			{ mode: "unknown", state: "unknown" },
+		]);
+		expect(sources(read([windowless("a", 0), windowless("b", 0)]))).toEqual([
+			{ mode: "unknown", state: "exhausted" },
+		]);
+	});
+
+	it("leaves the reset time out when a reset is not finite", () => {
+		expect(sources(read([counterLimit("google", "daily", 0, Number.NaN)]))).toEqual([
+			{ mode: "unknown", state: "exhausted" },
+		]);
+	});
+
+	it("reports no evidence without counters", () => {
+		expect(read([])).toMatchObject({ status: "unknown", reason: "no-evidence" });
 	});
 });
 

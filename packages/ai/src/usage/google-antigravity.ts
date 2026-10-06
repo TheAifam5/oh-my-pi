@@ -13,6 +13,7 @@ import type {
 	UsageStatus,
 	UsageWindow,
 } from "../usage";
+import { type BillingSource, knownBilling, type ProviderBilling, unknownBilling } from "./billing";
 import { DAY_MS, HOUR_MS, parseIsoTimestamp, WEEK_MS } from "./shared";
 
 // (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
@@ -731,4 +732,73 @@ export const antigravityRankingStrategy: CredentialRankingStrategy = {
 	// as daily/weekly. Fall back to daily for legacy unlabelled quotaInfo
 	// entries from `daily-cloudcode-pa.googleapis.com`.
 	windowDefaults: { primaryMs: DAY_MS, secondaryMs: DAY_MS },
+};
+
+/** Group key of a counter's limits that carry no identified window. */
+const WINDOWLESS_GROUP = "\0windowless";
+
+/**
+ * Epoch ms an exhausted counter regains room, `null` while it has room, or
+ * `undefined` when it is exhausted without a known recovery time.
+ *
+ * Limits of a counter in the same window are alternative buckets (tiers), so a
+ * window is exhausted only when all of them are, and recovers when the first
+ * resets. Limits without an identified window (no duration and no window id
+ * of their own) form one such group too. Distinct windows apply together, so
+ * the counter is exhausted when any window is, and recovers when every
+ * exhausted window has. A missing or non-finite reset time is unknown.
+ */
+function antigravityCounterRecovery(limits: readonly UsageLimit[]): number | null | undefined {
+	const windows = new Map<string, UsageLimit[]>();
+	for (const limit of limits) {
+		const window = limit.window;
+		// Without window info the provider falls back to the bucket id, which is not a window.
+		const windowId =
+			window && (window.durationMs !== undefined || window.id !== "default") ? window.id : WINDOWLESS_GROUP;
+		const buckets = windows.get(windowId);
+		if (buckets) buckets.push(limit);
+		else windows.set(windowId, [limit]);
+	}
+	let recovery: number | null | undefined = null;
+	for (const buckets of windows.values()) {
+		if (!buckets.every(limit => limit.status === "exhausted")) continue;
+		const resets = buckets
+			.map(limit => limit.window?.resetsAt)
+			.filter((reset): reset is number => reset !== undefined && Number.isFinite(reset));
+		const windowRecovery = resets.length === buckets.length ? Math.min(...resets) : undefined;
+		if (windowRecovery === undefined) return undefined;
+		recovery = recovery === null ? windowRecovery : Math.max(recovery, windowRecovery);
+	}
+	return recovery;
+}
+
+/**
+ * Antigravity billing: one source of unknown mode, since the reports do not
+ * say how the quota is paid for. Each backend counter meters its own model
+ * family, so the source is `exhausted` only when every counter is (see
+ * {@link antigravityCounterRecovery}), and then resets when the first counter
+ * recovers; otherwise its state is `unknown`.
+ */
+export const antigravityBilling: ProviderBilling = {
+	id: "google-antigravity",
+	readBilling(report) {
+		const counters = new Map<string, UsageLimit[]>();
+		for (const limit of report.limits) {
+			const counterKey = limit.id.split(":")[1]?.toLowerCase();
+			if (!counterKey) continue;
+			const limits = counters.get(counterKey);
+			if (limits) limits.push(limit);
+			else counters.set(counterKey, [limit]);
+		}
+		if (counters.size === 0) return unknownBilling(report, "no-evidence");
+		const recoveries: (number | undefined)[] = [];
+		for (const limits of counters.values()) {
+			const recovery = antigravityCounterRecovery(limits);
+			if (recovery === null) return knownBilling(report, [{ mode: "unknown", state: "unknown" }]);
+			recoveries.push(recovery);
+		}
+		const source: BillingSource = { mode: "unknown", state: "exhausted" };
+		if (recoveries.every(reset => reset !== undefined)) source.resetsAt = Math.min(...recoveries);
+		return knownBilling(report, [source]);
+	},
 };
