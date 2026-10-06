@@ -595,9 +595,27 @@ describe("update-cli package manager commands", () => {
 	it.skipIf(!miseBinary)("overrides per-tool release age during actual mise upgrade resolution", async () => {
 		if (!miseBinary) throw new Error("mise binary unavailable");
 		const root = await makeTempDir();
+		// mise drops releases without assets from the version list, so each carries one.
+		const asset = (tag: string) => ({
+			name: "notes.txt",
+			url: `http://127.0.0.1:9/assets/${tag}`,
+			browser_download_url: `http://127.0.0.1:9/${tag}/notes.txt`,
+		});
 		const releases = [
-			{ tag_name: "v2.0.0", draft: false, prerelease: false, created_at: "2026-09-09T00:00:00Z", assets: [] },
-			{ tag_name: "v1.0.0", draft: false, prerelease: false, created_at: "2020-01-01T00:00:00Z", assets: [] },
+			{
+				tag_name: "v2.0.0",
+				draft: false,
+				prerelease: false,
+				created_at: "2026-09-09T00:00:00Z",
+				assets: [asset("v2.0.0")],
+			},
+			{
+				tag_name: "v1.0.0",
+				draft: false,
+				prerelease: false,
+				created_at: "2020-01-01T00:00:00Z",
+				assets: [asset("v1.0.0")],
+			},
 		];
 		const server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -623,6 +641,7 @@ describe("update-cli package manager commands", () => {
 				MISE_CONFIG_DIR: path.join(root, "config"),
 				MISE_DATA_DIR: path.join(root, "data"),
 				MISE_STATE_DIR: path.join(root, "state"),
+				MISE_TRUSTED_CONFIG_PATHS: root,
 				HTTP_PROXY: "http://127.0.0.1:9",
 				HTTPS_PROXY: "http://127.0.0.1:9",
 				ALL_PROXY: "http://127.0.0.1:9",

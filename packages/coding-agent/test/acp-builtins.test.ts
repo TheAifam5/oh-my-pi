@@ -16,6 +16,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 
 import { cfgBrowserEnabled, cfgBrowserHeadless } from "@oh-my-pi/pi-coding-agent/tools/browser/settings";
@@ -1305,12 +1306,21 @@ describe("wave 4 commands", () => {
 		expect(output[0]).toContain("reload");
 	});
 
-	it("/mcp resources: outputs server list or no-server message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/mcp resources", runtime);
-		expect(result).toEqual({ consumed: true });
-		// No servers configured in tmp project dir — should report that
-		expect(output[0]).toMatch(/No MCP servers configured|No resources/);
+	it("/mcp resources: reports no servers when none are configured", async () => {
+		// Point both config scopes at an empty dir so the user's real MCP servers are never contacted.
+		const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-resources-"));
+		const configPathSpy = spyOn(piUtils, "getMCPConfigPath").mockImplementation(scope =>
+			path.join(configRoot, scope, "mcp.json"),
+		);
+		try {
+			const { output, runtime } = createRuntime();
+			const result = await executeAcpBuiltinSlashCommand("/mcp resources", runtime);
+			expect(result).toEqual({ consumed: true });
+			expect(output[0]).toBe("No MCP servers configured.");
+		} finally {
+			configPathSpy.mockRestore();
+			await removeWithRetries(configRoot);
+		}
 	});
 
 	it("/mcp unknown-verb: returns usage pointing to help", async () => {
