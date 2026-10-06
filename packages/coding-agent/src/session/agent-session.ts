@@ -13348,6 +13348,11 @@ export class AgentSession implements SettingsScope {
 	unpinCurrentProviderAccount(): SessionUnpinOutcome {
 		const provider = this.model?.provider;
 		if (!provider) return "no-model";
+		return this.unpinProviderAccount(provider);
+	}
+
+	/** Like {@link unpinCurrentProviderAccount}, for an explicit `provider` (the `/account` manager). */
+	unpinProviderAccount(provider: string): SessionUnpinOutcome {
 		if (this.isStreaming) return "streaming";
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.sessions.unpin(provider, this.sessionId)) {

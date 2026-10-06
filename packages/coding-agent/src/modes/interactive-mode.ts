@@ -8015,6 +8015,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#selectorController.showOAuthSelector(mode, providerId);
 	}
 
+	showAccountManager(): Promise<void> {
+		return this.#selectorController.showAccountManager();
+	}
+
 	showSessionPinSelector(): Promise<void> {
 		return this.#selectorController.showSessionPinSelector();
 	}

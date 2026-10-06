@@ -824,11 +824,16 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "account",
 		aliases: ["logout"],
 		icon: "signOut",
-		description: "Manage stored provider accounts: log out, pin to this session or project, name",
+		description: "Manage stored provider accounts: name, priority, drain, limits, pins; log out",
 		inlineHint: "[provider]",
 		allowArgs: true,
 		handleTui: (command, runtime) => {
 			const providerId = command.args.trim();
+			if (!providerId && command.name === "account") {
+				void runtime.ctx.showAccountManager();
+				clearSubmittedText(runtime);
+				return;
+			}
 			if (providerId) {
 				const matchedProvider = getOAuthProviders().find(provider => provider.id === providerId);
 				if (!matchedProvider) {

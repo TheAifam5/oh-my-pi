@@ -9,6 +9,7 @@ type RuntimeHarness = {
 	getWarning: () => string | undefined;
 	getSelectorMode: () => "login" | "logout" | undefined;
 	getSelectorProvider: () => string | undefined;
+	accountManagerOpened: () => boolean;
 };
 
 const createRuntimeHarness = (manualInput: OAuthManualInputManager): RuntimeHarness => {
@@ -16,6 +17,7 @@ const createRuntimeHarness = (manualInput: OAuthManualInputManager): RuntimeHarn
 	let warningMessage: string | undefined;
 	let selectorMode: "login" | "logout" | undefined;
 	let selectorProvider: string | undefined;
+	let accountManager = false;
 	const ctx = {
 		oauthManualInput: manualInput,
 		editor: {
@@ -31,6 +33,9 @@ const createRuntimeHarness = (manualInput: OAuthManualInputManager): RuntimeHarn
 			selectorMode = mode;
 			selectorProvider = providerId;
 		},
+		showAccountManager: async () => {
+			accountManager = true;
+		},
 	} as InteractiveModeContext;
 
 	return {
@@ -41,6 +46,7 @@ const createRuntimeHarness = (manualInput: OAuthManualInputManager): RuntimeHarn
 		getWarning: () => warningMessage,
 		getSelectorMode: () => selectorMode,
 		getSelectorProvider: () => selectorProvider,
+		accountManagerOpened: () => accountManager,
 	};
 };
 
@@ -100,5 +106,19 @@ describe("/login slash command", () => {
 		expect(handled).toBe(true);
 		expect(harness.getSelectorMode()).toBeUndefined();
 		expect(harness.getWarning()).toBe("No OAuth login is waiting for a manual callback.");
+	});
+});
+
+describe("/account slash command", () => {
+	it("opens the account manager without arguments and keeps the logout selector for /logout", async () => {
+		const manager = createRuntimeHarness(new OAuthManualInputManager());
+		await executeBuiltinSlashCommand("/account", manager.runtime);
+		expect(manager.accountManagerOpened()).toBe(true);
+		expect(manager.getSelectorMode()).toBeUndefined();
+
+		const logout = createRuntimeHarness(new OAuthManualInputManager());
+		await executeBuiltinSlashCommand("/logout", logout.runtime);
+		expect(logout.accountManagerOpened()).toBe(false);
+		expect(logout.getSelectorMode()).toBe("logout");
 	});
 });

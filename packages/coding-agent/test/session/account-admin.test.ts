@@ -7,14 +7,19 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runAccountCommand } from "@oh-my-pi/pi-coding-agent/cli/account-cli";
 import {
 	AccountAdminError,
+	accountLimits,
+	formatAccountLimitSpec,
 	labelAccount,
 	listAccounts,
 	logoutAccount,
+	parseAccountLimitSpec,
 	pinProjectAccount,
 	resolveAccount,
 	setAccountDrain,
+	setAccountLimits,
 	setAccountPriority,
 	setAccountReserve,
+	setAccountReturn,
 	unpinProjectAccount,
 } from "@oh-my-pi/pi-coding-agent/session/account-admin";
 import {
@@ -287,5 +292,76 @@ describe("account administration", () => {
 		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
 			{ provider: "anthropic", account: { accountId: "acc-a" }, drain: true },
 		]);
+	});
+
+	it("writes limits and return thresholds from the limit syntax and drops an entry they leave empty", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const a = resolveAccount(authStorage, "a@example.com");
+		const limit = parseAccountLimitSpec("usd $5 2h warn");
+		expect(limit).toEqual({
+			metric: "usd",
+			max: "5",
+			window: { type: "rolling", durationMs: 7_200_000 },
+			onLimit: "warn",
+		});
+		expect(() => parseAccountLimitSpec("usd 5 fortnight")).toThrow(AccountAdminError);
+		setAccountLimits(settings, authStorage, a, [limit, parseAccountLimitSpec("credits 2.50")]);
+		setAccountReturn(settings, authStorage, a, { returnMargin: 20 });
+		expect(settings.getGlobalSettings().auth).toEqual({
+			accountPolicies: [
+				{
+					provider: "anthropic",
+					account: { accountId: "acc-a" },
+					limits: [limit, { metric: "credits", max: "2.50" }],
+					returnMargin: 20,
+				},
+			],
+		});
+		expect(accountLimits(settings, a).map(formatAccountLimitSpec)).toEqual(["usd 5 2h warn", "credits 2.50 skip"]);
+		expect(() => setAccountLimits(settings, authStorage, a, [parseAccountLimitSpec("requests 0 day")])).toThrow(
+			/max must be a positive whole number/,
+		);
+		setAccountReturn(settings, authStorage, a, { returnMargin: undefined });
+		setAccountLimits(settings, authStorage, a, []);
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+	});
+
+	it("refuses duplicate and invalid limits and clears one field without dropping the entry", async () => {
+		const writeConfig = (policies: unknown[]) =>
+			fs.writeFileSync(path.join(agentDir, "config.yml"), YAML.stringify({ auth: { accountPolicies: policies } }));
+		writeConfig([
+			{ provider: "anthropic", name: "work", priority: 3, returnMargin: 10, account: { email: "a@example.com" } },
+		]);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const a = resolveAccount(authStorage, "a@example.com");
+		const limits = [parseAccountLimitSpec("requests 5 day"), parseAccountLimitSpec("requests 5 day skip")];
+		expect(() => setAccountLimits(settings, authStorage, a, limits)).toThrow(
+			"requests 5 day skip is already a limit of this account.",
+		);
+
+		setAccountReturn(settings, authStorage, a, { returnMargin: undefined });
+		expect(settings.getGlobalSettings().auth).toEqual({
+			accountPolicies: [{ provider: "anthropic", name: "work", priority: 3, account: { email: "a@example.com" } }],
+		});
+
+		writeConfig([
+			{ provider: "anthropic", account: { email: "b@example.com" }, limits: [{ metric: "requests", max: 0 }] },
+		]);
+		const invalid = await Settings.loadIsolated({ cwd: project, agentDir });
+		expect(() => accountLimits(invalid, resolveAccount(authStorage, "b@example.com"))).toThrow(
+			/limits\[0\]\.max must be a positive whole number/,
+		);
+	});
+
+	it("warns when a new name adopts a project pin that named no stored account", async () => {
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ auth: { accountPins: { [project]: { anthropic: "home" } } } }),
+		);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const result = labelAccount(settings, authStorage, resolveAccount(authStorage, "a@example.com"), "home");
+		expect(result.warning).toBe(
+			`auth.accountPins["${project}"] already name "home"; anthropic requests that use it now reach this account.`,
+		);
 	});
 });

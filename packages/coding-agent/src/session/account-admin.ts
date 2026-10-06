@@ -1,25 +1,39 @@
 /**
- * Account administration shared by `omp account` and the `/account` selector:
- * naming accounts and setting their priority or reserve (`auth.accountPolicies`
- * in the user config), pinning a project to an account (`auth.accountPins`),
- * and logging an account out.
+ * Account administration shared by `omp account`, the `/account` manager, and
+ * the account selector: naming accounts and setting their priority, reserve,
+ * drain return thresholds, and limits (`auth.accountPolicies` in the user
+ * config), pinning a project to an account (`auth.accountPins`), setting a pool
+ * member's preferred account, and logging an account out.
  *
  * Every write goes to the user (global) config layer only and is validated
  * against the stored credentials before it is applied.
  */
 
 import * as path from "node:path";
-import type { AuthAccountPolicies, AuthAccountPolicy, AuthAccountSelector } from "@oh-my-pi/pi-ai/auth-storage";
+import type {
+	AuthAccountPolicies,
+	AuthAccountPolicy,
+	AuthAccountSelector,
+	DrainReturnTrigger,
+	DrainSpendClass,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import { AccountPolicies, accountUsageKey, matchesAuthAccountSelector } from "@oh-my-pi/pi-ai/auth/policy";
-import { type AccountEvidenceMetric, isAccountEvidenceLimit, parseAccountLimits } from "@oh-my-pi/pi-ai/usage/limits";
+import {
+	type AccountEvidenceMetric,
+	type AccountLimit,
+	isAccountEvidenceLimit,
+	LOCAL_LIMIT_PERIODS,
+	parseAccountLimits,
+} from "@oh-my-pi/pi-ai/usage/limits";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
-import { cfgAuthAccountPins, cfgAuthAccountPolicies } from "../config/model-settings";
+import type { ModelGroup, ParsedModelValue } from "../config/model-groups";
+import { cfgAuthAccountPins, cfgAuthAccountPolicies, cfgModelGroups } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import { canonicalDir, projectAccountPin } from "./account-pins";
 import { loadEffectiveAuthAccountPolicyConfig } from "./auth-broker-config";
 import type { AuthAccountSummary, AuthStorage } from "./auth-storage";
 import { type LimitStatus, limitStatus } from "./local-limits";
-import { cfgRetryUsageReservePct } from "./settings";
+import { cfgRetryFallbackChains, cfgRetryUsageReservePct } from "./settings";
 import type { UsageLedger } from "./usage-ledger";
 
 /** A rejected account operation; the message is meant for the user. */
@@ -44,6 +58,14 @@ export interface AccountListing extends AccountRef {
 	reservePct?: number;
 	/** True when the account policy drains this account first. */
 	drain: boolean;
+	/** Funding classes the drained account may spend, as configured. */
+	spend?: readonly DrainSpendClass[];
+	/** Triggers that return the drained account, as configured. */
+	returnWhen?: readonly DrainReturnTrigger[];
+	/** Percent of quota back before a drained account is used first again. */
+	returnMargin?: number;
+	/** Shortest time a drained account stays behind its siblings, in ms. */
+	returnCooldownMs?: number;
 	/**
 	 * The account policy's limits with their counted usage; a provider-evidence limit
 	 * (`usage`, `credits`, `extra-usd`) carries no `window` or `used`.
@@ -151,23 +173,53 @@ function shadowWarning(settings: Settings): string | undefined {
 	return `auth.accountPolicies is set in the ${provenance} layer, which replaces the user config value; this change does not apply there.`;
 }
 
+/**
+ * Why an `auth.accountPolicies` edit would not apply: a project, `--config`, or runtime layer
+ * sets the value and replaces the user config's; undefined when the user config value is effective.
+ */
+export function accountPolicyWriteBlocker(settings: Settings): string | undefined {
+	const provenance = cfgAuthAccountPolicies.provenance(settings);
+	return provenance === "global" || provenance === "default"
+		? undefined
+		: `auth.accountPolicies is set in the ${provenance} layer`;
+}
+
 /** Result of a write: the user-facing warning, if any. */
 export interface AccountWriteResult {
 	warning?: string;
 }
 
-/** `policies` with `patch` applied to the entry for `ref`, created when missing. */
+type PolicyPatch = Partial<
+	Pick<
+		AuthAccountPolicy,
+		| "name"
+		| "priority"
+		| "reservePct"
+		| "drain"
+		| "spend"
+		| "returnWhen"
+		| "returnMargin"
+		| "returnCooldownMs"
+		| "limits"
+	>
+>;
+
+/** `policies` with `patch` applied to the entry for `ref`, created when missing; an `undefined` field is removed. */
 function patchedPolicies(
 	authStorage: AuthStorage,
 	policies: AuthAccountPolicies,
 	ref: AccountRef,
-	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct" | "drain" | "spend" | "returnWhen">>,
+	patch: PolicyPatch,
 ): AuthAccountPolicy[] {
 	const index = policies.findIndex(policy => matchesPolicy(policy, ref));
 	const next = [...policies];
 	const base = index === -1 ? { provider: ref.provider, account: selectorFor(authStorage, ref) } : policies[index]!;
-	const updated = { ...base, ...patch };
-	if (index === -1) next.push(updated);
+	const updated: { -readonly [K in keyof AuthAccountPolicy]: AuthAccountPolicy[K] } = { ...base, ...patch };
+	for (const key of Object.keys(patch) as (keyof PolicyPatch)[]) if (patch[key] === undefined) delete updated[key];
+	// An entry left with only its provider and account would still switch on the policy reserve; drop it.
+	if (Object.keys(updated).every(key => key === "provider" || key === "account")) {
+		if (index !== -1) next.splice(index, 1);
+	} else if (index === -1) next.push(updated);
 	else next[index] = updated;
 	return next;
 }
@@ -196,7 +248,7 @@ function writePolicy(
 	settings: Settings,
 	authStorage: AuthStorage,
 	ref: AccountRef,
-	patch: Partial<Pick<AuthAccountPolicy, "name" | "priority" | "reservePct">>,
+	patch: PolicyPatch,
 ): AccountWriteResult {
 	return commitPolicies(
 		settings,
@@ -247,14 +299,57 @@ export function setAccountDrain(
 	);
 }
 
-/** Name an account (`auth.accountPolicies[].name`); names are unique per provider. */
+/**
+ * Name an account (`auth.accountPolicies[].name`); names are unique per provider. Renaming warns
+ * about project pins and pool members that still name the account by its previous name; session
+ * pins follow the credential and are unaffected.
+ */
 export function labelAccount(
 	settings: Settings,
 	authStorage: AuthStorage,
 	ref: AccountRef,
 	name: string,
 ): AccountWriteResult {
-	return writePolicy(settings, authStorage, ref, { name });
+	const result = writePolicy(settings, authStorage, ref, { name });
+	const previous = ref.account.name;
+	if (previous === name) return result;
+	const warnings = [result.warning];
+	// The name is already written; a failed reference scan must not turn that into a reported failure.
+	try {
+		const dangling = previous === undefined ? [] : nameReferences(settings, ref.provider, previous);
+		if (dangling.length > 0) {
+			warnings.push(
+				`${dangling.join(", ")} still name "${previous}"; ${ref.provider} requests that use ${dangling.length === 1 ? "it" : "them"} no longer reach this account until updated to "${name}".`,
+			);
+		}
+		const adopted = nameReferences(settings, ref.provider, name);
+		if (adopted.length > 0) {
+			warnings.push(
+				`${adopted.join(", ")} already name "${name}"; ${ref.provider} requests that use ${adopted.length === 1 ? "it" : "them"} now reach this account.`,
+			);
+		}
+	} catch (error) {
+		warnings.push(
+			`Could not check what else names this account: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const warning = warnings.filter(Boolean).join(" ");
+	return warning ? { warning } : {};
+}
+
+/** Project pins (outside the project layer) and pool members that name `provider`'s account `name`. */
+function nameReferences(settings: Settings, provider: string, name: string): string[] {
+	const references: string[] = [];
+	for (const { source, value } of settings.getLayerValues(cfgAuthAccountPins)) {
+		if (source === "project" || !isRecord(value)) continue;
+		for (const [dir, pins] of Object.entries(value)) {
+			if (stringPins(pins)[provider] === name) references.push(`auth.accountPins["${dir}"]`);
+		}
+	}
+	for (const member of listPoolMembers(settings)) {
+		if (member.account === name && member.model.startsWith(`${provider}/`)) references.push(poolMemberPath(member));
+	}
+	return references;
 }
 
 /** Set an account's routing priority; higher wins among otherwise equal accounts. */
@@ -283,6 +378,214 @@ export function setAccountReserve(
 		throw new AccountAdminError(`${ref.provider} reports no usage, so a reserve cannot be enforced.`);
 	}
 	return writePolicy(settings, authStorage, ref, { reservePct });
+}
+
+/**
+ * Set when a drained OAuth account is used first again: `returnMargin` (percent of quota back,
+ * 0–100) and `returnCooldownMs`. A field given as `undefined` is removed (its default applies);
+ * an omitted field is kept.
+ */
+export function setAccountReturn(
+	settings: Settings,
+	authStorage: AuthStorage,
+	ref: AccountRef,
+	thresholds: Pick<AuthAccountPolicy, "returnMargin" | "returnCooldownMs">,
+): AccountWriteResult {
+	if (ref.account.type !== "oauth") throw new AccountAdminError("Return thresholds apply to OAuth accounts only.");
+	return writePolicy(settings, authStorage, ref, thresholds);
+}
+
+/**
+ * Replace an account's local limits; an empty list removes them.
+ *
+ * @throws AccountAdminError when two limits are the same, or the policy write refuses them.
+ */
+export function setAccountLimits(
+	settings: Settings,
+	authStorage: AuthStorage,
+	ref: AccountRef,
+	limits: readonly unknown[],
+): AccountWriteResult {
+	const parsed = parseAccountLimits(limits, "limits");
+	if (parsed.issues.length === 0) {
+		const duplicate = parsed.limits.findIndex((limit, index) =>
+			parsed.limits.slice(0, index).some(earlier => Bun.deepEquals(earlier, limit)),
+		);
+		if (duplicate !== -1) {
+			throw new AccountAdminError(
+				`${formatAccountLimitSpec(parsed.limits[duplicate]!)} is already a limit of this account.`,
+			);
+		}
+	}
+	return writePolicy(settings, authStorage, ref, {
+		limits: limits.length > 0 ? (limits as AuthAccountPolicy["limits"]) : undefined,
+	});
+}
+
+const LIMIT_SPEC_USAGE =
+	"Limit: <usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip], or <usage|credits|extra-usd> <max> [warn|skip].";
+const ROLLING_UNITS_MS = { d: 86_400_000, h: 3_600_000, m: 60_000 } as const;
+
+/**
+ * An account limit from `<metric> <max> [<window>] [warn|skip]`: a calendar `day`/`week`/`month`
+ * or a rolling `<n>m`/`<n>h`/`<n>d` window for ledger metrics, none for provider evidence. Only
+ * the syntax is checked here; the policy write validates the values.
+ *
+ * @throws AccountAdminError when the text does not have that shape.
+ */
+export function parseAccountLimitSpec(spec: string): Record<string, unknown> {
+	const [metric, max, ...rest] = spec.trim().split(/\s+/);
+	if (!metric || !max) throw new AccountAdminError(LIMIT_SPEC_USAGE);
+	const limit: Record<string, unknown> = {
+		metric,
+		max: ["requests", "tokens", "usage"].includes(metric) ? Number(max) : max.replace(/^\$/, ""),
+	};
+	for (const word of rest) {
+		const rolling = /^(\d+)([mhd])$/.exec(word);
+		if (word === "warn" || word === "skip") limit.onLimit = word;
+		else if ((LOCAL_LIMIT_PERIODS as readonly string[]).includes(word))
+			limit.window = { type: "calendar", period: word };
+		else if (rolling) {
+			const unit = rolling[2] as keyof typeof ROLLING_UNITS_MS;
+			limit.window = { type: "rolling", durationMs: Number(rolling[1]) * ROLLING_UNITS_MS[unit] };
+		} else throw new AccountAdminError(LIMIT_SPEC_USAGE);
+	}
+	return limit;
+}
+
+/** `limit` in the {@link parseAccountLimitSpec} syntax. */
+export function formatAccountLimitSpec(limit: AccountLimit): string {
+	const words = [limit.metric, String(limit.max)];
+	if ("window" in limit) {
+		const { window } = limit;
+		if (window.type === "calendar") words.push(window.period);
+		else {
+			const unit = (["d", "h", "m"] as const).find(
+				candidate => window.durationMs % ROLLING_UNITS_MS[candidate] === 0,
+			);
+			words.push(unit ? `${window.durationMs / ROLLING_UNITS_MS[unit]}${unit}` : `${window.durationMs}ms`);
+		}
+	}
+	words.push(limit.onLimit);
+	return words.join(" ");
+}
+
+/**
+ * The limits configured on `ref`'s effective policy entry, parsed.
+ *
+ * @throws AccountAdminError when an entry is invalid, so a later write never drops it silently.
+ */
+export function accountLimits(settings: Settings, ref: AccountRef): AccountLimit[] {
+	const policy = cfgAuthAccountPolicies.get(settings).find(entry => matchesPolicy(entry, ref));
+	if (policy?.limits === undefined) return [];
+	const parsed = parseAccountLimits(policy.limits, "limits");
+	const issue = parsed.issues[0];
+	if (issue)
+		throw new AccountAdminError(`${ref.provider} account ${issue.path} ${issue.message}; fix it in the config.`);
+	return parsed.limits;
+}
+
+/** A model pool member, addressed by where its pool is configured. */
+export interface PoolMemberRef {
+	/** `modelRoles.<key>`, `retry.fallbackChains.<key>`, or `modelGroups.<key>`. */
+	kind: "role" | "chain" | "group";
+	key: string;
+	alias: string;
+}
+
+/** One member of a configured model pool with the account it prefers. */
+export interface PoolMemberListing extends PoolMemberRef {
+	/** `provider/model-id`. */
+	model: string;
+	account?: string;
+	/** Why the member cannot be edited in the user config: the layer that sets its pool. */
+	readOnly?: string;
+}
+
+const POOL_PATH: Record<PoolMemberRef["kind"], string> = {
+	role: "modelRoles",
+	chain: "retry.fallbackChains",
+	group: "modelGroups",
+};
+
+/** Config path of `ref`, such as `modelRoles.default.models.fast`. */
+export function poolMemberPath(ref: PoolMemberRef): string {
+	return `${POOL_PATH[ref.kind]}.${ref.key}.models.${ref.alias}`;
+}
+
+function poolProvenanceBlocker(settings: Settings, kind: PoolMemberRef["kind"], key: string): string | undefined {
+	const provenance =
+		kind === "role"
+			? settings.getModelRoleProvenance(key)
+			: settings.getProvenance(kind === "chain" ? cfgRetryFallbackChains : cfgModelGroups);
+	return provenance === "global" || provenance === "default" ? undefined : `set in the ${provenance} layer`;
+}
+
+/** Members of every inline role and fallback-chain pool and every named model group. */
+export function listPoolMembers(settings: Settings): PoolMemberListing[] {
+	const rows: PoolMemberListing[] = [];
+	const add = (kind: PoolMemberRef["kind"], key: string, group: ModelGroup | undefined) => {
+		if (!group) return;
+		const readOnly = poolProvenanceBlocker(settings, kind, key);
+		for (const member of group.models) {
+			rows.push({
+				kind,
+				key,
+				alias: member.alias,
+				model: member.model,
+				...(member.account !== undefined ? { account: member.account } : {}),
+				...(readOnly ? { readOnly } : {}),
+			});
+		}
+	};
+	const inline = (spec: ParsedModelValue | undefined) => (spec?.kind === "group" ? spec.group : undefined);
+	for (const role of Object.keys(settings.getModelRoleEntries()))
+		add("role", role, inline(settings.getModelRoleSpec(role)));
+	for (const key of Object.keys(cfgRetryFallbackChains.get(settings))) {
+		add("chain", key, inline(settings.getFallbackChainSpec(key)));
+	}
+	for (const name of Object.keys(cfgModelGroups.get(settings))) add("group", name, settings.getModelGroup(name));
+	return rows;
+}
+
+/**
+ * Set (or with `account` undefined, remove) the account a pool member tries first, in the
+ * user config. The pool is written back through its strict validator.
+ *
+ * @throws AccountAdminError when a higher layer sets the pool, the user config holds no inline
+ * pool with that member, or the validator refuses the result.
+ */
+export function setPoolMemberAccount(settings: Settings, ref: PoolMemberRef, account: string | undefined): void {
+	const where = poolMemberPath(ref);
+	const blocker = poolProvenanceBlocker(settings, ref.kind, ref.key);
+	if (blocker) throw new AccountAdminError(`${where} is ${blocker}; change it there.`);
+	const global = settings.getGlobalSettings();
+	const container =
+		ref.kind === "role"
+			? global.modelRoles
+			: ref.kind === "chain"
+				? isRecord(global.retry)
+					? global.retry.fallbackChains
+					: undefined
+				: global.modelGroups;
+	const raw = isRecord(container) ? container[ref.key] : undefined;
+	const members = isRecord(raw) ? raw.models : undefined;
+	const member = isRecord(members) ? members[ref.alias] : undefined;
+	if (!isRecord(raw) || !isRecord(members) || !isRecord(member)) {
+		throw new AccountAdminError(`${where} is not a pool member in the user config.`);
+	}
+	const { account: _previous, ...rest } = member;
+	const next = {
+		...raw,
+		models: { ...members, [ref.alias]: account === undefined ? rest : { ...rest, account } },
+	};
+	try {
+		if (ref.kind === "role") settings.setModelRoleSpec(ref.key, next);
+		else if (ref.kind === "chain") settings.setFallbackChainSpec(ref.key, next);
+		else settings.setModelGroup(ref.key, next);
+	} catch (error) {
+		throw new AccountAdminError(error instanceof Error ? error.message : String(error));
+	}
 }
 
 /** A user-config `auth.accountPins` location: its canonical directory, raw key spellings, and merged pins. */
@@ -422,15 +725,36 @@ export function unpinProjectAccount(settings: Settings, cwd: string, provider?: 
 		removed = Object.keys(location.pins).length - kept.length;
 		writePinLocation(settings, location, Object.fromEntries(kept));
 	}
+	return {
+		removed,
+		...(location ? { projectDir: location.dir } : {}),
+		shadowedBy: shadowingPinLayers(settings, cwd, covers),
+	};
+}
+
+/** Layers above the user config (overlay, runtime) whose `auth.accountPins` cover `cwd` with pins satisfying `covers`. */
+function shadowingPinLayers(
+	settings: Settings,
+	cwd: string,
+	covers: (pins: Record<string, string>) => boolean,
+): string[] {
 	const dirs = new Set(ancestorDirs(cwd));
-	const shadowedBy = settings
+	return settings
 		.getLayerValues(cfgAuthAccountPins)
 		.filter(({ source, value }) => {
 			if (source === "global" || source === "project" || !isRecord(value)) return false;
 			return Object.entries(value).some(([key, entry]) => dirs.has(canonicalDir(key)) && covers(stringPins(entry)));
 		})
 		.map(({ source }) => source);
-	return { removed, ...(location ? { projectDir: location.dir } : {}), shadowedBy };
+}
+
+/**
+ * Why a user-config project pin edit for `provider` at `cwd` would not apply: an overlay or
+ * runtime `auth.accountPins` value pins it; undefined otherwise.
+ */
+export function projectPinWriteBlocker(settings: Settings, cwd: string, provider: string): string | undefined {
+	const layers = shadowingPinLayers(settings, cwd, pins => Object.hasOwn(pins, provider));
+	return layers.length > 0 ? `auth.accountPins for this project is set in the ${layers.at(-1)} layer` : undefined;
 }
 
 /** The views of an account policy's `configured` limits, ledger limits counted under the account's usage key. */
@@ -473,6 +797,10 @@ export function listAccounts(settings: Settings, authStorage: AuthStorage, cwd: 
 				...(policy?.priority !== undefined ? { priority: policy.priority } : {}),
 				...(policy?.reservePct !== undefined ? { reservePct: policy.reservePct } : {}),
 				drain: policy?.drain === true,
+				...(policy?.spend !== undefined ? { spend: policy.spend } : {}),
+				...(policy?.returnWhen !== undefined ? { returnWhen: [policy.returnWhen].flat() } : {}),
+				...(policy?.returnMargin !== undefined ? { returnMargin: policy.returnMargin } : {}),
+				...(policy?.returnCooldownMs !== undefined ? { returnCooldownMs: policy.returnCooldownMs } : {}),
 				limits: accountLimitViews(provider, account, policy?.limits, ledger, nowMs),
 				projectPinned: pinnedName !== undefined && account.name === pinnedName,
 			});

@@ -66,7 +66,7 @@ export function selectReportableAccounts(
 }
 
 /** Lowercased identity strings a report can be attributed to. */
-function reportIdentifiers(report: UsageReport): Set<string> {
+export function reportIdentifiers(report: UsageReport): Set<string> {
 	const ids = new Set<string>();
 	const add = (value: unknown): void => {
 		if (typeof value === "string" && value) ids.add(value.toLowerCase());

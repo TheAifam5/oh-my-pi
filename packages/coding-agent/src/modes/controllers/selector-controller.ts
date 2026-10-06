@@ -17,6 +17,7 @@ import {
 	getProjectDir,
 	normalizePathForComparison,
 	sanitizeText,
+	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import {
 	ADVISOR_DEFAULT_TOOL_NAMES,
@@ -108,6 +109,8 @@ import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-o
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { createAgentHubRuntime } from "../agent-hub-runtime";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
+import { AccountManagerComponent } from "@oh-my-pi/pi-tui/overlays/account-manager";
+import { createAccountManagerDeps, STORE_TIMEOUT_MESSAGE, STORE_TIMEOUT_MS } from "../account-manager-deps";
 import { CopySelectorComponent } from "@oh-my-pi/pi-tui/overlays/copy-selector";
 import { ExtensionDashboard } from "@oh-my-pi/pi-tui/overlays/extensions/extension-dashboard";
 import { listLiveToolRecords, liveToolRecordFromSession } from "@oh-my-pi/pi-tui/overlays/extensions/live-tool-session";
@@ -2261,6 +2264,41 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	/** Fullscreen `/account` manager over every stored account; edits go through account-admin. */
+	async showAccountManager(): Promise<void> {
+		const session = this.ctx.session;
+		const authStorage = session.modelRegistry.authStorage;
+		try {
+			await withTimeout(authStorage.credentials.reload(), STORE_TIMEOUT_MS, STORE_TIMEOUT_MESSAGE);
+		} catch (error: unknown) {
+			this.ctx.showError(
+				`Could not load stored credentials: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		let closed = false;
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			overlayHandle.hide();
+			this.focusActiveEditorArea();
+			this.ctx.statusLine.invalidate();
+			this.ctx.ui.requestRender();
+		};
+		const manager = new AccountManagerComponent(
+			this.ctx.ui,
+			createAccountManagerDeps({
+				settings: session.settings,
+				authStorage,
+				cwd: () => session.sessionManager.getCwd(),
+				session,
+				usageReports: () => session.lastUsageReports,
+			}),
+			{ onCancel: done },
+		);
+		const overlayHandle = this.#showFullscreenMenu(manager);
 	}
 
 	async showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
