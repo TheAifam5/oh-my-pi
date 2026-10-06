@@ -374,10 +374,15 @@ export function setAccountReserve(
 	if (!Number.isFinite(reservePct) || reservePct < 0 || reservePct > 100) {
 		throw new AccountAdminError("Reserve must be a percentage between 0 and 100.");
 	}
-	if (authStorage.usage.providerFor(ref.provider) === undefined) {
-		throw new AccountAdminError(`${ref.provider} reports no usage, so a reserve cannot be enforced.`);
+	if (!authStorage.usage.canFetchOAuthUsage(ref.provider)) {
+		throw new AccountAdminError(
+			`${ref.provider} has no usage source (no local provider and no broker), so a reserve cannot be enforced.`,
+		);
 	}
-	return writePolicy(settings, authStorage, ref, { reservePct });
+	const result = writePolicy(settings, authStorage, ref, { reservePct });
+	if (authStorage.usage.providerFor(ref.provider) !== undefined) return result;
+	const brokerWarning = `The reserve gives no protection until the broker reports usage for ${ref.provider}; if it never does, the reserve never applies.`;
+	return { warning: [result.warning, brokerWarning].filter(Boolean).join(" ") };
 }
 
 /**

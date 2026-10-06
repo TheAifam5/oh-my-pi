@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -41,6 +41,7 @@ describe("account manager deps", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		authStorage.close();
 		restoreSettingsTestState(state);
 		state = undefined;
@@ -74,6 +75,14 @@ describe("account manager deps", () => {
 		const openai = deps.load().find(account => account.provider === "openai")!;
 		expect(openai.identity).toMatch(/^API key [0-9a-f]{16}$/);
 		expect(JSON.stringify(openai)).not.toContain("sk-test-secret");
+	});
+
+	it("shows the warning of a reserve whose usage only the broker reports", async () => {
+		const { deps, ids } = await open({ auth: { accountPolicies: [workPolicy] } });
+		vi.spyOn(authStorage.usage, "providerFor").mockReturnValue(undefined);
+		vi.spyOn(authStorage.usage, "canFetchOAuthUsage").mockReturnValue(true);
+
+		expect((await deps.apply(ids.anthropic!, "reserve", "20")).warning).toContain("no protection");
 	});
 
 	it("shows policies from a runtime layer read-only and refuses their edits", async () => {

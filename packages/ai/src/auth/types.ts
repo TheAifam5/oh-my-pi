@@ -1374,6 +1374,8 @@ export interface UsageApi {
 	 * providers without a usage API) — the latter never warrants a usage row.
 	 */
 	providerFor(provider: Provider): UsageProvider | undefined;
+	/** Whether OAuth usage for `provider` can be fetched, from a local provider or the store's usage hook. */
+	canFetchOAuthUsage(provider: Provider): boolean;
 	/**
 	 * Return model ids whose live reports map to a quantitative usage scope.
 	 * Provider strategies supply model/tier mapping when available; otherwise
