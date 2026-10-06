@@ -27,7 +27,7 @@ import { minimaxCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/minimax-code";
 import { ollamaUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 import { codexBilling, openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
-import { openrouterBilling, openrouterUsageProvider } from "@oh-my-pi/pi-ai/usage/openrouter";
+import { limitResetAt, openrouterBilling, openrouterUsageProvider } from "@oh-my-pi/pi-ai/usage/openrouter";
 import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { syntheticBilling, syntheticUsageProvider } from "@oh-my-pi/pi-ai/usage/synthetic";
 import { xaiOauthBilling } from "@oh-my-pi/pi-ai/usage/xai-oauth";
@@ -492,6 +492,18 @@ describe("OpenRouter billing", () => {
 		expect(sources(openrouterBilling.readBilling(capped))).toEqual([{ mode: "free", state: "unknown" }]);
 		expect(sources(openrouterBilling.readBilling(spent))).toEqual([{ mode: "free", state: "unknown" }]);
 		expect(spent.limits[0]).toMatchObject({ amount: { remaining: 0 }, status: "exhausted" });
+	});
+
+	it("resets the key cap at the next midnight UTC boundary of its period", async () => {
+		// Sunday 2025-12-28 15:30 UTC.
+		const now = Date.UTC(2025, 11, 28, 15, 30);
+		expect(limitResetAt("daily", now)).toBe(Date.UTC(2025, 11, 29));
+		expect(limitResetAt("weekly", now)).toBe(Date.UTC(2025, 11, 29));
+		expect(limitResetAt("weekly", Date.UTC(2025, 11, 29))).toBe(Date.UTC(2026, 0, 5));
+		expect(limitResetAt("monthly", now)).toBe(Date.UTC(2026, 0, 1));
+		const report = await keyReport({ ...documentedKey, limit_reset: "daily" });
+		const resetsAt = report.limits[0]?.window?.resetsAt;
+		expect(resetsAt).toBe(limitResetAt("daily", report.fetchedAt));
 	});
 
 	it("leaves an unlisted limit_reset windowless", async () => {

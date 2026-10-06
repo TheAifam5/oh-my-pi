@@ -16,28 +16,48 @@ const CANONICAL_HOST = "openrouter.ai";
 const KEY_PATH = "/key";
 
 /** `limit_reset` values used as a window; any other value leaves the cap windowless. */
-const RESET_WINDOW_LABELS: Record<string, string> = { daily: "Daily", weekly: "Weekly", monthly: "Monthly" };
+const RESET_WINDOW_LABELS = { daily: "Daily", weekly: "Weekly", monthly: "Monthly" } as const;
+type LimitReset = keyof typeof RESET_WINDOW_LABELS;
+
+function isLimitReset(value: unknown): value is LimitReset {
+	return typeof value === "string" && Object.hasOwn(RESET_WINDOW_LABELS, value);
+}
 
 function finiteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Epoch ms of the next `limit_reset` boundary after `now`: resets happen at
+ * midnight UTC and weeks run Monday through Sunday. A monthly reset is taken
+ * as midnight UTC on the 1st, which the docs imply but do not state.
+ */
+export function limitResetAt(reset: LimitReset, now: number): number {
+	const date = new Date(now);
+	const year = date.getUTCFullYear();
+	const month = date.getUTCMonth();
+	const day = date.getUTCDate();
+	if (reset === "monthly") return Date.UTC(year, month + 1, 1);
+	if (reset === "daily") return Date.UTC(year, month, day + 1);
+	// getUTCDay() is 0 on Sunday; a week starting exactly now resets next Monday.
+	return Date.UTC(year, month, day + ((8 - date.getUTCDay()) % 7 || 7));
+}
+
 /** The key's spending cap in USD; `undefined` for a key without one (`limit: null`). */
-function keyLimit(data: Record<string, unknown>): UsageLimit | undefined {
+function keyLimit(data: Record<string, unknown>, now: number): UsageLimit | undefined {
 	const limit = finiteNumber(data.limit);
 	if (limit === undefined || limit < 0) return undefined;
 	const reported = finiteNumber(data.limit_remaining);
 	const remaining = reported === undefined ? undefined : Math.min(limit, Math.max(0, reported));
 	const usedFraction = remaining === undefined ? undefined : limit > 0 ? (limit - remaining) / limit : 1;
-	const reset =
-		typeof data.limit_reset === "string" && Object.hasOwn(RESET_WINDOW_LABELS, data.limit_reset)
-			? data.limit_reset
-			: undefined;
+	const reset = isLimitReset(data.limit_reset) ? data.limit_reset : undefined;
 	return {
 		id: "openrouter:key-limit",
 		label: "Key credit limit",
 		scope: { provider: PROVIDER, windowId: reset ?? "lifetime" },
-		...(reset !== undefined ? { window: { id: reset, label: RESET_WINDOW_LABELS[reset] } } : {}),
+		...(reset !== undefined
+			? { window: { id: reset, label: RESET_WINDOW_LABELS[reset], resetsAt: limitResetAt(reset, now) } }
+			: {}),
 		amount: {
 			limit,
 			...(remaining !== undefined ? { remaining } : {}),
@@ -83,10 +103,11 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 	}
 	if (!data) return null;
 
-	const cap = keyLimit(data);
+	const fetchedAt = Date.now();
+	const cap = keyLimit(data, fetchedAt);
 	return {
 		provider: PROVIDER,
-		fetchedAt: Date.now(),
+		fetchedAt,
 		limits: cap ? [cap] : [],
 		// `is_free_tier` describes the account (it has never purchased credits), not the key.
 		metadata: typeof data.is_free_tier === "boolean" ? { isFreeTier: data.is_free_tier } : {},
