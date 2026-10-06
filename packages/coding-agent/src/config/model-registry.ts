@@ -3173,22 +3173,29 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Whether an unresolved selector on `provider` may still be supplied by
-	 * discovery this process has not finished. Two states qualify:
-	 * - `idle`: a config-declared provider with a cold cache has no catalog yet
-	 *   (e.g. after `omp update` bumps the cache namespace, #10048).
-	 * - `cached`/`unavailable` while the initial background refresh is in
-	 *   flight: startup replayed a cache row or fell back to the bundled
-	 *   catalog, and that refresh may still add ids (a cold namespace after an
-	 *   upgrade, or a cache row keyed to another credential). With no refresh
-	 *   running (an embedder that manages discovery itself) these states are
-	 *   final, so unresolved selectors warn immediately.
+	 * Whether discovery may still add models to `provider` in this process.
+	 *
+	 * True while the provider's discovery state is `idle` (a cold discovery
+	 * cache, e.g. after `omp update` bumps the cache namespace, #10048), and,
+	 * until the initial background refresh settles, for an enabled provider
+	 * that startup served from a cache row or the bundled catalog while that
+	 * refresh is in flight, or whose catalog comes from live discovery: a
+	 * models.yml `discovery:` provider, an extension runtime provider, or a
+	 * built-in provider whose runtime roster is authoritative. A warm cache for
+	 * such a provider may predate a model the live roster now serves (e.g. a
+	 * per-account Codex catalog), so a selector missing from it is not yet known
+	 * to be unknown.
 	 */
 	isProviderDiscoveryPending(provider: string): boolean {
 		const status = this.#providerDiscoveryStates.get(provider)?.status;
 		if (status === "idle") return true;
-		if (status !== "cached" && status !== "unavailable") return false;
-		return this.#backgroundRefresh !== undefined && !this.#initialRefreshSettled;
+		if (this.#initialRefreshSettled || this.#isProviderDisabled(provider)) return false;
+		if ((status === "cached" || status === "unavailable") && this.#backgroundRefresh !== undefined) return true;
+		return (
+			AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(provider) ||
+			this.#runtimeModelManagers.has(provider) ||
+			this.#discoverableProviders.some(config => config.provider === provider)
+		);
 	}
 
 	/**

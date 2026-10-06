@@ -307,12 +307,11 @@ function providerScopedPool(
  * Validates configured fallback chains and reports each warning via `warn`.
  *
  * `options.isDiscoveryPending` suppresses "unknown model" warnings for
- * selectors whose provider discovery has not settled yet: a cold discovery
- * cache after `omp update` bumps the cache namespace (#10048), or a startup
- * cache replay the pending online refresh may still extend. Such selectors
- * are re-checked once background discovery settles. Logging is the caller's
- * responsibility so a post-discovery re-run does not double-log persistent
- * warnings.
+ * selectors whose provider discovery may still add the model (a cold discovery
+ * cache, #10048, or a discovery-backed provider before the initial background
+ * refresh settles). Such selectors are re-checked once background discovery
+ * settles. Logging is the caller's responsibility so a post-discovery re-run
+ * does not double-log persistent warnings.
  */
 export function validateRetryFallbackChains(
 	settings: Settings,
