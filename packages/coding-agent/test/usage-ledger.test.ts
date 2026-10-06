@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -34,5 +35,22 @@ describe("usage ledger", () => {
 		).toEqual({ costNanos: 2_000n, requests: 2n, tokens: 30n });
 		expect(usageLedger.totals([{ account: "work" }], NOW - 100).requests).toBe(2n);
 		expect(usageLedger.totals([{}], NOW - 100).requests).toBe(3n);
+	});
+
+	it("sees writes by another connection and by itself on the next repeated totals call", async () => {
+		const dbPath = path.join(tempDir.path(), "agent.db");
+		const { usageLedger } = await AgentStorage.open(dbPath);
+		usageLedger.record(entry("openai", "gpt-4o", NOW - 10));
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 100).requests).toBe(1n);
+
+		using other = new Database(dbPath);
+		other.run(
+			"INSERT INTO usage_ledger (at_ms, provider, model, cost_nanos, input_tokens, output_tokens) VALUES (?, 'openai', 'gpt-4o', 1000, 10, 5)",
+			[NOW - 5],
+		);
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 100).requests).toBe(2n);
+
+		usageLedger.record(entry("openai", "gpt-4o", NOW - 1));
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 100).requests).toBe(3n);
 	});
 });
