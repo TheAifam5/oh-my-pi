@@ -244,6 +244,7 @@ describe("Devin account usage", () => {
 			orgId: "org-42",
 			orgName: "Acme Robotics",
 			planType: "Devin Teams",
+			teamsTier: TeamsTier.DEVIN_TEAMS,
 			planEnd: PLAN_END_MS,
 			overageBalanceUsd: 2.5,
 		});
