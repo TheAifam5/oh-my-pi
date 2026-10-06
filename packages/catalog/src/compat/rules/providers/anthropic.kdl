@@ -13,6 +13,7 @@ provider "anthropic" {
 		short 300
 		long 3600
 	}
+	prompt-cache-warming #true
 
 	// Curated Anthropic models that are live or limited-availability on the
 	// first-party `/v1/models` endpoint but that stencil.so has not catalogued

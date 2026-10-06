@@ -29,7 +29,6 @@ function makeModel(): Model {
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-		promptCache: { short: 300, long: 3600 },
 		contextWindow: 200_000,
 		maxTokens: 8_192,
 	});
@@ -211,7 +210,6 @@ describe("cache warming scheduling math", () => {
 			reasoning: true,
 			input: ["text"],
 			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-			promptCache: { short: 300 },
 			contextWindow: 200_000,
 			maxTokens: 8_192,
 			compat: { supportsLongCacheRetention: false },
@@ -227,7 +225,6 @@ describe("cache warming scheduling math", () => {
 			reasoning: true,
 			input: ["text"],
 			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-			promptCache: { short: 300, long: 3600 },
 			contextWindow: 200_000,
 			maxTokens: 8_192,
 			compat: {
@@ -304,6 +301,30 @@ describe("cache warmer lifecycle", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+	});
+
+	test("never schedules a model whose lifetime only informs cache affinity", async () => {
+		const gpt = buildModel({
+			id: "gpt-5.6",
+			name: "GPT-5.6",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 400_000,
+			maxTokens: 128_000,
+		});
+		expect(gpt.promptCache).toEqual({ short: 1800 });
+		const h = harness();
+		h.warmer.start({ model: gpt, context: { messages: [] }, options: {} }, () => h.current);
+		expect(h.warmer.status).toEqual({ state: "inactive", reason: "cache lifetime unavailable" });
+		await advance(30 * 60_000);
+		expect(h.replays).toHaveLength(0);
+
+		start(h);
+		expect(h.warmer.status.state).toBe("scheduled");
 	});
 
 	test("cuts the replay off at the first generated block and re-arms on a cache hit", async () => {

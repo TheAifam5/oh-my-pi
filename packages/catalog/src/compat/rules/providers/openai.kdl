@@ -136,6 +136,22 @@ provider "openai" {
 			apply-patch-tool-type "freeform"
 		}
 	}
+	// Prompt-cache entry lifetimes in seconds, from OpenAI's prompt-caching
+	// guide: GPT-5.6 and later keep a prefix reusable for 30 minutes after its
+	// most recent write or reuse; earlier models typically keep in-memory
+	// entries 5 to 10 minutes of inactivity, of which 300 is the floor.
+	class "openai" {
+		revision "<5.6" {
+			prompt-cache {
+				short 300
+			}
+		}
+		revision ">=5.6" {
+			prompt-cache {
+				short 1800
+			}
+		}
+	}
 	// First-party GPT-5.6 whole-request long-context tiers (>272K input).
 	models "daybreak-blue-latest" "gpt-5.6" "gpt-5.6-sol*" {
 		long-context-cost {
@@ -188,5 +204,8 @@ provider "openai" {
 		prompt-cache-breakpoint-ttl "30m"
 		supports-prompt-cache-breakpoints #true
 		supports-sampling-params #false
+		prompt-cache {
+			short 1800
+		}
 	}
 }

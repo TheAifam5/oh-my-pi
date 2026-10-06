@@ -119,6 +119,8 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
 			...(long !== undefined && { long }),
 		};
 	}
+	if (catalog.promptCacheWarming === true) model.promptCacheWarming = true;
+	else if (catalog.promptCacheWarming === false) delete model.promptCacheWarming;
 	const applyPatchToolType = catalog.applyPatchToolType;
 	if (applyPatchToolType === "freeform" || applyPatchToolType === "function") {
 		model.applyPatchToolType = applyPatchToolType;
@@ -363,10 +365,17 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 		compat: policy.compat,
 		compatConfig: spec.compat,
 	};
+	// Lifetimes and the warming opt-in are rule-owned: values copied from a reference row on another host never carry over.
+	delete model.promptCache;
+	delete model.promptCacheWarming;
 	applyCatalogAssignments(model, policy.catalog);
 	applyCatalogCorrections(model, policy.catalog);
-	// Configured kinds and lifetimes replace catalog values rather than merging with them.
+	// Configured kinds and lifetimes replace catalog values rather than merging with them; a configured
+	// lifetime also opts into warming.
 	if (spec.kindConfig !== undefined) model.kind = spec.kindConfig;
-	if (spec.promptCacheConfig !== undefined) model.promptCache = { ...spec.promptCacheConfig };
+	if (spec.promptCacheConfig !== undefined) {
+		model.promptCache = { ...spec.promptCacheConfig };
+		model.promptCacheWarming = true;
+	}
 	return model;
 }

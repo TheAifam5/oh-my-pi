@@ -478,6 +478,8 @@ class "anthropic" {
 		// pricing is deliberately not used to infer these request shapes. Keep the
 		// provider and adapter conjunctive so this policy stays on Converse.
 		on-api "bedrock-converse-stream" {
+			// Replays are validated wherever a lifetime below is declared.
+			prompt-cache-warming #true
 			family "opus" {
 				revision ">=4 <4.5" {
 					prompt-cache-mode "explicit"
@@ -621,6 +623,8 @@ class "anthropic" {
 	// alone do not distinguish Bedrock from gateways or other API lanes.
 	on "amazon-bedrock" "bedrock-mantle" {
 		on-api "anthropic-messages" {
+			// Replays are validated wherever a lifetime below is declared.
+			prompt-cache-warming #true
 			family "opus" {
 				revision ">=4.7" {
 					prompt-cache {

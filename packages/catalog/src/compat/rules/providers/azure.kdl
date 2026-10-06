@@ -7,6 +7,22 @@ provider "azure" {
 	class "openai" {
 		thinking-mode "effort"
 	}
+	// Prompt-cache entry lifetimes in seconds, from Azure OpenAI's prompt-caching
+	// guide: GPT-5.6 and later keep a prefix reusable for at least 30 minutes;
+	// earlier models' in-memory caches typically clear within 5 to 10 minutes
+	// of inactivity, of which 300 is the floor.
+	class "openai" {
+		revision "<5.6" {
+			prompt-cache {
+				short 300
+			}
+		}
+		revision ">=5.6" {
+			prompt-cache {
+				short 1800
+			}
+		}
+	}
 	// residue: taxonomy ranks and exact globs do not isolate these models.
 	models "codex-mini" "gpt-chat-latest" {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"

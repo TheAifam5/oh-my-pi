@@ -372,6 +372,11 @@ retention tier actually used is never warmed; custom models and `modelOverrides`
 with `promptCache` once the backing cache behavior is known. See `providers.cacheWarming` in
 [Settings](./settings.md).
 
+Catalog lifetimes for OpenAI and Azure OpenAI GPT models and Moonshot Kimi K3 only inform pool
+cache affinity (`routing.cache.affinity`); they never enable warming. Warming also requires the
+model's `promptCacheWarming` flag, which the catalog sets for the Anthropic and Bedrock Claude
+routes above and a models.yml `promptCache` sets implicitly.
+
 ## Usage costs and time-based pricing
 
 OMP estimates token costs from the selected provider/model's catalog pricing, preferring server-reported monetary costs when available. Completed messages retain their recorded costs: crossing a pricing boundary, switching models, or reopening a session does not reprice accumulated usage.

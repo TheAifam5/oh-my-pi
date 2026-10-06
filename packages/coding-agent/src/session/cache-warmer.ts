@@ -13,8 +13,9 @@
  * streaming / 30 min idle). An entry whose lifetime outlasts the idle window
  * (Anthropic's 1h tier) is therefore only warmed while a run is active.
  *
- * A model is warmed only when its catalog entry (or a models.yml `promptCache`
- * override) declares a lifetime for the retention tier the request used, so
+ * A model is warmed only when its catalog entry opts into warming
+ * (`promptCacheWarming`) and declares a lifetime for the retention tier the
+ * request used, or a models.yml `promptCache` override declares one, so
  * providers whose replay behavior is unvalidated are never touched.
  */
 import {
@@ -118,10 +119,16 @@ export function resolvePromptCacheTier(
 	return retention === "long" && !supportsLongCacheRetention(model) ? "short" : retention;
 }
 
+/** `model`'s `promptCache` lifetime for `tier` in seconds, when the model also opts into warming. */
+function warmableLifetimeSeconds(model: Model<Api>, tier: PromptCacheTier): number | undefined {
+	return model.promptCacheWarming === true ? model.promptCache?.[tier] : undefined;
+}
+
 /**
  * Lifetime of the prompt cache entry a request writes, from the model's
  * `promptCache` tier for the retention the request used. Undefined when the
- * model has no lifetime for that tier or caching is off.
+ * model has no lifetime for that tier, does not opt into warming
+ * (`promptCacheWarming`), or caching is off.
  */
 export function getPromptCacheTtlMs(
 	model: Model<Api>,
@@ -129,7 +136,7 @@ export function getPromptCacheTtlMs(
 	isOAuthToken = false,
 ): number | undefined {
 	const tier = resolvePromptCacheTier(model, options, isOAuthToken);
-	const seconds = tier === undefined ? undefined : model.promptCache?.[tier];
+	const seconds = tier === undefined ? undefined : warmableLifetimeSeconds(model, tier);
 	return seconds === undefined ? undefined : seconds * 1000;
 }
 
@@ -416,7 +423,7 @@ export class CacheWarmer {
 	}
 
 	#delayFor(model: Model<Api>, tier: PromptCacheTier): number | undefined {
-		const seconds = model.promptCache?.[tier];
+		const seconds = warmableLifetimeSeconds(model, tier);
 		return seconds === undefined ? undefined : getCacheWarmingDelayMs(seconds * 1000);
 	}
 

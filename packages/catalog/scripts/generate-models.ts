@@ -787,6 +787,7 @@ export function buildGeneratedModel(model: ModelSpec<Api>): Model<Api> {
 	delete spec.promptCache;
 	delete spec.promptCacheConfig;
 	delete spec.kindConfig;
+	delete spec.promptCacheWarming;
 	return buildModel(spec);
 }
 

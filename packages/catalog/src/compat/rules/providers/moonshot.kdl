@@ -50,4 +50,12 @@ provider "moonshot" {
 	models token="vl" {
 		input-modalities "text" "image"
 	}
+	// Prompt-cache entry lifetime in seconds, from Kimi's context-caching guide:
+	// K3 supports cache writes, and without prompt_cache_options an entry lives
+	// 5 minutes of inactivity, renewed by each hit.
+	models "kimi-k3" {
+		prompt-cache {
+			short 300
+		}
+	}
 }

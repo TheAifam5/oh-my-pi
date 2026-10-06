@@ -172,10 +172,10 @@ describe("Bedrock prompt-cache compat", () => {
 
 		const uncached = buildGeneratedModel({
 			...bedrockSpec(),
-			id: "gpt-5.2",
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "https://api.openai.com/v1",
+			id: "openai/gpt-5.2",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
 			promptCache: stale,
 			promptCacheConfig: stale,
 		});

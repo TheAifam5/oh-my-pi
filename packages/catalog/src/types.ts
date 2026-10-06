@@ -1529,13 +1529,18 @@ export interface Model<TApi extends Api = Api> {
 	factoryDroidOrgId?: string;
 	cost: ModelCost;
 	/**
-	 * Prompt-cache entry lifetime per retention tier, in seconds. Populated only
-	 * for providers whose cache-expiry and replay behavior has been validated
-	 * for cache warming (direct Anthropic: 5m / 1h). A missing entry means the
-	 * provider's cache behavior is unknown — such models are never warmed.
-	 * Custom models and provider overrides opt in via models.yml `promptCache`.
+	 * Prompt-cache entry lifetime per retention tier, in seconds. A missing
+	 * entry means the provider's cache expiry is unknown. Custom models and
+	 * provider overrides declare lifetimes via models.yml `promptCache`.
 	 */
 	promptCache?: ModelPromptCache;
+	/**
+	 * Whether the cache warmer may replay requests to keep `promptCache`
+	 * entries alive: set only where replay behavior has been validated, or
+	 * when models.yml configures `promptCache`. Lifetimes without it only
+	 * inform cache affinity.
+	 */
+	promptCacheWarming?: boolean;
 	/**
 	 * Verbatim configured lifetimes (models.yml, `modelOverrides`, runtime
 	 * registrations). `buildModel` applies them over catalog `prompt-cache`
@@ -1696,6 +1701,9 @@ export interface Model<TApi extends Api = Api> {
  * A model as authored by configs, bundled catalogs, and discovery — the input
  * vocabulary of `buildModel`. Identical to `Model` except `compat` carries the
  * sparse override shape and nothing is resolved yet.
+ *
+ * `buildModel` ignores `promptCache` and `promptCacheWarming`: lifetimes come
+ * from catalog rules or from `promptCacheConfig`, which also opts into warming.
  */
 export interface ModelSpec<TApi extends Api = Api> extends Omit<
 	Model<TApi>,
