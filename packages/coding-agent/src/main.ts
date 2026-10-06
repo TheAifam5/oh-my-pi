@@ -2496,7 +2496,7 @@ export async function runRootCommand(
 			}
 			// Interactive mode shows these in the header through `session.configWarnings`.
 			if (!isInteractive) {
-				for (const warning of startupWarnings ?? [])
+				for (const warning of [...(startupWarnings ?? []), ...session.accountPinWarnings])
 					process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
 			}
 

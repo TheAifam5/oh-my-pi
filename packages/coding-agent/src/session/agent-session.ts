@@ -741,6 +741,9 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 	};
 }
 
+/** `notice` source of an unavailable account pin warning. */
+export const ACCOUNT_PIN_NOTICE_SOURCE = "account-pin";
+
 export class AgentSession implements SettingsScope {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -2670,6 +2673,14 @@ export class AgentSession implements SettingsScope {
 			}
 		}
 		return changed;
+	}
+
+	/**
+	 * Unavailable-pin warnings found while no listener was attached; they are held in
+	 * `configWarnings` instead of emitted as notices, and dropped once the pin is resolved.
+	 */
+	get accountPinWarnings(): readonly string[] {
+		return Array.from(this.#accountPinWarnings.values());
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -5970,7 +5981,7 @@ export class AgentSession implements SettingsScope {
 				const message = `The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`;
 				// A notice emitted before anyone subscribes (construction) is lost; the header renders configWarnings later.
 				if (this.#eventListeners.length > 0) {
-					this.emitNotice("warning", message, "account-pin");
+					this.emitNotice("warning", message, ACCOUNT_PIN_NOTICE_SOURCE);
 				} else {
 					this.#accountPinWarnings.set(provider, message);
 					this.configWarnings.push(message);
