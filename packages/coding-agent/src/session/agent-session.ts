@@ -14112,8 +14112,9 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Re-run retry.fallbackChains validation once the initial background discovery
 	 * settles. Startup validation suppresses "unknown model" warnings for
-	 * config-declared discovery providers whose cold cache left the registry empty
-	 * (#10048); this retracts the ones discovery resolved and surfaces any that
+	 * providers whose discovery could still add the model (a cold cache, #10048,
+	 * or a discovery-backed provider whose warm cache may predate its live
+	 * roster); this retracts the ones discovery resolved and surfaces any that
 	 * stayed unknown. Uses {@link ModelRegistry.awaitInitialBackgroundRefresh}
 	 * because the CLI starts that refresh right after the session is built, so an
 	 * in-flight snapshot taken in the constructor would always miss it.

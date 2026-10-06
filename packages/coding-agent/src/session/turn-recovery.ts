@@ -1879,10 +1879,10 @@ export class TurnRecovery {
 	/**
 	 * Re-run fallback-chain validation once background discovery has settled and
 	 * reconcile `configWarnings`. Startup validation suppresses "unknown model"
-	 * warnings for selectors whose config-declared discovery provider had not yet
-	 * populated the registry (a cold cache after `omp update` bumps the discovery
-	 * namespace, #10048). With discovery done, drop any startup warning discovery
-	 * resolved and surface warnings for selectors that stayed unknown.
+	 * warnings for selectors whose provider discovery could still add the model
+	 * (see {@link ModelRegistry.isProviderDiscoveryPending}). With discovery
+	 * done, drop any startup warning discovery resolved and surface warnings for
+	 * selectors that stayed unknown.
 	 *
 	 * @returns true when `configWarnings` changed and the header must rebuild.
 	 */

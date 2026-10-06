@@ -2892,14 +2892,25 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Whether a config-declared discovery provider has not yet produced a
-	 * catalog in this process. A cold discovery cache (e.g. after `omp update`
-	 * bumps the cache namespace) leaves the provider in its initial `idle`
-	 * state with no models, so a selector the provider will supply looks
-	 * unknown until background discovery lands (#10048).
+	 * Whether discovery may still add models to `provider` in this process.
+	 *
+	 * True while the provider's discovery state is `idle` (a cold discovery
+	 * cache, e.g. after `omp update` bumps the cache namespace, #10048), and,
+	 * until the initial background refresh settles, for an enabled provider
+	 * whose catalog comes from live discovery: a models.yml `discovery:`
+	 * provider, an extension runtime provider, or a built-in provider whose
+	 * runtime roster is authoritative. A warm cache for such a provider may
+	 * predate a model the live roster now serves (e.g. a per-account Codex
+	 * catalog), so a selector missing from it is not yet known to be unknown.
 	 */
 	isProviderDiscoveryPending(provider: string): boolean {
-		return this.#providerDiscoveryStates.get(provider)?.status === "idle";
+		if (this.#providerDiscoveryStates.get(provider)?.status === "idle") return true;
+		if (this.#initialRefreshSettled || this.#isProviderDisabled(provider)) return false;
+		return (
+			AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(provider) ||
+			this.#runtimeModelManagers.has(provider) ||
+			this.#discoverableProviders.some(config => config.provider === provider)
+		);
 	}
 
 	/**

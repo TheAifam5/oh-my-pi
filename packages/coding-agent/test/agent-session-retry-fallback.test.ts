@@ -5970,6 +5970,123 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
+	describe("discovery-backed provider with a warm cache lacking the chain model", () => {
+		const keyWarning = "retry.fallbackChains key references unknown model: gateway/fresh-model";
+		const staticWarning = "retry.fallbackChains key references unknown model: fixed/no-such-model";
+
+		async function startSession(servedIds: string[]): Promise<{ registry: ModelRegistry; session: AgentSession }> {
+			const primaryModel = getBundledModel("openai", "gpt-4o-mini");
+			if (!primaryModel) {
+				throw new Error("Expected bundled OpenAI test model to exist");
+			}
+			const dir = path.join(tempDir.path(), `warm-discovery-${servedIds.length}`);
+			const modelsConfigPath = path.join(dir, "models.json");
+			await Bun.write(
+				modelsConfigPath,
+				JSON.stringify({
+					providers: {
+						gateway: {
+							baseUrl: "http://127.0.0.1:9993",
+							api: "openai-completions",
+							auth: "none",
+							discovery: { type: "openai-models-list" },
+						},
+						fixed: {
+							baseUrl: "http://127.0.0.1:9994/v1",
+							api: "openai-completions",
+							auth: "none",
+							models: [{ id: "fixed-model", reasoning: false, input: ["text"] }],
+						},
+					},
+				}),
+			);
+			const cachedModel: Model<"openai-completions"> = buildModel({
+				id: "old-model",
+				name: "old-model",
+				api: "openai-completions",
+				provider: "gateway",
+				baseUrl: "http://127.0.0.1:9993/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 65_536,
+				maxTokens: 8_192,
+			});
+			writeModelCache(
+				"gateway:openai-models-list-context-v3",
+				Date.now(),
+				[cachedModel],
+				true,
+				"",
+				path.join(dir, "models.db"),
+			);
+			const registry = new ModelRegistry(authStorage, modelsConfigPath, {
+				fetch: async input =>
+					String(input) === "http://127.0.0.1:9993/v1/models"
+						? Response.json({ data: servedIds.map(id => ({ id, context_length: 65_536 })) })
+						: new Response("", { status: 404 }),
+			});
+			expect(registry.find("gateway", "old-model")).toBeDefined();
+			expect(registry.find("gateway", "fresh-model")).toBeUndefined();
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.fallbackChains": { "gateway/fresh-model": [], "fixed/no-such-model": [] },
+			});
+			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: () => {
+					throw new Error("Not exercised");
+				},
+			});
+			const started = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: registry,
+			});
+			return { registry, session: started };
+		}
+
+		async function settleDiscovery(registry: ModelRegistry): Promise<void> {
+			registry.refreshInBackground("online");
+			await registry.awaitInitialBackgroundRefresh();
+			await scheduler.wait(0);
+		}
+
+		it("defers the startup warning and retracts it when discovery serves the model", async () => {
+			const started = await startSession(["old-model", "fresh-model"]);
+			session = started.session;
+
+			expect(session.configWarnings).not.toContain(keyWarning);
+			expect(session.configWarnings).toContain(staticWarning);
+			// Built-in providers with an authoritative live roster defer the same way.
+			expect(started.registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
+
+			await settleDiscovery(started.registry);
+			expect(started.registry.isProviderDiscoveryPending("openai-codex")).toBe(false);
+			expect(started.registry.find("gateway", "fresh-model")).toBeDefined();
+			expect(session.configWarnings).not.toContain(keyWarning);
+		});
+
+		it("surfaces the warning once discovery settles without the model", async () => {
+			const started = await startSession(["old-model"]);
+			session = started.session;
+			let warningEvents = 0;
+			session.subscribe(event => {
+				if (event.type === "config_warnings_changed") warningEvents++;
+			});
+
+			expect(session.configWarnings).not.toContain(keyWarning);
+
+			await settleDiscovery(started.registry);
+			expect(session.configWarnings.filter(warning => warning === keyWarning)).toHaveLength(1);
+			expect(warningEvents).toBe(1);
+		});
+	});
+
 	it("resolves awaitInitialBackgroundRefresh for a refresh started after the waiter is armed", async () => {
 		const modelsConfigPath = path.join(tempDir.path(), "late-refresh-models.json");
 		await Bun.write(
