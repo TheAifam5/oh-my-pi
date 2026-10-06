@@ -42,6 +42,7 @@ import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-select
 import { getRoleInfo } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
+import { resolveToolExecutionRenderers } from "../../extensibility/extensions/wrapper";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -1283,6 +1284,7 @@ export class SelectorController {
 			ui: this.ctx.ui,
 			getTool: name => this.ctx.session.getToolByName(name),
 			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+			getToolRenderers: (name, tool) => resolveToolExecutionRenderers(this.ctx.session.extensionRunner, name, tool),
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -1415,6 +1417,7 @@ export class SelectorController {
 			ui: this.ctx.ui,
 			getTool: name => this.ctx.session.getToolByName(name),
 			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+			getToolRenderers: (name, tool) => resolveToolExecutionRenderers(this.ctx.session.extensionRunner, name, tool),
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -2533,6 +2536,7 @@ export class SelectorController {
 			ui: this.ctx.ui,
 			getTool: name => this.ctx.session.getToolByName(name),
 			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+			getToolRenderers: (name, tool) => resolveToolExecutionRenderers(this.ctx.session.extensionRunner, name, tool),
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,

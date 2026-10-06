@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { Component } from "@oh-my-pi/pi-tui";
+import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
+import { ChatTranscriptBuilder } from "@oh-my-pi/pi-tui/chat/chat-transcript-builder";
 import { ToolExecutionComponent, type ToolExecutionUi } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { getThemeByName, setThemeInstance, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { Settings } from "../src/config/settings";
@@ -88,5 +89,42 @@ describe("pi.registerToolRenderer", () => {
 	test("next() yields the tool's own renderer to a pi-order wrapper", async () => {
 		const { runner, tool } = await setup();
 		expect(renderCard(runner, "aft_search", tool)).toContain("wrapped: own renderer");
+	});
+
+	test("replayed overlay transcripts render tool calls through the resolvers", async () => {
+		const { runner } = await setup();
+		const builder = new ChatTranscriptBuilder({
+			ui: ui as unknown as TUI,
+			cwd: "/project",
+			requestRender() {},
+			getToolRenderers: (name, tool) => resolveToolExecutionRenderers(runner, name, tool),
+		});
+		builder.rebuild([
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-1", name: "mcp_lookup", arguments: {} }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					stopReason: "toolUse",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					timestamp: 0,
+				},
+			},
+		]);
+		const rendered = builder.container.children.map(child => child.render(100).join("\n")).join("\n");
+		expect(Bun.stripANSI(rendered)).toContain("resolver renderer");
 	});
 });

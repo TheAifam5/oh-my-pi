@@ -66,7 +66,7 @@ import {
 } from "./late-diagnostics-message";
 import { groupedReadUsageCallIds, ReadToolGroupComponent, readArgsCollapseIntoGroup } from "./read-tool-group";
 import { SkillMessageComponent } from "./skill-message";
-import { ToolExecutionComponent } from "./tool-execution";
+import { ToolExecutionComponent, type ToolExecutionRenderers } from "./tool-execution";
 import { TranscriptContainer } from "../chrome/transcript-container";
 import { createUsageRowBlock, TurnUsageTally, turnElapsedMs } from "../overlays/usage-row";
 import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "./user-message";
@@ -76,6 +76,8 @@ export interface ChatTranscriptBuilderDeps {
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	/** Renderers replacing the tool's own for a call to `name`; `undefined` keeps the default rendering. */
+	getToolRenderers?: (name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
@@ -494,6 +496,7 @@ export class ChatTranscriptBuilder {
 
 			this.#readGroup?.seal();
 			this.#readGroup = null;
+			const tool = this.#deps.getTool?.(content.name);
 			const component = new ToolExecutionComponent(
 				content.name,
 				content.arguments,
@@ -502,8 +505,9 @@ export class ChatTranscriptBuilder {
 					// Stable ids and Kitty placeholder cells keep images anchored
 					// while the transcript viewport scrolls and reflows.
 					showImages: displayPreferences.showImages,
+					renderers: this.#deps.getToolRenderers?.(content.name, tool),
 				},
-				this.#deps.getTool?.(content.name),
+				tool,
 				this.#deps.ui,
 				this.#deps.cwd,
 				content.id,

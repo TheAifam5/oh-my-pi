@@ -24,6 +24,7 @@ import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
 import { formatKeyHint, formatKeyHints, type KeyId } from "../app-keybindings";
 import { editorKey } from "../chrome/keybinding-hints";
 import type { MessageRenderer } from "../chat/extension-types";
+import type { ToolExecutionRenderers } from "../chat/tool-execution";
 import type { AgentLifecycleLike } from "./agent-hub-types";
 import type { AgentHubRegistry, AgentStatus } from "./agent-hub-types";
 import type { SessionMessageEntryLike } from "../chat/transcript-entry";
@@ -76,6 +77,7 @@ export interface AgentTranscriptViewerDeps {
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	getToolRenderers?: (name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
@@ -209,6 +211,7 @@ export class AgentTranscriptViewer implements Component {
 			ui: deps.ui,
 			getTool: deps.getTool,
 			isBuiltInTool: deps.isBuiltInTool,
+			getToolRenderers: deps.getToolRenderers,
 			getMessageRenderer: deps.getMessageRenderer,
 			cwd: deps.cwd,
 			hideThinkingBlock: deps.hideThinkingBlock,
