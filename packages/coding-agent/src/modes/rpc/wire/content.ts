@@ -109,6 +109,7 @@ export const messageDefs = {
 		"responseId?": "string",
 		"upstreamProvider?": "string",
 		"upstreamModel?": "string",
+		"requestedModel?": "string",
 		usage: "Usage",
 		stopReason: "StopReason",
 		"errorMessage?": "string",

@@ -75,6 +75,33 @@ fn open_record_keeps_unknown_keys_and_tolerates_missing_fields() {
 }
 
 #[test]
+fn assistant_requested_model_round_trips_and_stays_optional() {
+	let raw = json!({
+		"role": "assistant", "content": [], "api": "anthropic-messages", "provider": "anthropic",
+		"model": "claude-sonnet-4-5", "requestedModel": "claude-opus-4-1",
+		"usage": {}, "stopReason": "stop", "timestamp": 1.5,
+	});
+	let AgentMessage::Assistant(message) =
+		serde_json::from_value::<AgentMessage>(raw.clone()).unwrap()
+	else {
+		panic!("not routed to assistant")
+	};
+	assert_eq!(message.requested_model.as_deref(), Some("claude-opus-4-1"));
+	assert!(message.extra.is_empty());
+	assert_eq!(serde_json::to_value(AgentMessage::Assistant(message)).unwrap(), raw);
+	// A message from a server that predates the field still decodes.
+	let mut older = raw.clone();
+	older.as_object_mut().unwrap().remove("requestedModel");
+	let AgentMessage::Assistant(message) =
+		serde_json::from_value::<AgentMessage>(older.clone()).unwrap()
+	else {
+		panic!("not routed to assistant")
+	};
+	assert_eq!(message.requested_model, None);
+	assert_eq!(serde_json::to_value(AgentMessage::Assistant(message)).unwrap(), older);
+}
+
+#[test]
 fn unknown_fallback_field_keeps_raw_event() {
 	let raw = json!({"type": "subagent_event", "payload": {"id": "sa_1", "event": {"type": "from_the_future", "n": 1}}});
 	let RpcNotification::SubagentEvent(event) = notification(raw.clone()).unwrap() else {

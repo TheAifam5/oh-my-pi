@@ -625,6 +625,7 @@ type AssistantMessage struct {
 	ResponseID       *string                    `json:"responseId,omitempty"`
 	UpstreamProvider *string                    `json:"upstreamProvider,omitempty"`
 	UpstreamModel    *string                    `json:"upstreamModel,omitempty"`
+	RequestedModel   *string                    `json:"requestedModel,omitempty"`
 	ErrorMessage     *string                    `json:"errorMessage,omitempty"`
 	ErrorStatus      *int64                     `json:"errorStatus,omitempty"`
 	ErrorID          *float64                   `json:"errorId,omitempty"`
@@ -655,6 +656,7 @@ func (v *AssistantMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("responseId", &out.ResponseID)
 	d.optional("upstreamProvider", &out.UpstreamProvider)
 	d.optional("upstreamModel", &out.UpstreamModel)
+	d.optional("requestedModel", &out.RequestedModel)
 	d.optional("errorMessage", &out.ErrorMessage)
 	d.optional("errorStatus", &out.ErrorStatus)
 	d.optional("errorId", &out.ErrorID)

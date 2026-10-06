@@ -928,6 +928,7 @@ pub struct AssistantMessage {
 	pub response_id: Option<String>,
 	pub upstream_provider: Option<String>,
 	pub upstream_model: Option<String>,
+	pub requested_model: Option<String>,
 	pub error_message: Option<String>,
 	pub error_status: Option<i64>,
 	pub error_id: Option<f64>,
@@ -975,6 +976,9 @@ impl Serialize for AssistantMessage {
 		if let Some(value) = &self.upstream_model {
 			map.serialize_entry("upstreamModel", value)?;
 		}
+		if let Some(value) = &self.requested_model {
+			map.serialize_entry("requestedModel", value)?;
+		}
 		if let Some(value) = &self.error_message {
 			map.serialize_entry("errorMessage", value)?;
 		}
@@ -1009,6 +1013,7 @@ impl Serialize for AssistantMessage {
 				"responseId" if self.response_id.is_some() => continue,
 				"upstreamProvider" if self.upstream_provider.is_some() => continue,
 				"upstreamModel" if self.upstream_model.is_some() => continue,
+				"requestedModel" if self.requested_model.is_some() => continue,
 				"errorMessage" if self.error_message.is_some() => continue,
 				"errorStatus" if self.error_status.is_some() => continue,
 				"errorId" if self.error_id.is_some() => continue,
@@ -1039,6 +1044,7 @@ impl<'de> Deserialize<'de> for AssistantMessage {
 			response_id: take(&mut extra, "responseId"),
 			upstream_provider: take(&mut extra, "upstreamProvider"),
 			upstream_model: take(&mut extra, "upstreamModel"),
+			requested_model: take(&mut extra, "requestedModel"),
 			error_message: take(&mut extra, "errorMessage"),
 			error_status: take(&mut extra, "errorStatus"),
 			error_id: take(&mut extra, "errorId"),
