@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, type Mock, mock, spyOn } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
-import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { setStreamUsageObserver, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -323,6 +323,31 @@ describe("streamPiNative request shape", () => {
 				"cf-aig-cache-status": "HIT",
 			},
 		});
+	});
+
+	it("keeps the client-local cacheWarm and usageRecorded flags off the gateway wire", async () => {
+		const captured: { init?: RequestInit } = {};
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			captured.init = init;
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+		// An installed observer makes streamSimple mark the admitted request `usageRecorded`.
+		setStreamUsageObserver({ admit: () => undefined, record: () => {} });
+		try {
+			await streamSimple(fakeModel(), baseContext, {
+				apiKey: "gw-bearer",
+				fetch: fetchImpl,
+				cacheWarm: true,
+				maxTokens: 1,
+			}).result();
+		} finally {
+			setStreamUsageObserver(undefined);
+		}
+
+		const body = JSON.parse(captured.init?.body as string);
+		expect("cacheWarm" in body.options).toBe(false);
+		expect("usageRecorded" in body.options).toBe(false);
+		expect(body.options.maxTokens).toBe(1);
 	});
 
 	it("normalizes trailing slashes on `baseUrl` so the endpoint never double-slashes", async () => {
