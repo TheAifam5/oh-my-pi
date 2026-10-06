@@ -427,9 +427,15 @@ export class CredentialSelector {
 
 	/**
 	 * Why a `skip` limit of the stored credential's account policy refuses another call, as the
-	 * installed {@link AccountLimitSource} reports; never without a source or limits.
+	 * installed {@link AccountLimitSource} reports; never without a source or limits, nor for a
+	 * {@link AuthApiKeyOptions.committedSpend} call.
 	 */
-	accountLimit(provider: string, index: number): AccountLimitRefusal | undefined {
+	accountLimit(
+		provider: string,
+		index: number,
+		options: AuthApiKeyOptions | undefined,
+	): AccountLimitRefusal | undefined {
+		if (options?.committedSpend) return undefined;
 		const source = this.#deps.usage.limitSource;
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (!source || !credential) return undefined;
@@ -456,7 +462,7 @@ export class CredentialSelector {
 	): Promise<AccountLimitRefusal | undefined> {
 		const rowId = this.#deps.pool.entries(provider)[index]?.id;
 		const compute = async () =>
-			this.accountLimit(provider, index) ?? (await this.#evidenceRefusal(provider, index, options));
+			this.accountLimit(provider, index, options) ?? (await this.#evidenceRefusal(provider, index, options));
 		if (!memo || rowId === undefined) return compute();
 		let verdict = memo.get(rowId);
 		if (!verdict) {
@@ -473,12 +479,14 @@ export class CredentialSelector {
 	 * spend that class: a known balance under the floor or reported extra usage at the cap refuses
 	 * with `reached`, missing evidence with `unreadable`. An account whose usage report cannot be
 	 * read is never held back by these limits. A reached `warn` limit is logged once until it clears.
+	 * A {@link AuthApiKeyOptions.committedSpend} call is never refused.
 	 */
 	async #evidenceRefusal(
 		provider: string,
 		index: number,
 		options: AuthApiKeyOptions | undefined,
 	): Promise<AccountLimitRefusal | undefined> {
+		if (options?.committedSpend) return undefined;
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (credential?.type !== "oauth") return undefined;
 		const limits = this.#deps.policies.forStored(provider, credential)?.limits?.filter(isAccountEvidenceLimit) ?? [];
@@ -569,7 +577,7 @@ export class CredentialSelector {
 			.filter((entry): entry is ApiKeySelection => {
 				if (entry.credential.type !== "api_key") return false;
 				if (!(filter?.(entry.credential) ?? true)) return false;
-				return this.accountLimit(provider, entry.index) === undefined;
+				return this.accountLimit(provider, entry.index, options) === undefined;
 			});
 
 		if (credentials.length === 0) return undefined;

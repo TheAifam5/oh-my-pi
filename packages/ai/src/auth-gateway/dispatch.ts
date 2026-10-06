@@ -12,7 +12,6 @@ import { extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver, ResolvedApiKey } from "../auth-retry";
 import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
 import { accountUsageKey } from "../auth/policy";
-import type { AccountLimitSource } from "../auth/types";
 import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
@@ -187,9 +186,17 @@ async function refreshGatewayApiKeyAfterAuthError(
 	return storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal));
 }
 
-/** Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it. */
+/**
+ * Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it,
+ * and {@link AuthApiKeyOptions.committedSpend} inside {@link withCommittedSpend}.
+ */
 function modelKeyOptions(model: Model<Api>, signal: AbortSignal): AuthApiKeyOptions {
-	return { modelId: model.id, accountIds: model.accountAccess && Object.keys(model.accountAccess), signal };
+	return {
+		modelId: model.id,
+		accountIds: model.accountAccess && Object.keys(model.accountAccess),
+		signal,
+		...(committedSpend.getStore() && { committedSpend: true }),
+	};
 }
 
 /**
@@ -254,20 +261,12 @@ export function buildGatewayApiKeyResolver(
 /** Set while the gateway serves work already paid for. */
 const committedSpend = new AsyncLocalStorage<true>();
 
-/** Runs `fn` as work already paid for: an {@link exemptCommittedSpend} source refuses nothing inside it. */
+/**
+ * Runs `fn` as work already paid for: its credential selections are
+ * {@link AuthApiKeyOptions.committedSpend}, so no account limit refuses them.
+ */
 export function withCommittedSpend<T>(fn: () => Promise<T>): Promise<T> {
 	return committedSpend.run(true, fn);
-}
-
-/**
- * `source`, refusing nothing while the gateway serves work already paid for (polling or
- * downloading a submitted video job), so a cap that job reached never strands its result.
- */
-export function exemptCommittedSpend(source: AccountLimitSource): AccountLimitSource {
-	return {
-		refuses: (provider, account, limits, nowMs) =>
-			committedSpend.getStore() ? undefined : source.refuses(provider, account, limits, nowMs),
-	};
 }
 
 /**

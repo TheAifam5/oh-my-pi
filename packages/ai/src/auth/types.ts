@@ -579,6 +579,12 @@ export type AuthApiKeyOptions = {
 	refreshReason?: OAuthRefreshReason;
 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
 	recordAffinity?: boolean;
+	/**
+	 * The call serves work already paid for (polling or downloading a submitted job): no account
+	 * policy limit refuses it, neither those the {@link AccountLimitSource} counts nor those on
+	 * provider evidence (`usage`, `credits`, `extra-usd`).
+	 */
+	committedSpend?: boolean;
 };
 
 /** Non-secret identity bound to the OAuth credential selected for one request attempt. */

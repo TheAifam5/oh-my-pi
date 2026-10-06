@@ -545,7 +545,7 @@ export class KeyCascade implements KeysApi {
 			}
 			return resolved.apiKey;
 		}
-		const refusal = this.#deps.selector.accountLimit(provider, target.index);
+		const refusal = this.#deps.selector.accountLimit(provider, target.index, options);
 		if (refusal) {
 			if (exclusive) throw new AIError.AccountLimitError(provider, refusal);
 			return undefined;
