@@ -42,6 +42,7 @@ import {
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { trackInFlightRequest } from "@oh-my-pi/pi-coding-agent/session/in-flight-requests";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -7232,6 +7233,80 @@ describe("AgentSession retry fallback", () => {
 
 				expect(requestedModels).toEqual(["openai/gpt-4o-mini"]);
 				expect(getLastAssistantMessage(session!).errorMessage).toContain("no fallback model is eligible");
+			});
+
+			it("lets a p2c chain draw only among fallbacks no limit refuses", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const once = [{ metric: "requests", max: 1, window: DAY }];
+				const { requestedModels } = await limitSession(
+					{ "openai/gpt-4o-mini": once, "google/gemini-2.5-flash": once },
+					primary,
+					{
+						strategy: "p2c",
+						models: {
+							flash: { model: "google/gemini-2.5-flash" },
+							gpt: { model: "openai/gpt-4o" },
+							sonnet: { model: "anthropic/claude-sonnet-4-5" },
+						},
+					},
+				);
+				storage!.usageLedger.record({
+					atMs: Date.now(),
+					provider: "google",
+					model: "gemini-2.5-flash",
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				await session!.prompt("First call fits the limit");
+				await session!.waitForIdle();
+				// p2c draws the first two candidates: among all three, the limited flash wins and its
+				// drop falls through to the busy gpt; among the admitted two, the idle sonnet wins.
+				vi.spyOn(Math, "random").mockReturnValue(0);
+				const busy = Promise.withResolvers<void>();
+				trackInFlightRequest("openai", "gpt-4o", busy.promise);
+				try {
+					await session!.prompt("Second call needs a fallback");
+					await session!.waitForIdle();
+				} finally {
+					busy.resolve();
+					await busy.promise;
+				}
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini", "anthropic/claude-sonnet-4-5"]);
+			});
+
+			it("keeps a limited fallback without quota evidence out of a quota chain that excludes unknown usage", async () => {
+				const primary = getBundledModel("openai", "gpt-4o-mini");
+				if (!primary) throw new Error("Expected bundled test model to exist");
+				const { requestedModels } = await limitSession(
+					{ "google/gemini-2.5-flash": [{ metric: "requests", max: 1, window: DAY }] },
+					primary,
+					{
+						strategy: "quota",
+						strategyOptions: { objective: "balance", capacityMetric: "fraction" },
+						routing: { quota: { unknown: "exclude" } },
+						models: { flash: { model: "google/gemini-2.5-flash" } },
+					},
+					{ responses: [{ throw: "overloaded_error: provider returned error 503" }] },
+				);
+				storage!.usageLedger.record({
+					atMs: Date.now(),
+					provider: "google",
+					model: "gemini-2.5-flash",
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				vi.spyOn(modelRegistry.authStorage.health, "model").mockRejectedValue(new Error("no usage report"));
+
+				await session!.prompt("primary fails");
+				await session!.waitForIdle();
+
+				expect(requestedModels).toEqual(["openai/gpt-4o-mini"]);
+				expect(session!.model?.id).toBe(primary.id);
+				expect(getLastAssistantMessage(session!).errorMessage).toContain("overloaded_error");
 			});
 
 			it("fails the request when a global spend limit is reached and no fallback is eligible", async () => {

@@ -297,6 +297,164 @@ describe("model role pools", () => {
 			if (resolution?.kind !== "picked") return;
 			expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
 		});
+
+		it("lets a randomized strategy choose only among members no limit refuses", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "random-limits.db"));
+			const pending = Promise.withResolvers<void>();
+			trackInFlightRequest(GOOGLE.provider, GOOGLE.id, pending.promise);
+			try {
+				const limits = {
+					[selectorOf(OPENAI)]: [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }],
+				};
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: OPENAI.provider,
+					model: OPENAI.id,
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				const members = [OPENAI, GOOGLE, ANTHROPIC];
+
+				// Over all three members these draws would pick the limited OPENAI; over the other two
+				// they draw GOOGLE and ANTHROPIC, and ANTHROPIC has fewer requests in flight.
+				const draws = [0, 0.9];
+				const p2c = Settings.isolated({ modelRoles: { engineer: pool("p2c", members) }, limits }, { storage });
+				const p2cPick = await resolveRolePool("engineer", deps(p2c, { random: () => draws.shift() ?? 0 }));
+				if (p2cPick?.kind !== "picked") throw new Error("expected a pick");
+				expect([p2cPick.pick.selector, ...p2cPick.pick.rest].map(selector => selector.raw)).toEqual(
+					[ANTHROPIC, GOOGLE].map(selectorOf),
+				);
+
+				// A bag left holding only the limited member refills, so the cycle never stalls on it.
+				const bag = Settings.isolated(
+					{ modelRoles: { engineer: pool("shuffle-bag", members) }, limits },
+					{ storage },
+				);
+				const counts = new Map<string, number>();
+				for (let i = 0; i < 4; i++) {
+					const resolution = await resolveRolePool("engineer", deps(bag, { random: () => 0.5 }));
+					if (resolution?.kind !== "picked") throw new Error("expected a pick");
+					counts.set(resolution.pick.selector.raw, (counts.get(resolution.pick.selector.raw) ?? 0) + 1);
+					notePoolPickApplied(resolution.pick);
+				}
+				expect(Object.fromEntries(counts)).toEqual({ [selectorOf(GOOGLE)]: 2, [selectorOf(ANTHROPIC)]: 2 });
+			} finally {
+				pending.resolve();
+				await pending.promise;
+				AgentStorage.close();
+			}
+		});
+
+		it("reports every limited and cooling-down member of a randomized pool in member order", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "all-limited.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: { engineer: pool("shuffle-bag", [OPENAI, GOOGLE, ANTHROPIC]) },
+						limits: {
+							[OPENAI.provider]: [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }],
+							[GOOGLE.provider]: [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }],
+						},
+					},
+					{ storage },
+				);
+				for (const model of [OPENAI, GOOGLE]) {
+					storage.usageLedger.record({
+						atMs: Date.now(),
+						provider: model.provider,
+						model: model.id,
+						costNanos: 0,
+						inputTokens: 1,
+						outputTokens: 1,
+					});
+				}
+				modelRegistry.suppressSelector(selectorOf(ANTHROPIC), Date.now() + 60_000);
+
+				const resolution = await resolveRolePool("engineer", deps(settings, { random: () => 0 }));
+
+				expect(resolution?.kind).toBe("none");
+				if (resolution?.kind !== "none") return;
+				expect(resolution.skipped.map(entry => [entry.selector, entry.reason.kind])).toEqual([
+					[selectorOf(OPENAI), "limit-reached"],
+					[selectorOf(GOOGLE), "limit-reached"],
+					[selectorOf(ANTHROPIC), "cooldown"],
+				]);
+				expect(rolePoolPolicyBlocked(resolution.skipped)).toBe(true);
+			} finally {
+				AgentStorage.close();
+			}
+		});
+		/** Records one call on each of `models` today in `storage`'s usage ledger. */
+		function recordCalls(storage: AgentStorage, models: Model[]): void {
+			for (const model of models) {
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: model.provider,
+					model: model.id,
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+			}
+		}
+
+		const ONCE_A_DAY = [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }];
+
+		it("reports a member that is both limited and cooling down as limited", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "limited-cooling.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: { engineer: pool("random", [OPENAI, GOOGLE]) },
+						limits: { [selectorOf(OPENAI)]: ONCE_A_DAY },
+					},
+					{ storage },
+				);
+				recordCalls(storage, [OPENAI]);
+				modelRegistry.suppressSelector(selectorOf(OPENAI), Date.now() + 60_000);
+				modelRegistry.suppressSelector(selectorOf(GOOGLE), Date.now() + 60_000);
+
+				const resolution = await resolveRolePool("engineer", deps(settings, { random: () => 0 }));
+
+				expect(resolution?.kind).toBe("none");
+				if (resolution?.kind !== "none") return;
+				expect(resolution.skipped.map(entry => [entry.selector, entry.reason.kind])).toEqual([
+					[selectorOf(OPENAI), "limit-reached"],
+					[selectorOf(GOOGLE), "cooldown"],
+				]);
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
+		it("rotates a round-robin pool over the members no limit refuses", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "round-robin-limits.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: { engineer: pool("round-robin", [OPENAI, GOOGLE, ANTHROPIC]) },
+						limits: { [selectorOf(OPENAI)]: ONCE_A_DAY },
+					},
+					{ storage },
+				);
+				recordCalls(storage, [OPENAI]);
+				const used: string[][] = [];
+				for (let i = 0; i < 3; i++) {
+					const resolution = await resolveRolePool("engineer", deps(settings));
+					if (resolution?.kind !== "picked") throw new Error("expected a pick");
+					used.push([resolution.pick.selector, ...resolution.pick.rest].map(selector => selector.raw));
+					notePoolPickApplied(resolution.pick);
+				}
+				expect(used).toEqual([
+					[selectorOf(GOOGLE), selectorOf(ANTHROPIC)],
+					[selectorOf(ANTHROPIC), selectorOf(GOOGLE)],
+					[selectorOf(GOOGLE), selectorOf(ANTHROPIC)],
+				]);
+			} finally {
+				AgentStorage.close();
+			}
+		});
 	});
 
 	describe("selection order", () => {

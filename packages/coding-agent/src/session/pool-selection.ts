@@ -86,6 +86,8 @@ export interface PoolOrderOptions {
 	chain(): readonly RetryFallbackSelector[];
 	/** Whether a walk is under way; `round-robin` and `shuffle-bag` then keep the given order. */
 	walkActive: boolean;
+	/** Whether a candidate that is not cooling down may be picked now; default every candidate. */
+	admits?(candidate: RetryFallbackSelector): boolean;
 	signal?: AbortSignal;
 	lookups?: RetryFallbackHealthLookups;
 }
@@ -136,6 +138,11 @@ export class PoolSelection {
 	/**
 	 * `candidates` ordered by `strategy`.
 	 *
+	 * Except under `priority` and `quota`, which order every candidate, the strategy orders only the
+	 * candidates that are not cooling down and that `options.admits` accepts; the others follow them
+	 * in given order. A strategy therefore never picks, and its state never names, a member that
+	 * cannot be used now.
+	 *
 	 * `round-robin` starts a new walk (`walkActive` false) after the entry last recorded for
 	 * `options.chain()`; a walk under way keeps the given order. `random` and `weighted-random` draw a
 	 * fresh order per call, `weighted-random` by each member's `weight`. `cheapest` ranks by the
@@ -144,10 +151,9 @@ export class PoolSelection {
 	 * `r` ({@link PoolSelectionHost.cacheHitRate}) has its input priced `r * cacheRead + (1 - r) * input`.
 	 * `least-used` ranks by the model's requests in the usage ledger over the strategy's window (an
 	 * unreadable ledger keeps given order), and `least-loaded` and `p2c` by the model's requests in flight in this process
-	 * (unresolved last). `p2c` draws only among members not cooling down, which follow in given order.
-	 * `shuffle-bag` puts the members left in its current bag first, refilling a bag that holds none of
-	 * the members not cooling down with a fresh shuffle; a walk under way keeps the given order.
-	 * `quota` reads usage health
+	 * (unresolved last). `shuffle-bag` puts the members left in its current bag first, refilling a bag
+	 * that holds none of the ordered members with a fresh shuffle; a walk under way keeps the given
+	 * order. `quota` reads usage health
 	 * for each unsuppressed candidate with configured auth, concurrently, sharing one lookup per
 	 * routed model through `lookups`, and ages evidence by the group's
 	 * `routing.quota.maxObservationAgeMs`. When the lookups outlast {@link QUOTA_ORDERING_DEADLINE_MS}
@@ -155,9 +161,9 @@ export class PoolSelection {
 	 * `routing.quota.unknown: exclude`) and `health` is empty. Otherwise `health` holds the answered
 	 * lookups keyed by selector; a failed lookup leaves no entry.
 	 *
-	 * Under `routing.cache.affinity`, the ordered members not cooling down whose prompt cache is warm
-	 * ({@link PoolSelectionHost.promptCacheWarm}) then move ahead of the rest, keeping their relative
-	 * order; members the strategy dropped stay dropped.
+	 * Under `routing.cache.affinity`, the ordered members not cooling down that `options.admits`
+	 * accepts and whose prompt cache is warm ({@link PoolSelectionHost.promptCacheWarm}) then move
+	 * ahead of the rest, keeping their relative order; members the strategy dropped stay dropped.
 	 */
 	async order(
 		label: string,
@@ -166,20 +172,36 @@ export class PoolSelection {
 		policy: GroupFallbackChain | undefined,
 		options: PoolOrderOptions,
 	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
-		const ordered = await this.#orderByStrategy(label, candidates, strategy, policy, options);
+		const admitted = new Map<RetryFallbackSelector, boolean>();
+		const admits = (candidate: RetryFallbackSelector) => {
+			let result = admitted.get(candidate);
+			if (result === undefined) {
+				result =
+					!this.#host.modelRegistry.isSelectorSuppressed(candidate.raw) && options.admits?.(candidate) !== false;
+				admitted.set(candidate, result);
+			}
+			return result;
+		};
+		// Their order is fixed per candidate, so a member passed over later leaves the others' order
+		// unchanged, and `quota` keeps dropping members without evidence under `unknown: exclude`.
+		const keepsAll = strategy === "priority" || strategy === "quota";
+		const held = keepsAll ? [] : candidates.filter(candidate => !admits(candidate));
+		const eligible = held.length > 0 ? candidates.filter(candidate => !held.includes(candidate)) : candidates;
+		const ordered = await this.#orderByStrategy(label, eligible, strategy, policy, options);
+		const result = { candidates: [...ordered.candidates, ...held], health: ordered.health };
 		const warm = this.#host.promptCacheWarm;
-		if (!policy?.group.routing?.cache?.affinity || !warm || ordered.candidates.length <= 1) return ordered;
+		if (!policy?.group.routing?.cache?.affinity || !warm || result.candidates.length <= 1) return result;
 		const nowMs = this.#now();
 		const isWarm = (candidate: RetryFallbackSelector) => {
-			if (this.#host.modelRegistry.isSelectorSuppressed(candidate.raw)) return false;
+			if (!admits(candidate)) return false;
 			const model = options.resolveCandidate(candidate);
 			return model !== undefined && warm(model, nowMs);
 		};
-		const first = ordered.candidates.filter(isWarm);
-		if (first.length === 0) return ordered;
+		const first = result.candidates.filter(isWarm);
+		if (first.length === 0) return result;
 		return {
-			candidates: [...first, ...ordered.candidates.filter(candidate => !first.includes(candidate))],
-			health: ordered.health,
+			candidates: [...first, ...result.candidates.filter(candidate => !first.includes(candidate))],
+			health: result.health,
 		};
 	}
 
@@ -214,37 +236,36 @@ export class PoolSelection {
 				health: new Map(),
 			};
 		}
-		// p2c and shuffle-bag pick among members that can serve now; cooling-down members go last.
-		const suppressed = (candidate: RetryFallbackSelector) => host.modelRegistry.isSelectorSuppressed(candidate.raw);
-		const live =
-			strategy === "p2c" || strategy === "shuffle-bag" ? candidates.filter(candidate => !suppressed(candidate)) : [];
-		const cooling = candidates.filter(candidate => !live.includes(candidate));
-		const ranked = this.#rank(strategy === "p2c" ? live : candidates, strategy, policy, options, nowMs);
+		const ranked = this.#rank(candidates, strategy, policy, options, nowMs);
 		if (ranked) {
-			const ordered = orderRetryFallbackCandidates(strategy === "p2c" ? live : candidates, strategy, {
-				nowMs,
-				maxAgeMs,
-				random,
-				rank: candidate => ranked.get(candidate.raw),
-			});
-			return { candidates: strategy === "p2c" ? [...ordered, ...cooling] : ordered, health: new Map() };
+			return {
+				candidates: orderRetryFallbackCandidates(candidates, strategy, {
+					nowMs,
+					maxAgeMs,
+					random,
+					rank: candidate => ranked.get(candidate.raw),
+				}),
+				health: new Map(),
+			};
 		}
 		if (strategy === "shuffle-bag") {
 			if (options.walkActive) return { candidates, health: new Map() };
 			const bag = getRetryFallbackShuffleBag(
 				options.chain(),
-				live.map(candidate => candidate.raw),
+				candidates.map(candidate => candidate.raw),
 				random,
 			);
-			const ordered = orderRetryFallbackCandidates(live, strategy, {
-				nowMs,
-				maxAgeMs,
-				bagPosition: candidate => {
-					const position = bag.indexOf(candidate.raw);
-					return position >= 0 ? position : undefined;
-				},
-			});
-			return { candidates: [...ordered, ...cooling], health: new Map() };
+			return {
+				candidates: orderRetryFallbackCandidates(candidates, strategy, {
+					nowMs,
+					maxAgeMs,
+					bagPosition: candidate => {
+						const position = bag.indexOf(candidate.raw);
+						return position >= 0 ? position : undefined;
+					},
+				}),
+				health: new Map(),
+			};
 		}
 		if (strategy === "round-robin") {
 			const chain = options.chain();
@@ -633,9 +654,11 @@ export class RolePoolUnavailableError extends Error {
  * Members are ordered by the pool's strategy ({@link PoolSelection.order}; `round-robin` starts
  * after the member last recorded by {@link notePoolPickApplied} or retry fallback for the same
  * members). Members that resolve to no model exactly in `deps.availableModels()` or lack usable
- * credentials are passed over first; the rest are ordered, filtered by the pool's
- * `routing.funding` ({@link PoolSelection.filterFunding}, cooled-down members included), and the
- * first eligible member that is not cooling down is picked with its effort. A member that does not parse as a `provider/model` selector is not a
+ * credentials are passed over first; the rest are ordered (a strategy other than `priority` and
+ * `quota` choosing among the members that are not cooling down and that no local limit refuses,
+ * the others following), filtered by the pool's `routing.funding`
+ * ({@link PoolSelection.filterFunding}, limited and cooled-down members included), and the first
+ * eligible member that is neither limited nor cooling down is picked with its effort. A member that does not parse as a `provider/model` selector is not a
  * candidate. A member without verified billing evidence is not excluded: it ranks after every funded
  * member. Returns `aborted`, never rejects, when `options.signal` aborts.
  */
@@ -698,12 +721,28 @@ export async function resolveRolePool(
 		callable.push(member);
 	}
 	const isSuppressed = (selector: RetryFallbackSelector) => deps.modelRegistry.isSelectorSuppressed(selector.raw);
+	// Refusals are read before ordering so the strategy chooses among members a limit admits.
+	const limitSkips = new Map<string, RolePoolSkipReason>();
+	if (hasLocalLimits(deps.settings)) {
+		const ledger = deps.settings.getStorage()?.usageLedger;
+		const nowMs = Date.now();
+		for (const member of callable) {
+			const model = resolve(member).model;
+			if (!model) continue;
+			const targets = limitTargets(deps.settings, model.provider, model.id, policy.poolId);
+			const [refusal] = evaluateLimits(ledger, targets, nowMs).refused;
+			if (!refusal) continue;
+			const kind = refusal.reason === "reached" ? "limit-reached" : "limit-unreadable";
+			limitSkips.set(member.raw, { kind, limit: refusal.target.label });
+		}
+	}
 	const strategy = selection.strategy(policy);
 	const ordered = await selection.order(role, callable, strategy, policy, {
 		purpose: "model-role",
 		resolveCandidate: selector => resolve(selector).model,
 		chain: () => members,
 		walkActive: false,
+		admits: selector => !limitSkips.has(selector.raw),
 		signal,
 	});
 	if (signal?.aborted) return aborted;
@@ -721,7 +760,7 @@ export async function resolveRolePool(
 	let eligible = [...ordered.candidates, ...droppedCooledDown];
 	let notice: string | undefined;
 	if (funding && eligible.length > 0) {
-		// Cooled-down members are judged too: a member the funding policy forbids counts as an exclusion.
+		// Limited and cooled-down members are judged too: a member the funding policy forbids counts as an exclusion.
 		const filtered = await selection.filterFunding(role, eligible, policy, funding, {
 			purpose: "model-role",
 			resolveCandidate: selector => resolve(selector).model,
@@ -733,20 +772,11 @@ export async function resolveRolePool(
 		skipped.push(...filtered.skipped);
 		notice = filtered.notice;
 	}
-	if (hasLocalLimits(deps.settings)) {
-		const ledger = deps.settings.getStorage()?.usageLedger;
-		const nowMs = Date.now();
-		eligible = eligible.filter(candidate => {
-			const model = resolve(candidate).model;
-			if (!model) return true;
-			const targets = limitTargets(deps.settings, model.provider, model.id, policy.poolId);
-			const [refusal] = evaluateLimits(ledger, targets, nowMs).refused;
-			if (!refusal) return true;
-			const kind = refusal.reason === "reached" ? "limit-reached" : "limit-unreadable";
-			skipped.push({ selector: candidate.raw, reason: { kind, limit: refusal.target.label } });
-			return false;
-		});
-	}
+	eligible = eligible.filter(candidate => {
+		const reason = limitSkips.get(candidate.raw);
+		if (reason) skipped.push({ selector: candidate.raw, reason });
+		return reason === undefined;
+	});
 	for (const candidate of eligible.filter(isSuppressed)) {
 		skipped.push({ selector: candidate.raw, reason: { kind: "cooldown" } });
 	}

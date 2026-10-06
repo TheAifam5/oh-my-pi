@@ -2053,7 +2053,8 @@ export class TurnRecovery {
 	 * {@link findRetryFallbackCandidates}, ordered by the chain's strategy ({@link PoolSelection.order})
 	 * and filtered by its group's funding policy ({@link PoolSelection.filterFunding}).
 	 *
-	 * `round-robin` starts a new walk (`walkActive` false) after the entry this
+	 * A strategy other than `priority` and `quota` orders only candidates that are not cooling down and that no
+	 * local `skip` limit refuses; the others follow in given order. `round-robin` starts a new walk (`walkActive` false) after the entry this
 	 * process last applied from the same chain; a walk under way continues
 	 * around the chain from its current entry, and cooldown suppression keeps
 	 * failed entries out. A group with `routing.funding` drops candidates its
@@ -2133,11 +2134,20 @@ export class TurnRecovery {
 	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
 		const resolveCandidate = (selector: RetryFallbackSelector) => this.resolveRetryFallbackCandidate(role, selector);
 		const strategy = this.#poolSelection.strategy(policy);
+		const nowMs = Date.now();
+		const limited = hasLocalLimits(this.#host.settings);
 		const ordered = await this.#poolSelection.order(label, candidates, strategy, policy, {
 			purpose: "retry-fallback",
 			resolveCandidate,
 			chain,
 			walkActive: options.walkActive,
+			// The same check `enforceLocalBudgets` applies, so the strategy picks among members it would use.
+			admits: candidate => {
+				const model = limited ? resolveCandidate(candidate) : undefined;
+				return (
+					!model || this.#evaluateLimits(model, nowMs, this.#poolFor(role, model)?.poolId).refused.length === 0
+				);
+			},
 			signal: options.signal,
 			lookups: options.lookups,
 		});
