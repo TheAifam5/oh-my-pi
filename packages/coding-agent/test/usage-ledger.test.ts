@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import type { UsageEntry } from "@oh-my-pi/pi-coding-agent/session/usage-ledger";
+import { TOTALS_CACHE_TTL_MS, type UsageEntry } from "@oh-my-pi/pi-coding-agent/session/usage-ledger";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const NOW = 1_700_000_000_000;
@@ -52,5 +52,22 @@ describe("usage ledger", () => {
 
 		usageLedger.record(entry("openai", "gpt-4o", NOW - 1));
 		expect(usageLedger.totals([{ provider: "openai" }], NOW - 100).requests).toBe(3n);
+	});
+
+	it("answers a slightly later rolling window start from memory until another connection writes", async () => {
+		const dbPath = path.join(tempDir.path(), "agent.db");
+		const { usageLedger } = await AgentStorage.open(dbPath);
+		usageLedger.record(entry("openai", "gpt-4o", NOW - 100));
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 150).requests).toBe(1n);
+		// The memoized total still includes the call that has left the later window: over-count only.
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 50).requests).toBe(1n);
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 150 + TOTALS_CACHE_TTL_MS).requests).toBe(0n);
+
+		using other = new Database(dbPath);
+		other.run(
+			"INSERT INTO usage_ledger (at_ms, provider, model, cost_nanos, input_tokens, output_tokens) VALUES (?, 'openai', 'gpt-4o', 1000, 10, 5)",
+			[NOW - 5],
+		);
+		expect(usageLedger.totals([{ provider: "openai" }], NOW - 140).requests).toBe(2n);
 	});
 });
