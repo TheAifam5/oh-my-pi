@@ -14,7 +14,7 @@ import { type LocalLimit, parseLocalLimits } from "@oh-my-pi/pi-ai/usage/limits"
 import { ACCOUNT_NAME, drainFundingIssue, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/policy";
 import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import { splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import { splitThinkingSuffix } from "@oh-my-pi/pi-tui/thinking";
 import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	isKindRole,

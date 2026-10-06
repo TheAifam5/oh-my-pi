@@ -143,6 +143,53 @@ export const AUTO_THINKING = "auto" as const;
 /** A thinking selector as configured by the user — a concrete level or `auto`. */
 export type { ConfiguredThinkingLevel } from "./render/render-utils";
 
+/** Opt-in selectors that can otherwise be literal model-id suffixes. */
+export interface ThinkingSuffixOptions {
+	allowMaxSuffix?: boolean;
+	allowAutoAlias?: boolean;
+}
+
+// Suffix recognition for the model-pattern parser: `:max` is a real thinking
+// level and `:auto` maps to the auto sentinel. Both are gated behind flags
+// (and the literal-id / exact-match guards on the callers) because real model
+// ids end in `:max` (e.g. `glm-4.7:max`) — an ungated split would silently
+// reinterpret them as a thinking suffix.
+/** Recognize all configured effort selectors after literal-id matching. */
+export const MAX_THINKING_SUFFIX_OPTIONS: ThinkingSuffixOptions = { allowMaxSuffix: true, allowAutoAlias: true };
+
+/** Parse a suffix while preserving selectors not explicitly enabled. */
+export function parseThinkingSuffix(
+	value: string,
+	options?: ThinkingSuffixOptions,
+): ConfiguredThinkingLevel | undefined {
+	const level = parseThinkingLevel(value);
+	if (level === ThinkingLevel.Max) return options?.allowMaxSuffix === true ? level : undefined;
+	if (level !== undefined) return level;
+	if (options?.allowAutoAlias === true && value === AUTO_THINKING) return AUTO_THINKING;
+	return undefined;
+}
+
+/**
+ * Split a trailing `:<level>` thinking selector off a model pattern.
+ *
+ * `level` is set when the suffix parses as a concrete thinking level (or, when
+ * the caller opts in via `allowMaxSuffix`/`allowAutoAlias`, the guarded `:max`
+ * level / `:auto` sentinel); `base` then has the suffix stripped. Otherwise
+ * `base` is the input.
+ * `minColonIndex` requires the colon to appear strictly after that index —
+ * role-alias callers pass the matched alias prefix length.
+ */
+export function splitThinkingSuffix(
+	pattern: string,
+	minColonIndex = -1,
+	options?: ThinkingSuffixOptions,
+): { base: string; level?: ConfiguredThinkingLevel } {
+	const colonIdx = pattern.lastIndexOf(":");
+	if (colonIdx <= minColonIndex) return { base: pattern };
+	const level = parseThinkingSuffix(pattern.slice(colonIdx + 1), options);
+	return level ? { base: pattern.slice(0, colonIdx), level } : { base: pattern };
+}
+
 /** Maps the session-level `auto` sentinel to `undefined`; concrete levels pass through. */
 export function concreteThinkingLevel(level: ConfiguredThinkingLevel | undefined): ThinkingLevel | undefined {
 	return level === AUTO_THINKING ? undefined : level;
