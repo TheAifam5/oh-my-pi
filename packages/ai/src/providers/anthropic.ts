@@ -1878,6 +1878,12 @@ function fallbackServedModelFromUsage(source: AnthropicWireUsage): string | unde
 	return undefined;
 }
 
+/** Retags the turn with the model a server-side fallback served, recording the requested id. */
+function adoptServerFallbackModel(output: AssistantMessage, requestedModelId: string, served: string): void {
+	output.model = served;
+	output.requestedModel = requestedModelId;
+}
+
 /**
  * Resolve a served/iteration model id to its bundled catalog entry when
  * possible so the per-iteration cost uses the served model's pricing
@@ -2790,6 +2796,7 @@ const streamAnthropicOnce = (
 				providerRetryAttempt = 0;
 				output.content.length = 0;
 				output.model = sourceModel.id;
+				output.requestedModel = undefined;
 				output.responseId = undefined;
 				output.upstreamModel = undefined;
 				output.errorMessage = undefined;
@@ -3091,7 +3098,7 @@ const streamAnthropicOnce = (
 									output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 								if (serverSideFallback) {
 									const served = fallbackServedModelFromUsage(startUsage);
-									if (served) output.model = served;
+									if (served) adoptServerFallbackModel(output, sourceModel.id, served);
 								}
 								if (
 									!(serverSideFallback || compacted) ||
@@ -3161,7 +3168,7 @@ const streamAnthropicOnce = (
 								// pricing decisions downstream (final usage.iterations may
 								// arrive before/after) see the right model. Served-model
 								// promotion and per-iteration pricing stay opt-in.
-								if (serverSideFallback) output.model = fallback.to.model;
+								if (serverSideFallback) adoptServerFallbackModel(output, sourceModel.id, fallback.to.model);
 								continue;
 							}
 							if (event.content_block.type === "text") {
@@ -3458,7 +3465,7 @@ const streamAnthropicOnce = (
 									output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 								if (serverSideFallback) {
 									const served = fallbackServedModelFromUsage(deltaUsage);
-									if (served) output.model = served;
+									if (served) adoptServerFallbackModel(output, sourceModel.id, served);
 								}
 								if (
 									!(serverSideFallback || compacted) ||
@@ -3621,6 +3628,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
 						output.errorMessage = undefined;
@@ -3649,6 +3657,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
 						output.errorMessage = undefined;
@@ -3692,6 +3701,7 @@ const streamAnthropicOnce = (
 							providerRetryAttempt = 0;
 							output.content.length = 0;
 							output.model = sourceModel.id;
+							output.requestedModel = undefined;
 							output.responseId = undefined;
 							output.upstreamModel = undefined;
 							output.errorMessage = undefined;
@@ -3727,6 +3737,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
 						output.errorMessage = undefined;
@@ -3769,6 +3780,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.errorMessage = undefined;
 						output.inputTransformations = undefined;
@@ -3796,6 +3808,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
 						output.errorMessage = undefined;
@@ -3837,6 +3850,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.errorMessage = undefined;
 						output.providerPayload = undefined;
@@ -3901,6 +3915,7 @@ const streamAnthropicOnce = (
 						providerRetryAttempt = 0;
 						output.content.length = 0;
 						output.model = sourceModel.id;
+						output.requestedModel = undefined;
 						output.responseId = undefined;
 						output.errorMessage = undefined;
 						output.providerPayload = undefined;
@@ -3944,6 +3959,7 @@ const streamAnthropicOnce = (
 					await waitForRetry(options?.providerRetryWait, delayMs, options?.signal);
 					output.content.length = 0;
 					output.model = sourceModel.id;
+					output.requestedModel = undefined;
 					output.responseId = undefined;
 					output.errorMessage = undefined;
 					output.stopDetails = undefined;

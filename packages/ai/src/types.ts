@@ -1350,6 +1350,15 @@ export interface AssistantMessage {
 	 * the session's live setting may already have changed.
 	 */
 	serviceTier?: ServiceTier;
+	/**
+	 * Model id the request asked for, set only when the request opted into a
+	 * provider fallback chain (Anthropic `fallbacks`) and the provider reported
+	 * serving the turn on another model, in which case `model` names the served
+	 * model. Absent when the requested model served the turn, when the request
+	 * did not opt in (a persisted `fallback` boundary alone does not set it), and
+	 * after a retry discarded a fallback-served attempt.
+	 */
+	requestedModel?: string;
 	usage: Usage;
 	/**
 	 * Visible output tokens a history rewrite (shake) has since removed from
