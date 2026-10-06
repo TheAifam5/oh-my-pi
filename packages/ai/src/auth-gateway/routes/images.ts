@@ -7,6 +7,7 @@ import { deterministicUuid } from "../../utils/deterministic-id";
 import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -78,6 +79,7 @@ async function handleImages(
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return imagesServer.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -99,12 +101,13 @@ async function handleImages(
 				controller.signal,
 				"images",
 				peer,
+				resolved => serving.update(resolved),
 			),
 			fetch: bootOpts.fetch,
 			signal: controller.signal,
 		});
 		if (result.usage.cost.total === 0) calculateCost(model, result.usage);
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		return json(
 			200,
 			imagesServer.encodeResponse(result, parsed.modelId),

@@ -14,10 +14,12 @@
  *   - `token` / `token --regenerate` — manages the gateway bearer token file.
  *   - `status` — prints the locally-stored gateway token and bind hint.
  */
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	type Api,
+	type AuthAccountPolicies,
 	AuthStorage,
 	type CompletionProbe,
 	type CompletionProbeInput,
@@ -32,10 +34,16 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@oh-my-pi/pi-ai/auth-broker";
-import { DEFAULT_AUTH_GATEWAY_BIND, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
+import {
+	type AuthGatewayRouteOptions,
+	DEFAULT_AUTH_GATEWAY_BIND,
+	exemptCommittedSpend,
+	startAuthGateway,
+} from "@oh-my-pi/pi-ai/auth-gateway";
+import { isAccountEvidenceLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, getConfigRootDir, isEnoent, logger, openSqliteDatabase, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { cfgDisabledProviders } from "../config/model-settings";
@@ -46,6 +54,8 @@ import {
 	resolveAuthBrokerConfig,
 	resolveEffectiveSettings,
 } from "../session/auth-broker-config";
+import { createAccountLimitSource } from "../session/local-limits";
+import { recordUsageEntry, UsageLedger, usageEntryOf } from "../session/usage-ledger";
 import { runAuthGatewayStdio } from "./auth-gateway-stdio";
 import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
 
@@ -126,6 +136,92 @@ async function fetchBrokerSnapshot(client: AuthBrokerClient): Promise<SnapshotRe
 	const result = await client.fetchSnapshot();
 	if (result.status !== 200) throw new Error("Auth broker returned no initial snapshot");
 	return result.snapshot;
+}
+
+/** Account limits a gateway enforces against its own usage ledger. */
+export interface GatewayAccountLimits {
+	/** Records each served call in the ledger under its account. */
+	onUsage: NonNullable<AuthGatewayRouteOptions["onUsage"]>;
+	/** Waits for the ledger writes recorded so far, then closes the ledger and its database. */
+	close(): Promise<void>;
+}
+
+/**
+ * Enforce the account-policy limits that count calls (`usd`, `requests`, `tokens`) on `storage`
+ * against the usage ledger in the database `openDatabase` opens, and return the hook that records
+ * the gateway's calls there; undefined, without opening the database, when no policy has such a
+ * limit. A failed ledger write is logged and never fails the request it records.
+ */
+export async function installGatewayAccountLimits(
+	storage: AuthStorage,
+	accountPolicies: AuthAccountPolicies,
+	openDatabase: () => Promise<Database>,
+): Promise<GatewayAccountLimits | undefined> {
+	if (!accountPolicies.some(policy => policy.limits?.some(limit => !isAccountEvidenceLimit(limit)) === true)) {
+		return undefined;
+	}
+	const db = await openDatabase();
+	const ledger = new UsageLedger(db);
+	storage.usage.setLimitSource(exemptCommittedSpend(createAccountLimitSource(() => ledger)));
+	const pendingWrites = new Set<Promise<void>>();
+	return {
+		onUsage(model, usage, account) {
+			const entry = usageEntryOf(
+				{ provider: model.provider, model: model.id, usage },
+				Date.now(),
+				account === undefined ? {} : { account },
+			);
+			if (!entry) return;
+			// The gateway logs a failed write; the pending set only waits for it.
+			const write = recordUsageEntry(ledger, entry);
+			const settled = write.then(
+				() => {},
+				() => {},
+			);
+			pendingWrites.add(settled);
+			void settled.finally(() => pendingWrites.delete(settled));
+			return write;
+		},
+		async close() {
+			await Promise.all(pendingWrites);
+			ledger.close();
+			db.close();
+		},
+	};
+}
+
+/**
+ * Open `dbPath` (the agent's `agent.db`) for the usage ledger alone, creating it owner-only in an
+ * owner-only directory when missing. Corruption recovery stays off: a gateway never quarantines or
+ * replaces the database other processes share, so a corrupt one fails the open instead.
+ */
+export async function openGatewayLedgerDatabase(dbPath: string): Promise<Database> {
+	await fs.mkdir(path.dirname(dbPath), { recursive: true, mode: 0o700 });
+	// Created owner-only before SQLite opens it, so the WAL and shared-memory files it adds inherit the mode.
+	let created = false;
+	try {
+		await (await fs.open(dbPath, "wx", 0o600)).close();
+		created = true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+	const db = await openSqliteDatabase(dbPath, db => {
+		db.run("PRAGMA journal_mode=WAL");
+		return db;
+	});
+	if (created && process.platform !== "win32") {
+		for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+			try {
+				await fs.chmod(sidecar, 0o600);
+			} catch (error) {
+				if (!isEnoent(error)) {
+					db.close();
+					throw error;
+				}
+			}
+		}
+	}
+	return db;
 }
 
 /**
@@ -250,7 +346,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
-	// in sdk.ts. The gateway never touches local SQLite.
+	// in sdk.ts. The gateway keeps no credentials in local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
 	const settings = await resolveEffectiveSettings();
 	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
@@ -271,6 +367,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		defaultReservePct,
 	});
 	await storage.credentials.reload();
+	// Account limits count this gateway's own calls in its agent.db.
+	const accountLimits = await installGatewayAccountLimits(storage, accountPolicies, () =>
+		openGatewayLedgerDatabase(getAgentDbPath(settings.getAgentDir())),
+	);
 
 	// Build the model resolver + catalog from the ModelRegistry — the same
 	// component the TUI/CLI use — scoped to providers we hold credentials for.
@@ -307,6 +407,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		version: VERSION,
 		resolveModel: (id: string) => modelById.get(id),
 		listModels: () => modelById.values(),
+		onUsage: accountLimits?.onUsage,
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {
@@ -362,8 +463,18 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			await handle.close();
 		} catch (error) {
 			closeError = error;
-		} finally {
+		}
+		try {
+			await accountLimits?.close();
+		} catch (error) {
+			logger.warn("auth-gateway usage ledger did not close cleanly", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
 			storage.close();
+		} catch (error) {
+			closeError ??= error;
 		}
 		if (closeError) {
 			stopped.reject(closeError);

@@ -336,6 +336,8 @@ describe("local limits setting", () => {
 		expect(source.refuses("openai", "work", warnOnly, now)).toBeUndefined();
 		expect(source.refuses("openai", "work", warnOnly, now)).toBeUndefined();
 		expect(warn.mock.calls.filter(([message]) => message === "Local account limit reached")).toHaveLength(1);
+		// Account keys can be emails, so warnings name the account by a digest only.
+		expect(JSON.stringify(warn.mock.calls)).not.toContain("work");
 	});
 
 	it("keeps global account limits when project account policies replace the global ones", async () => {

@@ -9,8 +9,12 @@ import { deterministicUuid } from "../../utils/deterministic-id";
 import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
+	GatewayServingAccount,
+	hasRecordableUsage,
 	mirrorRequestAbort,
+	recordGatewayUsage,
 	resolveGatewayApiKey,
+	withCommittedSpend,
 } from "../dispatch";
 import { gatewayResponseHeaders, json, resolveClientIdentity } from "../http";
 
@@ -19,6 +23,7 @@ interface ResolvedVideoRequest {
 	upstreamId: string;
 	sessionId: string;
 	apiKey: ResolvedApiKey;
+	serving: GatewayServingAccount;
 	controller: AbortController;
 }
 
@@ -60,7 +65,8 @@ async function resolveVideoJob(
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return videoServer.formatError(apiKey.status, apiKey.type, apiKey.message);
-	return { model, upstreamId: identity.upstreamId, sessionId, apiKey, controller };
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
+	return { model, upstreamId: identity.upstreamId, sessionId, apiKey, serving, controller };
 }
 
 function videoOptions(bootOpts: AuthGatewayRouteOptions, resolved: ResolvedVideoRequest, peer: string) {
@@ -73,6 +79,7 @@ function videoOptions(bootOpts: AuthGatewayRouteOptions, resolved: ResolvedVideo
 			resolved.controller.signal,
 			"video",
 			peer,
+			next => resolved.serving.update(next),
 		),
 		fetch: bootOpts.fetch,
 		signal: resolved.controller.signal,
@@ -96,19 +103,68 @@ function logVideoRequest(
 	});
 }
 
+/**
+ * Most completed jobs a {@link RecordedVideoJobs} remembers. The oldest is forgotten first, and a
+ * restart forgets them all, so a job polled again after either is recorded again.
+ */
+const RECORDED_VIDEO_JOBS_MAX = 4096;
+
+/** Completed video jobs whose usage a router already recorded, so repeated polls record it once. */
+export class RecordedVideoJobs {
+	/** Jobs whose ledger record is done or in flight. */
+	#recorded = new Set<string>();
+	/** Jobs the broker has observed; a retried ledger record does not observe them again. */
+	#observed = new Set<string>();
+
+	has(key: string): boolean {
+		return this.#recorded.has(key);
+	}
+
+	/** Claim `key` for recording: undefined when already claimed, else whether the broker still has to observe it. */
+	claim(key: string): { observe: boolean } | undefined {
+		if (this.#recorded.has(key)) return undefined;
+		remember(this.#recorded, key);
+		const observe = !this.#observed.has(key);
+		if (observe) remember(this.#observed, key);
+		return { observe };
+	}
+
+	/** Forget the ledger record of `key`, so a later poll retries it. */
+	release(key: string): void {
+		this.#recorded.delete(key);
+	}
+}
+
+/** Adds `key` to `keys`, forgetting the oldest past {@link RECORDED_VIDEO_JOBS_MAX}. */
+function remember(keys: Set<string>, key: string): void {
+	keys.add(key);
+	if (keys.size > RECORDED_VIDEO_JOBS_MAX) keys.delete(keys.values().next().value!);
+}
+
+/**
+ * A job's identity for {@link RecordedVideoJobs}: the provider the server resolved and the
+ * provider's job id, which is unique per provider. The model named in the gateway job id is
+ * client-supplied, so it stays out: naming another model must not record the job again.
+ */
+function recordedJobKey(resolved: ResolvedVideoRequest): string {
+	return `${resolved.model.provider}\0${resolved.upstreamId}`;
+}
+
 function recordCompletedUsage(
 	bootOpts: AuthGatewayRouteOptions,
 	resolved: ResolvedVideoRequest,
 	req: Request,
 	job: VideoJob,
+	recorded: RecordedVideoJobs,
 ): void {
-	if (job.status !== "completed" || job.usage === undefined) return;
-	bootOpts.storage.usage.observe({
-		provider: resolved.model.provider,
-		model: resolved.model.id,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		costUsd: job.usage.cost.total,
-		client: resolveClientIdentity(req.headers),
+	if (job.status !== "completed" || job.usage === undefined || !hasRecordableUsage(job.usage)) return;
+	const key = recordedJobKey(resolved);
+	const claim = recorded.claim(key);
+	if (!claim) return;
+	void recordGatewayUsage(bootOpts, resolved.model, resolveClientIdentity(req.headers), job.usage, resolved.serving, {
+		observe: claim.observe,
+	}).then(ok => {
+		if (!ok) recorded.release(key);
 	});
 }
 
@@ -184,12 +240,27 @@ export async function handleVideoSubmit(
 	}
 }
 
-/** OpenRouter-compatible `GET /v1/videos/:id` asynchronous video poll handler. */
-export async function handleVideoPoll(
+/**
+ * OpenRouter-compatible `GET /v1/videos/:id` asynchronous video poll handler. A submitted job is
+ * already paid for, so its polls are never refused by a local account limit; a completed job's
+ * usage is recorded on the first poll that sees it.
+ */
+export function handleVideoPoll(
 	bootOpts: AuthGatewayRouteOptions,
 	req: Request,
 	peer: string,
 	gatewayId: string,
+	recorded: RecordedVideoJobs,
+): Promise<Response> {
+	return withCommittedSpend(() => pollVideoJob(bootOpts, req, peer, gatewayId, recorded));
+}
+
+async function pollVideoJob(
+	bootOpts: AuthGatewayRouteOptions,
+	req: Request,
+	peer: string,
+	gatewayId: string,
+	recorded: RecordedVideoJobs,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -198,7 +269,7 @@ export async function handleVideoPoll(
 	logVideoRequest(requestId, "poll", resolved.model, peer);
 	try {
 		const job = await pollVideo(resolved.model, resolved.upstreamId, videoOptions(bootOpts, resolved, peer));
-		recordCompletedUsage(bootOpts, resolved, req, job);
+		recordCompletedUsage(bootOpts, resolved, req, job, recorded);
 		return json(
 			200,
 			videoServer.encodePollResponse(job, req, gatewayId),
@@ -216,18 +287,46 @@ export async function handleVideoPoll(
 	}
 }
 
-/** OpenRouter-compatible `GET /v1/videos/:id/content` streaming video content handler. */
-export async function handleVideoContent(
+/**
+ * OpenRouter-compatible `GET /v1/videos/:id/content` streaming video content handler; like polls,
+ * never refused by a local account limit. A job no poll recorded yet is polled once first, so a
+ * client that skips polling is still charged.
+ */
+export function handleVideoContent(
 	bootOpts: AuthGatewayRouteOptions,
 	req: Request,
 	peer: string,
 	gatewayId: string,
+	recorded: RecordedVideoJobs,
+): Promise<Response> {
+	return withCommittedSpend(() => fetchVideoContent(bootOpts, req, peer, gatewayId, recorded));
+}
+
+async function fetchVideoContent(
+	bootOpts: AuthGatewayRouteOptions,
+	req: Request,
+	peer: string,
+	gatewayId: string,
+	recorded: RecordedVideoJobs,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
 	const resolved = await resolveVideoJob(bootOpts, req, peer, gatewayId);
 	if (resolved instanceof Response) return resolved;
 	logVideoRequest(requestId, "content", resolved.model, peer);
+	if (!recorded.has(recordedJobKey(resolved))) {
+		try {
+			const job = await pollVideo(resolved.model, resolved.upstreamId, videoOptions(bootOpts, resolved, peer));
+			recordCompletedUsage(bootOpts, resolved, req, job, recorded);
+		} catch (error) {
+			if (resolved.controller.signal.aborted) return aborted();
+			logger.warn("auth-gateway video status before content failed", {
+				format: "video-content",
+				error: classifyGatewayError(error).message,
+				peer,
+			});
+		}
+	}
 	try {
 		const content = await downloadVideo(resolved.model, resolved.upstreamId, videoOptions(bootOpts, resolved, peer));
 		const headers = new Headers(gatewayResponseHeaders(resolved.model, { requestId, startedAt }));

@@ -7,9 +7,12 @@
  * Everything credential-shaped lives here so each route drives the same
  * broker-backed rotation policy and the same usage ledger.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver, ResolvedApiKey } from "../auth-retry";
 import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
+import { accountUsageKey } from "../auth/policy";
+import type { AccountLimitSource } from "../auth/types";
 import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
@@ -34,6 +37,13 @@ export interface AuthGatewayRouteOptions {
 	listModels?: () => Iterable<Model<Api>>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
 	fetch?: FetchImpl;
+	/**
+	 * Host hook receiving each settled request's usage after it is observed, with the
+	 * {@link accountUsageKey} of the account that served it (undefined when unknown). Skipped
+	 * for results with neither tokens nor cost. A throw or a rejected promise means the usage
+	 * was not recorded; it is logged and never fails the request.
+	 */
+	onUsage?: (model: Model<Api>, usage: Usage, account: string | undefined) => void | Promise<void>;
 }
 
 /** The HTTP server's options: the routes' plus its listener and inbound auth. */
@@ -194,8 +204,8 @@ function modelKeyOptions(model: Model<Api>, signal: AbortSignal): AuthApiKeyOpti
  *
  * `lastKey` tracks the most recent bearer so the switch step invalidates the
  * credential that actually failed. `onResolvedKey` observes every rotation;
- * routes that retain provider session state use it to re-key the account
- * lease, one-shot routes pass `undefined`.
+ * routes use it to follow the {@link GatewayServingAccount} and, when they
+ * retain provider session state, to re-key the account lease.
  */
 export function buildGatewayApiKeyResolver(
 	storage: AuthStorage,
@@ -205,7 +215,7 @@ export function buildGatewayApiKeyResolver(
 	requestSignal: AbortSignal,
 	format: string,
 	peer: string,
-	onResolvedKey?: (apiKey: string) => void,
+	onResolvedKey?: (resolved: ResolvedApiKey) => void,
 ): ApiKeyResolver {
 	let lastKey = initialKey.apiKey;
 	return async ({ lastChance, error, signal }) => {
@@ -221,7 +231,7 @@ export function buildGatewayApiKeyResolver(
 				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
 			});
 			lastKey = refreshed?.apiKey ?? lastKey;
-			if (refreshed) onResolvedKey?.(refreshed.apiKey);
+			if (refreshed) onResolvedKey?.(refreshed);
 			return refreshed;
 		}
 		const next = await refreshGatewayApiKeyAfterAuthError(
@@ -236,34 +246,114 @@ export function buildGatewayApiKeyResolver(
 			peer,
 		);
 		lastKey = next?.apiKey ?? lastKey;
-		if (next) onResolvedKey?.(next.apiKey);
+		if (next) onResolvedKey?.(next);
 		return next;
 	};
+}
+
+/** Set while the gateway serves work already paid for. */
+const committedSpend = new AsyncLocalStorage<true>();
+
+/** Runs `fn` as work already paid for: an {@link exemptCommittedSpend} source refuses nothing inside it. */
+export function withCommittedSpend<T>(fn: () => Promise<T>): Promise<T> {
+	return committedSpend.run(true, fn);
+}
+
+/**
+ * `source`, refusing nothing while the gateway serves work already paid for (polling or
+ * downloading a submitted video job), so a cap that job reached never strands its result.
+ */
+export function exemptCommittedSpend(source: AccountLimitSource): AccountLimitSource {
+	return {
+		refuses: (provider, account, limits, nowMs) =>
+			committedSpend.getStore() ? undefined : source.refuses(provider, account, limits, nowMs),
+	};
+}
+
+/**
+ * The account serving one gateway request, as its {@link accountUsageKey}: taken from each
+ * credential its resolver hands out, so a concurrent request on the same session cannot change
+ * it. Undefined for a key not stored as a credential (runtime, config, or environment).
+ */
+export class GatewayServingAccount {
+	#storage: AuthStorage;
+	#provider: string;
+	#key: string | undefined;
+
+	constructor(storage: AuthStorage, provider: string, resolved: ResolvedApiKey) {
+		this.#storage = storage;
+		this.#provider = provider;
+		this.update(resolved);
+	}
+
+	get key(): string | undefined {
+		return this.#key;
+	}
+
+	/** Follow a rotation to `resolved`. */
+	update(resolved: ResolvedApiKey): void {
+		const { credentialId } = resolved;
+		const account =
+			credentialId === undefined
+				? undefined
+				: this.#storage.sessions.accounts(this.#provider).find(entry => entry.credentialId === credentialId);
+		this.#key = account ? accountUsageKey(account) : undefined;
+	}
+}
+
+/** Whether `usage` reports anything to record: tokens or a positive cost. */
+export function hasRecordableUsage(usage: Usage): boolean {
+	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0 || usage.cost.total > 0;
 }
 
 /**
  * Attribute one settled upstream request to the originating client via the
  * broker's observed-usage channel (`AuthStorage.usage.observe`, batched
- * by the remote store). Error/aborted turns still record — the provider
- * billed whatever tokens the partial turn consumed; zero-usage results
- * (pre-flight failures) are skipped. `at` defaults to now.
+ * by the remote store), then hand it to {@link AuthGatewayRouteOptions.onUsage}
+ * with the account `serving` names. Error/aborted turns still record — the
+ * provider billed whatever the partial turn consumed; results without
+ * {@link hasRecordableUsage} (pre-flight failures) are skipped. `options.at` defaults to now;
+ * `options.observe: false` skips the broker observation (a retried hook).
+ *
+ * Resolves to false when the hook failed to record the usage, else true. Never rejects.
  */
-export function recordGatewayUsage(
-	storage: AuthStorage,
+export async function recordGatewayUsage(
+	opts: AuthGatewayRouteOptions,
 	model: Model<Api>,
 	client: ClientUsageIdentity,
 	usage: Usage,
-	at?: number,
-): void {
-	if (usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0) return;
-	storage.usage.observe({
-		provider: model.provider,
-		model: model.id,
-		at,
-		usage: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite },
-		costUsd: usage.cost.total,
-		client,
-	});
+	serving: GatewayServingAccount,
+	options: { at?: number; observe?: boolean } = {},
+): Promise<boolean> {
+	if (!hasRecordableUsage(usage)) return true;
+	const { storage, onUsage } = opts;
+	const { at, observe = true } = options;
+	if (observe) {
+		storage.usage.observe({
+			provider: model.provider,
+			model: model.id,
+			at,
+			usage: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite },
+			costUsd: usage.cost.total,
+			client,
+		});
+	}
+	if (!onUsage) return true;
+	const account = serving.key;
+	if (account === undefined) {
+		logger.debug("auth-gateway usage has no stored account", { provider: model.provider, model: model.id });
+	}
+	try {
+		await onUsage(model, usage, account);
+		return true;
+	} catch (error) {
+		logger.warn("auth-gateway usage hook failed", {
+			provider: model.provider,
+			model: model.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return false;
+	}
 }
 
 /**

@@ -6,6 +6,7 @@ import { deterministicUuid } from "../../utils/deterministic-id";
 import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -54,6 +55,7 @@ export async function handleTranscriptions(
 	if ("status" in apiKey) {
 		return transcriptions.formatError(apiKey.status, apiKey.type, apiKey.message);
 	}
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -75,11 +77,12 @@ export async function handleTranscriptions(
 				controller.signal,
 				"transcriptions",
 				peer,
+				resolved => serving.update(resolved),
 			),
 			fetch: bootOpts.fetch,
 			signal: controller.signal,
 		});
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		return json(
 			200,
 			transcriptions.encodeResponse(result),

@@ -392,6 +392,11 @@ export function limitWarningKey(target: LimitTarget, nowMs: number): string {
 	return window.type === "calendar" ? `${target.key}\0${localLimitWindowStart(window, nowMs)}` : target.key;
 }
 
+/** A short stable digest of an account usage key, for logs. */
+function accountLogId(account: string): string {
+	return `#${Bun.hash(account).toString(16).padStart(16, "0").slice(0, 8)}`;
+}
+
 /**
  * The account limit source the auth store consults ({@link AccountLimitSource}): each limit counts
  * the calls `account` made to `provider` in the usage `ledger()`. A reached `warn` limit is logged
@@ -403,7 +408,9 @@ export function createAccountLimitSource(ledger: () => UsageLedger | undefined):
 	const warnedUnreadable = new Set<string>();
 	return {
 		refuses(provider, account, limits, nowMs) {
-			const subject = `${provider} account ${account}`;
+			// Account keys can be emails; logs name the account by a digest.
+			const accountId = accountLogId(account);
+			const subject = `${provider} account ${accountId}`;
 			const targets = limits.map((limit, index) => ({
 				key: `account:${provider}/${account}#${index}`,
 				label: localLimitLabel(subject, limit),
@@ -425,7 +432,10 @@ export function createAccountLimitSource(ledger: () => UsageLedger | undefined):
 			const accountKey = `${provider}\0${account}`;
 			if (!warnedUnreadable.has(accountKey)) {
 				warnedUnreadable.add(accountKey);
-				logger.warn("Local account limit usage could not be read; the account is not used", { provider, account });
+				logger.warn("Local account limit usage could not be read; the account is not used", {
+					provider,
+					account: accountId,
+				});
 			}
 			return "unreadable";
 		},

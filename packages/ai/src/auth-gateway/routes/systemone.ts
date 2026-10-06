@@ -19,6 +19,7 @@ import { deterministicUuid } from "../../utils/deterministic-id";
 import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -74,6 +75,7 @@ export async function handleSystemOne(
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return systemOne.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	const judge = new TypeSafeJudge({
 		apiKey: buildGatewayApiKeyResolver(
@@ -84,6 +86,7 @@ export async function handleSystemOne(
 			controller.signal,
 			"systemone",
 			peer,
+			resolved => serving.update(resolved),
 		),
 		api: model.api,
 		provider: model.provider,
@@ -109,7 +112,7 @@ export async function handleSystemOne(
 		// when the upstream reported tokens only (TypeSafe).
 		const body = systemOne.encodeResponse(result);
 		if (result.usage.cost.total === 0) calculateCost(model, result.usage);
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		return json(200, body, gatewayResponseHeaders(model, { requestId, costUsd: result.usage.cost.total, startedAt }));
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();

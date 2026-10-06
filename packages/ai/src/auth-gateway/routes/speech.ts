@@ -6,6 +6,7 @@ import { deterministicUuid } from "../../utils/deterministic-id";
 import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -58,6 +59,7 @@ export async function handleSpeech(bootOpts: AuthGatewayRouteOptions, req: Reque
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return speechWire.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -79,11 +81,12 @@ export async function handleSpeech(bootOpts: AuthGatewayRouteOptions, req: Reque
 				controller.signal,
 				"speech",
 				peer,
+				resolved => serving.update(resolved),
 			),
 			fetch: bootOpts.fetch,
 			signal: controller.signal,
 		});
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		const response = speechWire.encodeResponse(result, parsed.modelId);
 		const responseHeaders = gatewayResponseHeaders(model, {
 			requestId,

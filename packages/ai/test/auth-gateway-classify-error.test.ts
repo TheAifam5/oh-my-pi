@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { classifyGatewayError } from "@oh-my-pi/pi-ai/error";
+import { AccountLimitError, classifyGatewayError } from "@oh-my-pi/pi-ai/error";
 
 describe("auth-gateway classifyGatewayError", () => {
 	it("honours an explicit numeric `status` property on the error", () => {
@@ -107,6 +107,12 @@ describe("auth-gateway classifyGatewayError", () => {
 		const c = classifyGatewayError(new Error("request aborted by caller"));
 		expect(c.status).toBe(499);
 		expect(c.type).toBe("request_aborted");
+	});
+
+	it("maps a local account limit refusal to 429, thrown or as a failed turn's text", () => {
+		const refusal = new AccountLimitError("anthropic");
+		expect(classifyGatewayError(refusal)).toMatchObject({ status: 429, type: "rate_limit_error" });
+		expect(classifyGatewayError(refusal.message)).toMatchObject({ status: 429, type: "rate_limit_error" });
 	});
 
 	it("falls through to 502 upstream_error when nothing matches", () => {
