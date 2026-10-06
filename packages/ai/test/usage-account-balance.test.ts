@@ -295,28 +295,167 @@ describe("AI/ML API balance", () => {
 	});
 });
 
-describe("NanoGPT balance", () => {
+describe("NanoGPT balance and subscription", () => {
 	/** Documentation-derived: https://docs.nano-gpt.com/api-reference/endpoint/check-balance */
 	const documented = {
 		usd_balance: "129.46956147",
 		nano_balance: "26.71801147",
 		nanoDepositAddress: "nano_1gx385nnj7rw67hsksa3pyxwnfr48zu13t35ncjmtnqb9zdebtjhh7ahks34",
 	};
+	/**
+	 * Schema-derived, not a docs example (the page has none):
+	 * https://docs.nano-gpt.com/api-reference/endpoint/subscription-usage
+	 */
+	const subscription = {
+		active: true,
+		state: "active",
+		limits: { dailyInputTokens: 2_000_000, weeklyInputTokens: 10_000_000, dailyImages: 100 },
+		dailyInputTokens: {
+			used: 500_000,
+			remaining: 1_500_000,
+			percentUsed: 0.25,
+			resetAt: 1_767_225_600_000,
+			degraded: false,
+		},
+		weeklyInputTokens: {
+			used: 10_000_000,
+			remaining: 0,
+			percentUsed: 1.02,
+			resetAt: 1_767_571_200_000,
+			degraded: false,
+		},
+		dailyImages: { used: null, remaining: null, percentUsed: null, resetAt: null, degraded: true },
+		period: { currentPeriodEnd: "2026-01-31T00:00:00.000Z" },
+		routing: {
+			recommendedMode: "paygo",
+			reason: "weekly input-token quota exhausted",
+			subscriptionQuotaAvailable: false,
+			paidSpendPolicyAllowsBalance: true,
+		},
+	};
 
-	it("posts with x-api-key and reads only the USD balance", async () => {
-		const { report, seen } = await fetchReport(nanogptUsageProvider, documented);
+	async function nanogptReport(
+		balanceBody: unknown,
+		subscriptionBody: unknown,
+		options: { balanceStatus?: number; subscriptionStatus?: number } = {},
+	) {
+		const seen: { url: string; method: string; headers: Headers }[] = [];
+		const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			seen.push({ url, method: init?.method ?? "GET", headers: new Headers(init?.headers) });
+			const isSubscription = url.endsWith("/subscription/v1/usage");
+			return new Response(JSON.stringify(isSubscription ? subscriptionBody : balanceBody), {
+				status: (isSubscription ? options.subscriptionStatus : options.balanceStatus) ?? 200,
+			});
+		}) as unknown as FetchImpl;
+		const report = await nanogptUsageProvider.fetchUsage(
+			{ provider: "nanogpt", credential: { type: "api_key", apiKey: KEY } },
+			{ fetch },
+		);
+		return { report, seen };
+	}
+
+	it("posts the balance with x-api-key and reads the subscription quota with the Bearer inference key", async () => {
+		const { report, seen } = await nanogptReport(documented, subscription);
 		expect(
 			seen.map(({ url, method, headers }) => [url, method, headers.get("x-api-key"), headers.get("authorization")]),
-		).toEqual([["https://api.nano-gpt.com/api/check-balance", "POST", KEY, null]]);
+		).toEqual([
+			["https://api.nano-gpt.com/api/check-balance", "POST", KEY, null],
+			["https://api.nano-gpt.com/api/subscription/v1/usage", "GET", null, `Bearer ${KEY}`],
+		]);
 		expect(JSON.stringify(report)).not.toContain("nano_1");
-		expect(await billingOf(nanogptUsageProvider, nanogptBilling, documented)).toEqual([
+		expect(report?.limits.map(limit => [limit.id, limit.amount.unit, limit.window?.resetsAt, limit.status])).toEqual([
+			["nanogpt:subscription:daily-input-tokens", "tokens", 1_767_225_600_000, "ok"],
+			// Spent, but routing still pays from the balance, so the credential is not blocked.
+			["nanogpt:subscription:weekly-input-tokens", "tokens", 1_767_571_200_000, "warning"],
+			["nanogpt:balance", "usd", undefined, undefined],
+		]);
+		expect(report?.limits[1]?.amount).toMatchObject({ limit: 10_000_000, remaining: 0, usedFraction: 1 });
+		expect(report?.metadata).toMatchObject({
+			recommendedMode: "paygo",
+			subscriptionPeriodEnd: Date.parse("2026-01-31T00:00:00.000Z"),
+		});
+		if (!report) throw new Error("fixture did not parse");
+		expect(sources(nanogptBilling.readBilling(report))).toEqual([
+			{ mode: "subscription-included", state: "exhausted" },
 			{ mode: "prepaid-credits", state: "available", allowance: { kind: "money", remaining: usd(12946) } },
 		]);
 	});
 
-	it("rejects a non-string balance", async () => {
-		expect((await fetchReport(nanogptUsageProvider, { usd_balance: 12.5 })).report).toBeNull();
+	it("follows routing for the subscription state and the key's paid-spend policy for the balance", async () => {
+		const quotaLeft = {
+			...subscription,
+			routing: { recommendedMode: "subscription", paidSpendPolicyAllowsBalance: false },
+		};
+		expect(await billingOfNanogpt(quotaLeft)).toEqual([
+			{ mode: "subscription-included", state: "available" },
+			{ mode: "prepaid-credits", state: "disabled", allowance: { kind: "money", remaining: usd(12946) } },
+		]);
+		const unavailable = { ...subscription, routing: { recommendedMode: "unavailable" } };
+		const { report } = await nanogptReport(documented, unavailable);
+		expect(report?.limits[1]?.status).toBe("exhausted");
+		expect((await billingOfNanogpt(unavailable)).map(source => source.state)).toEqual(["exhausted", "exhausted"]);
+		const inactive = { ...subscription, active: false, state: "inactive" };
+		expect((await billingOfNanogpt(inactive)).map(source => source.mode)).toEqual(["prepaid-credits"]);
 	});
+
+	it("drops a resetAt in seconds or microseconds", async () => {
+		const seconds = {
+			...subscription,
+			dailyInputTokens: { ...subscription.dailyInputTokens, resetAt: 1_767_225_600 },
+		};
+		const { report } = await nanogptReport(documented, seconds);
+		expect(report?.limits[0]?.window?.resetsAt).toBeUndefined();
+		const micros = {
+			...subscription,
+			dailyInputTokens: { ...subscription.dailyInputTokens, resetAt: 1_767_225_600_000_000 },
+		};
+		expect((await nanogptReport(documented, micros)).report?.limits[0]?.window?.resetsAt).toBeUndefined();
+	});
+
+	it("accepts quota counters nested under limits", async () => {
+		const nested = {
+			active: true,
+			limits: { dailyInputTokens: { used: 10, remaining: 90, percentUsed: 0.1, resetAt: 5_000, degraded: false } },
+			routing: { recommendedMode: "subscription" },
+		};
+		const { report } = await nanogptReport({ error: "no balance" }, nested);
+		expect(report?.limits).toMatchObject([
+			{ id: "nanogpt:subscription:daily-input-tokens", amount: { used: 10, remaining: 90, usedFraction: 0.1 } },
+		]);
+	});
+
+	// The docs do not say how the subscription endpoint answers a key without a subscription,
+	// so a 401 from either endpoint is transient and never purges the key.
+	it("treats a 401 from either endpoint as transient and stays out of credential health checks", async () => {
+		expect(nanogptUsageProvider.validatesCredentials).toBe(false);
+		const subscriptionRejected = await nanogptReport(
+			documented,
+			{ error: "unauthorized" },
+			{ subscriptionStatus: 401 },
+		);
+		expect(subscriptionRejected.report?.limits.map(limit => limit.id)).toEqual(["nanogpt:balance"]);
+		const balanceRejected = await nanogptReport({ error: "unauthorized" }, subscription, { balanceStatus: 401 });
+		expect(balanceRejected.report?.limits.map(limit => limit.id)).not.toContain("nanogpt:balance");
+	});
+
+	it("keeps either half when the other endpoint answers malformed", async () => {
+		const { active: _active, ...noVerdict } = subscription;
+		const balanceOnly = await nanogptReport(documented, noVerdict);
+		expect(balanceOnly.report?.limits.map(limit => limit.id)).toEqual(["nanogpt:balance"]);
+		const subscriptionOnly = await nanogptReport({ usd_balance: 12.5 }, subscription);
+		expect(subscriptionOnly.report?.limits.map(limit => limit.id)).toEqual([
+			"nanogpt:subscription:daily-input-tokens",
+			"nanogpt:subscription:weekly-input-tokens",
+		]);
+		expect((await nanogptReport({ usd_balance: 12.5 }, noVerdict)).report).toBeNull();
+	});
+
+	async function billingOfNanogpt(subscriptionBody: unknown) {
+		const { report } = await nanogptReport(documented, subscriptionBody);
+		if (!report) throw new Error("fixture did not parse");
+		return sources(nanogptBilling.readBilling(report));
+	}
 });
 
 describe("Vercel AI Gateway credits", () => {
