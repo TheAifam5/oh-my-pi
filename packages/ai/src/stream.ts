@@ -893,13 +893,29 @@ function withResolvedModelHeaders<TApi extends Api>(
 	return outer;
 }
 
+/**
+ * Streams a request with provider options, after merging the model's sampling parameters for the
+ * thinking level selected by `options.reasoning` (see {@link withModelSamplingParams}).
+ */
 export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	const sampledOptions = withModelSamplingParams(model, (options ?? {}) as SimpleStreamOptions);
+	return streamProvider(model, context, sampledOptions as OptionsForApi<TApi>);
+}
+
+/** {@link stream} without the model sampling merge, for callers that already applied it. */
+function streamProvider<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: OptionsForApi<TApi>,
+): AssistantMessageEventStream {
 	if (model.resolveHeaders) {
-		return withResolvedModelHeaders(model, options?.signal, resolvedModel => stream(resolvedModel, context, options));
+		return withResolvedModelHeaders(model, options?.signal, resolvedModel =>
+			streamProvider(resolvedModel, context, options),
+		);
 	}
 	if (!model.requiresGlyphTokenization) {
 		return withThinkingLoopGuard(model, options, opts =>
@@ -1561,18 +1577,18 @@ function streamSimpleRequest<TApi extends Api>(
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamProvider(model, context, providerOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamProvider(model, context, providerOptions);
 	} else if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
 		const providerOptions = mapOptionsForApi(
 			model,
 			requestOptions,
 			typeof requestOptions.apiKey === "string" ? requestOptions.apiKey : getEnvApiKey(model.provider),
 		);
-		return stream(model, context, providerOptions);
+		return streamProvider(model, context, providerOptions);
 	}
 
 	// The resolver form is handled by the wrapper above; only a static string
@@ -1646,7 +1662,7 @@ function streamSimpleRequest<TApi extends Api>(
 	}
 	const providerModel = getProviderDefinition(model.provider)?.prepareModel?.(model) ?? model;
 	const providerOptions = mapOptionsForApi(providerModel, requestOptions, apiKey);
-	return stream(providerModel, context, providerOptions);
+	return streamProvider(providerModel, context, providerOptions);
 }
 
 export async function completeSimple<TApi extends Api>(
@@ -1907,6 +1923,7 @@ function mapOptionsForApi<TApi extends Api>(
 		minP: options?.minP,
 		presencePenalty: options?.presencePenalty,
 		repetitionPenalty: options?.repetitionPenalty,
+		frequencyPenalty: options?.frequencyPenalty,
 		maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 		signal: options?.signal,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),

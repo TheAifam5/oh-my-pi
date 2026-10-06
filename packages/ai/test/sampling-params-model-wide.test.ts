@@ -162,4 +162,58 @@ describe("sampling params are gated by model, on every provider", () => {
 		expect(low.top_p).toBe(0.95);
 		expect(low).not.toHaveProperty("top_k");
 	});
+
+	test("the non-simple stream() entry applies the level entry selected by its reasoning effort", async () => {
+		const model: Model<"openai-completions"> = {
+			...buildModel({
+				id: "local-reasoner",
+				name: "local-reasoner",
+				api: "openai-completions",
+				provider: "custom-proxy",
+				baseUrl: "http://127.0.0.1:9/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 32_000,
+			}),
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High] },
+			samplingParams: { temperature: 1, topP: 0.95 },
+			samplingParamsByThinkingLevel: { [Effort.High]: { temperature: 0.6, topK: 20 } },
+		};
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		void stream(model, context, {
+			apiKey: "test-key",
+			reasoning: Effort.High,
+			temperature: 0,
+			fetch: emptyResponse,
+			onPayload: payload => resolve(wire(payload)),
+		});
+		const payload = await promise;
+		expect(payload.temperature).toBe(0.6);
+		expect(payload.top_k).toBe(20);
+		expect(payload.top_p).toBe(0.95);
+	});
+
+	test("streamSimple selects the level once, before mandatory reasoning raises the provider effort", async () => {
+		const model: Model<Api> = {
+			...buildModel({
+				id: "local-reasoner",
+				name: "local-reasoner",
+				api: "openai-completions",
+				provider: "custom-proxy",
+				baseUrl: "http://127.0.0.1:9/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 32_000,
+			}),
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High], requiresEffort: true },
+			samplingParamsByThinkingLevel: { off: { temperature: 0.7 }, [Effort.Low]: { temperature: 0.2 } },
+		};
+		const payload = await simplePayload(model);
+		expect(payload.temperature).toBe(0.7);
+		expect(payload.frequency_penalty).toBe(1);
+	});
 });

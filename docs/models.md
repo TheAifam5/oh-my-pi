@@ -143,8 +143,9 @@ OMP merges the request's sampling options (including the global sampling setting
 `samplingParams`, then the effective level's entry; later values win per key. A `modelOverrides`
 entry merges with the model's values per key, and per level for `samplingParamsByThinkingLevel`.
 The fields apply only to `openai-completions`, `openai-responses`, and `azure-openai-responses`
-models; other APIs ignore them. Models whose catalog compat rejects sampling parameters never
-receive them.
+models; other APIs ignore them. `frequencyPenalty` is sent on `openai-completions` only, because
+the OpenAI Responses API has no frequency penalty parameter. Models whose catalog compat rejects
+sampling parameters never receive them.
 
 ### Bedrock request options
 
