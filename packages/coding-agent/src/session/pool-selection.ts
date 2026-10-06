@@ -98,13 +98,16 @@ export interface FundingSkip {
 
 /** Outcome of {@link PoolSelection.filterFunding}. */
 export interface FundingFilterResult {
-	/** Authorized candidates in funding-stage order, given order within a stage. */
-	funded: RetryFallbackSelector[];
+	/**
+	 * Candidates the funding policy keeps: funded ones in funding-stage order, then those whose billing
+	 * evidence is unverified; given order within each.
+	 */
+	eligible: RetryFallbackSelector[];
 	/** Candidates left out, in given order; cooled-down candidates only with `includeSuppressed`. */
 	skipped: FundingSkip[];
 	/** Notice text naming `skipped`, when any were skipped. */
 	notice?: string;
-	/** Whether the caller's signal aborted; `funded` is then empty. */
+	/** Whether the caller's signal aborted; `eligible` is then empty. */
 	aborted: boolean;
 }
 
@@ -385,13 +388,14 @@ export class PoolSelection {
 	}
 
 	/**
-	 * Candidates of `policy`'s group that their provider's billing evidence authorizes
-	 * ({@link fundingVerdict}), in funding-stage order and given order within a stage. Usage reports
-	 * are read once per call, bounded by {@link QUOTA_ORDERING_DEADLINE_MS}; reports that do not
-	 * arrive in time leave billing unavailable, so only self-hosted candidates judged from their
-	 * endpoint ({@link providerBillingResults}) can be authorized. Returns no
-	 * candidates when `signal` aborts. Emits one notice naming the skipped candidates, unless it
-	 * repeats the last one for `purpose` and `label`.
+	 * Candidates of `policy`'s group that their provider's billing evidence does not exclude
+	 * ({@link fundingVerdict}): funded ones in funding-stage order, then unverified ones, given order
+	 * within each. Usage reports are read once per call, bounded by {@link QUOTA_ORDERING_DEADLINE_MS};
+	 * reports that do not arrive in time leave billing unavailable, so only self-hosted candidates
+	 * judged from their endpoint ({@link providerBillingResults}) can be funded and the rest are
+	 * unverified. Returns no candidates when `signal` aborts. Emits one notice naming the skipped
+	 * candidates, unless it repeats the last one for `purpose` and `label`; unverified candidates are
+	 * not skipped and not named.
 	 */
 	async filterFunding(
 		label: string,
@@ -420,7 +424,7 @@ export class PoolSelection {
 						this.#host.modelRegistry.authStorage.usage.reports({ signal: bounded }),
 				)) ?? undefined;
 		} catch (error) {
-			if (signal?.aborted) return { funded: [], skipped: [], aborted: true };
+			if (signal?.aborted) return { eligible: [], skipped: [], aborted: true };
 			logger.debug(`${subject} funding filter could not read usage reports`, {
 				role: label,
 				reason: deadline.aborted ? "deadline" : String(error),
@@ -430,7 +434,8 @@ export class PoolSelection {
 		const nowMs = this.#now();
 		const maxAgeMs = routing?.quota?.maxObservationAgeMs ?? DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS;
 		const budgetSpend = ledgerBudgetSpend(this.#host.settings.getStorage()?.spendLedger, nowMs);
-		const funded: { candidate: RetryFallbackSelector; stage: number; index: number }[] = [];
+		const eligible: { candidate: RetryFallbackSelector; stage: number; index: number }[] = [];
+		const unverified: { selector: string; reason: string }[] = [];
 		const skipped: FundingSkip[] = [];
 		const noticed: FundingSkip[] = [];
 		for (const [index, candidate] of candidates.entries()) {
@@ -443,7 +448,10 @@ export class PoolSelection {
 				budgetSpend,
 			);
 			if (verdict.kind === "funded") {
-				funded.push({ candidate, stage: verdict.stage, index });
+				eligible.push({ candidate, stage: verdict.stage, index });
+			} else if (verdict.kind === "unverified") {
+				eligible.push({ candidate, stage: funding.length, index });
+				unverified.push({ selector: candidate.raw, reason: verdict.reason });
 			} else if (!this.#host.modelRegistry.isSelectorSuppressed(candidate.raw)) {
 				noticed.push({ selector: candidate.raw, reason: verdict.reason });
 				skipped.push({ selector: candidate.raw, reason: verdict.reason });
@@ -452,9 +460,12 @@ export class PoolSelection {
 				skipped.push({ selector: candidate.raw, reason: verdict.reason });
 			}
 		}
+		if (unverified.length > 0) {
+			logger.debug(`${subject} ranked candidates without billing evidence last`, { role: label, unverified });
+		}
 		const notice = await this.#noteFundingSkips(label, noticed, purpose);
 		return {
-			funded: funded.sort((a, b) => a.stage - b.stage || a.index - b.index).map(entry => entry.candidate),
+			eligible: eligible.sort((a, b) => a.stage - b.stage || a.index - b.index).map(entry => entry.candidate),
 			skipped,
 			...(notice !== undefined ? { notice } : {}),
 			aborted: false,
@@ -556,7 +567,6 @@ export type RolePoolResolution =
 export function isPolicySkipReason(reason: RolePoolSkipReason): boolean {
 	switch (reason.kind) {
 		case "quota-unknown":
-		case "unknown-evidence":
 		case "exhausted":
 		case "disabled":
 		case "unauthorized":
@@ -577,32 +587,6 @@ export function isPolicySkipReason(reason: RolePoolSkipReason): boolean {
  */
 export function rolePoolPolicyBlocked(skipped: readonly RolePoolSkip[]): boolean {
 	return skipped.some(entry => isPolicySkipReason(entry.reason));
-}
-
-/**
- * Guidance for a pool whose members were skipped for missing billing evidence, or `undefined` when
- * none was. It names the providers that have no billing reader, says when evidence was missing or
- * could not be read, and names `--model <provider/model>` as the way to choose a model directly.
- */
-export function rolePoolEvidenceHint(skipped: readonly RolePoolSkip[]): string | undefined {
-	const noReader = new Set<string>();
-	let unread = false;
-	for (const entry of skipped) {
-		if (entry.reason.kind !== "unknown-evidence") continue;
-		if (entry.reason.reason === "no-reader") {
-			noReader.add(parseRetryFallbackSelector(entry.selector)?.provider ?? entry.selector);
-		} else {
-			unread = true;
-		}
-	}
-	if (noReader.size === 0 && !unread) return undefined;
-	const causes: string[] = [];
-	if (unread)
-		causes.push("Billing evidence was missing or could not be read (offline, usage reports unavailable, or stale)");
-	if (noReader.size > 0) {
-		causes.push(`${unread ? "no" : "No"} billing reader exists for ${[...noReader].join(", ")}`);
-	}
-	return `${causes.join("; ")}; start with --model <provider/model> to choose a model directly`;
 }
 
 /** Short user-facing description of a {@link RolePoolSkipReason}. */
@@ -630,14 +614,12 @@ export class RolePoolUnavailableError extends Error {
 	readonly role: string;
 	readonly skipped: readonly RolePoolSkip[];
 
-	/** `hint`, when given, follows the skip list as guidance for the reader. */
-	constructor(role: string, skipped: readonly RolePoolSkip[], hint?: string) {
+	constructor(role: string, skipped: readonly RolePoolSkip[]) {
 		const listed =
 			skipped.length > 0
 				? skipped.map(entry => `${entry.selector} (${describeRolePoolSkip(entry.reason)})`).join(", ")
 				: "no member names a model";
-		const message = `No member of the model role pool "${role}" is eligible: ${listed}`;
-		super(sanitizeNoticeLine(hint ? `${message}. ${hint}` : message));
+		super(sanitizeNoticeLine(`No member of the model role pool "${role}" is eligible: ${listed}`));
 		this.name = "RolePoolUnavailableError";
 		this.role = role;
 		this.skipped = skipped;
@@ -653,9 +635,9 @@ export class RolePoolUnavailableError extends Error {
  * members). Members that resolve to no model exactly in `deps.availableModels()` or lack usable
  * credentials are passed over first; the rest are ordered, filtered by the pool's
  * `routing.funding` ({@link PoolSelection.filterFunding}, cooled-down members included), and the
- * first funded member that is not cooling down is picked with its effort. A member that does not parse as a `provider/model` selector is not a
- * candidate. Missing billing evidence never funds a member. Returns `aborted`, never rejects, when
- * `options.signal` aborts.
+ * first eligible member that is not cooling down is picked with its effort. A member that does not parse as a `provider/model` selector is not a
+ * candidate. A member without verified billing evidence is not excluded: it ranks after every funded
+ * member. Returns `aborted`, never rejects, when `options.signal` aborts.
  */
 export async function resolveRolePool(
 	role: string,
@@ -747,7 +729,7 @@ export async function resolveRolePool(
 			includeSuppressed: true,
 		});
 		if (filtered.aborted || signal?.aborted) return aborted;
-		eligible = filtered.funded;
+		eligible = filtered.eligible;
 		skipped.push(...filtered.skipped);
 		notice = filtered.notice;
 	}

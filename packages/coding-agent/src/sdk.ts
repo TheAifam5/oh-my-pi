@@ -229,7 +229,6 @@ import {
 	rolePoolTarget,
 	RolePoolUnavailableError,
 	resolveRolePool,
-	rolePoolEvidenceHint,
 	rolePoolPolicyBlocked,
 } from "./session/pool-selection";
 import { getRestorableSessionModels } from "./session/session-context";
@@ -3461,11 +3460,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 
 				if (!model && defaultRolePoolBlocked) {
-					throw new RolePoolUnavailableError(
-						defaultRolePoolTarget?.role ?? "default",
-						defaultRolePoolSkips,
-						rolePoolEvidenceHint(defaultRolePoolSkips),
-					);
+					throw new RolePoolUnavailableError(defaultRolePoolTarget?.role ?? "default", defaultRolePoolSkips);
 				}
 				if (!model && pick) {
 					model = pick;

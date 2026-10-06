@@ -189,10 +189,9 @@ export function billingClassOfMode(mode: BillingMode): BillingClass | undefined 
 }
 
 /**
- * Why a candidate was left out by its group's funding policy.
+ * Why a candidate was left out by its group's funding policy. Each reason rests on verified billing
+ * evidence or a local budget; missing evidence is never one ({@link FundingVerdict}).
  *
- * - `unknown-evidence`: no fresh, usable billing evidence; `unavailable` means the usage reports
- *   could not be read in time.
  * - `exhausted` / `disabled`: every source of an authorized class is exhausted or disabled.
  * - `unauthorized`: the account draws only on classes `funding.order` does not list.
  * - `budget-exhausted`: metered funding under `local-hard-budget` whose window has no room left
@@ -201,16 +200,20 @@ export function billingClassOfMode(mode: BillingMode): BillingClass | undefined 
  *   read, so the budget cannot be checked.
  */
 export type FundingSkipReason =
-	| { kind: "unknown-evidence"; reason: BillingUnknownReason | "unavailable" }
 	| { kind: "exhausted" }
 	| { kind: "disabled" }
 	| { kind: "unauthorized" }
 	| { kind: "budget-exhausted" }
 	| { kind: "budget-unreadable" };
 
-/** Funding stage a candidate draws on, or why it is skipped. `stage` indexes `funding.order`. */
+/**
+ * Funding stage a candidate draws on, why it is skipped, or `unverified` when its billing evidence is
+ * missing, stale, or unreadable (`unavailable` means the usage reports could not be read in time).
+ * `stage` indexes `funding.order`. An `unverified` candidate stays eligible, ranked after every funded one.
+ */
 export type FundingVerdict =
 	| { kind: "funded"; stage: number; billingClass: BillingClass }
+	| { kind: "unverified"; reason: BillingUnknownReason | "unavailable" }
 	| { kind: "skipped"; reason: FundingSkipReason };
 
 /**
@@ -276,9 +279,11 @@ export function meteredSpendingRefusal(
  * `disabled`, so its `unknown` state is usable (readers report a subscription `exhausted` only from
  * account-wide windows; model-scoped exhaustion is judged by quota ranking, see `BillingSourceState`).
  * A `metered` source counts only when reported `available`, since an unknown state is not
- * authorization to spend. Results that are all `unknown`, or `unavailable` reports, skip the
- * candidate: missing evidence is never read as free. A usable metered source is further gated by
- * `spending` ({@link meteredSpendingRefusal}).
+ * authorization to spend. Results that are all `unknown`, `unavailable` reports, and listed sources
+ * whose state is unknown leave the candidate `unverified`: missing evidence is never read as free,
+ * nor as a reason to exclude. A usable metered source and an `unverified` candidate, whose call a
+ * local budget charges ({@link chargesLocalBudget}), are further gated by `spending`
+ * ({@link meteredSpendingRefusal}).
  */
 export function fundingVerdict(
 	funding: readonly BillingClass[],
@@ -286,18 +291,18 @@ export function fundingVerdict(
 	spending?: GroupSpendingPolicy,
 	budgetSpend?: BudgetSpendReader,
 ): FundingVerdict {
-	if (results === "unavailable") {
-		return { kind: "skipped", reason: { kind: "unknown-evidence", reason: "unavailable" } };
-	}
+	const unverified = (reason: BillingUnknownReason | "unavailable"): FundingVerdict => {
+		const refused = meteredSpendingRefusal(spending, budgetSpend);
+		return refused ? { kind: "skipped", reason: refused } : { kind: "unverified", reason };
+	};
+	if (results === "unavailable") return unverified("unavailable");
 	const sources = results.flatMap(result => (result.status === "known" ? result.snapshot.sources : []));
 	if (sources.length === 0) {
 		const unknown = results.find(result => result.status === "unknown");
-		return {
-			kind: "skipped",
-			reason: { kind: "unknown-evidence", reason: unknown?.status === "unknown" ? unknown.reason : "no-report" },
-		};
+		return unverified(unknown?.status === "unknown" ? unknown.reason : "no-report");
 	}
 	let blocked: FundingSkipReason | undefined;
+	let unclear = false;
 	for (const [stage, billingClass] of funding.entries()) {
 		const ofClass = sources.filter(source => billingClassOfMode(source.mode) === billingClass);
 		const usable = ofClass.some(
@@ -311,14 +316,14 @@ export function fundingVerdict(
 			if (refused) return { kind: "skipped", reason: refused };
 			return { kind: "funded", stage, billingClass };
 		}
-		if (ofClass.some(source => source.state === "disabled")) blocked ??= { kind: "disabled" };
+		// A metered source in an unknown state may still fund the call, so it outranks an exhausted one.
+		if (ofClass.some(source => source.state === "unknown")) unclear = true;
+		else if (ofClass.some(source => source.state === "disabled")) blocked ??= { kind: "disabled" };
 		else if (ofClass.some(source => source.state === "exhausted")) blocked ??= { kind: "exhausted" };
-		else if (ofClass.length > 0) blocked ??= { kind: "unknown-evidence", reason: "no-evidence" };
 	}
+	if (unclear) return unverified("no-evidence");
 	if (blocked) return { kind: "skipped", reason: blocked };
-	if (sources.every(source => billingClassOfMode(source.mode) === undefined)) {
-		return { kind: "skipped", reason: { kind: "unknown-evidence", reason: "no-evidence" } };
-	}
+	if (sources.every(source => billingClassOfMode(source.mode) === undefined)) return unverified("no-evidence");
 	return { kind: "skipped", reason: { kind: "unauthorized" } };
 }
 
@@ -370,10 +375,6 @@ export function providerBillingResults(
 /** Short user-facing description of a skip reason. */
 export function describeFundingSkip(reason: FundingSkipReason): string {
 	switch (reason.kind) {
-		case "unknown-evidence":
-			return reason.reason === "unavailable"
-				? "billing evidence unavailable"
-				: `billing evidence unknown (${reason.reason})`;
 		case "exhausted":
 			return "funding exhausted";
 		case "disabled":

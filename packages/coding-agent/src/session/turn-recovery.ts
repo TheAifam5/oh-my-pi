@@ -1954,10 +1954,10 @@ export class TurnRecovery {
 	 * `round-robin` starts a new walk (`walkActive` false) after the entry this
 	 * process last applied from the same chain; a walk under way continues
 	 * around the chain from its current entry, and cooldown suppression keeps
-	 * failed entries out. A group with `routing.funding` keeps only candidates
-	 * its billing evidence authorizes, stage by stage in funding order with
-	 * strategy order inside a stage, and emits one `notice` naming the
-	 * candidates it skipped.
+	 * failed entries out. A group with `routing.funding` drops candidates its
+	 * verified billing evidence excludes, orders funded ones stage by stage in
+	 * funding order and unverified ones after them, with strategy order inside
+	 * each, and emits one `notice` naming the candidates it skipped.
 	 */
 	async orderedRetryFallbackCandidates(
 		role: string,
@@ -2046,7 +2046,7 @@ export class TurnRecovery {
 			resolveCandidate,
 			signal: options.signal,
 		});
-		return { candidates: filtered.funded, health: ordered.health };
+		return { candidates: filtered.eligible, health: ordered.health };
 	}
 
 	/**
