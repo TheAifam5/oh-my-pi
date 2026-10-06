@@ -387,6 +387,31 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(registry.find(providerName, "fallback-model")).toBeDefined();
 	});
 
+	test("registerProvider models keep sampling params across a refresh", async () => {
+		const providerName = "sampling-runtime-provider";
+		registry.registerProvider(
+			providerName,
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				models: [
+					{
+						...baseModel,
+						samplingParams: { temperature: 0.7, topP: 0.8 },
+						samplingParamsByThinkingLevel: { high: { topK: 20 } },
+					},
+				],
+			},
+			"ext://runtime",
+		);
+
+		await registry.refresh("offline");
+		const model = registry.find(providerName, baseModel.id);
+		expect(model?.samplingParams).toEqual({ temperature: 0.7, topP: 0.8 });
+		expect(model?.samplingParamsByThinkingLevel).toEqual({ high: { topK: 20 } });
+	});
+
 	test("configured discovery suppresses extension fetchDynamicModels for the same provider", async () => {
 		const providerName = "runtime-configured-provider";
 		fs.writeFileSync(
