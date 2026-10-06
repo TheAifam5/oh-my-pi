@@ -180,6 +180,20 @@ describe("buildProviderCards", () => {
 		expect(cards[0].idle).toBe(false);
 	});
 
+	it("labels a balance in a currency the unit cannot name with its ISO code", () => {
+		const reports = [
+			report("deepseek", "a@x.test", [
+				{
+					id: "deepseek:balance:cny",
+					label: "CNY balance",
+					scope: { provider: "deepseek", windowId: "balance", shared: true },
+					amount: { remaining: 110, unit: "unknown", currency: "CNY" },
+				},
+			]),
+		];
+		expect(buildProviderCards(reports, now)[0].windows[0].usedText).toBe("110.00 CNY left");
+	});
+
 	it("collapses an account-wide balance reported once per key, whatever the order", () => {
 		// AuthStorage probes every stored key, so a two-key Charm Hyper account
 		// yields two shared rows for one pool. The two probes fire moments

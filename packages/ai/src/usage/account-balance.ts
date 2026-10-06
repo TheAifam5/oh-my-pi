@@ -70,7 +70,7 @@ export function balanceLimit(
 	label: string,
 	remaining: number,
 	unit: "usd" | "credits" | "unknown",
-	options: { limit?: number; exhausted?: boolean } = {},
+	options: { limit?: number; exhausted?: boolean; currency?: string } = {},
 ): UsageLimit {
 	const cap = options.limit !== undefined && options.limit >= 0 ? options.limit : undefined;
 	const clamped = Math.max(0, cap === undefined ? remaining : Math.min(cap, remaining));
@@ -78,7 +78,12 @@ export function balanceLimit(
 		id,
 		label,
 		scope: { provider, windowId: "balance", shared: true },
-		amount: { ...(cap !== undefined ? { limit: cap } : {}), remaining: clamped, unit },
+		amount: {
+			...(cap !== undefined ? { limit: cap } : {}),
+			remaining: clamped,
+			unit,
+			...(options.currency ? { currency: options.currency } : {}),
+		},
 		...(options.exhausted ? { status: "exhausted" } : {}),
 	};
 }

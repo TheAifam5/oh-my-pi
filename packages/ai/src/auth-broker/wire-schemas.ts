@@ -210,6 +210,7 @@ const usageAmountSchema = type({
 	"usedFraction?": "number",
 	"remainingFraction?": "number",
 	unit: "'percent' | 'tokens' | 'requests' | 'credits' | 'usd' | 'minutes' | 'bytes' | 'unknown'",
+	"currency?": "string",
 });
 
 const usageScopeSchema = type({

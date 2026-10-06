@@ -20,7 +20,7 @@ function formatUsageAmount(limit: UsageLimit): string {
 	const remainingFraction =
 		amount.remainingFraction ??
 		(amount.usedFraction !== undefined ? Math.max(0, 1 - amount.usedFraction) : undefined);
-	const unit = amount.unit === "percent" ? "%" : ` ${amount.unit}`;
+	const unit = amount.unit === "percent" ? "%" : ` ${amount.currency ?? amount.unit}`;
 	const usedText = used === undefined ? "unknown used" : `${used.toFixed(2)}${unit} used`;
 	const remainingText = remainingFraction === undefined ? "" : ` (${(remainingFraction * 100).toFixed(1)}% left)`;
 	return `${usedText}${remainingText}`;

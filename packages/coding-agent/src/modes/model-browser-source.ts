@@ -241,16 +241,16 @@ function remainingText(allowance: BillingAllowance | undefined): string | undefi
  * Compact billing state of `provider` from `reports` (the session's last polled usage reports):
  * each funding source of every account with known evidence as `mode state [remaining]`,
  * deduplicated, then `(+N unknown)` for the accounts without it; or `unknown (reason)` when no
- * account has evidence. Evidence older than the pool funding bound
- * ({@link DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS}) counts as unknown (`stale`). A self-hosted
- * provider is judged from the model's `baseUrl` ({@link providerBillingResults}).
+ * account has evidence; or `undefined` when the provider has no billing reader. Evidence older
+ * than the pool funding bound ({@link DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS}) counts as unknown
+ * (`stale`). A self-hosted provider is judged from the model's `baseUrl` ({@link providerBillingResults}).
  */
 export function billingSummary(
 	provider: string,
 	reports: readonly UsageReport[] | undefined,
 	nowMs: number,
 	baseUrl?: string,
-): string {
+): string | undefined {
 	const results = providerBillingResults(provider, reports ?? [], nowMs, DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS, {
 		baseUrl,
 	});
@@ -259,6 +259,7 @@ export function billingSummary(
 	let firstUnknown: BillingUnknownReason | undefined;
 	for (const result of results) {
 		if (result.status === "unknown") {
+			if (result.reason === "no-reader") continue;
 			unknownCount++;
 			firstUnknown ??= result.reason;
 			continue;
@@ -268,7 +269,7 @@ export function billingSummary(
 			parts.add(`${source.mode} ${source.state}${remaining ? ` ${remaining}` : ""}`);
 		}
 	}
-	if (parts.size === 0) return firstUnknown ? `unknown (${firstUnknown})` : "unknown";
+	if (parts.size === 0) return firstUnknown ? `unknown (${firstUnknown})` : undefined;
 	const known = [...parts].join(", ");
 	return unknownCount > 0 ? `${known} (+${unknownCount} unknown)` : known;
 }

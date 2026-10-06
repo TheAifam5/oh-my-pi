@@ -2257,7 +2257,9 @@ function renderUsageBar(limit: UsageLimit, uiTheme: Theme, barWidth: number): st
 		const used =
 			limit.amount.unit === "usd"
 				? `$${usedAmount.toFixed(2)}`
-				: `${formatNumber(usedAmount, 2)} ${limit.amount.unit}`;
+				: limit.amount.currency !== undefined
+					? `${usedAmount.toFixed(2)} ${limit.amount.currency}`
+					: `${formatNumber(usedAmount, 2)} ${limit.amount.unit}`;
 		return uiTheme.fg("dim", truncateJobLabel(`${used} used`, barWidth));
 	}
 	const fraction = resolveUsedFraction(limit);

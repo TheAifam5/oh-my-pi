@@ -42,6 +42,8 @@ export interface UsageAmount {
 	remainingFraction?: number;
 	/** Unit for the amounts (percent, tokens, etc.). */
 	unit: UsageUnit;
+	/** ISO 4217 code of money amounts in major units that {@link unit} cannot name; `unit` is then `unknown`. */
+	currency?: string;
 }
 
 /** Scope metadata describing what the limit applies to. */
@@ -295,6 +297,7 @@ export const usageAmountSchema = type({
 	"usedFraction?": "number",
 	"remainingFraction?": "number",
 	unit: usageUnitSchema,
+	"currency?": "string",
 });
 
 export const usageScopeSchema = type({

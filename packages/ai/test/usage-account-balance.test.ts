@@ -75,7 +75,11 @@ describe("DeepSeek balance", () => {
 			{ url: "https://api.deepseek.com/user/balance", method: "GET", authorization: `Bearer ${KEY}` },
 		]);
 		expect(report?.limits).toMatchObject([
-			{ id: "deepseek:balance:cny", amount: { remaining: 110, unit: "unknown" }, scope: { shared: true } },
+			{
+				id: "deepseek:balance:cny",
+				amount: { remaining: 110, unit: "unknown", currency: "CNY" },
+				scope: { shared: true },
+			},
 		]);
 		const both = {
 			is_available: true,

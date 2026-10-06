@@ -214,8 +214,9 @@ function aggregateStatus(limits: UsageLimit[]): LimitStatus {
 	return "unknown";
 }
 
-function formatUnitValue(value: number, unit: UsageUnit): string {
+function formatUnitValue(value: number, unit: UsageUnit, currency?: string): string {
 	if (unit === "usd") return `$${value.toFixed(2)}`;
+	if (currency !== undefined) return `${value.toFixed(2)} ${currency}`;
 	return formatNumber(value);
 }
 
@@ -233,14 +234,14 @@ const UNIT_SUFFIX: Record<UsageUnit, string> = {
 function describeAmount(limit: UsageLimit): string {
 	const amount = limit.amount;
 	const parts: string[] = [];
-	const absoluteUnit = amount.unit !== "percent" && amount.unit !== "unknown";
+	const absoluteUnit = amount.unit !== "percent" && (amount.unit !== "unknown" || amount.currency !== undefined);
 	const fraction = resolveUsedFraction(limit);
 	if (absoluteUnit && amount.used !== undefined && amount.limit !== undefined) {
 		parts.push(
-			`${formatUnitValue(amount.used, amount.unit)} / ${formatUnitValue(amount.limit, amount.unit)}${UNIT_SUFFIX[amount.unit]}`,
+			`${formatUnitValue(amount.used, amount.unit, amount.currency)} / ${formatUnitValue(amount.limit, amount.unit, amount.currency)}${UNIT_SUFFIX[amount.unit]}`,
 		);
 	} else if (absoluteUnit && amount.remaining !== undefined) {
-		parts.push(`${formatUnitValue(amount.remaining, amount.unit)}${UNIT_SUFFIX[amount.unit]} left`);
+		parts.push(`${formatUnitValue(amount.remaining, amount.unit, amount.currency)}${UNIT_SUFFIX[amount.unit]} left`);
 	} else if (
 		absoluteUnit &&
 		amount.used !== undefined &&
@@ -249,7 +250,7 @@ function describeAmount(limit: UsageLimit): string {
 		amount.remaining === undefined &&
 		fraction === undefined
 	) {
-		parts.push(`${formatUnitValue(amount.used, amount.unit)}${UNIT_SUFFIX[amount.unit]} used`);
+		parts.push(`${formatUnitValue(amount.used, amount.unit, amount.currency)}${UNIT_SUFFIX[amount.unit]} used`);
 	}
 	if (fraction !== undefined) {
 		parts.push(`${(fraction * 100).toFixed(1)}% used`);
