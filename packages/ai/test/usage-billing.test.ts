@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { TeamsTier } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import {
@@ -411,6 +412,21 @@ describe("Devin billing", () => {
 				allowance: { kind: "credits", used: credits(200), limit: credits(200), remaining: credits(0) },
 			},
 		]);
+	});
+
+	it("reads plan grants as free on the free tier and claims nothing for a trial", () => {
+		const report = (teamsTier: TeamsTier): UsageReport => ({
+			provider: "devin",
+			fetchedAt: 1,
+			limits: [devinCredits("prompt", 125, 375, 500), devinCredits("flex", 0, 50, 50)],
+			metadata: { teamsTier },
+		});
+		const modes = (teamsTier: TeamsTier) =>
+			sources(devinBilling.readBilling(report(teamsTier))).map(source => source.mode);
+		expect(modes(TeamsTier.DEVIN_FREE)).toEqual(["free", "prepaid-credits"]);
+		expect(modes(TeamsTier.DEVIN_TRIAL)).toEqual(["unknown", "prepaid-credits"]);
+		expect(modes(TeamsTier.TRIAL)).toEqual(["unknown", "prepaid-credits"]);
+		expect(modes(TeamsTier.DEVIN_PRO)).toEqual(["subscription-included", "prepaid-credits"]);
 	});
 
 	it("reports no evidence for a quota-only report", () => {

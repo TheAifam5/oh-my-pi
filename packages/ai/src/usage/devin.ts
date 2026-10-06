@@ -183,7 +183,8 @@ function buildDevinReport(response: GetUserStatusResponse): UsageReport | null {
 	const accountId = userStatus.userId.trim() || undefined;
 	const orgId = plan?.devinInfo?.orgId.trim() || userStatus.teamId.trim() || undefined;
 	const orgName = plan?.devinInfo?.accountDisplayName.trim() || undefined;
-	const planName = plan?.planName.trim() || devinTierLabel(plan?.teamsTier ?? userStatus.teamsTier);
+	const teamsTier = plan?.teamsTier ?? userStatus.teamsTier;
+	const planName = plan?.planName.trim() || devinTierLabel(teamsTier);
 
 	const scope: UsageScope = {
 		provider: PROVIDER,
@@ -255,6 +256,7 @@ function buildDevinReport(response: GetUserStatusResponse): UsageReport | null {
 	if (orgId !== undefined) metadata.orgId = orgId;
 	if (orgName !== undefined) metadata.orgName = orgName;
 	if (planName !== undefined) metadata.planType = planName;
+	if (teamsTier !== TeamsTier.UNSPECIFIED) metadata.teamsTier = teamsTier;
 	if (planEnd !== undefined && planEnd > 0) metadata.planEnd = planEnd;
 	if (overageUsd !== 0) metadata.overageBalanceUsd = overageUsd;
 
@@ -326,6 +328,17 @@ const DEVIN_BILLING_BUCKETS: readonly { id: string; mode: BillingMode }[] = [
 ];
 
 /**
+ * Billing mode of the plan's credit grants by `metadata.teamsTier`: the free
+ * tier's grants are free, a trial's are not claimed either way, and every other
+ * tier's are included in the subscription.
+ */
+function devinPlanGrantMode(teamsTier: unknown): BillingMode {
+	if (teamsTier === TeamsTier.DEVIN_FREE) return "free";
+	if (teamsTier === TeamsTier.DEVIN_TRIAL || teamsTier === TeamsTier.TRIAL) return "unknown";
+	return "subscription-included";
+}
+
+/**
  * Devin billing: the plan's prompt and flow credit grants, then purchased flex
  * credits. The overage balance is not a source because the report does not say
  * whether it is owed or available.
@@ -334,6 +347,7 @@ export const devinBilling: ProviderBilling = {
 	id: PROVIDER,
 	readBilling(report) {
 		const sources: BillingSource[] = [];
+		const grantMode = devinPlanGrantMode(report.metadata?.teamsTier);
 		for (const bucket of DEVIN_BILLING_BUCKETS) {
 			const limit = report.limits.find(entry => entry.id === bucket.id);
 			if (!limit) continue;
@@ -341,7 +355,8 @@ export const devinBilling: ProviderBilling = {
 			const credits: UsageLimit = { ...limit, amount: { ...limit.amount, unit: "credits" } };
 			// The bucket window is the plan period, which resets plan grants but not purchased credits.
 			if (bucket.mode === "prepaid-credits") delete credits.window;
-			const source = sourceFromLimit(bucket.mode, credits);
+			const mode = bucket.mode === "subscription-included" ? grantMode : bucket.mode;
+			const source = sourceFromLimit(mode, credits);
 			if (!source) return unknownBilling(report, "malformed");
 			sources.push(source);
 		}
