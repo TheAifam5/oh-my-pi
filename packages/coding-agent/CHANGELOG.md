@@ -10,6 +10,10 @@
 
 - Fixed relative file links in Tern assistant replies opening against the folder omp was started in after `/wt` or `/move`; they now open the file in the session's working directory ([#14879](https://github.com/can1357/oh-my-pi/pull/14879) by [@H4vC](https://github.com/H4vC))
 
+### Fixed
+
+- Fixed switching models during a streaming Codex turn retrying the cancelled request and falling back to another model instead of keeping the selected one.
+
 ## [18.8.3] - 2026-10-07
 
 ### Fixed

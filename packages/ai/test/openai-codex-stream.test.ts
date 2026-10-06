@@ -5948,6 +5948,54 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	it("ends an in-flight request as a non-retriable abort when the session closes its provider state", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE replay must not run after the session closed its provider state");
+		});
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		let constructorCount = 0;
+		class SessionClosedWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				// A model switch closes the provider state while the request streams.
+				setTimeout(() => {
+					for (const state of providerSessionState.values()) state.close();
+				}, 0);
+			}
+
+			override close(): void {
+				super.close();
+				this.emit("close", { code: 1000 } as unknown as Event);
+			}
+		}
+		global.WebSocket = SessionClosedWebSocket as unknown as typeof WebSocket;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-session-closed-session",
+			providerSessionState,
+		}).result();
+
+		expect(constructorCount).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.retriable(result.errorId)).toBe(false);
+		// The coding-agent retries bare abort sentinels as reasonless aborts.
+		expect(result.errorMessage).not.toMatch(/^(?:Request was aborted|The operation was aborted)\.?$/);
+	});
+
 	it("surfaces a connection-limit error instead of replaying a delivered tool call over SSE", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

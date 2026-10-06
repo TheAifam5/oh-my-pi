@@ -1060,7 +1060,7 @@ function createCodexProviderSessionState(): CodexProviderSessionState {
 		effortControls: new Map(),
 		close: () => {
 			for (const session of state.webSocketSessions.values()) {
-				session.connection?.close("session_disposed");
+				session.connection?.cancel("session_disposed");
 			}
 			state.webSocketSessions.clear();
 			state.webSocketPublicToPrivate.clear();
@@ -2789,6 +2789,8 @@ class CodexStreamProcessor {
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
+		// The generic provider-retry check treats every AbortError as transient.
+		if (error instanceof CodexSessionClosedError) return false;
 		this.#stopSteeringOnNativeLaneRejection(error);
 		if (
 			error instanceof CodexSteerCommitError &&
@@ -3975,6 +3977,22 @@ class CodexWebSocketConnection {
 					reason,
 				});
 		}
+	}
+
+	/**
+	 * Close on behalf of the provider-session owner. A request streaming on this
+	 * socket ends with {@link CodexSessionClosedError} instead of the retriable
+	 * transport error the close event queues behind it.
+	 */
+	cancel(reason: string): void {
+		if (this.#activeRequest) {
+			this.#push(
+				new CodexSessionClosedError(
+					`Codex request cancelled because the session closed its provider connection (${reason})`,
+				),
+			);
+		}
+		this.close(reason);
 	}
 
 	async connect(signal?: AbortSignal): Promise<void> {
@@ -5175,6 +5193,12 @@ export class CodexWebSocketTransportError extends Error {
 		this.name = "CodexWebSocketTransportError";
 	}
 }
+/**
+ * The session owner closed the provider state while a request was streaming.
+ * Abort-class and never replayed by the stream processor: the owner (a model
+ * switch, session reset, or dispose) deliberately ended the request.
+ */
+class CodexSessionClosedError extends AIError.AbortError {}
 /**
  * The server failed to commit accepted steering to its automatic successor, so
  * the request that was reading that successor must be sent explicitly instead.

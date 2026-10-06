@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed switching models during a streaming Codex turn retrying the cancelled request and falling back to another model instead of keeping the selected one.
+
 ## [18.8.3] - 2026-10-07
 
 ### Added
