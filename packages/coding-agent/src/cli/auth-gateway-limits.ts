@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AuthAccountPolicies, AuthStorage } from "@oh-my-pi/pi-ai";
-import { type AuthGatewayRouteOptions, exemptCommittedSpend } from "@oh-my-pi/pi-ai/auth-gateway";
+import type { AuthGatewayRouteOptions } from "@oh-my-pi/pi-ai/auth-gateway";
 import { isAccountEvidenceLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import { isEnoent, openSqliteDatabase } from "@oh-my-pi/pi-utils";
 import { createAccountLimitSource } from "../session/local-limits";
@@ -43,7 +43,7 @@ export async function installGatewayAccountLimits(
 	}
 	const opened = await openLedger();
 	const { ledger } = opened;
-	storage.usage.setLimitSource(exemptCommittedSpend(createAccountLimitSource(() => ledger)));
+	storage.usage.setLimitSource(createAccountLimitSource(() => ledger));
 	const pendingWrites = new Set<Promise<void>>();
 	return {
 		onUsage(model, usage, account) {
