@@ -1188,8 +1188,10 @@ Resolvers run in extension load order. `next()` returns the renderers the
 remaining resolvers, then the tool itself, would use, so `next() ?? mine` only
 fills in; returning `undefined` leaves default rendering. Returned renderers
 are called like tool-definition renderers and also accept upstream pi's
-`renderCall(args, theme, context)` order. `renderShell` is accepted and
-ignored. Resolvers apply to live and rebuilt interactive transcripts; the
+`renderCall(args, theme, context)` order. `renderShell: "self"` draws the
+returned renderers' output without the default card padding and background, so
+they can draw their own frame; `"default"` (or omitting it) keeps the card.
+Resolvers apply to live and rebuilt interactive transcripts; the
 `next()` chain ends at the tool's own `renderCall` / `renderResult`, not the
 built-in renderers of native tools. A resolver that throws is skipped and
 reported once through the extension error channel.

@@ -200,6 +200,8 @@ export interface ToolExecutionRenderers {
 		theme: Theme,
 		args?: unknown,
 	) => unknown;
+	/** `"self"` renders the output without the default card padding and background. */
+	renderShell?: "default" | "self";
 }
 
 export interface ToolExecutionOptions {
@@ -1484,9 +1486,9 @@ export class ToolExecutionComponent extends Container {
 					this.#contentBox.addChild(new Text(theme.fg("toolOutput", replaceTabs(output)), 0, 0));
 				}
 			}
-			// Custom tools that draw their own frame (task) render flush; plain
-			// extension renderers get the padded, state-tinted block back.
-			const customFramed = this.#contentBox.children.some(isFramedBlockComponent);
+			// Custom tools that draw their own frame (task, or `renderShell: "self"`)
+			// render flush; plain extension renderers get the padded, state-tinted block back.
+			const customFramed = tool.renderShell === "self" || this.#contentBox.children.some(isFramedBlockComponent);
 			this.#contentBox.setPaddingX(customFramed ? 0 : 1);
 			this.#contentBox.setBgFn(customFramed ? undefined : stateBgFn);
 		} else if (this.#renderer) {

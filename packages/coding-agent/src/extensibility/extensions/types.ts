@@ -1662,12 +1662,13 @@ export type MarkdownTransformer = (markdown: string, context: MarkdownTransformC
 
 /**
  * Call and result renderers chosen for a tool by {@link ToolRendererResolver}.
- * `renderShell` is accepted for upstream-pi compatibility and ignored.
+ * `renderShell: "self"` drops the default card padding and background so the
+ * renderers draw their own frame; `"default"` keeps the card.
  */
 export interface ToolRenderers {
 	renderCall?: ToolDefinition["renderCall"];
 	renderResult?: ToolDefinition["renderResult"];
-	renderShell?: unknown;
+	renderShell?: "default" | "self";
 }
 
 /**

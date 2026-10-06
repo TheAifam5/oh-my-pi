@@ -79,7 +79,8 @@ export function resolveToolExecutionRenderers(
 	const resolved = runner.resolveToolRenderers(toolName, own);
 	if (resolved === own) return undefined;
 	const renderers: ToolExecutionRenderers = {};
-	const { renderCall, renderResult } = resolved ?? {};
+	const { renderCall, renderResult, renderShell } = resolved ?? {};
+	if (renderShell === "self") renderers.renderShell = renderShell;
 	if (renderCall) {
 		renderers.renderCall = (args, options, theme) => renderCall(args, renderOptionsWithTheme(options, theme), theme);
 	}

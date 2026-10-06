@@ -36,6 +36,7 @@ async function setup(): Promise<{ runner: ExtensionRunner; tool: AgentTool }> {
 			});
 			pi.registerToolRenderer((toolName, next) => {
 				if (toolName === "mcp_lookup") return { renderCall: piRenderer("resolver renderer") };
+				if (toolName === "mcp_framed") return { renderCall: piRenderer("framed renderer"), renderShell: "self" };
 				const wrap: PiRenderCall = (args, theme, context) => {
 					const base = next()?.renderCall as unknown as PiRenderCall;
 					const inner = base(args, theme, context).render(80).join("");
@@ -61,7 +62,7 @@ async function setup(): Promise<{ runner: ExtensionRunner; tool: AgentTool }> {
 	return { runner, tool };
 }
 
-function renderCard(runner: ExtensionRunner, toolName: string, tool: AgentTool | undefined): string {
+function renderCardLines(runner: ExtensionRunner, toolName: string, tool: AgentTool | undefined): readonly string[] {
 	const component = new ToolExecutionComponent(
 		toolName,
 		{},
@@ -70,7 +71,11 @@ function renderCard(runner: ExtensionRunner, toolName: string, tool: AgentTool |
 		ui,
 		"/project",
 	);
-	return Bun.stripANSI(component.render(100).join("\n"));
+	return component.render(100);
+}
+
+function renderCard(runner: ExtensionRunner, toolName: string, tool: AgentTool | undefined): string {
+	return Bun.stripANSI(renderCardLines(runner, toolName, tool).join("\n"));
 }
 
 describe("pi.registerToolRenderer", () => {
@@ -89,6 +94,18 @@ describe("pi.registerToolRenderer", () => {
 	test("next() yields the tool's own renderer to a pi-order wrapper", async () => {
 		const { runner, tool } = await setup();
 		expect(renderCard(runner, "aft_search", tool)).toContain("wrapped: own renderer");
+	});
+
+	test('renderShell "self" drops the default card padding and background', async () => {
+		const { runner } = await setup();
+		const cardLine = (toolName: string, label: string) =>
+			renderCardLines(runner, toolName, undefined).find(line => Bun.stripANSI(line).includes(label)) ?? "";
+		const card = cardLine("mcp_lookup", "resolver renderer");
+		const framed = cardLine("mcp_framed", "framed renderer");
+		expect(Bun.stripANSI(card).startsWith(" resolver renderer")).toBe(true);
+		expect(card).toContain("\x1b[48;");
+		expect(Bun.stripANSI(framed).startsWith("framed renderer")).toBe(true);
+		expect(framed).not.toContain("\x1b[48;");
 	});
 
 	test("replayed overlay transcripts render tool calls through the resolvers", async () => {
