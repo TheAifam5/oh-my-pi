@@ -37,7 +37,7 @@ export const RECORD_RETRY_BASE_MS = 50;
  * usage at all (a failed request). An invalid cost (non-finite or negative) records as zero.
  */
 export function usageEntryOf(
-	message: AssistantMessage,
+	message: Pick<AssistantMessage, "provider" | "model" | "usage">,
 	atMs: number,
 	attribution: { account?: string; pool?: string } = {},
 ): UsageEntry | undefined {

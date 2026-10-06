@@ -1,4 +1,4 @@
-import { isUsageLimit } from "./flags";
+import { ACCOUNT_LIMIT_MESSAGE_PREFIX, isUsageLimit } from "./flags";
 
 /** A gateway-facing classification of an arbitrary upstream/internal error. */
 export interface GatewayErrorClassification {
@@ -29,6 +29,10 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 			? (err as { status: number }).status | 0
 			: undefined;
 	if (statusProp !== undefined) return bucketStatus(statusProp, message);
+
+	// A local account limit refused selection, thrown here or carried as a failed turn's text, which
+	// has no status or rate-limit wording.
+	if (message.includes(ACCOUNT_LIMIT_MESSAGE_PREFIX)) return { status: 429, type: "rate_limit_error", message };
 
 	if (err instanceof Error && err.name === "AbortError") return { status: 499, type: "request_aborted", message };
 

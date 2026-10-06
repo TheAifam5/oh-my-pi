@@ -7,6 +7,7 @@ import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
 	gatewayRequestLogFields,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -43,6 +44,7 @@ export async function handleRerank(bootOpts: AuthGatewayRouteOptions, req: Reque
 	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return rerankWire.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -57,11 +59,20 @@ export async function handleRerank(bootOpts: AuthGatewayRouteOptions, req: Reque
 
 	try {
 		const result = await rerank(model, parsed.request, {
-			apiKey: buildGatewayApiKeyResolver(bootOpts, model, sessionId, apiKey, controller.signal, "rerank", peer),
+			apiKey: buildGatewayApiKeyResolver(
+				bootOpts,
+				model,
+				sessionId,
+				apiKey,
+				controller.signal,
+				"rerank",
+				peer,
+				resolved => serving.update(resolved),
+			),
 			fetch: bootOpts.fetch,
 			signal: controller.signal,
 		});
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		return json(
 			200,
 			rerankWire.encodeResponse(

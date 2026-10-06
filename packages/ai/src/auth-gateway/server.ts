@@ -47,6 +47,7 @@ import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
 	gatewayRequestLogFields,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	normalizeClientSessionKey,
 	recordGatewayUsage,
@@ -70,7 +71,7 @@ import { handleRerank } from "./routes/rerank";
 import { handleSpeech } from "./routes/speech";
 import { handleSystemOne } from "./routes/systemone";
 import { handleTranscriptions } from "./routes/transcriptions";
-import { handleVideoContent, handleVideoPoll, handleVideoSubmit } from "./routes/video";
+import { handleVideoContent, handleVideoPoll, handleVideoSubmit, RecordedVideoJobs } from "./routes/video";
 import { AuthGatewaySessionStateStore } from "./session-state";
 import type {
 	AuthGatewayServerHandle,
@@ -271,6 +272,7 @@ async function handleFormatEndpoint(
 	req: Request,
 	peer: string,
 	sessionStates: AuthGatewaySessionStateStore,
+	settles: Set<Promise<unknown>>,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -367,6 +369,7 @@ async function handleFormatEndpoint(
 	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return clientClosedResponse(route);
 	if ("status" in apiKey) return route.module.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	const streamOpts = buildStreamOptions(parsed, model, controller.signal);
 	if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
@@ -393,7 +396,10 @@ async function handleFormatEndpoint(
 		controller.signal,
 		route.label,
 		peer,
-		resolved => lease.updateAccount(resolveGatewayAccount(resolved)),
+		resolved => {
+			serving.update(resolved);
+			lease.updateAccount(resolveGatewayAccount(resolved));
+		},
 	);
 
 	logger.info("auth-gateway request", {
@@ -411,7 +417,9 @@ async function handleFormatEndpoint(
 		try {
 			if (controller.signal.aborted) return clientClosedResponse(route);
 			const message = await completeSimple(model, parsed.context, streamOpts);
-			recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
+			void recordGatewayUsage(bootOpts, model, client, message.usage, serving, {
+				at: message.timestamp || undefined,
+			});
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -470,13 +478,18 @@ async function handleFormatEndpoint(
 			return route.module.formatError(classified.status, classified.type, classified.message);
 		}
 		if (controller.signal.aborted) return clientClosedResponse(route);
-		void events
-			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(settle);
+		trackSettle(
+			settles,
+			events
+				.result()
+				.then(message =>
+					recordGatewayUsage(bootOpts, model, client, message.usage, serving, {
+						at: message.timestamp || undefined,
+					}),
+				)
+				.catch(() => {})
+				.finally(settle),
+		);
 		streamOwnsLease = true;
 
 		const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
@@ -524,6 +537,7 @@ async function handlePiNative(
 	req: Request,
 	peer: string,
 	sessionStates: AuthGatewaySessionStateStore,
+	settles: Set<Promise<unknown>>,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -569,6 +583,7 @@ async function handlePiNative(
 	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return piNative.formatError(apiKey.status, apiKey.type, apiKey.message);
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	// Per-session provider learning, owned by this gateway instance. The map is
 	// non-serializable, so `parseRequest` cannot accept one from the wire and
@@ -602,7 +617,10 @@ async function handlePiNative(
 		controller.signal,
 		"pi-native",
 		peer,
-		resolved => lease.updateAccount(resolveGatewayAccount(resolved)),
+		resolved => {
+			serving.update(resolved);
+			lease.updateAccount(resolveGatewayAccount(resolved));
+		},
 	);
 	if (model.compat && "supportsSamplingParams" in model.compat && model.compat.supportsSamplingParams === false) {
 		delete streamOpts.temperature;
@@ -635,7 +653,9 @@ async function handlePiNative(
 		try {
 			if (controller.signal.aborted) return aborted();
 			const message = await completeSimple(model, parsed.context, streamOpts);
-			recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
+			void recordGatewayUsage(bootOpts, model, client, message.usage, serving, {
+				at: message.timestamp || undefined,
+			});
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -690,13 +710,18 @@ async function handlePiNative(
 			return piNative.formatError(classified.status, classified.type, classified.message);
 		}
 		if (controller.signal.aborted) return aborted();
-		void events
-			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(settle);
+		trackSettle(
+			settles,
+			events
+				.result()
+				.then(message =>
+					recordGatewayUsage(bootOpts, model, client, message.usage, serving, {
+						at: message.timestamp || undefined,
+					}),
+				)
+				.catch(() => {})
+				.finally(settle),
+		);
 		streamOwnsLease = true;
 
 		const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
@@ -842,6 +867,17 @@ export interface AuthGatewayRouter {
 	 * workflows), whose sockets and timers would otherwise keep the process alive.
 	 */
 	close(): void;
+	/**
+	 * Resolves once every request answered so far, and every stream response's usage
+	 * recording, has settled; never rejects.
+	 */
+	settled(): Promise<void>;
+}
+
+/** Keeps `settle` in `settles` until it finishes. */
+function trackSettle(settles: Set<Promise<unknown>>, settle: Promise<unknown>): void {
+	settles.add(settle);
+	void settle.finally(() => settles.delete(settle));
 }
 
 /** Why a scoped client cannot read `/v1/usage` or `/v1/credentials/check`: both cover every account the gateway holds. */
@@ -876,13 +912,18 @@ function scopeRouteOptions(opts: AuthGatewayRouteOptions, client: AuthGatewayCli
 	};
 }
 
+/** Longest a closing gateway waits for in-flight requests to record their usage, in ms. */
+const CLOSE_SETTLE_TIMEOUT_MS = 10_000;
+
 /**
  * The gateway's routes over `hostOpts`, owning their per-session provider state:
  * two routers in one process never share (or tear down) each other's.
  */
 export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): AuthGatewayRouter {
 	const sessionStates = new AuthGatewaySessionStateStore();
-	const route = async (req: Request, peer: string, client?: AuthGatewayClientScope): Promise<Response> => {
+	const settles = new Set<Promise<unknown>>();
+	const recordedVideoJobs = new RecordedVideoJobs();
+	const answer = async (req: Request, peer: string, client?: AuthGatewayClientScope): Promise<Response> => {
 		const pathname = new URL(req.url).pathname;
 		const opts = client ? scopeRouteOptions(hostOpts, client) : hostOpts;
 		try {
@@ -905,13 +946,13 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			// Provider-format dispatch.
 			const formatRoute = FORMAT_ROUTES[pathname];
 			if (formatRoute && req.method === "POST") {
-				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates);
+				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates, settles);
 			}
 
 			// Pi-native fast path. Same auth + provider plumbing as the
 			// foreign-wire routes, just without the wire-format translation.
 			if (req.method === "POST" && pathname === "/v1/pi/stream") {
-				return await handlePiNative(opts, req, peer, sessionStates);
+				return await handlePiNative(opts, req, peer, sessionStates, settles);
 			}
 
 			// TypeSafe System One judgments (jev). TypeSafe SDKs and omp's own
@@ -959,8 +1000,9 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			const videoJob = req.method === "GET" ? VIDEO_JOB_PATH.exec(pathname) : null;
 			if (videoJob) {
 				const gatewayId = decodeURIComponent(videoJob[1]);
-				const handler = videoJob[2] ? handleVideoContent : handleVideoPoll;
-				return await handler(opts, req, peer, gatewayId);
+				return await (videoJob[2]
+					? handleVideoContent(opts, req, peer, gatewayId, recordedVideoJobs)
+					: handleVideoPoll(opts, req, peer, gatewayId, recordedVideoJobs));
 			}
 
 			// Model catalog.
@@ -981,7 +1023,24 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			return json(500, { error: "internal error" });
 		}
 	};
-	return { route, close: () => sessionStates.close() };
+	const route = (req: Request, peer: string, client?: AuthGatewayClientScope): Promise<Response> => {
+		const response = answer(req, peer, client);
+		trackSettle(
+			settles,
+			response.then(
+				() => {},
+				() => {},
+			),
+		);
+		return response;
+	};
+	return {
+		route,
+		close: () => sessionStates.close(),
+		settled: async () => {
+			while (settles.size > 0) await Promise.all(settles);
+		},
+	};
 }
 
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
@@ -1052,6 +1111,17 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		hostname: boundHost,
 		close: async () => {
 			server.stop(true);
+			// Requests cut off by the stop still settle, and record their usage, once their upstream call ends.
+			const timedOut = Promise.withResolvers<boolean>();
+			const timer = setTimeout(() => timedOut.resolve(true), CLOSE_SETTLE_TIMEOUT_MS);
+			timer.unref();
+			const expired = await Promise.race([router.settled().then(() => false), timedOut.promise]);
+			clearTimeout(timer);
+			if (expired) {
+				logger.warn("auth-gateway closed before every request recorded its usage", {
+					timeoutMs: CLOSE_SETTLE_TIMEOUT_MS,
+				});
+			}
 			// Drain after the listener is down: the retained provider states own
 			// sockets and timers (Codex WebSockets, GitLab Duo workflows), so the
 			// process can't settle until each one is closed.

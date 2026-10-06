@@ -7,6 +7,7 @@ import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
 	gatewayRequestLogFields,
+	GatewayServingAccount,
 	mirrorRequestAbort,
 	recordGatewayUsage,
 	resolveGatewayApiKey,
@@ -55,6 +56,7 @@ export async function handleEmbeddings(
 	if ("status" in apiKey) {
 		return embeddings.formatError(apiKey.status, apiKey.type, apiKey.message);
 	}
+	const serving = new GatewayServingAccount(bootOpts.storage, model.provider, apiKey);
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -69,11 +71,20 @@ export async function handleEmbeddings(
 
 	try {
 		const result = await embed(model, parsed.request, {
-			apiKey: buildGatewayApiKeyResolver(bootOpts, model, sessionId, apiKey, controller.signal, "embeddings", peer),
+			apiKey: buildGatewayApiKeyResolver(
+				bootOpts,
+				model,
+				sessionId,
+				apiKey,
+				controller.signal,
+				"embeddings",
+				peer,
+				resolved => serving.update(resolved),
+			),
 			fetch: bootOpts.fetch,
 			signal: controller.signal,
 		});
-		recordGatewayUsage(bootOpts.storage, model, client, result.usage);
+		void recordGatewayUsage(bootOpts, model, client, result.usage, serving);
 		return json(
 			200,
 			embeddings.encodeResponse(result, parsed.modelId),
