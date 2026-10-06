@@ -87,6 +87,10 @@ export interface UsageTotals {
 
 const SCOPE_FIELDS = ["provider", "model", "account", "pool"] as const;
 
+/** How long a memoized total is served while no write is seen, in ms, and how many are kept. */
+export const TOTALS_CACHE_TTL_MS = 2_000;
+export const TOTALS_CACHE_MAX_ENTRIES = 16;
+
 /**
  * Durable per-call usage kept in agent.db, shared by every session and process on the database.
  *
@@ -101,6 +105,10 @@ export class UsageLedger {
 	readonly #pruneStmt: Statement;
 	/** Total statements by the scope shapes they filter on. */
 	readonly #totalStmts = new Map<string, Statement>();
+	readonly #dataVersionStmt: Statement;
+	/** Memoized totals by scopes and window start, valid while `#dataVersion` is unchanged. */
+	readonly #totalsCache = new Map<string, { atMs: number; totals: UsageTotals }>();
+	#dataVersion: number | undefined;
 	#writesSincePrune = 0;
 	#closed = false;
 
@@ -128,6 +136,8 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 		this.#pruneStmt = db.prepare(
 			"DELETE FROM usage_ledger WHERE id IN (SELECT id FROM usage_ledger WHERE at_ms < ? ORDER BY at_ms LIMIT ?)",
 		);
+		// Changes whenever another connection, in any process, commits to the database.
+		this.#dataVersionStmt = db.prepare("PRAGMA data_version");
 	}
 
 	/**
@@ -156,6 +166,8 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 			entry.inputTokens,
 			entry.outputTokens,
 		);
+		// This connection's own commits do not change data_version.
+		this.#totalsCache.clear();
 		if (retainMs === undefined) return;
 		this.#writesSincePrune++;
 		if (this.#writesSincePrune < PRUNE_EVERY_WRITES) return;
@@ -171,11 +183,25 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 	/**
 	 * Totals of the calls stamped after `sinceMs` that match any of `scopes`; a call matching
 	 * several counts once. Entries stamped in the future (clock skew between processes) count too.
+	 *
+	 * A repeated call is answered from memory for up to {@link TOTALS_CACHE_TTL_MS} while neither
+	 * this ledger nor another connection to the database has committed a write since.
 	 */
 	totals(scopes: readonly UsageScope[], sinceMs: number): UsageTotals {
 		this.#assertOpen();
 		if (scopes.length === 0) return { costNanos: 0n, requests: 0n, tokens: 0n };
 		const shape = scopes.map(scope => SCOPE_FIELDS.map(field => (scope[field] === undefined ? "-" : "+")).join(""));
+		const values = scopes.flatMap(scope => SCOPE_FIELDS.flatMap(field => scope[field] ?? []));
+		const start = Math.trunc(sinceMs);
+		const cacheKey = JSON.stringify([shape, values, start]);
+		const { data_version: dataVersion } = this.#dataVersionStmt.get() as { data_version: number };
+		if (dataVersion !== this.#dataVersion) {
+			this.#totalsCache.clear();
+			this.#dataVersion = dataVersion;
+		}
+		const nowMs = Date.now();
+		const cached = this.#totalsCache.get(cacheKey);
+		if (cached && nowMs - cached.atMs < TOTALS_CACHE_TTL_MS) return { ...cached.totals };
 		const key = shape.join(",");
 		let stmt = this.#totalStmts.get(key);
 		if (!stmt) {
@@ -191,13 +217,18 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 			);
 			this.#totalStmts.set(key, stmt);
 		}
-		const values = scopes.flatMap(scope => SCOPE_FIELDS.flatMap(field => scope[field] ?? []));
-		const row = stmt.get(Math.trunc(sinceMs), ...values) as { cost: string; requests: number; tokens: string } | null;
-		return {
+		const row = stmt.get(start, ...values) as { cost: string; requests: number; tokens: string } | null;
+		const totals = {
 			costNanos: BigInt(row?.cost ?? "0"),
 			requests: BigInt(row?.requests ?? 0),
 			tokens: BigInt(row?.tokens ?? "0"),
 		};
+		this.#totalsCache.delete(cacheKey);
+		if (this.#totalsCache.size >= TOTALS_CACHE_MAX_ENTRIES) {
+			this.#totalsCache.delete(this.#totalsCache.keys().next().value as string);
+		}
+		this.#totalsCache.set(cacheKey, { atMs: nowMs, totals });
+		return { ...totals };
 	}
 
 	#assertOpen(): void {
@@ -210,6 +241,8 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 		this.#closed = true;
 		this.#insertStmt.finalize();
 		this.#pruneStmt.finalize();
+		this.#dataVersionStmt.finalize();
+		this.#totalsCache.clear();
 		for (const stmt of this.#totalStmts.values()) stmt.finalize();
 		this.#totalStmts.clear();
 	}
