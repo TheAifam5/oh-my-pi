@@ -130,6 +130,7 @@ export async function selectSessionTextReviewSource(
 			title: "Select message to annotate",
 			actionLabel: "select",
 			requestRender: () => tui.requestRender(),
+			getToolRenderers: name => ctx.resolveToolRenderers?.(name),
 			onPick: (content, label, source) => done({ content, label, ...source }),
 			onCancel: () => done(undefined),
 		});
