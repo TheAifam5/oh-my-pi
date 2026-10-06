@@ -125,6 +125,7 @@ export interface AssistantMessage {
 	responseId?: string;
 	upstreamProvider?: string;
 	upstreamModel?: string;
+	requestedModel?: string;
 	errorMessage?: string;
 	errorStatus?: number;
 	errorId?: number;

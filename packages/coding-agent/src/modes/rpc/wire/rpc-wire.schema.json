@@ -1217,6 +1217,9 @@
 				"upstreamModel": {
 					"type": "string"
 				},
+				"requestedModel": {
+					"type": "string"
+				},
 				"errorMessage": {
 					"type": "string"
 				},
