@@ -303,63 +303,70 @@ describe("Vercel AI Gateway credits", () => {
 });
 
 describe("Venice balance", () => {
-	/** Documentation-derived: https://docs.venice.ai/api-reference/endpoint/billing/balance */
+	/** Documentation-derived: https://docs.venice.ai/api-reference/endpoint/api_keys/rate_limits */
 	const documented = {
-		canConsume: true,
-		consumptionCurrency: "DIEM",
-		balances: { diem: 90.5, usd: 25, bundledCredits: 10, earnedCredits: 5 },
-		diemEpochAllocation: 100,
+		data: {
+			accessPermitted: true,
+			apiTier: { id: "paid", isCharged: true },
+			balances: { USD: 50.23, DIEM: 100.023, BUNDLED_CREDITS: 25 },
+			keyExpiration: "2025-06-01T00:00:00.000Z",
+			nextEpochBegins: "2025-05-07T00:00:00.000Z",
+			rateLimits: [{ apiModelId: "zai-org-glm-5-1", rateLimits: [{ amount: 100, type: "RPM" }] }],
+		},
 	};
 
-	it("reads every balance, the consumed currency first", async () => {
-		const { seen } = await fetchReport(veniceUsageProvider, documented);
+	it("reads every balance with the inference key, DIEM renewing at the next epoch", async () => {
+		const { report, seen } = await fetchReport(veniceUsageProvider, documented);
 		expect(bearer(seen)).toEqual([
-			{ url: "https://api.venice.ai/api/v1/billing/balance", method: "GET", authorization: `Bearer ${KEY}` },
+			{ url: "https://api.venice.ai/api/v1/api_keys/rate_limits", method: "GET", authorization: `Bearer ${KEY}` },
 		]);
+		expect(report?.metadata).toEqual({ accessPermitted: true, apiTier: "paid", apiTierCharged: true });
+		const epoch = Date.parse("2025-05-07T00:00:00.000Z");
 		expect(await billingOf(veniceUsageProvider, veniceBilling, documented)).toEqual([
+			{ mode: "prepaid-credits", state: "available", allowance: { kind: "money", remaining: usd(5023) } },
 			{
 				mode: "prepaid-credits",
 				state: "available",
-				allowance: { kind: "credits", limit: credits(100), remaining: credits(905, 1) },
+				allowance: { kind: "credits", remaining: credits(100023, 3) },
+				resetsAt: epoch,
 			},
-			{ mode: "prepaid-credits", state: "available", allowance: { kind: "money", remaining: usd(2500) } },
-			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(10) } },
-			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(5) } },
+			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(25) } },
 		]);
 	});
 
-	it("marks every balance exhausted when the account cannot consume", async () => {
+	it("reads funded balances as unknown, not exhausted, when access is not permitted", async () => {
 		const blocked = {
-			...documented,
-			canConsume: false,
-			consumptionCurrency: null,
-			balances: { diem: 140, usd: null, bundledCredits: 3, earnedCredits: null },
+			data: { ...documented.data, accessPermitted: false, balances: { USD: 0, DIEM: 140, BUNDLED_CREDITS: null } },
 		};
 		const { report } = await fetchReport(veniceUsageProvider, blocked);
 		expect(report?.limits.map(limit => [limit.id, limit.amount.remaining, limit.status])).toEqual([
-			["venice:diem", 140, "exhausted"],
-			["venice:bundled-credits", 3, "exhausted"],
+			["venice:usd", 0, undefined],
+			["venice:diem", 140, undefined],
 		]);
 		const states = (await billingOf(veniceUsageProvider, veniceBilling, blocked)).map(source => source.state);
-		expect(states).toEqual(["exhausted", "exhausted"]);
+		expect(states).toEqual(["exhausted", "unknown"]);
 	});
 
-	it("keeps DIEM available without an epoch allocation while the account can consume", async () => {
-		const unallocated = { ...documented, balances: { diem: 5 }, diemEpochAllocation: 0 };
-		expect(await billingOf(veniceUsageProvider, veniceBilling, unallocated)).toEqual([
-			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(5) } },
+	it("keeps the other balances when one cannot be represented exactly", async () => {
+		const overflow = { data: { ...documented.data, balances: { USD: 50.23, DIEM: 1e12 } } };
+		expect(await billingOf(veniceUsageProvider, veniceBilling, overflow)).toEqual([
+			{ mode: "prepaid-credits", state: "available", allowance: { kind: "money", remaining: usd(5023) } },
 		]);
 	});
 
-	it("treats a 401 as transient and stays out of credential health checks", async () => {
-		expect(veniceUsageProvider.validatesCredentials).toBe(false);
-		expect((await fetchReport(veniceUsageProvider, { error: "unauthorized" }, { status: 401 })).report).toBeNull();
+	it("purges a rejected key and validates credentials", async () => {
+		expect(veniceUsageProvider.validatesCredentials).toBe(true);
+		await expect(fetchReport(veniceUsageProvider, { error: "unauthorized" }, { status: 401 })).rejects.toThrow(
+			"Venice api.venice.ai/api/v1/api_keys/rate_limits returned 401",
+		);
+		expect((await fetchReport(veniceUsageProvider, documented, { status: 403 })).report).toBeNull();
 	});
 
-	it("rejects a payload without a verdict or any balance", async () => {
-		const { canConsume: _verdict, ...noVerdict } = documented;
-		expect((await fetchReport(veniceUsageProvider, noVerdict)).report).toBeNull();
-		const noBalance = { ...documented, balances: { diem: null, usd: null } };
+	it("rejects a payload without the envelope, a verdict, or any balance", async () => {
+		expect((await fetchReport(veniceUsageProvider, documented.data)).report).toBeNull();
+		const { accessPermitted: _verdict, ...noVerdict } = documented.data;
+		expect((await fetchReport(veniceUsageProvider, { data: noVerdict })).report).toBeNull();
+		const noBalance = { data: { ...documented.data, balances: { USD: null, DIEM: "5" } } };
 		expect((await fetchReport(veniceUsageProvider, noBalance)).report).toBeNull();
 	});
 });
