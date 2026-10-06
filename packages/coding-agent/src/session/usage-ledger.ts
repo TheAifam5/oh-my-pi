@@ -107,7 +107,7 @@ export class UsageLedger {
 	readonly #totalStmts = new Map<string, Statement>();
 	readonly #dataVersionStmt: Statement;
 	/** Memoized totals by scopes and window start, valid while `#dataVersion` is unchanged. */
-	readonly #totalsCache = new Map<string, { atMs: number; totals: UsageTotals }>();
+	readonly #totalsCache = new Map<string, { scopeKey: string; start: number; atMs: number; totals: UsageTotals }>();
 	#dataVersion: number | undefined;
 	#writesSincePrune = 0;
 	#closed = false;
@@ -185,7 +185,10 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 	 * several counts once. Entries stamped in the future (clock skew between processes) count too.
 	 *
 	 * A repeated call is answered from memory for up to {@link TOTALS_CACHE_TTL_MS} while neither
-	 * this ledger nor another connection to the database has committed a write since.
+	 * this ledger nor another connection to the database has committed a write since. A call with a
+	 * later `sinceMs` for the same scopes, less than that TTL after a memoized start, is answered
+	 * from that memoized total: it may also count the calls stamped in the up to
+	 * {@link TOTALS_CACHE_TTL_MS} between the two starts, but never misses a call in the window.
 	 */
 	totals(scopes: readonly UsageScope[], sinceMs: number): UsageTotals {
 		this.#assertOpen();
@@ -193,14 +196,29 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 		const shape = scopes.map(scope => SCOPE_FIELDS.map(field => (scope[field] === undefined ? "-" : "+")).join(""));
 		const values = scopes.flatMap(scope => SCOPE_FIELDS.flatMap(field => scope[field] ?? []));
 		const start = Math.trunc(sinceMs);
-		const cacheKey = JSON.stringify([shape, values, start]);
+		const scopeKey = JSON.stringify([shape, values]);
+		const cacheKey = JSON.stringify([scopeKey, start]);
 		const { data_version: dataVersion } = this.#dataVersionStmt.get() as { data_version: number };
 		if (dataVersion !== this.#dataVersion) {
 			this.#totalsCache.clear();
 			this.#dataVersion = dataVersion;
 		}
 		const nowMs = Date.now();
-		const cached = this.#totalsCache.get(cacheKey);
+		let cached = this.#totalsCache.get(cacheKey);
+		if (!cached) {
+			// The closest earlier window start within the TTL: it can only over-count, never under-count.
+			for (const candidate of this.#totalsCache.values()) {
+				if (
+					candidate.scopeKey === scopeKey &&
+					candidate.start < start &&
+					start - candidate.start < TOTALS_CACHE_TTL_MS &&
+					nowMs - candidate.atMs < TOTALS_CACHE_TTL_MS &&
+					(!cached || candidate.start > cached.start)
+				) {
+					cached = candidate;
+				}
+			}
+		}
 		if (cached && nowMs - cached.atMs < TOTALS_CACHE_TTL_MS) return { ...cached.totals };
 		const key = shape.join(",");
 		let stmt = this.#totalStmts.get(key);
@@ -227,7 +245,7 @@ CREATE INDEX IF NOT EXISTS usage_ledger_account_at ON usage_ledger (account, at_
 		if (this.#totalsCache.size >= TOTALS_CACHE_MAX_ENTRIES) {
 			this.#totalsCache.delete(this.#totalsCache.keys().next().value as string);
 		}
-		this.#totalsCache.set(cacheKey, { atMs: nowMs, totals });
+		this.#totalsCache.set(cacheKey, { scopeKey, start, atMs: nowMs, totals });
 		return { ...totals };
 	}
 
