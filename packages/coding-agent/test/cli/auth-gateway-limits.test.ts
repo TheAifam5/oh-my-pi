@@ -3,13 +3,20 @@ import * as fs from "node:fs";
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { type AuthAccountPolicies, AuthStorage } from "@oh-my-pi/pi-ai";
 import { apiKeyFingerprint } from "@oh-my-pi/pi-ai/auth/policy";
-import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
+import { createAuthGatewayRouter, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { Api, FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { encodeGatewayJobId } from "@oh-my-pi/pi-ai/providers/video-server";
-import { installGatewayAccountLimits, openGatewayLedgerDatabase } from "../../src/cli/auth-gateway-cli";
+import {
+	installGatewayAccountLimits,
+	openGatewayLedger,
+	openGatewayLedgerDatabase,
+} from "../../src/cli/auth-gateway-limits";
+import { installStdioAccountLimits } from "../../src/cli/auth-gateway-stdio";
+import { Settings } from "../../src/config/settings";
+import { AgentStorage } from "../../src/session/agent-storage";
 
 const KEY = "sk-gateway-limit-test";
 const DAY = { type: "calendar", period: "day" } as const;
@@ -113,7 +120,7 @@ async function gateway(
 	let opened = 0;
 	const limits = await installGatewayAccountLimits(storage, accountPolicies, () => {
 		opened++;
-		return openGatewayLedgerDatabase(dbPath);
+		return openGatewayLedger(dbPath);
 	});
 	if (limits) cleanups.push(() => limits.close());
 	const models = [embedding, image, video, otherVideo];
@@ -261,5 +268,46 @@ describe("auth-gateway account limits", () => {
 		await expect(openGatewayLedgerDatabase(corrupt)).rejects.toThrow();
 		expect(fs.readFileSync(corrupt, "utf8")).toBe(garbage);
 		expect(fs.readdirSync(tempDir.path()).filter(name => name.startsWith("corrupt.db.corrupt"))).toEqual([]);
+	});
+});
+
+describe("auth-gateway stdio account limits", () => {
+	test("counts calls in the agent storage's ledger, refuses past a limit, and leaves that ledger open", async () => {
+		const tempDir = TempDir.createSync("@omp-auth-gateway-stdio-limits-");
+		cleanups.push(() => tempDir.removeSync());
+		const agentStorage = await AgentStorage.open(tempDir.join("agent.db"));
+		cleanups.push(() => AgentStorage.close());
+		const accountPolicies = [policy("openai", [{ metric: "requests", max: 1, window: DAY, onLimit: "skip" }])];
+		const storage = await AuthStorage.create(":memory:", { accountPolicies, defaultReservePct: 10 });
+		cleanups.push(() => storage.close());
+		await storage.credentials.set("openai", [{ type: "api_key", key: KEY }]);
+
+		const limits = await installStdioAccountLimits(
+			storage,
+			accountPolicies,
+			Settings.isolated({}, { storage: agentStorage }),
+		);
+		const router = createAuthGatewayRouter({
+			storage,
+			resolveModel: id => (id === embedding.id ? embedding : undefined),
+			fetch: upstream(),
+			onUsage: limits?.onUsage,
+		});
+		cleanups.push(() => router.close());
+		const embedCall = () =>
+			router.route(
+				new Request("http://stdio/v1/embeddings", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(embed),
+				}),
+				"stdio",
+			);
+
+		expect((await embedCall()).status).toBe(200);
+		expect((await embedCall()).status).toBe(429);
+		await router.settled();
+		await limits?.close();
+		expect(agentStorage.usageLedger.totals([{ provider: "openai" }], 0).requests).toBe(1n);
 	});
 });

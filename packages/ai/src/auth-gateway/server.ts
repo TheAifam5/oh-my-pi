@@ -857,6 +857,23 @@ function trackSettle(settles: Set<Promise<unknown>>, settle: Promise<unknown>): 
 const CLOSE_SETTLE_TIMEOUT_MS = 10_000;
 
 /**
+ * Waits for `router` to settle ({@link AuthGatewayRouter.settled}) for at most
+ * {@link CLOSE_SETTLE_TIMEOUT_MS}, logging a warning when the bound expires. Never rejects.
+ */
+export async function settleAuthGatewayRouter(router: AuthGatewayRouter): Promise<void> {
+	const timedOut = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => timedOut.resolve(true), CLOSE_SETTLE_TIMEOUT_MS);
+	timer.unref();
+	const expired = await Promise.race([router.settled().then(() => false), timedOut.promise]);
+	clearTimeout(timer);
+	if (expired) {
+		logger.warn("auth-gateway closed before every request recorded its usage", {
+			timeoutMs: CLOSE_SETTLE_TIMEOUT_MS,
+		});
+	}
+}
+
+/**
  * The gateway's routes over `opts`, owning their per-session provider state:
  * two routers in one process never share (or tear down) each other's.
  */
@@ -1031,16 +1048,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		close: async () => {
 			server.stop(true);
 			// Requests cut off by the stop still settle, and record their usage, once their upstream call ends.
-			const timedOut = Promise.withResolvers<boolean>();
-			const timer = setTimeout(() => timedOut.resolve(true), CLOSE_SETTLE_TIMEOUT_MS);
-			timer.unref();
-			const expired = await Promise.race([router.settled().then(() => false), timedOut.promise]);
-			clearTimeout(timer);
-			if (expired) {
-				logger.warn("auth-gateway closed before every request recorded its usage", {
-					timeoutMs: CLOSE_SETTLE_TIMEOUT_MS,
-				});
-			}
+			await settleAuthGatewayRouter(router);
 			// Drain after the listener is down: the retained provider states own
 			// sockets and timers (Codex WebSockets, GitLab Duo workflows), so the
 			// process can't settle until each one is closed.
