@@ -372,6 +372,13 @@ export interface ToolSession {
 	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
+	/**
+	 * Whether provider-visible descriptions may reference a sibling tool: the
+	 * active set frozen at the last system-prompt rebuild, so a mid-session
+	 * roster change leaves already-sent descriptions byte-stable. Undefined
+	 * results fall back to {@link isToolActive}.
+	 */
+	isToolAdvertised?: (name: string) => boolean | undefined;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Canonical map containing every registered tool exactly once. */

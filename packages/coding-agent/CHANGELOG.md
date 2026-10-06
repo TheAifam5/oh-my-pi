@@ -13,6 +13,7 @@
 ### Fixed
 
 - Fixed switching models during a streaming Codex turn retrying the cancelled request and falling back to another model instead of keeping the selected one.
+- Fixed enabling or disabling a tool mid-session on Claude models forcing a full prompt-cache rewrite.
 
 ## [18.8.3] - 2026-10-07
 

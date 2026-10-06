@@ -592,7 +592,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly loadMode = "essential";
 	get description(): string {
 		const evalBackends = resolveEvalBackends(this.session);
-		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
+		const isToolActive = (name: string, fallback: boolean): boolean =>
+			this.session.isToolAdvertised?.(name) ?? this.session.isToolActive?.(name) ?? fallback;
 		return prompt.render(bashDescription, {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
@@ -603,7 +604,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasAstEdit: isToolActive("ast_edit", cfgAstEditEnabled.get(this.session.settings)),
 			hasGrep: isToolActive("grep", cfgGrepEnabled.get(this.session.settings)),
 			hasGlob: isToolActive("glob", cfgGlobEnabled.get(this.session.settings)),
-			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
+			hasFind:
+				this.session.isToolAdvertised?.("find") ??
+				this.session.isToolActive?.("find") ??
+				isFindEnabled(this.session),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back

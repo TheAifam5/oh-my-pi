@@ -9853,6 +9853,11 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.skillHintVisible;
 	}
 
+	/** Frozen advertised-tool snapshot (see {@link SessionTools.isToolAdvertised}). */
+	isToolAdvertised(name: string): boolean {
+		return this.#tools.isToolAdvertised(name);
+	}
+
 	/** Skill loading warnings captured by SDK */
 	get skillWarnings(): readonly SkillWarning[] {
 		return this.#tools.skillWarnings;
