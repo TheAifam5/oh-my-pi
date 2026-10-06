@@ -104,6 +104,8 @@ export function buildCustomModelOverlay(
 		compactionModel: modelDef.compactionModel,
 		remoteCompaction: mergeRemoteCompactionConfig(providerRemoteCompaction, modelDef.remoteCompaction),
 		premiumMultiplier: modelDef.premiumMultiplier,
+		samplingParams: modelDef.samplingParams,
+		samplingParamsByThinkingLevel: modelDef.samplingParamsByThinkingLevel,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
 	};
 }
@@ -146,6 +148,8 @@ export function finalizeCustomModel(resolvedModel: CustomModelOverlay, options: 
 		compactionModel: resolvedModel.compactionModel,
 		remoteCompaction: resolvedModel.remoteCompaction,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
+		samplingParams: resolvedModel.samplingParams,
+		samplingParamsByThinkingLevel: resolvedModel.samplingParamsByThinkingLevel,
 		isOAuth: resolvedModel.isOAuth,
 	} as ModelSpec<Api>);
 	if (resolvedModel.cost) {
