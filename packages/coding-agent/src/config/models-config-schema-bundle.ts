@@ -199,6 +199,29 @@ export const getModelsConfigSchemaBundle = once(() => {
 		return true;
 	});
 
+	// Closed so a provider wire key such as `top_p` fails validation instead of being ignored.
+	const SamplingParamsSchema = type({
+		"+": "reject",
+		"temperature?": "number",
+		"topP?": "number",
+		"topK?": "number",
+		"minP?": "number",
+		"presencePenalty?": "number",
+		"repetitionPenalty?": "number",
+		"frequencyPenalty?": "number",
+	});
+
+	const SamplingParamsByThinkingLevelSchema = type({
+		"+": "reject",
+		"off?": SamplingParamsSchema,
+		"minimal?": SamplingParamsSchema,
+		"low?": SamplingParamsSchema,
+		"medium?": SamplingParamsSchema,
+		"high?": SamplingParamsSchema,
+		"xhigh?": SamplingParamsSchema,
+		"max?": SamplingParamsSchema,
+	});
+
 	const ModelDefinitionSchema = type({
 		id: "string",
 		"name?": "string",
@@ -222,6 +245,8 @@ export const getModelsConfigSchemaBundle = once(() => {
 			"long?": "number",
 		},
 		"premiumMultiplier?": "number",
+		"samplingParams?": SamplingParamsSchema,
+		"samplingParamsByThinkingLevel?": SamplingParamsByThinkingLevelSchema,
 		"contextWindow?": "number",
 		"maxContextWindow?": "number",
 		"maxTokens?": "number",
@@ -281,6 +306,8 @@ export const getModelsConfigSchemaBundle = once(() => {
 			"long?": "number",
 		},
 		"premiumMultiplier?": "number",
+		"samplingParams?": SamplingParamsSchema,
+		"samplingParamsByThinkingLevel?": SamplingParamsByThinkingLevelSchema,
 		"contextWindow?": "number",
 		"maxContextWindow?": "number",
 		"maxTokens?": "number",

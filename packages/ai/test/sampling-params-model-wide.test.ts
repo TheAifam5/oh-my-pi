@@ -6,6 +6,7 @@ import { stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 // Whether a model accepts `temperature`/`top_p` is a property of the model
@@ -27,11 +28,12 @@ const emptyResponse = async () => new Response(new Uint8Array(), { status: 200 }
 /** The body as sent: providers may build `temperature: undefined`, which serialization drops. */
 const wire = (payload: unknown): Record<string, unknown> => JSON.parse(JSON.stringify(payload));
 
-function simplePayload(model: Model<Api>): Promise<Record<string, unknown>> {
+function simplePayload(model: Model<Api>, reasoning?: Effort): Promise<Record<string, unknown>> {
 	setBedrockProviderModule({ streamBedrock });
 	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 	void streamSimple(model, context, {
 		apiKey: "test-key",
+		reasoning,
 		providerOptions: { bearerToken: "test-token" },
 		maxTokens: 16,
 		temperature: 0,
@@ -131,5 +133,33 @@ describe("sampling params are gated by model, on every provider", () => {
 			onPayload: payload => resolve(wire(payload)),
 		});
 		expect(bedrockInference(await promise)).not.toHaveProperty("temperature");
+	});
+
+	test("model samplingParams and the active level entry override request sampling per key on openai-completions", async () => {
+		const model: Model<Api> = {
+			...buildModel({
+				id: "local-reasoner",
+				name: "local-reasoner",
+				api: "openai-completions",
+				provider: "custom-proxy",
+				baseUrl: "http://127.0.0.1:9/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 32_000,
+			}),
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High] },
+			samplingParams: { temperature: 1, topP: 0.95 },
+			samplingParamsByThinkingLevel: { [Effort.High]: { temperature: 0.6, topK: 20 } },
+		};
+		const high = await simplePayload(model, Effort.High);
+		expect(high.temperature).toBe(0.6);
+		expect(high.top_k).toBe(20);
+		expect(high.top_p).toBe(0.95);
+		const low = await simplePayload(model, Effort.Low);
+		expect(low.temperature).toBe(1);
+		expect(low.top_p).toBe(0.95);
+		expect(low).not.toHaveProperty("top_k");
 	});
 });

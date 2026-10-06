@@ -114,6 +114,37 @@ scope it applies provider-wide. `transport: pi-native` always applies the gatewa
 `preferWebsockets` (on a model or `modelOverrides` entry) controls whether Codex requests prefer
 the WebSocket transport. `omitMaxOutputTokens` omits the model-derived output cap.
 
+### Sampling parameters
+
+`samplingParams` sets a model's sampling defaults and `samplingParamsByThinkingLevel` overrides them
+for the thinking level a request runs at. Both can be set on a model or a `modelOverrides` entry.
+Level keys are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `off` applies when
+reasoning is not requested or is disabled. Both fields accept `temperature`, `topP`, `topK`, `minP`,
+`presencePenalty`, `repetitionPenalty`, and `frequencyPenalty`; other keys, including provider wire
+names such as `top_p`, fail validation.
+
+```yaml
+providers:
+  local:
+    baseUrl: http://localhost:8000/v1
+    api: openai-completions
+    auth: none
+    models:
+      - id: qwen-thinking-model
+        reasoning: true
+        samplingParams: { temperature: 1.0, topP: 0.95 }
+        samplingParamsByThinkingLevel:
+          off: { temperature: 0.7, topP: 0.8 }
+          high: { topK: 20 }
+```
+
+OMP merges the request's sampling options (including the global sampling settings), then
+`samplingParams`, then the effective level's entry; later values win per key. A `modelOverrides`
+entry merges with the model's values per key, and per level for `samplingParamsByThinkingLevel`.
+The fields apply only to `openai-completions`, `openai-responses`, and `azure-openai-responses`
+models; other APIs ignore them. Models whose catalog compat rejects sampling parameters never
+receive them.
+
 ### Bedrock request options
 
 Provider-level `guardrailIdentifier`, `guardrailVersion`, and `guardrailTrace` attach a guardrail to
@@ -295,7 +326,8 @@ Provider defaults vs per-model overrides:
 - `modelOverrides` can override model metadata (`name`, `api`, `kind`, `reasoning`, `thinking`, `input`,
   `imageInputDecoder`, `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`,
   `maxContextWindow`, `maxTokens`, `omitMaxOutputTokens`, `preferWebsockets`, `headers`, `compat`,
-  `contextPromotionTarget`, `compactionModel`, and `remoteCompaction`).
+  `contextPromotionTarget`, `compactionModel`, `remoteCompaction`, `samplingParams`, and
+  `samplingParamsByThinkingLevel`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
   `extraBody`, and `whenThinking`).
 

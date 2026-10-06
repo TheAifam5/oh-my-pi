@@ -7,6 +7,7 @@ import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl, resolveVertexEndpointHost } from "@oh-my-pi/pi-catalog/hosts";
 import {
+	clampThinkingLevelForModel,
 	defaultSupportedEffort,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
@@ -1232,6 +1233,26 @@ function withSupportedSamplingParams<T extends SamplingOptions>(model: Model<Api
 	return supported;
 }
 
+const MODEL_SAMPLING_PARAMS_APIS: ReadonlySet<Api> = new Set([
+	"openai-completions",
+	"openai-responses",
+	"azure-openai-responses",
+]);
+
+/**
+ * Merge the model's `samplingParams`, then its `samplingParamsByThinkingLevel`
+ * entry for the request's effective (clamped) thinking level, over the
+ * request's sampling options, per key. A request without reasoning, or with
+ * reasoning disabled, selects `off`. Other APIs ignore both fields.
+ */
+function withModelSamplingParams(model: Model<Api>, options: SimpleStreamOptions): SimpleStreamOptions {
+	if (!MODEL_SAMPLING_PARAMS_APIS.has(model.api)) return options;
+	const level = options.disableReasoning ? undefined : clampThinkingLevelForModel(model, options.reasoning);
+	const levelParams = model.samplingParamsByThinkingLevel?.[level ?? "off"];
+	if (!model.samplingParams && !levelParams) return options;
+	return { ...options, ...model.samplingParams, ...levelParams };
+}
+
 let streamUsageObserver: StreamUsageObserver | undefined;
 /** Whether a throwing `admit` has been logged; the request goes ahead regardless. */
 let warnedAdmitFailure = false;
@@ -1342,7 +1363,7 @@ function streamSimpleRequest<TApi extends Api>(
 ): AssistantMessageEventStream {
 	const requestOptions = withSupportedSamplingParams(
 		model,
-		withTransportFetch(model, (options || {}) as SimpleStreamOptions),
+		withModelSamplingParams(model, withTransportFetch(model, (options || {}) as SimpleStreamOptions)),
 	);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;

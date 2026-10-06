@@ -2027,6 +2027,22 @@ describe("ModelRegistry", () => {
 			expect(invalid.find("myprovider", "my-model")).toBeUndefined();
 		});
 
+		test("samplingParamsByThinkingLevel rejects an unknown thinking level", () => {
+			writeRawModelsJson({
+				myprovider: {
+					baseUrl: "http://localhost:8000/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [{ id: "my-model", samplingParamsByThinkingLevel: { extreme: { temperature: 0.2 } } }],
+				},
+			});
+
+			const invalid = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(invalid.getError()?.message).toContain("samplingParamsByThinkingLevel.extreme");
+			expect(invalid.find("myprovider", "my-model")).toBeUndefined();
+		});
+
 		test("model override can change cost fields partially without dropping long-context pricing", () => {
 			const gpt56 = getModelsForProvider(costPartial, "openai").find(m => m.id === "gpt-5.6");
 			expect(gpt56?.cost.input).toBe(99);

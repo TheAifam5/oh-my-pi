@@ -1329,6 +1329,20 @@ export interface TimeBasedCost {
  */
 export type ModelPromptCache = Partial<Record<"short" | "long", number>>;
 
+/** Sampling values a model configuration can pin; keys match the stream option fields of the same name. */
+export interface ModelSamplingParams {
+	temperature?: number;
+	topP?: number;
+	topK?: number;
+	minP?: number;
+	presencePenalty?: number;
+	repetitionPenalty?: number;
+	frequencyPenalty?: number;
+}
+
+/** Sampling values keyed by the effective thinking level, where `off` means reasoning is not requested. */
+export type ModelSamplingParamsByThinkingLevel = Partial<Record<Effort | "off", ModelSamplingParams>>;
+
 /** Base token rates plus optional long-context and time-based pricing. */
 export interface ModelCost extends TokenCost {
 	longContext?: LongContextTokenCost;
@@ -1535,6 +1549,15 @@ export interface Model<TApi extends Api = Api> {
 	pricingStatus?: Exclude<ModelPricingStatus, "fixed">;
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
+	/**
+	 * Configured sampling defaults for OpenAI-compatible APIs (`openai-completions`,
+	 * `openai-responses`, `azure-openai-responses`). They override the request's
+	 * own sampling options per key and are still dropped for models whose compat
+	 * rejects sampling parameters.
+	 */
+	samplingParams?: ModelSamplingParams;
+	/** Per-key overrides of {@link samplingParams} for the request's effective thinking level. */
+	samplingParamsByThinkingLevel?: ModelSamplingParamsByThinkingLevel;
 	contextWindow: number | null;
 	/** Preserve the host's supplied window instead of applying inferred expansion or reference-price caps. */
 	contextWindowAuthoritative?: boolean;

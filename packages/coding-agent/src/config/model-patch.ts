@@ -1,4 +1,12 @@
-import type { Api, Model, ModelSpec, RemoteCompactionConfig, ThinkingConfig } from "@oh-my-pi/pi-ai/types";
+import type {
+	Api,
+	Model,
+	ModelSamplingParams,
+	ModelSamplingParamsByThinkingLevel,
+	ModelSpec,
+	RemoteCompactionConfig,
+	ThinkingConfig,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isVertexExpressOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
@@ -229,6 +237,21 @@ export function mergeProviderRemoteCompactionConfig(
 	return mergeRemoteCompactionConfig(providerConfig, modelConfig);
 }
 
+/** Merge per-level sampling entries, key by key within each level; `patch` wins. */
+function mergeSamplingParamsByThinkingLevel(
+	base: ModelSamplingParamsByThinkingLevel | undefined,
+	patch: ModelSamplingParamsByThinkingLevel,
+): ModelSamplingParamsByThinkingLevel {
+	const merged: ModelSamplingParamsByThinkingLevel = { ...base };
+	for (const [level, params] of Object.entries(patch) as [
+		keyof ModelSamplingParamsByThinkingLevel,
+		ModelSamplingParams,
+	][]) {
+		merged[level] = { ...base?.[level], ...params };
+	}
+	return merged;
+}
+
 /**
  * The patchable subset of `Model` fields shared by `modelOverrides` entries,
  * custom model definitions, and parsed custom-model overlays. `undefined`
@@ -260,6 +283,8 @@ export interface ModelPatch {
 	compactionModel?: string;
 	remoteCompaction?: RemoteCompactionConfig<Api>;
 	premiumMultiplier?: number;
+	samplingParams?: ModelSamplingParams;
+	samplingParamsByThinkingLevel?: ModelSamplingParamsByThinkingLevel;
 }
 
 /**
@@ -298,6 +323,15 @@ export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: 
 		result.remoteCompaction = mergeRemoteCompactionConfig(base.remoteCompaction, patch.remoteCompaction);
 	}
 	if (patch.premiumMultiplier !== undefined) result.premiumMultiplier = patch.premiumMultiplier;
+	if (patch.samplingParams !== undefined) {
+		result.samplingParams = { ...base.samplingParams, ...patch.samplingParams };
+	}
+	if (patch.samplingParamsByThinkingLevel !== undefined) {
+		result.samplingParamsByThinkingLevel = mergeSamplingParamsByThinkingLevel(
+			base.samplingParamsByThinkingLevel,
+			patch.samplingParamsByThinkingLevel,
+		);
+	}
 	if (patch.cost) {
 		const longContext = patch.cost.longContext ?? base.cost.longContext;
 		result.cost = {
