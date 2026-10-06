@@ -1,5 +1,5 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import { Box } from "../components/box";
 import { SPINNER_ADVANCE_MS } from "../components/loader";
 import { Image } from "../components/image";
@@ -191,10 +191,27 @@ export interface ToolExecutionUi {
 	imageBudget?: TUI["imageBudget"];
 }
 
+/** Custom call and result renderers, invoked as `renderCall(args, options, theme)` and `renderResult(result, options, theme, args)`. */
+export interface ToolExecutionRenderers {
+	renderCall?: (args: unknown, options: RenderResultOptions, theme: Theme) => unknown;
+	renderResult?: (
+		result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
+		options: RenderResultOptions,
+		theme: Theme,
+		args?: unknown,
+	) => unknown;
+}
+
 export interface ToolExecutionOptions {
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	/** Allow the name-keyed renderer registry only when the active tool is the built-in implementation. */
 	useBuiltInRenderer?: boolean;
+	/**
+	 * Renderers that replace the tool's own `renderCall`/`renderResult`, also for
+	 * a tool name with no registered tool. When either is set, the name-keyed
+	 * registry renderer is not used.
+	 */
+	renderers?: ToolExecutionRenderers;
 }
 
 export interface ToolExecutionHandle extends Component {
@@ -348,6 +365,8 @@ export class ToolExecutionComponent extends Container {
 	#textOutput = "";
 	#textOutputKey: string | undefined;
 	#tool?: AgentTool;
+	// Custom renderCall/renderResult source: resolver-chosen renderers, else the tool.
+	#customRenderers?: ToolExecutionRenderers;
 	#renderer?: ToolRenderer;
 	#ui: ToolExecutionUi;
 	#result?: {
@@ -428,9 +447,11 @@ export class ToolExecutionComponent extends Container {
 		this.#toolCallId = toolCallId;
 		this.#toolName = toolName;
 		this.#toolLabel = tool?.label ?? toolName;
-		this.#renderer = options.useBuiltInRenderer === false ? undefined : toolRenderers[toolName];
+		const overridesRenderers = !!(options.renderers?.renderCall || options.renderers?.renderResult);
+		this.#renderer = options.useBuiltInRenderer === false || overridesRenderers ? undefined : toolRenderers[toolName];
 		this.#showImages = options.showImages ?? true;
 		this.#tool = tool;
+		this.#customRenderers = options.renderers ?? (tool as ToolExecutionRenderers | undefined);
 		this.#ui = ui;
 		this.#args = args;
 		this.#editMode = resolveEditModeForTool(toolName, tool);
@@ -445,7 +466,7 @@ export class ToolExecutionComponent extends Container {
 		this.#contentText = new WidthAwareText(contentWidth => this.#renderDefaultCard(contentWidth), 1, 1);
 
 		// Use Box for custom tools or built-in tools with rich renderers.
-		const hasCustomRenderer = !!(tool?.renderCall || tool?.renderResult);
+		const hasCustomRenderer = this.#hasCustomRenderer();
 		this.#usesContentBox = hasCustomRenderer || this.#renderer !== undefined;
 		if (this.#usesContentBox) {
 			this.addChild(this.#contentBox);
@@ -458,6 +479,10 @@ export class ToolExecutionComponent extends Container {
 
 		this.#updateSpinnerAnimation();
 		this.#updateDisplay();
+	}
+
+	#hasCustomRenderer(): boolean {
+		return !!(this.#customRenderers?.renderCall || this.#customRenderers?.renderResult);
 	}
 
 	updateArgs(args: unknown, _toolCallId?: string): void {
@@ -672,14 +697,14 @@ export class ToolExecutionComponent extends Container {
 				? // Only the generic #formatToolExecution fallback consumes the frame;
 					// a custom renderCall/renderResult pair routes through the custom
 					// branch whose pending label is a static tool-name Text.
-					!this.#tool?.renderCall && !this.#tool?.renderResult
+					!this.#hasCustomRenderer()
 				: typeof pendingAnimation === "function"
 					? pendingAnimation(this.#args)
 					: pendingAnimation === true);
 		const partialResultConsumesSpinner =
 			this.#result !== undefined &&
 			(renderer === undefined
-				? !this.#tool?.renderCall && !this.#tool?.renderResult
+				? !this.#hasCustomRenderer()
 				: typeof partialAnimation === "function"
 					? partialAnimation(this.#args)
 					: partialAnimation === true);
@@ -1377,9 +1402,11 @@ export class ToolExecutionComponent extends Container {
 		// failure (#7199).
 		if (benignSkip) {
 			this.#renderBenignSkipCard(stateBgFn);
-		} else if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
-			const tool = this.#tool;
-			const mergeCallAndResult = Boolean((tool as { mergeCallAndResult?: boolean }).mergeCallAndResult);
+		} else if (this.#customRenderers && this.#hasCustomRenderer()) {
+			const tool = this.#customRenderers;
+			const mergeCallAndResult = Boolean(
+				(this.#tool as { mergeCallAndResult?: boolean } | undefined)?.mergeCallAndResult,
+			);
 			// Custom tools use Box for flexible component rendering
 			this.#contentBox.setBgFn(undefined);
 			this.#contentBox.clear();
@@ -1423,13 +1450,7 @@ export class ToolExecutionComponent extends Container {
 			// Render result component if we have a result
 			if (this.#result && tool.renderResult) {
 				try {
-					const renderResult = tool.renderResult as (
-						result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
-						options: { expanded: boolean; isPartial: boolean; spinnerFrame?: number },
-						theme: Theme,
-						args?: unknown,
-					) => Component;
-					const resultComponent = renderResult(
+					const resultComponent = tool.renderResult(
 						{
 							content: this.#result.content,
 							details: this.#result.details,
@@ -1438,7 +1459,7 @@ export class ToolExecutionComponent extends Container {
 						this.#renderState,
 						theme,
 						this.#args,
-					);
+					) as Component | undefined;
 					if (resultComponent) {
 						this.#contentBox.addChild(
 							new SafeToolRendererComponent(this.#toolName, "result", resultComponent, () => {

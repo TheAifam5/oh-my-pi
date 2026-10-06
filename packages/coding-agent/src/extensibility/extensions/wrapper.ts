@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import type { ToolExecutionRenderers } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	denyError,
@@ -24,7 +25,7 @@ import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult, ToolRenderers } from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -54,6 +55,45 @@ function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T &
 			return bound;
 		},
 	}) as T & Theme;
+}
+
+/**
+ * Renderers that registered tool renderer resolvers choose for calls to
+ * `toolName`, bridged to the omp call order like {@link RegisteredToolAdapter}.
+ * Returns `undefined` when the tool's own renderers stand, so callers keep the
+ * default rendering path; an empty object means no custom renderers.
+ */
+export function resolveToolExecutionRenderers(
+	runner: ExtensionRunner | undefined,
+	toolName: string,
+	tool: AgentTool | undefined,
+): ToolExecutionRenderers | undefined {
+	if (!runner?.hasToolRendererResolvers()) return undefined;
+	const own: ToolRenderers | undefined =
+		tool && (tool.renderCall || tool.renderResult)
+			? ({
+					renderCall: tool.renderCall?.bind(tool),
+					renderResult: tool.renderResult?.bind(tool),
+				} as ToolRenderers)
+			: undefined;
+	const resolved = runner.resolveToolRenderers(toolName, own);
+	if (resolved === own) return undefined;
+	const renderers: ToolExecutionRenderers = {};
+	const { renderCall, renderResult } = resolved ?? {};
+	if (renderCall) {
+		renderers.renderCall = (args, options, theme) => renderCall(args, renderOptionsWithTheme(options, theme), theme);
+	}
+	if (renderResult) {
+		renderers.renderResult = (result, options, theme, args) =>
+			renderResult(
+				// The component holds the tool's own result, typed loosely for display.
+				result as AgentToolResult<unknown>,
+				{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
+				theme,
+				args,
+			);
+	}
+	return renderers;
 }
 
 /**

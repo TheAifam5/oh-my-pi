@@ -117,7 +117,7 @@ Core methods:
 
 - `on(event, handler)` — returns an unsubscribe function
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
-- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerMarkdownTransformer`
+- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerMarkdownTransformer`, `registerToolRenderer`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
@@ -1172,6 +1172,27 @@ ignore transformers.
 ## Tool call/result renderer
 
 Provide `renderCall` / `renderResult` on `registerTool` definitions for custom tool visualization in TUI.
+
+To choose renderers for calls to any tool, including tools that are not
+registered (such as MCP tools in a resumed session before their server
+connected), register a resolver:
+
+```ts
+pi.registerToolRenderer((toolName, next) => {
+	if (toolName !== "mcp_github_search") return next();
+	return next() ?? { renderCall: (args, options, theme) => new Text(theme.bold(`search ${args.query}`), 0, 0) };
+});
+```
+
+Resolvers run in extension load order. `next()` returns the renderers the
+remaining resolvers, then the tool itself, would use, so `next() ?? mine` only
+fills in; returning `undefined` leaves default rendering. Returned renderers
+are called like tool-definition renderers and also accept upstream pi's
+`renderCall(args, theme, context)` order. `renderShell` is accepted and
+ignored. Resolvers apply to live and rebuilt interactive transcripts; the
+`next()` chain ends at the tool's own `renderCall` / `renderResult`, not the
+built-in renderers of native tools. A resolver that throws is skipped and
+reported once through the extension error channel.
 
 ## Constraints and pitfalls
 

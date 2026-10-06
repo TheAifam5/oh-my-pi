@@ -118,6 +118,8 @@ import type {
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
+	ToolRendererResolver,
+	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
 	UIPromptKind,
@@ -741,6 +743,7 @@ export class ExtensionRunner {
 	#promptEventUIContext: ExtensionUIContext;
 	/** Transformers that already reported a failure, so a broken one is not reported on every render. */
 	#failedMarkdownTransformers = new WeakSet<MarkdownTransformer>();
+	#failedToolRendererResolvers = new WeakSet<ToolRendererResolver>();
 	#disposeSessionNameListener: (() => void) | undefined;
 	/** Tail of queued `ui_prompt_*` deliveries; never rejects. */
 	#promptEvents: Promise<void> = Promise.resolve();
@@ -1715,6 +1718,43 @@ export class ExtensionRunner {
 
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
+	}
+
+	/** Whether any active extension registered a tool renderer resolver. */
+	hasToolRendererResolvers(): boolean {
+		return this.extensions.some(ext => (ext.toolRendererResolvers?.length ?? 0) > 0);
+	}
+
+	/**
+	 * Resolve the renderers for calls to `toolName` through every registered
+	 * resolver in load order; the last `next()` returns `own`. A resolver that
+	 * throws is skipped as if it returned `next()`; its first failure is
+	 * reported through {@link onError}.
+	 */
+	resolveToolRenderers(toolName: string, own: ToolRenderers | undefined): ToolRenderers | undefined {
+		const chain = this.extensions.flatMap(ext =>
+			(ext.toolRendererResolvers ?? []).map(resolver => ({ resolver, extensionPath: ext.path })),
+		);
+		const resolveFrom = (index: number): ToolRenderers | undefined => {
+			const link = chain[index];
+			if (!link) return own;
+			const next = () => resolveFrom(index + 1);
+			try {
+				return link.resolver(toolName, next);
+			} catch (error) {
+				if (!this.#failedToolRendererResolvers.has(link.resolver)) {
+					this.#failedToolRendererResolvers.add(link.resolver);
+					this.emitError({
+						extensionPath: link.extensionPath,
+						event: "tool_renderer",
+						error: error instanceof Error ? error.message : String(error),
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				}
+				return next();
+			}
+		};
+		return resolveFrom(0);
 	}
 
 	/** Whether any active extension registered a Markdown transformer. */

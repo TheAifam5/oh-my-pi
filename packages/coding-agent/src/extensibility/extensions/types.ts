@@ -1660,6 +1660,26 @@ export interface MarkdownTransformContext {
  */
 export type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string;
 
+/**
+ * Call and result renderers chosen for a tool by {@link ToolRendererResolver}.
+ * `renderShell` is accepted for upstream-pi compatibility and ignored.
+ */
+export interface ToolRenderers {
+	renderCall?: ToolDefinition["renderCall"];
+	renderResult?: ToolDefinition["renderResult"];
+	renderShell?: unknown;
+}
+
+/**
+ * Chooses renderers for calls to `toolName`, including tools that are not
+ * registered. `next()` returns the renderers the remaining resolvers, then the
+ * tool itself, would use; returning `undefined` leaves the default rendering.
+ */
+export type ToolRendererResolver = (
+	toolName: string,
+	next: () => ToolRenderers | undefined,
+) => ToolRenderers | undefined;
+
 // ============================================================================
 // Command Registration
 // ============================================================================
@@ -1932,6 +1952,13 @@ export interface ExtensionAPI {
 
 	/** Register a renderer for assistant thinking blocks. Rendered after the original thinking text. */
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void;
+
+	/**
+	 * Register a resolver that chooses call and result renderers for any tool.
+	 * Resolvers run in extension load order and apply to live and rebuilt
+	 * transcripts. A throwing resolver is skipped and reported.
+	 */
+	registerToolRenderer(resolver: ToolRendererResolver): void;
 
 	/**
 	 * Register this extension's Markdown transformer for user and assistant
@@ -2317,6 +2344,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];
+	toolRendererResolvers?: ToolRendererResolver[];
 	markdownTransformer?: MarkdownTransformer;
 	fileWriteFallbackHandlers: FileWriteFallbackHandler[];
 	fileDeleteFallbackHandlers: FileDeleteFallbackHandler[];
