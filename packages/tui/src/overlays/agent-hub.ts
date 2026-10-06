@@ -36,6 +36,7 @@ import {
 } from "./agent-activity";
 import { formatKeyHint, formatKeyHints, type KeyId } from "../app-keybindings";
 import type { MessageRenderer } from "../chat/extension-types";
+import type { ToolExecutionRenderers } from "../chat/tool-execution";
 import type { AgentLifecycleLike, IrcBusLike } from "./agent-hub-types";
 import { type AgentRecordLike, type AgentHubRegistry, type AgentStatus, MAIN_AGENT_ID } from "./agent-hub-types";
 import { USER_INTERRUPT_LABEL } from "../chat/messages";
@@ -299,6 +300,8 @@ export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike>
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	/** Renderers that extension tool renderer resolvers choose for a tool call in the transcript. */
+	getToolRenderers?: (name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined;
 	/** Extension message renderers for custom messages in the transcript. */
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	/** Cwd used by tool renderers for path shortening; defaults to the project dir. */
@@ -447,6 +450,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#ui: TUI;
 	#getTool: ((name: string) => AgentTool | undefined) | undefined;
 	#isBuiltInTool: ((name: string) => boolean) | undefined;
+	#getToolRenderers: ((name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined) | undefined;
 	#getMessageRenderer: ((customType: string) => MessageRenderer | undefined) | undefined;
 	#cwd: string;
 	#hideThinkingBlock: (() => boolean) | undefined;
@@ -493,6 +497,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			} as unknown as TUI);
 		this.#getTool = deps.getTool;
 		this.#isBuiltInTool = deps.isBuiltInTool;
+		this.#getToolRenderers = deps.getToolRenderers;
 		this.#getMessageRenderer = deps.getMessageRenderer;
 		this.#cwd = deps.cwd ?? getProjectDir();
 		this.#hideThinkingBlock = deps.hideThinkingBlock;
@@ -648,6 +653,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			ui: this.#ui,
 			getTool: this.#getTool,
 			isBuiltInTool: this.#isBuiltInTool,
+			getToolRenderers: this.#getToolRenderers,
 			getMessageRenderer: this.#getMessageRenderer,
 			cwd: this.#cwd,
 			hideThinkingBlock: this.#hideThinkingBlock,

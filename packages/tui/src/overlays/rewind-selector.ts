@@ -42,6 +42,7 @@ import {
 	visibleWidth,
 } from "../index";
 import type { MessageRenderer } from "../chat/extension-types";
+import type { ToolExecutionRenderers } from "../chat/tool-execution";
 import { recentTranscriptEntries, type TranscriptEntryLike as TranscriptEntry } from "../chat/transcript-entry";
 import { theme } from "../theme/theme";
 import { matchesAppToolsExpand, matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
@@ -79,6 +80,7 @@ export interface RewindSelectorDeps {
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	getToolRenderers?: (name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
@@ -249,6 +251,7 @@ export class RewindSelectorComponent implements Component {
 			ui: this.deps.ui,
 			getTool: this.deps.getTool,
 			isBuiltInTool: this.deps.isBuiltInTool,
+			getToolRenderers: this.deps.getToolRenderers,
 			getMessageRenderer: this.deps.getMessageRenderer,
 			cwd: this.deps.cwd,
 			hideThinkingBlock: this.deps.hideThinkingBlock,

@@ -18,6 +18,7 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TspPickerColumn, TspPickerItem, TspPickerProps, TspText } from "@oh-my-pi/pi-wire";
 import { type Component, matchesKey, routeSgrMouseInput, type TUI, truncateToWidth, visibleWidth } from "../index";
 import type { MessageRenderer } from "../chat/extension-types";
+import type { ToolExecutionRenderers } from "../chat/tool-execution";
 import {
 	recentTranscriptEntries,
 	type SessionMessageEntryLike as SessionMessageEntry,
@@ -270,6 +271,7 @@ export interface CopySelectorDeps {
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	getToolRenderers?: (name: string, tool: AgentTool | undefined) => ToolExecutionRenderers | undefined;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
@@ -384,6 +386,7 @@ export class CopySelectorComponent implements Component {
 			ui: this.deps.ui,
 			getTool: this.deps.getTool,
 			isBuiltInTool: this.deps.isBuiltInTool,
+			getToolRenderers: this.deps.getToolRenderers,
 			getMessageRenderer: this.deps.getMessageRenderer,
 			cwd: this.deps.cwd,
 			hideThinkingBlock: this.deps.hideThinkingBlock,
