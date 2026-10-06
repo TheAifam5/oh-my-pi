@@ -2043,6 +2043,30 @@ describe("ModelRegistry", () => {
 			expect(invalid.find("myprovider", "my-model")).toBeUndefined();
 		});
 
+		test("Pi snake_case sampling keys load as their camelCase equivalents", () => {
+			writeRawModelsJson({
+				myprovider: {
+					baseUrl: "http://localhost:8000/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [
+						{
+							id: "my-model",
+							samplingParams: { temperature: 0.7, top_p: 0.8 },
+							samplingParamsByThinkingLevel: { high: { top_k: 20, presence_penalty: 1.5 } },
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getError()).toBeUndefined();
+			const model = registry.find("myprovider", "my-model");
+			expect(model?.samplingParams).toEqual({ temperature: 0.7, topP: 0.8 });
+			expect(model?.samplingParamsByThinkingLevel).toEqual({ high: { topK: 20, presencePenalty: 1.5 } });
+		});
+
 		test("model override can change cost fields partially without dropping long-context pricing", () => {
 			const gpt56 = getModelsForProvider(costPartial, "openai").find(m => m.id === "gpt-5.6");
 			expect(gpt56?.cost.input).toBe(99);

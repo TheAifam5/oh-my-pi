@@ -1,6 +1,18 @@
 import { type NarrowContext, type } from "@oh-my-pi/omptype";
+import type { ModelSamplingParams } from "@oh-my-pi/pi-ai/types";
 import { MODEL_KINDS, RUNNER_API_KINDS } from "@oh-my-pi/pi-catalog/types";
 import { once } from "@oh-my-pi/pi-utils";
+
+const SAMPLING_PARAM_ALIASES = {
+	top_p: "topP",
+	top_k: "topK",
+	min_p: "minP",
+	presence_penalty: "presencePenalty",
+	repetition_penalty: "repetitionPenalty",
+	frequency_penalty: "frequencyPenalty",
+} as const satisfies Record<string, keyof ModelSamplingParams>;
+
+type SamplingParamAlias = keyof typeof SAMPLING_PARAM_ALIASES;
 
 function validateMaxContextWindow(
 	value: { maxContextWindow?: number; contextWindow?: number },
@@ -199,7 +211,8 @@ export const getModelsConfigSchemaBundle = once(() => {
 		return true;
 	});
 
-	// Closed so a provider wire key such as `top_p` fails validation instead of being ignored.
+	// Closed so an unsupported key fails validation instead of being ignored. The snake_case
+	// spellings Pi configs use are aliases, normalized to the camelCase keys.
 	const SamplingParamsSchema = type({
 		"+": "reject",
 		"temperature?": "number",
@@ -209,7 +222,31 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"presencePenalty?": "number",
 		"repetitionPenalty?": "number",
 		"frequencyPenalty?": "number",
-	});
+		"top_p?": "number",
+		"top_k?": "number",
+		"min_p?": "number",
+		"presence_penalty?": "number",
+		"repetition_penalty?": "number",
+		"frequency_penalty?": "number",
+	})
+		.narrow((value, ctx) => {
+			for (const [alias, key] of Object.entries(SAMPLING_PARAM_ALIASES) as [
+				SamplingParamAlias,
+				keyof ModelSamplingParams,
+			][]) {
+				if (value[alias] !== undefined && value[key] !== undefined) {
+					return ctx.mustBe(`sampling params with only one of \`${key}\` and \`${alias}\``);
+				}
+			}
+			return true;
+		})
+		.pipe((value): ModelSamplingParams => {
+			const normalized: ModelSamplingParams = {};
+			for (const [key, param] of Object.entries(value)) {
+				normalized[SAMPLING_PARAM_ALIASES[key as SamplingParamAlias] ?? (key as keyof ModelSamplingParams)] = param;
+			}
+			return normalized;
+		});
 
 	const SamplingParamsByThinkingLevelSchema = type({
 		"+": "reject",

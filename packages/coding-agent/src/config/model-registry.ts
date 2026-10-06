@@ -3521,5 +3521,7 @@ export interface ProviderConfigInput {
 		compactionModel?: string;
 		remoteCompaction?: RemoteCompactionConfig<Api>;
 		premiumMultiplier?: number;
+		samplingParams?: Model<Api>["samplingParams"];
+		samplingParamsByThinkingLevel?: Model<Api>["samplingParamsByThinkingLevel"];
 	}>;
 }

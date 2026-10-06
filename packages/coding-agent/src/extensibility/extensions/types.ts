@@ -2187,6 +2187,10 @@ export interface ProviderModelConfig {
 	headers?: Record<string, string>;
 	/** OpenAI compatibility settings. */
 	compat?: ModelSpec<Api>["compat"];
+	/** Sampling defaults for OpenAI-compatible APIs; see {@link Model.samplingParams}. */
+	samplingParams?: Model["samplingParams"];
+	/** Per-thinking-level sampling overrides; see {@link Model.samplingParamsByThinkingLevel}. */
+	samplingParamsByThinkingLevel?: Model["samplingParamsByThinkingLevel"];
 }
 
 /**

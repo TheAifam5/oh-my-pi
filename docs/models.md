@@ -120,8 +120,9 @@ the WebSocket transport. `omitMaxOutputTokens` omits the model-derived output ca
 for the thinking level a request runs at. Both can be set on a model or a `modelOverrides` entry.
 Level keys are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `off` applies when
 reasoning is not requested or is disabled. Both fields accept `temperature`, `topP`, `topK`, `minP`,
-`presencePenalty`, `repetitionPenalty`, and `frequencyPenalty`; other keys, including provider wire
-names such as `top_p`, fail validation.
+`presencePenalty`, `repetitionPenalty`, and `frequencyPenalty`, plus Pi's snake_case spellings
+(`top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty`, `frequency_penalty`) as aliases;
+setting both spellings of one key, or any other key, fails validation.
 
 ```yaml
 providers:
