@@ -49,7 +49,12 @@ import {
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
-import { type AgentSession, type PromptAdmission, SessionBusyError } from "../../session/agent-session";
+import {
+	ACCOUNT_PIN_NOTICE_SOURCE,
+	type AgentSession,
+	type PromptAdmission,
+	SessionBusyError,
+} from "../../session/agent-session";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
@@ -1692,6 +1697,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		promptResults.observe(event);
 		settleWatcher.observe(event);
 	});
+	// Found during construction, before this subscriber existed; main mirrors them on stderr.
+	for (const message of session.accountPinWarnings) {
+		sessionEvents.forward({ type: "notice", level: "warning", message, source: ACCOUNT_PIN_NOTICE_SOURCE });
+	}
 	await goalController.reconcile();
 	await goalController.settled();
 

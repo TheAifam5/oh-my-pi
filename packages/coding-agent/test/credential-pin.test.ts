@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { AccountUnavailableError } from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
@@ -282,4 +283,68 @@ describe("credential pins", () => {
 			await session.dispose();
 		}
 	});
+
+	test("RPC mode reports an unavailable pin found while the session is built as a notice frame", async () => {
+		const sourceDir = path.resolve(import.meta.dir, "../src");
+		const fixturePath = tempDir.join("rpc-pin.ts");
+		await Bun.write(
+			fixturePath,
+			`
+import { Database } from "bun:sqlite";
+import { Agent } from ${JSON.stringify(Bun.resolveSync("@oh-my-pi/pi-agent-core", import.meta.dir))};
+import { getBundledModel } from ${JSON.stringify(Bun.resolveSync("@oh-my-pi/pi-catalog/models", import.meta.dir))};
+import { ModelRegistry } from ${JSON.stringify(path.join(sourceDir, "config/model-registry.ts"))};
+import { Settings } from ${JSON.stringify(path.join(sourceDir, "config/settings.ts"))};
+import { runRpcMode } from ${JSON.stringify(path.join(sourceDir, "modes/rpc/rpc-mode.ts"))};
+import { AgentSession } from ${JSON.stringify(path.join(sourceDir, "session/agent-session.ts"))};
+import { AuthStorage, SqliteAuthCredentialStore } from ${JSON.stringify(path.join(sourceDir, "session/auth-storage.ts"))};
+import { credentialPinHash } from ${JSON.stringify(path.join(sourceDir, "session/credential-pin.ts"))};
+import { SessionManager } from ${JSON.stringify(path.join(sourceDir, "session/session-manager.ts"))};
+const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+await storage.credentials.reload();
+const manager = SessionManager.inMemory(process.cwd());
+manager.appendCredentialPin("anthropic", credentialPinHash("anthropic", { accountId: "account-gone" }), true);
+const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+const session = new AgentSession({
+  agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+  sessionManager: manager,
+  settings: Settings.isolated({}),
+  modelRegistry: new ModelRegistry(storage),
+});
+await runRpcMode(session);
+`,
+		);
+		const child = Bun.spawn([process.execPath, fixturePath], {
+			cwd: tempDir.path(),
+			env: {
+				PATH: Bun.env.PATH,
+				HOME: tempDir.join("home"),
+				PI_CODING_AGENT_DIR: tempDir.join("agent"),
+				XDG_CONFIG_HOME: tempDir.join("config"),
+				XDG_DATA_HOME: tempDir.join("data"),
+				XDG_CACHE_HOME: tempDir.join("cache"),
+				CI: "true",
+				PI_NO_TITLE: "1",
+			},
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 20_000,
+		});
+		const stderr = new Response(child.stderr).text();
+		let notice: Record<string, unknown> | undefined;
+		try {
+			for await (const frame of readJsonl<unknown>(child.stdout)) {
+				if (isRecord(frame) && frame.type === "notice") {
+					notice = frame;
+					break;
+				}
+			}
+		} finally {
+			child.stdin.end();
+			await child.exited;
+		}
+		expect(notice, await stderr).toMatchObject({ level: "warning", source: "account-pin" });
+		expect(notice?.message).toContain("pinned to this session for anthropic");
+	}, 30_000);
 });
