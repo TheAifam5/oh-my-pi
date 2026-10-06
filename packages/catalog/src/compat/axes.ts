@@ -567,6 +567,8 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	 * `compat/prompt-cache-persistent.ts`. Unassigned: entries expire.
 	 */
 	"prompt-cache-persistent": { key: "promptCachePersistent", set: "catalog", shape: "scalar", values: [true, false] },
+	/** Whether the cache warmer may replay requests to keep this model's `prompt-cache` entries alive. */
+	"prompt-cache-warming": { key: "promptCacheWarming", set: "catalog", shape: "scalar", values: [true, false] },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
 	"max-context-window": { key: "maxContextWindow", set: "catalog", shape: "scalar" },
 	/**
