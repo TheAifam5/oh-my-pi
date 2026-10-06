@@ -46,7 +46,7 @@ describe("group funding verdicts", () => {
 		for (const mode of ["subscription-included", "free"] as const) {
 			expect(fundingVerdict(["included", "free"], [known({ mode, state: "unknown" })]).kind).toBe("funded");
 		}
-		expect(fundingVerdict(["metered"], [known({ mode: "metered", state: "unknown" })]).kind).toBe("skipped");
+		expect(fundingVerdict(["metered"], [known({ mode: "metered", state: "unknown" })]).kind).toBe("unverified");
 		expect(fundingVerdict(["metered"], [known({ mode: "metered", state: "available" })])).toEqual({
 			kind: "funded",
 			stage: 0,
@@ -54,19 +54,19 @@ describe("group funding verdicts", () => {
 		});
 	});
 
-	it("never authorizes metered use without evidence that the metered source is available", () => {
+	it("leaves members without verified evidence unverified rather than funded or skipped", () => {
 		expect(fundingVerdict(["metered"], [{ status: "unknown", provider: "openai", reason: "no-reader" }])).toEqual({
-			kind: "skipped",
-			reason: { kind: "unknown-evidence", reason: "no-reader" },
+			kind: "unverified",
+			reason: "no-reader",
 		});
-		expect(fundingVerdict(["metered"], [known({ mode: "metered", state: "unknown" })])).toEqual({
-			kind: "skipped",
-			reason: { kind: "unknown-evidence", reason: "no-evidence" },
-		});
-		expect(fundingVerdict(["free", "metered"], "unavailable")).toEqual({
-			kind: "skipped",
-			reason: { kind: "unknown-evidence", reason: "unavailable" },
-		});
+		// A metered source in an unknown state may still fund the call, so an exhausted stage does not exclude it.
+		expect(
+			fundingVerdict(
+				["included", "metered"],
+				[known({ mode: "subscription-included", state: "exhausted" }, { mode: "metered", state: "unknown" })],
+			),
+		).toEqual({ kind: "unverified", reason: "no-evidence" });
+		expect(fundingVerdict(["free", "metered"], "unavailable")).toEqual({ kind: "unverified", reason: "unavailable" });
 		// Evidence of an unlisted class is not authorization to spend from it.
 		expect(fundingVerdict(["included", "free"], [known({ mode: "metered", state: "available" })])).toEqual({
 			kind: "skipped",
@@ -106,6 +106,11 @@ describe("group funding verdicts", () => {
 		expect(fundingVerdict(["metered"], metered, budget, () => "unavailable")).toEqual({
 			kind: "skipped",
 			reason: { kind: "budget-unreadable" },
+		});
+		// A call without billing evidence is charged to the budget, so a spent budget refuses it too.
+		expect(fundingVerdict(["metered"], "unavailable", budget, spent(10_000_000_000n))).toEqual({
+			kind: "skipped",
+			reason: { kind: "budget-exhausted" },
 		});
 		// An exhausted local budget never blocks a source of an earlier, included stage.
 		expect(
@@ -185,16 +190,13 @@ describe("group funding verdicts from provider billing readers", () => {
 			fundingVerdict(["free"], providerBillingResults(provider, reports, NOW, 60_000, { baseUrl }));
 
 		const funded = { kind: "funded", stage: 0, billingClass: "free" } as const;
-		const noEvidence = { kind: "skipped", reason: { kind: "unknown-evidence", reason: "no-evidence" } } as const;
+		const noEvidence = { kind: "unverified", reason: "no-evidence" } as const;
 		expect(verdict("vllm", "http://127.0.0.1:8000/v1", [])).toEqual(funded);
 		// Endpoint evidence does not depend on usage reports that failed to arrive.
 		expect(verdict("lm-studio", "http://localhost:1234/v1", undefined)).toEqual(funded);
 		expect(verdict("vllm", "http://192.168.1.20:8000/v1", [])).toEqual(noEvidence);
 		expect(verdict("vllm", "https://inference.example.com/v1", [])).toEqual(noEvidence);
-		expect(verdict("openai", "http://localhost:8000/v1", [])).toEqual({
-			kind: "skipped",
-			reason: { kind: "unknown-evidence", reason: "no-reader" },
-		});
+		expect(verdict("openai", "http://localhost:8000/v1", [])).toEqual({ kind: "unverified", reason: "no-reader" });
 		// A report of the provider's own wins over the model's endpoint.
 		const own: UsageReport = {
 			provider: "vllm",

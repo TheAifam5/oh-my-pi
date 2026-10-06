@@ -143,21 +143,26 @@ describe("model role pools", () => {
 			expect(notices[0]).toContain(selectorOf(OPENAI));
 		});
 
-		it("never picks a member whose billing is unknown, not even the first", async () => {
+		it("ranks a member without billing evidence after a funded one and still excludes an exhausted one", async () => {
 			const settings = Settings.isolated({
-				modelRoles: { engineer: pool("priority", [OPENAI], { funding: { order: ["included"] } }) },
+				modelRoles: {
+					engineer: pool("priority", [ANTHROPIC, OPENAI, GOOGLE], { funding: { order: ["included", "free"] } }),
+				},
 			});
-			// No reader and no report for openai: billing evidence is unknown.
-			vi.spyOn(modelRegistry.authStorage.usage, "reports").mockResolvedValue([]);
+			// anthropic has no usage report, so its billing evidence is unknown.
+			stubBilling({
+				openai: { mode: "subscription-included", state: "exhausted" },
+				google: { mode: "free", state: "available" },
+			});
 
 			const resolution = await resolveRolePool("engineer", deps(settings));
 
-			expect(resolution?.kind).toBe("none");
-			if (resolution?.kind !== "none") return;
-			expect(resolution.skipped.map(entry => [entry.selector, entry.reason.kind])).toEqual([
-				[selectorOf(OPENAI), "unknown-evidence"],
-			]);
-			expect(notices).toHaveLength(1);
+			expect(resolution?.kind).toBe("picked");
+			if (resolution?.kind !== "picked") return;
+			expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
+			expect(resolution.pick.rest.map(member => member.raw)).toEqual([selectorOf(ANTHROPIC)]);
+			expect(notices).toEqual([expect.stringContaining(`${selectorOf(OPENAI)} (funding exhausted)`)]);
+			expect(notices[0]).not.toContain(selectorOf(ANTHROPIC));
 		});
 
 		it("refuses a pool whose only member is metered under a spent local budget", async () => {
@@ -1017,22 +1022,19 @@ describe("model role pools", () => {
 			]);
 		});
 
-		it("names the --model workaround when billing evidence for the default pool is missing", async () => {
+		it("starts on the first default pool member when no member has billing evidence", async () => {
 			const settings = Settings.isolated({
-				modelRoles: { default: pool("priority", [OPENAI], { funding: { order: ["included"] } }) },
+				modelRoles: { default: pool("priority", [OPENAI, GOOGLE], { funding: { order: ["included"] } }) },
 			});
+			// Neither provider has a registered billing reader or a usage report in this test.
 			vi.spyOn(modelRegistry.authStorage.usage, "reports").mockResolvedValue([]);
 
-			const error = await createAgentSession(startupOptions(settings)).then(
-				() => undefined,
-				(reason: unknown) => reason,
-			);
-
-			expect(error).toBeInstanceOf(RolePoolUnavailableError);
-			const message = error instanceof Error ? error.message : "";
-			// openai has no registered billing reader in this test, so the hint names the provider.
-			expect(message).toContain("No billing reader exists for openai");
-			expect(message).toContain("--model");
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(OPENAI));
+			} finally {
+				await session.dispose();
+			}
 		});
 
 		it("starts on the funded default pool member", async () => {

@@ -245,7 +245,6 @@ import {
 	rolePoolTarget,
 	RolePoolUnavailableError,
 	resolveRolePool,
-	rolePoolEvidenceHint,
 	rolePoolPolicyBlocked,
 } from "./session/pool-selection";
 import { getRestorableSessionModels } from "./session/session-context";
@@ -3677,11 +3676,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 				// A blocked default pool is never replaced by its selector chain or an unrelated default.
 				if (!model && defaultRolePoolBlocked) {
-					throw new RolePoolUnavailableError(
-						defaultRolePoolTarget?.role ?? "default",
-						defaultRolePoolSkips,
-						rolePoolEvidenceHint(defaultRolePoolSkips),
-					);
+					throw new RolePoolUnavailableError(defaultRolePoolTarget?.role ?? "default", defaultRolePoolSkips);
 				}
 				if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates) && pick) {
 					model = pick;

@@ -18,7 +18,6 @@ import {
 	type RolePoolPick,
 	RolePoolUnavailableError,
 	resolveRolePool,
-	rolePoolEvidenceHint,
 	rolePoolPolicyBlocked,
 	type RolePoolTarget,
 	rolePoolTarget,
@@ -156,11 +155,7 @@ export async function pickRolePoolTarget(
 				return undefined;
 			case "none":
 				if (rolePoolPolicyBlocked(resolution.skipped)) {
-					throw new RolePoolUnavailableError(
-						target.role,
-						resolution.skipped,
-						rolePoolEvidenceHint(resolution.skipped),
-					);
+					throw new RolePoolUnavailableError(target.role, resolution.skipped);
 				}
 				return undefined;
 			case "picked": {
