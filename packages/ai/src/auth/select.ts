@@ -4,7 +4,7 @@ import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
-import { type BillingMode, type BillingSnapshot, type BillingSource, type DecimalQuantity } from "../usage/billing";
+import { type BillingSnapshot, type BillingSource, type DecimalQuantity } from "../usage/billing";
 import { type AccountEvidenceLimit, isAccountEvidenceLimit, type LocalLimit } from "../usage/limits";
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
@@ -15,6 +15,15 @@ import {
 	providerTypeKey,
 	type CredentialBlocks,
 } from "./blocks";
+import {
+	type DrainedState,
+	drainStateExpiresAtSec,
+	drainStateKey,
+	drainStateTtlMs,
+	parseDrainedState,
+	SPEND_CLASS_MODES,
+	serializeDrainedState,
+} from "./drain-state";
 import { type AccountPolicies, accountUsageKey, apiKeyFingerprint } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
@@ -94,13 +103,15 @@ type DrainTarget = {
 /** Billing evidence of a drain target's usage report, or why there is none. */
 type DrainBilling = { snapshot?: BillingSnapshot; unavailable?: string };
 
-/** Drain state of one target and block scope: when it drained and its billing evidence then. */
-type DrainedState = { since: number; baseline?: BillingSnapshot };
+/**
+ * A drain state this process last read or wrote: `persisted` once the store
+ * returned it, `misses` consecutive reads that found no row since, and
+ * `writtenAtMs` when this process last wrote it.
+ */
+type CachedDrainState = { state: DrainedState; persisted: boolean; misses: number; writtenAtMs?: number };
 
-const SPEND_CLASS_MODES: Record<Exclude<DrainSpendClass, "plan">, readonly BillingMode[]> = {
-	credits: ["prepaid-credits"],
-	money: ["paid-extra-usage", "metered"],
-};
+/** Consecutive missed reads after which a stored drain state counts as returned or expired, not a transient failure. */
+const DRAIN_STATE_DROP_MISSES = 2;
 
 function sourcesOf(snapshot: BillingSnapshot | undefined, spendClass: keyof typeof SPEND_CLASS_MODES): BillingSource[] {
 	return snapshot?.sources.filter(source => SPEND_CLASS_MODES[spendClass].includes(source.mode)) ?? [];
@@ -203,8 +214,8 @@ export interface CredentialSelectorDeps {
 export class CredentialSelector {
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
-	/** When each drain target last drained, by `rowId\0blockScope\0spend/returnWhen`; cleared once it returns. Process-local. */
-	#drainedSince: Map<string, DrainedState> = new Map();
+	/** Write-through copy of the persisted drain state rows, by {@link drainStateKey}; cleared once the target returns. */
+	#drainedSince: Map<string, CachedDrainState> = new Map();
 	/** Reached `warn` evidence limits already logged, by `provider\0rowId\0metric`; cleared once they clear. */
 	#warnedEvidenceLimits = new Set<string>();
 	/** Drain billing warnings already logged, by `provider\0kind`. */
@@ -853,7 +864,9 @@ export class CredentialSelector {
 	 * least `returnFraction` of its quota is left again; `credits-added` or
 	 * `money-available` against the billing evidence first seen after it drained.
 	 * Until a listed trigger holds it stays behind; a billing trigger without
-	 * evidence to compare is logged once per provider.
+	 * evidence to compare is logged once per provider. The state persists in the
+	 * store cache, so it survives a restart and a return in one process is seen
+	 * by every process sharing the store.
 	 */
 	#drainServing(
 		target: DrainTarget,
@@ -866,13 +879,30 @@ export class CredentialSelector {
 		const snapshot = billing?.snapshot;
 		// Pool and policy funding of one account drain and return independently.
 		const funding = `${[...target.spend].sort().join(",")}/${[...target.returnWhen].sort().join(",")}`;
-		const key = `${target.credentialId}\0${blockScope ?? ""}\0${funding}`;
-		const state = this.#drainedSince.get(key);
-		// A clock that stepped back restarts the cooldown instead of ending it early or never.
-		if (state !== undefined && nowMs < state.since) state.since = nowMs;
-		if (state) state.baseline ??= snapshot;
+		const key = drainStateKey(target.provider, target.credentialId, blockScope, funding);
+		let state = this.#loadDrainState(key);
+		if (state !== undefined) {
+			// A clock that stepped back restarts the cooldown instead of ending it early or never.
+			const since = Math.min(state.since, nowMs);
+			const baseline = state.baseline ?? snapshot;
+			const cached = this.#drainedSince.get(key);
+			// Rewrite an unsaved copy, and refresh the row well before it expires so a target
+			// waiting for its trigger never returns by expiry; a missed row may be another process's return.
+			const stale =
+				cached !== undefined &&
+				cached.misses === 0 &&
+				(!cached.persisted ||
+					cached.writtenAtMs === undefined ||
+					nowMs - cached.writtenAtMs >= drainStateTtlMs(target.cooldownMs) / 4);
+			if (since !== state.since || baseline !== state.baseline || stale) {
+				state = { since, baseline };
+				if (cached === undefined || cached.misses === 0) this.#saveDrainState(key, state, target.cooldownMs, nowMs);
+				else cached.state = state;
+			}
+		}
 		if (drained) {
-			if (state === undefined) this.#drainedSince.set(key, { since: nowMs, baseline: snapshot });
+			if (state === undefined)
+				this.#saveDrainState(key, { since: nowMs, baseline: snapshot }, target.cooldownMs, nowMs);
 			return false;
 		}
 		if (state === undefined) return true;
@@ -902,7 +932,60 @@ export class CredentialSelector {
 		});
 		if (!returned) return false;
 		this.#drainedSince.delete(key);
+		try {
+			this.#deps.store.setCache(key, "", 0);
+		} catch (err) {
+			logger.debug("Failed to clear drain state from persistent store cache", { err });
+		}
 		return true;
+	}
+
+	/**
+	 * The drain state under `key`: the stored row, else this process's copy. A
+	 * copy the store once returned and then misses on {@link DRAIN_STATE_DROP_MISSES}
+	 * consecutive reads was returned by another process or expired, so it is
+	 * dropped; one never seen stored (the write failed) stays in effect.
+	 */
+	#loadDrainState(key: string): DrainedState | undefined {
+		const cached = this.#drainedSince.get(key);
+		let raw: string | null;
+		try {
+			raw = this.#deps.store.getCache(key);
+		} catch (err) {
+			logger.debug("Failed to read drain state from persistent store cache", { err });
+			return cached?.state;
+		}
+		const stored = raw ? parseDrainedState(raw) : undefined;
+		if (stored) {
+			this.#drainedSince.set(key, {
+				state: stored,
+				persisted: true,
+				misses: 0,
+				writtenAtMs: cached?.writtenAtMs,
+			});
+			return stored;
+		}
+		if (cached?.persisted) {
+			cached.misses += 1;
+			if (cached.misses >= DRAIN_STATE_DROP_MISSES) {
+				this.#drainedSince.delete(key);
+				return undefined;
+			}
+		}
+		return cached?.state;
+	}
+
+	/** Writes `state` under `key`, expiring {@link drainStateExpiresAtSec} after `nowMs`; `persisted` once read back intact. */
+	#saveDrainState(key: string, state: DrainedState, cooldownMs: number, nowMs: number): void {
+		const value = serializeDrainedState(state);
+		let persisted = false;
+		try {
+			this.#deps.store.setCache(key, value, drainStateExpiresAtSec(nowMs, cooldownMs));
+			persisted = this.#deps.store.getCache(key) === value;
+		} catch (err) {
+			logger.debug("Failed to write drain state to persistent store cache", { err });
+		}
+		this.#drainedSince.set(key, { state, persisted, misses: 0, writtenAtMs: nowMs });
 	}
 
 	/** Whether a usage-limit block (not an auth or policy block) holds the credential for this request. */

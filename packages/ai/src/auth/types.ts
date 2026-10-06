@@ -78,7 +78,7 @@ export interface AuthAccountPolicy {
 	 * per provider. It ignores reserve and the hot-window demotion while serving.
 	 */
 	readonly drain?: boolean;
-	/** Remaining quota percentage (0–100) a drained account needs before it is used first again; default 5. */
+	/** Remaining quota percentage (0–100) the `reset` return trigger needs before a drained account is used first again; default 5. */
 	readonly returnMargin?: number;
 	/** Shortest time a drained account stays behind its siblings, in ms; default 600000. */
 	readonly returnCooldownMs?: number;
@@ -95,7 +95,10 @@ export interface AuthAccountPolicy {
 	 * `drain` only, default `reset`. `reset`: `returnMargin` percent of its quota
 	 * is back. `credits-added`: its prepaid credits grew, or `money-available`:
 	 * paid extra usage became available, since it drained (needs the matching
-	 * `spend` class and a billing reader for the provider).
+	 * `spend` class and a billing reader for the provider); neither requires
+	 * `returnMargin`. The drain state persists in the store cache across
+	 * restarts; once no process uses it, it expires within the longer of a day
+	 * and twice `returnCooldownMs`.
 	 */
 	readonly returnWhen?: DrainReturnTrigger | readonly DrainReturnTrigger[];
 	/**
@@ -1322,7 +1325,8 @@ export interface SessionsApi {
 	 * Override, for this session only, which OAuth account of `provider` is
 	 * drained first: a stored row id, `null` for none, or `undefined` to follow
 	 * `auth.accountPolicies`. Returns false when the row is not a stored OAuth
-	 * account. Exclusive pins take precedence.
+	 * account. Exclusive pins take precedence. The override persists in the
+	 * store cache like a session pin.
 	 */
 	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean;
 }

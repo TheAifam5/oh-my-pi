@@ -17,9 +17,10 @@ import {
 	moneyFromDecimal,
 	unknownBilling,
 } from "@oh-my-pi/pi-ai/usage/billing";
+import { drainStateKey, sessionDrainKey } from "@oh-my-pi/pi-ai/auth/drain-state";
 import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 const PROVIDER = "unit-drain";
 const SESSION = "session-drain";
@@ -92,6 +93,19 @@ describe("AuthStorage account drain", () => {
 		};
 	}
 
+	const usageProvider: UsageProvider = {
+		id: PROVIDER,
+		fetchUsage: async params => (params.credential.accountId ? report(params.credential.accountId) : null),
+	};
+
+	function storageOptions(accountPolicies: AuthAccountPolicies = POLICIES) {
+		return {
+			accountPolicies,
+			usageProviderResolver: (provider: string) => (provider === PROVIDER ? usageProvider : undefined),
+			rankingStrategyResolver: (provider: string) => (provider === PROVIDER ? strategy : undefined),
+		};
+	}
+
 	beforeEach(async () => {
 		setSystemTime(new Date("2026-10-05T10:00:00Z"));
 		used.clear();
@@ -103,15 +117,7 @@ describe("AuthStorage account drain", () => {
 			const credential = credentials[provider];
 			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
 		});
-		const usageProvider: UsageProvider = {
-			id: PROVIDER,
-			fetchUsage: async params => (params.credential.accountId ? report(params.credential.accountId) : null),
-		};
-		storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
-			accountPolicies: POLICIES,
-			usageProviderResolver: provider => (provider === PROVIDER ? usageProvider : undefined),
-			rankingStrategyResolver: provider => (provider === PROVIDER ? strategy : undefined),
-		});
+		storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), storageOptions());
 		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
 	});
 
@@ -122,8 +128,8 @@ describe("AuthStorage account drain", () => {
 	});
 
 	/** Billing source reading the fake report's `credits` and `money` metadata. */
-	function installBilling(): void {
-		storage.usage.setBillingSource({
+	function installBilling(target: AuthStorage = storage): void {
+		target.usage.setBillingSource({
 			read: (_provider, usage) => {
 				const { credits: creditMeta, money: moneyMeta, moneyUsed: usedMeta } = usage.metadata ?? {};
 				if (creditMeta === undefined && moneyMeta === undefined && usedMeta === undefined) {
@@ -458,6 +464,282 @@ describe("AuthStorage account drain", () => {
 		await storage.usage.invalidate(PROVIDER);
 		expect(await storage.keys.get(PROVIDER, policySession)).toBe("access-b");
 		expect(await storage.keys.get(PROVIDER, poolSession)).toBe("access-a");
+	});
+
+	describe("persisted drain state", () => {
+		let tempDir: TempDir;
+		let dbPath = "";
+		const extra: AuthStorage[] = [];
+
+		/** Opens another AuthStorage on the shared database file, closed after the test. */
+		async function open(accountPolicies?: AuthAccountPolicies): Promise<AuthStorage> {
+			const opened = new AuthStorage(await SqliteAuthCredentialStore.open(dbPath), storageOptions(accountPolicies));
+			extra.push(opened);
+			await opened.credentials.reload();
+			return opened;
+		}
+
+		/** Closes `storage` and continues on a fresh AuthStorage over the same database, like a restarted process. */
+		async function restart(accountPolicies?: AuthAccountPolicies): Promise<void> {
+			storage.close();
+			storage = await open(accountPolicies);
+			await storage.usage.invalidate(PROVIDER);
+		}
+
+		beforeEach(async () => {
+			storage.close();
+			// Cache rows expire against the database's wall clock, so the fake clock starts at real time.
+			setSystemTime();
+			setSystemTime(new Date(Date.now()));
+			tempDir = await TempDir.create("@pi-ai-account-drain-");
+			dbPath = tempDir.join("agent.db");
+			storage = await open();
+			await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		});
+
+		afterEach(async () => {
+			for (const opened of extra.splice(0)) opened.close();
+			await tempDir.remove();
+		});
+
+		/** Advances the clock and resolves for `session`, which is fresh so the persisted session affinity does not decide. */
+		async function after(ms: number, session: string): Promise<string | undefined> {
+			setSystemTime(new Date(Date.now() + ms));
+			await storage.usage.invalidate(PROVIDER);
+			return storage.keys.get(PROVIDER, session);
+		}
+
+		/** Writes a cache row into the database at `file`, live for an hour. */
+		function writeCacheRow(file: string, key: string, value: string): void {
+			const db = new Database(file);
+			try {
+				db.run(
+					"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
+					[key, value, Math.floor(Date.now() / 1000) + 3600],
+				);
+			} finally {
+				db.close();
+			}
+		}
+
+		/** Moves every drain state row's expiry `seconds` earlier, as if the database clock had run that far ahead. */
+		function ageDrainRows(seconds: number): void {
+			const db = new Database(dbPath);
+			try {
+				db.run("UPDATE cache SET expires_at = expires_at - ? WHERE key LIKE 'drain:state:%'", [seconds]);
+			} finally {
+				db.close();
+			}
+		}
+
+		test("a restart keeps the drained target behind until both cooldown and margin pass", async () => {
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+
+			await restart();
+			used.set("acc-b", 0.5);
+			// Past the stored usage block, which lapses at the window reset two minutes out.
+			expect(await after(3 * MINUTE, "in-cooldown")).toBe("access-a");
+			used.set("acc-b", 0.98);
+			expect(await after(8 * MINUTE, "below-margin")).toBe("access-a");
+			used.set("acc-b", 0.5);
+			expect(await after(MINUTE, "returned")).toBe("access-b");
+		});
+
+		test("credits-added compares against the baseline taken before a restart", async () => {
+			const funded: AuthAccountPolicies = [
+				POLICIES[0]!,
+				{ ...POLICIES[1]!, spend: ["credits"], returnWhen: "credits-added" },
+			];
+			await restart(funded);
+			installBilling();
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			credits.set("acc-b", "5.5");
+			const first = storage.sessions.accounts(PROVIDER).find(account => account.name === "first");
+			storage.blocks.upsert({
+				credentialId: first?.credentialId ?? -1,
+				providerKey: `${PROVIDER}:oauth`,
+				blockScope: "model:x",
+				blockedUntilMs: Date.now() + 2 * MINUTE,
+			});
+			expect(await storage.keys.get(PROVIDER, SESSION, { modelId: "x" })).toBe("access-a");
+			expect(await advance(5 * MINUTE, "x")).toBe("access-a");
+
+			await restart(funded);
+			installBilling();
+			credits.set("acc-b", "6");
+			expect(await advance(MINUTE, "x")).toBe("access-a");
+			expect(await advance(5 * MINUTE, "x")).toBe("access-b");
+		});
+
+		test("session drain overrides survive a restart, and clearing one restores the account policy", async () => {
+			const policies: AuthAccountPolicies = [
+				...POLICIES,
+				{ provider: PROVIDER, name: "third", account: { accountId: "acc-c" } },
+			];
+			await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+			await restart(policies);
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 0.5);
+			used.set("acc-c", 0.3);
+			const third = storage.sessions.accounts(PROVIDER).find(account => account.name === "third");
+			expect(storage.sessions.drain(PROVIDER, "s-target", third?.credentialId ?? -1)).toBe(true);
+			expect(storage.sessions.drain(PROVIDER, "s-off", null)).toBe(true);
+			expect(storage.sessions.drain(PROVIDER, "s-cleared", third?.credentialId ?? -1)).toBe(true);
+			expect(storage.sessions.drain(PROVIDER, "s-cleared", undefined)).toBe(true);
+
+			await restart(policies);
+			expect(await storage.keys.get(PROVIDER, "s-target")).toBe("access-c");
+			expect(await storage.keys.get(PROVIDER, "s-off")).toBe("access-a");
+			expect(await storage.keys.get(PROVIDER, "s-cleared")).toBe("access-b");
+		});
+
+		test("a return in one process is seen by another sharing the database", async () => {
+			const other = await open();
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			expect(await other.keys.get(PROVIDER, "session-other")).toBe("access-a");
+
+			used.set("acc-b", 0.5);
+			expect(await advance(11 * MINUTE)).toBe("access-b");
+			used.set("acc-b", 0.97);
+			await other.usage.invalidate(PROVIDER);
+			// The first missed read may be transient; the second confirms the return.
+			expect(await other.keys.get(PROVIDER, "session-other")).toBe("access-a");
+			expect(await other.keys.get(PROVIDER, "session-other")).toBe("access-b");
+		});
+
+		test("a process with a pending miss does not re-create a returned row when its clock steps back", async () => {
+			const other = await open();
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			expect(await other.keys.get(PROVIDER, "session-other")).toBe("access-a");
+			used.set("acc-b", 0.5);
+			expect(await advance(11 * MINUTE)).toBe("access-b");
+
+			used.set("acc-b", 0.97);
+			setSystemTime(new Date(Date.now() - 60 * MINUTE));
+			await other.usage.invalidate(PROVIDER);
+			expect(await other.keys.get(PROVIDER, "session-step-back")).toBe("access-a");
+			await storage.usage.invalidate(PROVIDER);
+			expect(await storage.keys.get(PROVIDER, "session-fresh")).toBe("access-b");
+		});
+
+		test("one missed read of a stored drain state does not return the target", async () => {
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			const getCache = SqliteAuthCredentialStore.prototype.getCache;
+			let missed = false;
+			vi.spyOn(SqliteAuthCredentialStore.prototype, "getCache").mockImplementation(
+				function (this: SqliteAuthCredentialStore, key, options) {
+					if (!missed && key.startsWith("drain:state:")) {
+						missed = true;
+						return null;
+					}
+					return getCache.call(this, key, options);
+				},
+			);
+			used.set("acc-b", 0.5);
+			expect(await after(3 * MINUTE, "after-miss")).toBe("access-a");
+			expect(missed).toBe(true);
+			expect(await after(MINUTE, "after-read")).toBe("access-a");
+		});
+
+		test("a target waiting for its trigger keeps its drain state past the row lifetime", async () => {
+			const funded: AuthAccountPolicies = [
+				POLICIES[0]!,
+				{ ...POLICIES[1]!, spend: ["credits"], returnWhen: "credits-added" },
+			];
+			await restart(funded);
+			installBilling();
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			credits.set("acc-b", "5.5");
+			const first = storage.sessions.accounts(PROVIDER).find(account => account.name === "first");
+			storage.blocks.upsert({
+				credentialId: first?.credentialId ?? -1,
+				providerKey: `${PROVIDER}:oauth`,
+				blockScope: "model:x",
+				blockedUntilMs: Date.now() + 2 * MINUTE,
+			});
+			expect(await storage.keys.get(PROVIDER, SESSION, { modelId: "x" })).toBe("access-a");
+			expect(await advance(5 * MINUTE, "x")).toBe("access-a");
+			// Credits keep it funded, so it is not drained, and none were added.
+			expect(await advance(7 * 60 * MINUTE, "x")).toBe("access-a");
+
+			ageDrainRows(25 * 60 * 60);
+			await restart(funded);
+			installBilling();
+			expect(await advance(MINUTE, "x")).toBe("access-a");
+			credits.set("acc-b", "6");
+			expect(await advance(MINUTE, "x")).toBe("access-b");
+		});
+
+		test("a store swap drops a session drain override whose account the new store lacks", async () => {
+			await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 0.5);
+			used.set("acc-c", 0.3);
+			const third = storage.sessions.accounts(PROVIDER).find(account => account.accountId === "acc-c");
+			expect(storage.sessions.drain(PROVIDER, SESSION, third?.credentialId ?? -1)).toBe(true);
+			const otherPath = tempDir.join("other.db");
+			const other = new AuthStorage(await SqliteAuthCredentialStore.open(otherPath), storageOptions());
+			extra.push(other);
+			await other.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+			const cool = other.sessions.accounts(PROVIDER).find(account => account.name === "cool");
+			// A stale override in the new store that the swap must not leave in effect.
+			writeCacheRow(
+				otherPath,
+				sessionDrainKey(PROVIDER, SESSION),
+				JSON.stringify({ credentialId: cool?.credentialId }),
+			);
+			await storage.replaceStore(await SqliteAuthCredentialStore.open(otherPath));
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-b");
+		});
+
+		test("a malformed drain state row reads as absent", async () => {
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 0.97);
+			const first = storage.sessions.accounts(PROVIDER).find(account => account.name === "first");
+			const key = drainStateKey(PROVIDER, first?.credentialId ?? -1, undefined, "/reset");
+			writeCacheRow(dbPath, key, JSON.stringify({ since: Date.now() }));
+			expect(await storage.keys.get(PROVIDER, "session-valid")).toBe("access-a");
+
+			writeCacheRow(dbPath, key, "{not json");
+			await restart();
+			expect(await storage.keys.get(PROVIDER, "session-malformed")).toBe("access-b");
+		});
+
+		test("ignores an expired drain state and one recorded for a deleted credential", async () => {
+			used.set("acc-a", 0.2);
+			used.set("acc-b", 1);
+			const realNow = Date.now();
+			setSystemTime(new Date(realNow - 2 * 24 * 60 * MINUTE));
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			setSystemTime(new Date(realNow));
+			await restart();
+			used.set("acc-b", 0.97);
+			expect(await storage.keys.get(PROVIDER, "session-expired")).toBe("access-b");
+
+			used.set("acc-b", 1);
+			await storage.usage.invalidate(PROVIDER);
+			expect(await storage.keys.get(PROVIDER, "session-deleted")).toBe("access-a");
+			const drainedId = storage.sessions.accounts(PROVIDER).find(account => account.name === "first")?.credentialId;
+			// A policy may not name an account that is not stored, so drop it while the account is gone.
+			storage.setAccountPolicies({ accountPolicies: [POLICIES[0]!], defaultReservePct: 10 });
+			expect(await storage.credentials.removeById(PROVIDER, drainedId ?? -1)).toBe(true);
+			await storage.credentials.upsert(PROVIDER, oauthCredential("b"));
+			await restart();
+			const readdedId = storage.sessions.accounts(PROVIDER).find(account => account.name === "first")?.credentialId;
+			expect(readdedId).not.toBe(drainedId);
+			used.set("acc-b", 0.97);
+			expect(await storage.keys.get(PROVIDER, "session-readded")).toBe("access-b");
+		});
 	});
 
 	describe("account evidence limits", () => {

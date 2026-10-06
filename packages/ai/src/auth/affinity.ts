@@ -16,6 +16,7 @@ import type { CredentialPool } from "./pool";
 import type { KeyOverrides } from "./cascade";
 import { resolveCredentialIdentityKey } from "./sqlite-credential-store";
 import { type AccountPolicies, apiKeyFingerprint } from "./policy";
+import { parseSessionDrain, serializeSessionDrain, sessionDrainKey } from "./drain-state";
 
 /** Prefix for persisted session-to-credential affinity. */
 export const SESSION_STICKY_CACHE_PREFIX = "session:sticky:";
@@ -98,7 +99,7 @@ export class SessionAffinity implements SessionsApi {
 	#pinSource: AccountPinSource | undefined;
 	/** `provider\0sessionId` whose pin a restriction overrode and was already logged; one bounded LRU. */
 	#restrictedPinWarnings = new LRUCache<string, true>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
-	/** Session drain overrides by `provider\0sessionId`: the drained row id, or `null` for no drain target. */
+	/** Session drain overrides by `provider\0sessionId`, persisted in the store cache: the drained row id, or `null` for no drain target. */
 	#drainOverrides: Map<string, number | null> = new Map();
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
@@ -194,17 +195,17 @@ export class SessionAffinity implements SessionsApi {
 			this.#writeSessionPin(pin.provider, pin.sessionId, match?.id ?? null);
 		}
 		for (const [key, credentialId] of previous.#drainOverrides) {
+			const [provider = "", sessionId = ""] = key.split("\0");
 			if (credentialId === null) {
-				this.#drainOverrides.set(key, null);
+				this.#writeDrainOverride(provider, sessionId, null);
 				continue;
 			}
-			const [provider = ""] = key.split("\0");
 			const credential = previous.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
 			const match = credential
 				? this.#pool.entries(provider).find(entry => sameAccount(entry.credential, credential))
 				: undefined;
 			// A drain target missing from the new store falls back to the account policy.
-			if (match) this.#drainOverrides.set(key, match.id);
+			this.#writeDrainOverride(provider, sessionId, match?.id);
 		}
 	}
 
@@ -249,21 +250,47 @@ export class SessionAffinity implements SessionsApi {
 
 	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean {
 		if (!sessionId) return false;
-		const key = `${provider}\0${sessionId}`;
-		if (credentialId === undefined || credentialId === null) {
-			if (credentialId === undefined) this.#drainOverrides.delete(key);
-			else this.#drainOverrides.set(key, null);
-			return true;
+		if (typeof credentialId === "number") {
+			const target = this.#pool.entries(provider).find(entry => entry.id === credentialId);
+			if (target?.credential.type !== "oauth") return false;
 		}
-		const target = this.#pool.entries(provider).find(entry => entry.id === credentialId);
-		if (target?.credential.type !== "oauth") return false;
-		this.#drainOverrides.set(key, credentialId);
+		this.#writeDrainOverride(provider, sessionId, credentialId);
 		return true;
 	}
 
 	/** The session's drain override: a row id, `null` for no drain target, `undefined` to follow account policy. */
 	drainOverride(provider: string, sessionId: string | undefined): number | null | undefined {
-		return sessionId ? this.#drainOverrides.get(`${provider}\0${sessionId}`) : undefined;
+		if (!sessionId) return undefined;
+		const key = `${provider}\0${sessionId}`;
+		if (this.#drainOverrides.has(key)) return this.#drainOverrides.get(key);
+		// A miss is not cached, like #sessionPin: one primary-key lookup per selection picks up an override written later by another process.
+		try {
+			const raw = this.#store.getCache(sessionDrainKey(provider, sessionId));
+			const credentialId = raw ? parseSessionDrain(raw) : undefined;
+			if (credentialId !== undefined) this.#drainOverrides.set(key, credentialId);
+			return credentialId;
+		} catch (err) {
+			logger.debug("Failed to read session drain override from persistent store cache", { err });
+			return undefined;
+		}
+	}
+
+	#writeDrainOverride(provider: string, sessionId: string, credentialId: number | null | undefined): void {
+		const key = `${provider}\0${sessionId}`;
+		if (credentialId === undefined) this.#drainOverrides.delete(key);
+		else this.#drainOverrides.set(key, credentialId);
+		try {
+			const cacheKey = sessionDrainKey(provider, sessionId);
+			if (credentialId === undefined) this.#store.setCache(cacheKey, "", 0);
+			else
+				this.#store.setCache(
+					cacheKey,
+					serializeSessionDrain(credentialId),
+					Math.floor(Date.now() / 1000) + SESSION_STICKY_TTL_SEC,
+				);
+		} catch (err) {
+			logger.debug("Failed to write session drain override to persistent store cache", { err });
+		}
 	}
 
 	/** Whether a session or project pin exists for `provider`, ignoring key overrides. */
@@ -664,9 +691,10 @@ export class SessionAffinity implements SessionsApi {
 		for (const pin of [...this.#exclusivePins.values()]) {
 			if (pin.sessionId === sourceSessionId) this.#writeSessionPin(pin.provider, targetSessionId, pin.credentialId);
 		}
+		for (const provider of this.#pool.providers()) this.drainOverride(provider, sourceSessionId);
 		for (const [key, credentialId] of [...this.#drainOverrides]) {
-			const [provider, sessionId] = key.split("\0");
-			if (sessionId === sourceSessionId) this.#drainOverrides.set(`${provider}\0${targetSessionId}`, credentialId);
+			const [provider = "", sessionId] = key.split("\0");
+			if (sessionId === sourceSessionId) this.#writeDrainOverride(provider, targetSessionId, credentialId);
 		}
 		for (const provider of this.#pool.providers()) {
 			const credential = this.get(provider, sourceSessionId);
