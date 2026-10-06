@@ -10,16 +10,18 @@
  * that fails before its reply starts moves on to the next candidate. Serving
  * ends when stdin does.
  */
-import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { createAuthGatewayRouter, serveAuthGatewayStdio } from "@oh-my-pi/pi-ai/auth-gateway";
-import { getProjectDir, isRecord, logger, postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import type { Api, AuthAccountPolicies, AuthStorage, Model } from "@oh-my-pi/pi-ai";
+import { createAuthGatewayRouter, serveAuthGatewayStdio, settleAuthGatewayRouter } from "@oh-my-pi/pi-ai/auth-gateway";
+import { getAgentDbPath, getProjectDir, isRecord, logger, postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, normalizeModelPatternList, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { claimRpcInput } from "../modes/rpc/rpc-input";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
+import { loadEffectiveAuthAccountPolicyConfig } from "../session/auth-broker-config";
 import { warnRolePoolProjection } from "../session/pool-selection";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import { type GatewayAccountLimits, installGatewayAccountLimits, openGatewayLedger } from "./auth-gateway-limits";
 
 /** Names the caller in the gateway's logs. */
 const STDIO_PEER = "stdio";
@@ -55,16 +57,53 @@ export function selectorCandidates(
 	return [];
 }
 
+/**
+ * Enforce `accountPolicies`' call-counting limits on `storage` as `serve` does, against the usage
+ * ledger of the agent storage `settings` holds (which owns and closes it); without one, against
+ * `agent.db` opened ledger-only.
+ */
+export function installStdioAccountLimits(
+	storage: AuthStorage,
+	accountPolicies: AuthAccountPolicies,
+	settings: Settings,
+): Promise<GatewayAccountLimits | undefined> {
+	return installGatewayAccountLimits(storage, accountPolicies, async () => {
+		const agentStorage = settings.getStorage();
+		if (!agentStorage) return openGatewayLedger(getAgentDbPath(settings.getAgentDir()));
+		return { ledger: agentStorage.usageLedger, close: () => {} };
+	});
+}
+
 /** Serves the gateway on stdin/stdout until stdin ends, then exits. */
 export async function runAuthGatewayStdio(): Promise<void> {
 	// Claimed before extension discovery so no in-process module can read the protocol's input.
 	const input = claimRpcInput();
 	const cwd = getProjectDir();
 	const settings = await Settings.init({ cwd });
-	const storage = await discoverAuthStorage(undefined, { settings });
-	const registry = new ModelRegistry(storage);
-	await registry.refresh();
-	await loadCliExtensionProviders(registry, settings, cwd);
+	const { accountPolicies } = await loadEffectiveAuthAccountPolicyConfig({ settings });
+	const storage = await discoverAuthStorage(undefined, { settings, accountPolicies });
+	let accountLimits: GatewayAccountLimits | undefined;
+	const closeLedger = async () => {
+		try {
+			await accountLimits?.close();
+		} catch (error) {
+			logger.warn("auth-gateway usage ledger did not close cleanly", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
+	let registry: ModelRegistry;
+	try {
+		// Account limits count this process's own calls in its agent.db.
+		accountLimits = await installStdioAccountLimits(storage, accountPolicies, settings);
+		registry = new ModelRegistry(storage);
+		await registry.refresh();
+		await loadCliExtensionProviders(registry, settings, cwd);
+	} catch (error) {
+		await closeLedger();
+		storage.close();
+		throw error;
+	}
 
 	// Candidates are routed by their exact `provider/id[@upstream]`, so the
 	// router only ever resolves a model this process picked for the request.
@@ -73,6 +112,7 @@ export async function runAuthGatewayStdio(): Promise<void> {
 		storage,
 		resolveModel: id => routed.get(id),
 		listModels: () => registry.getAvailable(),
+		onUsage: accountLimits?.onUsage,
 	});
 	const route = async (req: Request): Promise<Response> => {
 		// Unparseable bodies pass through for the route to reject in its own wire format.
@@ -108,7 +148,10 @@ export async function runAuthGatewayStdio(): Promise<void> {
 	try {
 		await serveAuthGatewayStdio({ input, write: line => process.stdout.write(line), route, version: VERSION });
 	} finally {
+		// Stream responses record their usage after their last line is written.
+		await settleAuthGatewayRouter(router);
 		router.close();
+		await closeLedger();
 		storage.close();
 	}
 	// Idle provider sockets and settings timers would otherwise keep the process alive past stdin's end.
