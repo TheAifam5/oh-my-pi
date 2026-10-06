@@ -200,6 +200,85 @@ describe("anthropic server-side fallback opt-in", () => {
 		expect(result.usage.cost.cacheRead).toBeCloseTo(0.000012, 10);
 	});
 
+	it("records the requested model when only usage iterations report the fallback", async () => {
+		const usageOnlyEvents = createFallbackServedEvents("continued", "claude-opus-4-8-20260615").filter(
+			event => event.index !== 0,
+		);
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() => createMockRequest(usageOnlyEvents) as never,
+		);
+
+		const s = streamAnthropic(fableModel, context, {
+			apiKey: "sk-ant-test",
+			fallbacks: [{ model: "claude-opus-4-8" }],
+		});
+		for await (const _ of s) {
+			// drain
+		}
+		const result = await s.result();
+
+		expect(result.content.some(block => block.type === "fallback")).toBe(false);
+		expect(result.model).toBe("claude-opus-4-8-20260615");
+		expect(result.requestedModel).toBe(fableModel.id);
+	});
+
+	it("drops the requested model when a provider retry discards the fallback-served attempt", async () => {
+		// The first attempt reports the fallback in its start usage, then fails before any content.
+		const fallbackAttempt = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_fb",
+					model: "claude-opus-4-8",
+					usage: {
+						input_tokens: 12,
+						output_tokens: 0,
+						iterations: [
+							{ type: "fallback_message", model: "claude-opus-4-8", input_tokens: 12, output_tokens: 0 },
+						],
+					},
+				},
+			},
+		];
+		const requestedAttempt = createFallbackServedEvents("answered", "claude-opus-4-8")
+			.filter(event => event.type !== "content_block_start" || event.index !== 0)
+			.filter(event => event.type !== "content_block_stop" || event.index !== 0)
+			.map(event =>
+				event.type === "message_delta"
+					? { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } }
+					: event.type === "message_start"
+						? { ...event, message: { ...(event.message as object), model: fableModel.id } }
+						: event,
+			);
+		let calls = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			calls += 1;
+			if (calls > 1) return createMockRequest(requestedAttempt) as never;
+			const response = new Response(null, { status: 200, headers: { "request-id": "req_mock" } });
+			const failing = {
+				async *[Symbol.asyncIterator]() {
+					for (const event of fallbackAttempt) yield event;
+					throw new Error("overloaded_error: provider returned error 529");
+				},
+			};
+			return { withResponse: async () => ({ data: failing, response, request_id: "req_mock" }) } as never;
+		});
+
+		const s = streamAnthropic(fableModel, context, {
+			apiKey: "sk-ant-test",
+			fallbacks: [{ model: "claude-opus-4-8" }],
+			providerRetryWait: async () => {},
+		});
+		for await (const _ of s) {
+			// drain
+		}
+		const result = await s.result();
+
+		expect(calls).toBe(2);
+		expect(result.model).toBe(fableModel.id);
+		expect(result.requestedModel).toBeUndefined();
+	});
+
 	it("stays inert when opted out: fallback content_block is dropped, model stays requested id", async () => {
 		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
 			() => createMockRequest(createFallbackServedEvents("continued", "claude-opus-4-8")) as never,

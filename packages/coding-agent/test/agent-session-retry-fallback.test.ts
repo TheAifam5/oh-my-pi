@@ -22,6 +22,7 @@ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mo
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -198,6 +199,41 @@ function recoveredTextStream(model: Model<Api>, text: string): AssistantMessageE
 	});
 	return stream;
 }
+/**
+ * A completed Anthropic server-side fallback turn as the provider records it:
+ * the response names the served snapshot and the requested id, and carries the
+ * `fallback` boundary block only when the stream sent one.
+ */
+function serverSideFallbackStream(
+	model: Model<Api>,
+	servedId: string,
+	text: string,
+	options: { boundaryBlock: boolean },
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: options.boundaryBlock
+				? [
+						{ type: "fallback", from: { model: model.id }, to: { model: servedId } },
+						{ type: "text", text },
+					]
+				: [{ type: "text", text }],
+			api: model.api,
+			provider: model.provider,
+			model: servedId,
+			requestedModel: model.id,
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "done", reason: "stop", message });
+	});
+	return stream;
+}
+
 function transportErrorAfterToolCallStream(
 	model: Model<Api>,
 	toolCall: ToolCall,
@@ -7574,5 +7610,280 @@ describe("AgentSession retry fallback", () => {
 			expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`, fundedSelector]);
 			expect(notices).toEqual([`Retry fallback skipped ${exhaustedSelector} (funding exhausted) for default`]);
 		});
+	});
+
+	it("attributes an Anthropic server-side fallback to its dated served snapshot", async () => {
+		const requestedModel = getBundledModel("anthropic", "claude-fable-5");
+		const servedModel = getBundledModel("anthropic", "claude-opus-4-8");
+		if (!requestedModel || !servedModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: requestedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model =>
+				serverSideFallbackStream(model, "claude-opus-4-8-20260615", "answered by the fallback", {
+					boundaryBlock: true,
+				}),
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${requestedModel.provider}/${requestedModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("Answer once");
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(requestedModel.id);
+		expect(session.servingModel).toEqual({
+			selector: `${servedModel.provider}/${servedModel.id}`,
+			modelIdentity: `${servedModel.provider}/${servedModel.id}`,
+			thinkingLevel: undefined,
+			isFallback: true,
+			contextWindow: servedModel.contextWindow,
+		});
+	});
+
+	it("marks a fallback reported only by usage iterations as fallback-served", async () => {
+		const requestedModel = getBundledModel("anthropic", "claude-fable-5");
+		const servedModel = getBundledModel("anthropic", "claude-opus-4-8");
+		if (!requestedModel || !servedModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+		// The dated snapshot resolves through its classified identity.
+		expect(classifyModel("anthropic", "claude-opus-4-8-20260615", { lenient: true })).toMatchObject({
+			class: servedModel.identity.class,
+			family: servedModel.identity.family,
+			revision: servedModel.identity.revision,
+		});
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: requestedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model =>
+				serverSideFallbackStream(model, "claude-opus-4-8-20260615", "answered by the fallback", {
+					boundaryBlock: false,
+				}),
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${requestedModel.provider}/${requestedModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("Answer once");
+		await session.waitForIdle();
+
+		expect(session.servingModel).toMatchObject({
+			modelIdentity: `${servedModel.provider}/${servedModel.id}`,
+			isFallback: true,
+		});
+	});
+
+	it("credits a substituted turn at the session thinking level clamped to the served model", async () => {
+		const requestedModel = getBundledModel("anthropic", "claude-fable-5");
+		const servedModel = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!requestedModel || !servedModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: requestedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model =>
+				serverSideFallbackStream(model, servedModel.id, "answered by the fallback", { boundaryBlock: false }),
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${requestedModel.provider}/${requestedModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setThinkingLevel(Effort.Max);
+		expect(session.thinkingLevel).toBe(Effort.Max);
+
+		await session.prompt("Answer once");
+		await session.waitForIdle();
+
+		// Sonnet 4.6 tops out at high, so the requested max is credited as high.
+		expect(session.servingModel).toEqual({
+			selector: `${servedModel.provider}/${servedModel.id}:${Effort.High}`,
+			modelIdentity: `${servedModel.provider}/${servedModel.id}`,
+			thinkingLevel: Effort.High,
+			isFallback: true,
+			contextWindow: servedModel.contextWindow,
+		});
+	});
+
+	it("does not credit a dated snapshot to a lone variant whose effort differs", async () => {
+		const requestedModel = getBundledModel("anthropic", "claude-fable-5");
+		const servedModel = getBundledModel("anthropic", "claude-opus-4-8");
+		if (!requestedModel || !servedModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+		const highVariantId = "claude-opus-4-8-high";
+		const highVariant: Model<Api> = {
+			...servedModel,
+			id: highVariantId,
+			identity: classifyModel(servedModel.provider, highVariantId, { lenient: true }),
+		};
+		// The variant shares the snapshot's class, family and revision; only its effort differs.
+		expect(highVariant.identity).toMatchObject({
+			class: servedModel.identity.class,
+			family: servedModel.identity.family,
+			revision: servedModel.identity.revision,
+			effort: "high",
+		});
+		const getProviderModels = modelRegistry.getProviderModels.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getProviderModels").mockImplementation(provider =>
+			provider === servedModel.provider ? [requestedModel, highVariant] : getProviderModels(provider),
+		);
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: requestedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model =>
+				serverSideFallbackStream(model, "claude-opus-4-8-20260615", "answered by the fallback", {
+					boundaryBlock: true,
+				}),
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${requestedModel.provider}/${requestedModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("Answer once");
+		await session.waitForIdle();
+
+		expect(session.servingModel?.modelIdentity).toBe(`${requestedModel.provider}/${requestedModel.id}`);
+	});
+
+	it("keeps the attributed thinking level for a response that settles after a model switch", async () => {
+		const requestedModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const switchedModel = getBundledModel("openai", "gpt-4o");
+		if (!requestedModel || !switchedModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		let requests = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: requestedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model => {
+				requests += 1;
+				const switchBeforeSettling = requests === 2;
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					// The user switches models while the second request is still streaming.
+					if (switchBeforeSettling) await session?.setModelTemporary(switchedModel);
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "answered by the requested model" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: emptyUsage(),
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				})();
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${requestedModel.provider}/${requestedModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setThinkingLevel(Effort.High);
+
+		await session.prompt("First answer");
+		await session.waitForIdle();
+		const firstAttribution = session.servingModel;
+		if (!firstAttribution) throw new Error("Expected the first turn to be attributed");
+		expect(firstAttribution.thinkingLevel).toBe(Effort.High);
+
+		await session.prompt("Second answer");
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(switchedModel.id);
+		expect(session.thinkingLevel).not.toBe(Effort.High);
+		expect(session.servingModel).toEqual({ ...firstAttribution, isFallback: false });
+	});
+
+	it("does not prove an armed fallback with a turn another model answered", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		const substituteModel = getBundledModel("openai", "gpt-4o");
+		if (!primaryModel || !fallbackModel || !substituteModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const failing = createMockModel();
+		const substitute = createMockModel({ provider: substituteModel.provider, id: substituteModel.id });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				if (model.id === primaryModel.id) {
+					failing.push({ throw: "overloaded_error: provider returned error 503" });
+					return failing.stream(model, context, options);
+				}
+				substitute.push({ content: ["answered by the substitute"] });
+				return substitute.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const succeeded: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_succeeded") succeeded.push(event.model);
+		});
+
+		await session.prompt("Fail over");
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(fallbackModel.id);
+		expect(succeeded).toEqual([]);
+		expect(session.servingModel?.modelIdentity).toBe(`${substituteModel.provider}/${substituteModel.id}`);
+	});
+
+	it("does not prove an armed fallback with a substituted turn whose served model does not resolve", async () => {
+		const primaryModel = getBundledModel("openai", "gpt-4o");
+		const fallbackModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const failing = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				if (model.id === primaryModel.id) {
+					failing.push({ throw: "overloaded_error: provider returned error 503" });
+					return failing.stream(model, context, options);
+				}
+				return serverSideFallbackStream(model, "unlisted-model-20260615", "answered by an unlisted model", {
+					boundaryBlock: true,
+				});
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const succeeded: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_succeeded") succeeded.push(event.model);
+		});
+
+		await session.prompt("Fail over");
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(fallbackModel.id);
+		expect(succeeded).toEqual([]);
 	});
 });

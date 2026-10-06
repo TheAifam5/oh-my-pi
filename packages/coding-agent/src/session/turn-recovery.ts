@@ -26,6 +26,7 @@ import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-credit";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
+import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import {
 	isSqliteBusyError,
@@ -567,26 +568,125 @@ export class TurnRecovery {
 		return active.handle;
 	}
 
+	#sessionModelAttribution(model: Model): ServingModel {
+		const level = this.#host.thinkingLevel();
+		return {
+			selector: formatRetryFallbackSelector(model, level),
+			modelIdentity: formatModelStringWithRouting(model),
+			thinkingLevel: level,
+			isFallback: this.#fallbackRouted,
+			contextWindow: model.contextWindow,
+		};
+	}
+
+	/**
+	 * Registry model a settled message names, when it is not the session model.
+	 *
+	 * With substitution evidence, an id the registry does not list exactly (a
+	 * dated snapshot such as `claude-opus-4-8-20260615`) resolves by classified
+	 * identity; without it only an exact registry lookup counts.
+	 */
+	#messageServedModel(
+		message: AssistantMessage,
+		sessionModel: Model | undefined,
+		substituted: boolean,
+	): Model | undefined {
+		if (!message.provider || !message.model) return undefined;
+		if (sessionModel?.provider === message.provider && sessionModel.id === message.model) return undefined;
+		const servedModel =
+			this.#host.modelRegistry.find(message.provider, message.model) ??
+			(substituted ? this.#findModelByIdentity(message.provider, message.model) : undefined);
+		if (!servedModel) {
+			logger.debug("Settled turn names a model the registry cannot resolve; crediting the session model", {
+				provider: message.provider,
+				model: message.model,
+				substituted,
+			});
+			return undefined;
+		}
+		return modelsAreEqual(servedModel, sessionModel) ? undefined : servedModel;
+	}
+
+	/**
+	 * The provider's single model sharing `modelId`'s classified class, family,
+	 * revision, effort and thinking-variant facts; undefined when the identity is
+	 * unclassified, nothing matches, or several models still match.
+	 */
+	#findModelByIdentity(provider: string, modelId: string): Model | undefined {
+		const identity = classifyModel(provider, modelId, { lenient: true });
+		if (identity.class === "unknown" || identity.revision === undefined) return undefined;
+		const matches = this.#host.modelRegistry
+			.getProviderModels(provider)
+			.filter(
+				candidate =>
+					candidate.identity.class === identity.class &&
+					candidate.identity.family === identity.family &&
+					candidate.identity.revision === identity.revision &&
+					candidate.identity.effort === identity.effort &&
+					(candidate.identity.thinkingVariant ?? false) === (identity.thinkingVariant ?? false),
+			);
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	/**
+	 * Attribution for a turn a registry model other than the session model
+	 * answered.
+	 *
+	 * A provider-reported substitution is fallback-served at the request's
+	 * thinking level, clamped to the served model. A response that settled after
+	 * the session switched models keeps the previous attribution when it names
+	 * the same model, and is otherwise credited by identity with no thinking
+	 * level, since the level it was requested at is no longer known.
+	 */
+	#servedModelAttribution(servedModel: Model, substituted: boolean): ServingModel {
+		const modelIdentity = formatModelStringWithRouting(servedModel);
+		const previous = this.#lastServed;
+		if (
+			!substituted &&
+			previous &&
+			previous.sessionId === this.#host.sessionManager.getSessionId() &&
+			previous.attribution.modelIdentity === modelIdentity
+		) {
+			return previous.attribution;
+		}
+		const level = substituted ? resolveThinkingLevelForModel(servedModel, this.#host.thinkingLevel()) : undefined;
+		return {
+			selector: formatRetryFallbackSelector(servedModel, level),
+			modelIdentity,
+			thinkingLevel: level,
+			isFallback: substituted,
+			contextWindow: servedModel.contextWindow,
+		};
+	}
+
 	/**
 	 * Records which model produced this turn, marks an active fallback as having
 	 * served, then closes a successful retry saga and annotates recovered
 	 * persisted errors.
+	 *
+	 * Attribution names the model the settled message reports when the registry
+	 * resolves it to a model other than the session model. Otherwise the session
+	 * model is credited, keeping its routing suffix and thinking level.
 	 */
 	async onAssistantSettledSuccessfully(message: AssistantMessage): Promise<void> {
 		if (!assistantTurnProducedOutput(message)) {
 			return;
 		}
 		const model = this.#host.model();
-		if (model) {
-			const level = this.#host.thinkingLevel();
+		// The provider's own report, not the session model, is the reference: the
+		// session may have switched models while this response was streaming.
+		const substituted =
+			(message.requestedModel !== undefined && message.requestedModel !== message.model) ||
+			message.content.some(block => block.type === "fallback");
+		const servedModel = this.#messageServedModel(message, model, substituted);
+		if (servedModel) {
 			this.#lastServed = {
-				attribution: {
-					selector: formatRetryFallbackSelector(model, level),
-					modelIdentity: formatModelStringWithRouting(model),
-					thinkingLevel: level,
-					isFallback: this.#fallbackRouted,
-					contextWindow: model.contextWindow,
-				},
+				attribution: this.#servedModelAttribution(servedModel, substituted),
+				sessionId: this.#host.sessionManager.getSessionId(),
+			};
+		} else if (model) {
+			this.#lastServed = {
+				attribution: this.#sessionModelAttribution(model),
 				sessionId: this.#host.sessionManager.getSessionId(),
 			};
 		}
@@ -594,7 +694,9 @@ export class TurnRecovery {
 		// before a request without ever incrementing `#retryAttempt`, and it still
 		// owns every turn it serves. Gating this on the saga left such a fallback
 		// permanently unproven, hiding it from observers for the whole session.
-		if (this.#activeRetryFallback && !this.#activeRetryFallback.served && model) {
+		// A turn another model answered proves nothing about the armed candidate, even when the
+		// registry cannot resolve the model the provider substituted.
+		if (this.#activeRetryFallback && !this.#activeRetryFallback.served && model && !servedModel && !substituted) {
 			this.#activeRetryFallback.served = true;
 			await this.#host.emitSessionEvent({
 				type: "retry_fallback_succeeded",

@@ -1279,6 +1279,14 @@ export interface AssistantMessage {
 	 * the session's live setting may already have changed.
 	 */
 	serviceTier?: ServiceTier;
+	/**
+	 * Model id the request asked for, set only when the provider reported
+	 * serving the turn on another model (Anthropic server-side fallback), in
+	 * which case `model` names the served model. Absent when the requested
+	 * model served the turn, including after a retry discarded a fallback-served
+	 * attempt.
+	 */
+	requestedModel?: string;
 	usage: Usage;
 	stopReason: StopReason;
 	stopDetails?: StopDetails | null;
