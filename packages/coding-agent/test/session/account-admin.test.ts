@@ -179,6 +179,37 @@ describe("account administration", () => {
 		expect(projectAccountPin(settings, nested, "anthropic")).toBeUndefined();
 	});
 
+	it("accepts a reserve whose usage only the broker reports, and rejects one with no usage source", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const brokerStore = Object.assign(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			getUsageReport: async () => null,
+		});
+		const brokered = new AuthStorage(brokerStore, { usageProviderResolver: () => undefined });
+		const sourceless = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageProviderResolver: () => undefined,
+		});
+		try {
+			await brokered.credentials.set("anthropic", [oauth("a")]);
+			await sourceless.credentials.set("anthropic", [oauth("a")]);
+
+			const result = setAccountReserve(settings, brokered, resolveAccount(brokered, "a@example.com"), 15);
+			expect(result.warning).toContain("broker");
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+				{ provider: "anthropic", account: { accountId: "acc-a" }, reservePct: 15 },
+			]);
+
+			expect(() => setAccountReserve(settings, sourceless, resolveAccount(sourceless, "a@example.com"), 30)).toThrow(
+				"no usage source",
+			);
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+				{ provider: "anthropic", account: { accountId: "acc-a" }, reservePct: 15 },
+			]);
+		} finally {
+			brokered.close();
+			sourceless.close();
+		}
+	});
+
 	it("exits with status 1 on a rejected CLI action and prints list JSON", async () => {
 		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
 		const context = { settings, authStorage, cwd: project };
