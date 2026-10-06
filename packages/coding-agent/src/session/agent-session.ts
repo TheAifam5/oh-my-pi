@@ -166,6 +166,7 @@ import { emitSessionShutdownEvent, TOP_LEVEL_AGENT, UNAVAILABLE_ANNOTATIONS } fr
 import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
+import { resolveToolExecutionRenderers } from "../extensibility/extensions/wrapper";
 import type {
 	AgentActivityOutcome,
 	CompactOptions,
@@ -9557,6 +9558,8 @@ export class AgentSession implements SettingsScope {
 		const ctx = {
 			...baseCtx,
 			hasQueuedMessages: baseCtx.hasPendingMessages,
+			resolveToolRenderers: (toolName: string) =>
+				resolveToolExecutionRenderers(this.#extensionRunner, toolName, this.getToolByName(toolName)),
 		} as unknown as CustomCommandContext;
 
 		try {

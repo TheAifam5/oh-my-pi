@@ -11,6 +11,7 @@ import type * as zod from "@oh-my-pi/omptype/zod";
 import type { ExtensionUIContext } from "../extensions/types";
 import type { ExecOptions, ExecResult, HookCommandContext } from "../../extensibility/hooks/types";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
+import type { ToolExecutionRenderers } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import type * as PiCodingAgent from "../../index";
 
 // Re-export for custom commands to use
@@ -19,6 +20,8 @@ export type { ExecOptions, ExecResult, HookCommandContext };
 /** Interactive capabilities available to user-invoked commands, not hooks. */
 export interface CustomCommandContext extends HookCommandContext {
 	ui: ExtensionUIContext;
+	/** Renderers an extension's `registerToolRenderer` resolvers choose for `toolName`, for transcript views a command draws. */
+	resolveToolRenderers?: (toolName: string) => ToolExecutionRenderers | undefined;
 }
 
 /**
