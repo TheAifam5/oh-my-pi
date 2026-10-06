@@ -143,7 +143,7 @@ describe("Moonshot balance", () => {
 		else Bun.env.MOONSHOT_BASE_URL = originalBaseUrl;
 	});
 
-	/** Documentation-derived: https://platform.kimi.ai/docs/api/balance */
+	/** Documentation-derived: https://platform.kimi.ai/docs/api/balance and https://platform.kimi.com/docs/api/balance */
 	const documented = {
 		code: 0,
 		data: { available_balance: 49.58894, voucher_balance: 46.58893, cash_balance: 3.00001 },
@@ -176,21 +176,59 @@ describe("Moonshot balance", () => {
 		expect((await fetchReport(moonshotUsageProvider, { ...documented, status: false })).report).toBeNull();
 	});
 
-	it("never sends the key to the China platform", async () => {
+	it("reads a China-platform key only on the China host, in yuan rounded down", async () => {
 		const { report, seen } = await fetchReport(moonshotUsageProvider, documented, {
 			baseUrl: "https://api.moonshot.cn/v1",
 		});
-		expect(report).toBeNull();
-		expect(seen).toEqual([]);
+		expect(bearer(seen)).toEqual([
+			{ url: "https://api.moonshot.cn/v1/users/me/balance", method: "GET", authorization: `Bearer ${KEY}` },
+		]);
+		expect(report?.limits[0]?.amount).toEqual({ remaining: 49.58894, unit: "unknown", currency: "CNY" });
+		expect(report?.metadata).toEqual({
+			availableBalanceCny: 49.58894,
+			voucherBalanceCny: 46.58893,
+			cashBalanceCny: 3.00001,
+		});
+		if (!report) throw new Error("fixture did not parse");
+		expect(sources(moonshotBilling.readBilling(report))).toEqual([
+			{
+				mode: "prepaid-credits",
+				state: "available",
+				allowance: { kind: "money", remaining: { amountMinor: 4958, currency: "CNY" } },
+			},
+		]);
 	});
 
-	it("never sends the key when MOONSHOT_BASE_URL points inference at the China platform", async () => {
+	it("never drives a China-platform balance below zero on a cash debt", async () => {
+		const debt = { ...documented, data: { available_balance: -2.5, voucher_balance: 0, cash_balance: -2.5 } };
+		const { report } = await fetchReport(moonshotUsageProvider, debt, { baseUrl: "https://api.moonshot.cn/v1" });
+		if (!report) throw new Error("fixture did not parse");
+		expect(report.limits[0]).toMatchObject({ amount: { remaining: 0 }, status: "exhausted" });
+		expect(sources(moonshotBilling.readBilling(report))).toEqual([
+			{
+				mode: "prepaid-credits",
+				state: "exhausted",
+				allowance: { kind: "money", remaining: { amountMinor: 0, currency: "CNY" } },
+			},
+		]);
+	});
+
+	it("reads the China platform when MOONSHOT_BASE_URL points inference there", async () => {
 		Bun.env.MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
 		const { report, seen } = await fetchReport(moonshotUsageProvider, documented);
-		expect(report).toBeNull();
-		expect(seen).toEqual([]);
-		const explicit = await fetchReport(moonshotUsageProvider, documented, { baseUrl: "https://api.moonshot.ai/v1" });
-		expect(explicit.seen).toEqual([]);
+		expect(seen.map(request => request.url)).toEqual(["https://api.moonshot.cn/v1/users/me/balance"]);
+		expect(report?.limits[0]?.amount.currency).toBe("CNY");
+		const conflicting = await fetchReport(moonshotUsageProvider, documented, {
+			baseUrl: "https://api.moonshot.ai/v1",
+		});
+		expect(conflicting.seen).toEqual([]);
+	});
+
+	it("never sends an international or unconfigured key to the China host", async () => {
+		const unconfigured = await fetchReport(moonshotUsageProvider, documented, { status: 500 });
+		expect(unconfigured.seen.map(request => request.url)).toEqual(["https://api.moonshot.ai/v1/users/me/balance"]);
+		const proxied = await fetchReport(moonshotUsageProvider, documented, { baseUrl: "https://proxy.example/v1" });
+		expect(proxied.seen).toEqual([]);
 	});
 });
 
