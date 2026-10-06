@@ -10,7 +10,8 @@ import { resolveUsedFraction, type UsageLimit } from "@oh-my-pi/pi-ai/usage";
  * only). Neither can fill a quota bar, so each renders as text instead.
  */
 function isAbsoluteUnit(limit: UsageLimit): boolean {
-	return limit.amount.unit !== "percent" && limit.amount.unit !== "unknown";
+	const { unit, currency } = limit.amount;
+	return unit !== "percent" && (unit !== "unknown" || currency !== undefined);
 }
 
 export function isUsedOnlyAbsoluteAmount(limit: UsageLimit): boolean {
@@ -37,8 +38,14 @@ export function isRemainingOnlyAbsoluteAmount(limit: UsageLimit): boolean {
 	);
 }
 
-function formatQuantity(value: number, unit: UsageLimit["amount"]["unit"], suffix: string): string {
+function formatQuantity(
+	value: number,
+	unit: UsageLimit["amount"]["unit"],
+	currency: string | undefined,
+	suffix: string,
+): string {
 	if (unit === "usd") return `$${value.toFixed(2)} ${suffix}`;
+	if (currency !== undefined) return `${value.toFixed(2)} ${currency} ${suffix}`;
 	const formatted = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 	return `${formatted} ${unit} ${suffix}`;
 }
@@ -56,11 +63,11 @@ function formatQuantity(value: number, unit: UsageLimit["amount"]["unit"], suffi
  */
 export function totalRemainingOnly(
 	limits: readonly UsageLimit[],
-): { value: number; unit: UsageLimit["amount"]["unit"] } | undefined {
+): { value: number; unit: UsageLimit["amount"]["unit"]; currency?: string } | undefined {
 	const first = limits[0];
 	if (first === undefined || !limits.every(isRemainingOnlyAbsoluteAmount)) return undefined;
-	const unit = first.amount.unit;
-	if (!limits.every(limit => limit.amount.unit === unit)) return undefined;
+	const { unit, currency } = first.amount;
+	if (!limits.every(limit => limit.amount.unit === unit && limit.amount.currency === currency)) return undefined;
 
 	let total = 0;
 	let sharedMax: number | undefined;
@@ -72,13 +79,13 @@ export function totalRemainingOnly(
 		}
 		total += remaining;
 	}
-	return { value: total + (sharedMax ?? 0), unit };
+	return { value: total + (sharedMax ?? 0), unit, currency };
 }
 
 /** `"100 credits left"` for a bucket of remaining-only limits, else `undefined`. */
 export function formatRemainingOnlyTotal(limits: readonly UsageLimit[]): string | undefined {
 	const total = totalRemainingOnly(limits);
-	return total === undefined ? undefined : formatQuantity(total.value, total.unit, "left");
+	return total === undefined ? undefined : formatQuantity(total.value, total.unit, total.currency, "left");
 }
 
 /**
@@ -90,10 +97,10 @@ export function formatAbsoluteOnlyAmount(limits: readonly UsageLimit[]): string 
 	const first = limits[0];
 	if (first === undefined) return undefined;
 	if (limits.every(isUsedOnlyAbsoluteAmount)) {
-		const unit = first.amount.unit;
-		if (!limits.every(limit => limit.amount.unit === unit)) return undefined;
+		const { unit, currency } = first.amount;
+		if (!limits.every(limit => limit.amount.unit === unit && limit.amount.currency === currency)) return undefined;
 		const used = limits.reduce((max, limit) => Math.max(max, limit.amount.used ?? 0), 0);
-		return formatQuantity(used, unit, "used");
+		return formatQuantity(used, unit, currency, "used");
 	}
 	return formatRemainingOnlyTotal(limits);
 }

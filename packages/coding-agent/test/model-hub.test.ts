@@ -1331,7 +1331,7 @@ describe("ModelHub", () => {
 			).toBe("prepaid-credits available 489.25 credits");
 			expect(billingSummary("charm-hyper", [], now)).toBe("unknown (no-report)");
 			expect(billingSummary("charm-hyper", undefined, now)).toBe("unknown (no-report)");
-			expect(billingSummary("test", [], now)).toBe("unknown (no-reader)");
+			expect(billingSummary("test", [], now)).toBeUndefined();
 			expect(billingSummary("charm-hyper", [hyperReport(5, "usd", now - 16 * 60_000)], now)).toBe("unknown (stale)");
 		});
 

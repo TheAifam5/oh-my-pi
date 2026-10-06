@@ -45,10 +45,10 @@ function parseDeepSeekBalance(payload: Record<string, unknown>): Pick<UsageRepor
 			`${currency} balance`,
 			Number(total),
 			currency === "USD" ? "usd" : "unknown",
-			{ exhausted },
+			currency === "USD" ? { exhausted } : { exhausted, currency },
 		),
 	);
-	// Limits carry floats and no CNY unit; billing reads the exact strings.
+	// Limits carry floats; billing reads the exact strings.
 	return { limits, metadata: { isAvailable: payload.is_available, balances } };
 }
 
