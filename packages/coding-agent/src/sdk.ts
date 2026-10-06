@@ -2589,6 +2589,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return sessionManager.getCwd();
 			},
 			isToolActive: name => activeToolNames.has(name),
+			isToolAdvertised: name => session?.isToolAdvertised(name),
 			setActiveToolNames,
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
@@ -5097,6 +5098,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// and the provider boundary handles text-only advisor models.
 			xdev: undefined,
 			isToolActive: name => toolSession.isToolActive?.(name) === true,
+			// Descriptions follow the primary's frozen roster, like `isToolActive` above.
+			isToolAdvertised: name => toolSession.isToolAdvertised?.(name),
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {

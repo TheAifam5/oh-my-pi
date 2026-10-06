@@ -321,6 +321,8 @@ interface PromptSurface {
 	evalPreludes: readonly EvalPreludeDefinition[];
 	/** User-tagged model agents listed in the task description. */
 	sessionAgents: readonly AgentDefinition[];
+	/** Active tool names sibling descriptions may reference (`bash`/`grep`/`glob` hints for `find`, ...). */
+	advertisedToolNames: ReadonlySet<string>;
 }
 
 interface PendingNoticePreview<T> {
@@ -515,7 +517,8 @@ export class SessionTools {
 		this.#skillWarnings = options.skillWarnings ?? [];
 		this.#skillsSettings = options.skillsSettings;
 		this.#skillsReloadable = options.skillsReloadable ?? true;
-		this.#promptSurface = this.#derivePromptSurface();
+		// The construction slate is the active set the startup prompt rendered with.
+		this.#promptSurface = this.#derivePromptSurface(host.agent.state.tools.map(tool => tool.name));
 		// Seed from the construction slate (top-level tools plus xd:// mounts).
 		// Left empty, getEnabledToolNames() falls back to live agent.state.tools,
 		// so an early reconcile (think after the startup model resolution)
@@ -620,13 +623,36 @@ export class SessionTools {
 		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).sessionAgents;
 	}
 
-	/** Derives the candidate surface from live state without publishing it. */
-	#derivePromptSurface(): PromptSurface {
+	/**
+	 * Whether a tool description may advertise `name` (see {@link #promptSurface});
+	 * the candidate inside a rebuild frame.
+	 */
+	isToolAdvertised(name: string): boolean {
+		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).advertisedToolNames.has(name);
+	}
+
+	/**
+	 * Derives the candidate surface from live state without publishing it.
+	 * `toolNames` is the `isToolActive` predicate set the candidate renders with.
+	 */
+	#derivePromptSurface(toolNames: readonly string[]): PromptSurface {
 		return {
 			skillHintVisible: cfgSkillful.get(this.#host.settings) === true && (this.#skills?.length ?? 0) > 0,
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
+			advertisedToolNames: new Set(toolNames),
 		};
+	}
+
+	/**
+	 * A prefix-binding model already answered on the current prompt, so a
+	 * rebuilt system prompt or tool prefix would void its cached prefix.
+	 */
+	#prefixBoundTurnSent(): boolean {
+		return (
+			this.#host.model()?.thinking?.prefixBinding === true &&
+			this.#host.agent.state.messages.some(message => message.role === "assistant")
+		);
 	}
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
 	clearAcpPermissionDecisions(): void {
@@ -1182,7 +1208,16 @@ export class SessionTools {
 		);
 	}
 
-	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
+	/**
+	 * `prefixBoundTurnSent` pins the freeze decision a caller already sampled;
+	 * omitted, the freeze check reads live session state.
+	 */
+	async #applyActiveToolsByName(
+		toolNames: string[],
+		forcePromptRefresh = false,
+		signal?: AbortSignal,
+		prefixBoundTurnSent?: boolean,
+	): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
@@ -1308,7 +1343,7 @@ export class SessionTools {
 				// getters read the candidate, so prompt, signature and provider
 				// schemas describe the same state. Nothing publishes outside this
 				// frame until the commit below.
-				const candidate = this.#derivePromptSurface();
+				const candidate = this.#derivePromptSurface(validToolNames);
 				const computeSignature = (surface: PromptSurface): string =>
 					this.#promptSurfaceScope.run(surface, () =>
 						this.#computeAppliedToolSignature(validToolNames, tools, mountedSignatureTools),
@@ -1325,7 +1360,10 @@ export class SessionTools {
 				const freezeImplicitPromptRefresh =
 					!forcePromptRefresh &&
 					triggerSignature !== this.#lastAppliedToolSignature &&
-					this.#implicitRebuildBinding() === "frozen";
+					(this.#implicitRebuildBinding() === "frozen" ||
+						(this.#lastAppliedToolSignature !== undefined &&
+							this.#implicitRebuildBinding() === "free" &&
+							(prefixBoundTurnSent ?? this.#prefixBoundTurnSent())));
 				if (freezeImplicitPromptRefresh) {
 					frozenSignature = triggerSignature;
 				} else if (forcePromptRefresh || triggerSignature !== this.#lastAppliedToolSignature) {
@@ -2123,13 +2161,22 @@ export class SessionTools {
 	 * `xd://` mounting) against live settings: registers newly allowed tools,
 	 * unregisters disallowed ones, and reapplies the enabled set with one forced
 	 * prompt rebuild — unconditionally unless `refreshPrompt` is false, then only
-	 * when the tool set changed. Unrelated selections and MCP/extension tools are
-	 * preserved.
+	 * when the tool set changed. A prefix-bound session with an assistant turn is
+	 * not forced unless the `xd://` state changed: the change rides a hidden roster
+	 * notice and the prompt stays byte-stable. Unrelated selections and MCP/extension
+	 * tools are preserved.
 	 */
 	reconcileBuiltinTools({ refreshPrompt = true }: { refreshPrompt?: boolean } = {}): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const reconcile = this.#reconcileSettingsGatedTools;
 			if (!reconcile || this.#host.isDisposed()) return;
+			// The startup prompt is built outside this class and leaves no signature;
+			// the freeze path compares against the surface the provider already has,
+			// sampled before the delta mutates the registry.
+			const baselineSignature =
+				this.#lastAppliedToolSignature === undefined && this.#host.model()?.thinking?.prefixBinding === true
+					? this.#committedToolSignature()
+					: undefined;
 			// Sampled before the delta: it still carries names mounted under the
 			// `xd://` state the reconcile may release.
 			const enabled = new Set(this.getEnabledToolNames());
@@ -2148,8 +2195,28 @@ export class SessionTools {
 				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
 			}
 			if (!refreshPrompt && !xdevChanged && delta.added.length === 0 && delta.removed.length === 0) return;
-			await this.#applyActiveToolsByName([...enabled], true);
+			// An `xd://` change moves tools between top level and mounts, which the
+			// roster notice does not describe, so it always rebuilds.
+			const freezePrompt = !xdevChanged && this.#prefixBoundTurnSent();
+			if (freezePrompt) this.#lastAppliedToolSignature ??= baselineSignature;
+			await this.#applyActiveToolsByName([...enabled], !freezePrompt, undefined, freezePrompt);
 		});
+	}
+
+	/** Signature of the active tool surface as the committed prompt surface renders it. */
+	#committedToolSignature(): string {
+		const activeToolNames = this.getActiveToolNames();
+		const promptTools = activeToolNames.flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [tool] : [];
+		});
+		const mountedSignatureTools = [...(this.#xdev?.mountedNames ?? [])].flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [tool] : [];
+		});
+		return this.#promptSurfaceScope.run(this.#promptSurface, () =>
+			this.#computeAppliedToolSignature(activeToolNames, promptTools, mountedSignatureTools),
+		);
 	}
 
 	/**
@@ -2179,7 +2246,7 @@ export class SessionTools {
 		// throwing preparation leaves the committed snapshot untouched, and the
 		// scope frame (not a rollback write) guarantees no clobbering of a newer
 		// winner.
-		const candidate = this.#derivePromptSurface();
+		const candidate = this.#derivePromptSurface(activeToolNames);
 		const built = await this.#promptSurfaceScope.run(candidate, () =>
 			rebuildSystemPrompt(activeToolNames, this.#toolRegistry),
 		);
