@@ -417,7 +417,11 @@ export class ModelRegistry {
 			this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
 			return;
 		}
-		this.#reloadStaticModels();
+		// A provider-scoped refresh re-discovers only `providerId`; other providers'
+		// discovered slices (credential-scoped built-ins have no other restore path)
+		// must survive the static rebuild. A full refresh re-discovers every provider
+		// and must rebuild them under the current model policies.
+		this.#reloadStaticModels(providerId ? { preserveRuntimeDiscovery: true } : undefined);
 	}
 
 	#installProviderApiKey(provider: string, keyConfig: string, options?: { fallback?: boolean }): void {
@@ -645,12 +649,10 @@ export class ModelRegistry {
 			}
 		}
 		await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
-		// #reloadStaticModels above may have rebuilt #models from static sources,
-		// dropping models previously discovered by OTHER runtime providers (their
-		// fetchDynamicModels results live only in #models + the SQLite cache, not
-		// in #loadModels' static inputs). Restore them from cache with the default
-		// online-if-uncached strategy: no network while their cached row is
-		// fresh, so the scoped refresh above stays the only forced fetch.
+		// Reconcile OTHER runtime providers (extension fetchDynamicModels managers)
+		// from cache with the default online-if-uncached strategy: no network while
+		// their cached row is fresh, so the scoped refresh above stays the only
+		// forced fetch.
 		const otherRuntimeProviderIds = new Set(
 			[...this.#runtimeModelManagers.keys()].filter(runtimeId => runtimeId !== providerId),
 		);
