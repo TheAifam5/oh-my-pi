@@ -18,6 +18,7 @@
  */
 
 import { logger } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { AuthStorage } from "./auth-storage";
 import type { SessionManager } from "./session-manager";
 
@@ -61,12 +62,19 @@ export function credentialPinHash(provider: string, identity: CredentialPinIdent
 	return new Bun.CryptoHasher("sha256").update(key).digest("hex");
 }
 
+/** `sessionId\0provider` whose recorded user pin a restriction already overrode and logged. */
+const ignoredPinWarnings = new LRUCache<string, true>({ max: 256 });
+
 /**
  * Record the account that served the latest assistant turn for `provider`.
  * Appends a `credential_pin` entry only when the account differs from the
  * branch's latest pin, so steady-state sessions add a single entry; the
  * effective last-use time is derived from later assistant turns on read
- * (see `SessionManager.getCredentialPins`).
+ * (see `SessionManager.getCredentialPins`). Records nothing while the branch's
+ * latest entry is a user pin, so an automatic entry never replaces it on resume,
+ * including one an account restriction ignores: a later unrestricted resume
+ * restores it. Such a restricted session keeps its in-pool affinity only in the
+ * auth store's sticky rows, which a remote auth broker does not persist.
  */
 export function recordCredentialPin(
 	authStorage: AuthStorage,
@@ -74,6 +82,7 @@ export function recordCredentialPin(
 	sessionId: string,
 	provider: string,
 ): void {
+	if (sessionManager.getCredentialPins().get(provider)?.exclusive) return;
 	const identity = authStorage.oauth.identity(provider, sessionId);
 	if (!identity) return;
 	const hash = credentialPinHash(provider, identity);
@@ -108,7 +117,10 @@ export function recordExclusiveCredentialPin(
  * A user pin is restored as the session's exclusive pin and overwrites any
  * live sticky. When its account is no longer stored, or the pin is refused
  * (a key override is active), the session fails closed for that provider and
- * the provider is returned so the caller can tell the user.
+ * the provider is returned so the caller can tell the user. A session
+ * restricted to an account pool instead ignores a user pin it cannot apply
+ * (outside its pool, or an account no longer stored, which cannot be shown to
+ * be inside it): nothing is persisted and selection stays inside the pool.
  *
  * An automatic pin is a no-op when the account is gone (logged out) or when a
  * live sticky for another account exists (same-process branch/session switches
@@ -116,12 +128,16 @@ export function recordExclusiveCredentialPin(
  * use predates the pin is advanced to the pin's time: the persisted sticky is
  * written lazily, so the session file can be newer. It seeds with the
  * session's effective last-use time so stale resumes still fall through to
- * usage ranking.
+ * usage ranking. `options.exclusiveOnly` restores only user pins, for a fresh
+ * provider session id that wants new automatic routing but keeps the user's pins.
+ * `options.onIgnored` receives each provider whose user pin a restriction
+ * overrides; the override is logged once per session and provider.
  */
 export function seedCredentialPins(
 	authStorage: AuthStorage,
 	sessionManager: SessionManager,
 	sessionId: string,
+	options?: { exclusiveOnly?: boolean; onIgnored?: (provider: string) => void },
 ): string[] {
 	const unavailable: string[] = [];
 	for (const [provider, pin] of sessionManager.getCredentialPins()) {
@@ -129,13 +145,24 @@ export function seedCredentialPins(
 			const pinned = authStorage.sessions
 				.accounts(provider, sessionId)
 				.find(account => credentialPinHash(provider, account) === pin.hash);
-			if (!pinned || !authStorage.sessions.pin(provider, sessionId, pinned.credentialId)) {
-				authStorage.sessions.pinMissing(provider, sessionId);
-				logger.warn("Pinned account of the resumed session is unavailable", { provider });
-				unavailable.push(provider);
+			if (pinned && authStorage.sessions.pin(provider, sessionId, pinned.credentialId)) continue;
+			if (authStorage.sessions.isRestricted(provider, sessionId)) {
+				const warnKey = `${sessionId}\0${provider}`;
+				if (!ignoredPinWarnings.has(warnKey)) {
+					ignoredPinWarnings.set(warnKey, true);
+					logger.warn("Session account restriction overrides the pinned account of the resumed session", {
+						provider,
+					});
+				}
+				options?.onIgnored?.(provider);
+				continue;
 			}
+			authStorage.sessions.pinMissing(provider, sessionId);
+			logger.warn("Pinned account of the resumed session is unavailable", { provider });
+			unavailable.push(provider);
 			continue;
 		}
+		if (options?.exclusiveOnly) continue;
 		const accounts = authStorage.oauth.accounts(provider, sessionId);
 		if (accounts.length === 0) continue;
 		const match = accounts.find(account => credentialPinHash(provider, account) === pin.hash);

@@ -1,10 +1,14 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { SESSION_PIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
+import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import { AccountUnavailableError } from "@oh-my-pi/pi-ai/error";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
+import { SessionAccountPoolScope } from "../src/config/account-pools";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
@@ -20,7 +24,7 @@ function mintOAuthCredential(suffix: string, extra?: { orgId?: string }) {
 		type: "oauth" as const,
 		access: `access-${suffix}`,
 		refresh: `refresh-${suffix}`,
-		expires: Date.now() + 60_000,
+		expires: Date.now() + 60 * 60_000,
 		accountId: `account-${suffix}`,
 		email: `${suffix}@example.com`,
 		...extra,
@@ -49,6 +53,7 @@ function assistantMessage(provider: string, timestamp: number) {
 
 describe("credential pins", () => {
 	let tempDir: TempDir;
+	let store: SqliteAuthCredentialStore;
 	let storage: AuthStorage;
 
 	beforeEach(async () => {
@@ -57,7 +62,7 @@ describe("credential pins", () => {
 			delete process.env[key];
 		}
 		tempDir = TempDir.createSync("@pi-credential-pin-");
-		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+		store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		await store.saveOAuth("anthropic", mintOAuthCredential("a"));
 		await store.saveOAuth("anthropic", mintOAuthCredential("b"));
 		storage = new AuthStorage(store);
@@ -65,6 +70,7 @@ describe("credential pins", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		for (const key of ANTHROPIC_ENV) {
 			const value = savedEnv[key];
 			if (value === undefined) delete process.env[key];
@@ -282,6 +288,155 @@ describe("credential pins", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	/** Serve each stored OAuth credential's access token without a network refresh. */
+	function serveStoredTokens(): void {
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+	}
+
+	function identityKey(suffix: string): string {
+		const key = resolveCredentialIdentityKey("anthropic", mintOAuthCredential(suffix));
+		if (!key) throw new Error("expected an identity key");
+		return key;
+	}
+
+	function storedAccount(suffix: string): { credentialId: number } {
+		const account = storage.sessions.accounts("anthropic").find(entry => entry.accountId === `account-${suffix}`);
+		if (!account) throw new Error(`expected stored account ${suffix}`);
+		return account;
+	}
+
+	function pinnedCredentialId(sessionId: string): number | undefined {
+		return storage.sessions.accounts("anthropic", sessionId).find(account => account.pinned)?.credentialId;
+	}
+
+	function createSession(manager: SessionManager, accountPoolScope?: SessionAccountPoolScope): AgentSession {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		return new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: manager,
+			settings: Settings.isolated({}),
+			modelRegistry: new ModelRegistry(storage),
+			accountPoolScope,
+		});
+	}
+
+	test("a fresh or reset provider session keeps the user's exclusive pin", async () => {
+		serveStoredTokens();
+		const session = createSession(SessionManager.inMemory(tempDir.path()));
+		try {
+			const accountB = storedAccount("b");
+			expect(session.pinCurrentProviderAccount(accountB.credentialId)).toBe("pinned");
+
+			const fresh = session.freshSession();
+			expect(fresh?.sessionId).not.toBe(fresh?.previousSessionId);
+			expect(pinnedCredentialId(session.sessionId)).toBe(accountB.credentialId);
+			expect(await storage.keys.get("anthropic", session.sessionId)).toBe("access-b");
+
+			const beforeReset = session.sessionId;
+			expect(await session.resetSessionContext()).toBeDefined();
+			expect(session.sessionId).not.toBe(beforeReset);
+			expect(pinnedCredentialId(session.sessionId)).toBe(accountB.credentialId);
+			expect(await storage.keys.get("anthropic", session.sessionId)).toBe("access-b");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a restricted session keeps its pin and pool across a fresh provider session", async () => {
+		serveStoredTokens();
+		const manager = SessionManager.inMemory(tempDir.path());
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, manager.getSessionId());
+		const session = createSession(manager, scope);
+		try {
+			const accountA = storedAccount("a");
+			const accountB = storedAccount("b");
+			expect(session.pinCurrentProviderAccount(accountB.credentialId)).toBe("restricted");
+			expect(session.pinCurrentProviderAccount(accountA.credentialId)).toBe("pinned");
+
+			session.freshSession();
+			const providerSessionId = session.sessionId;
+			expect(providerSessionId).not.toBe(manager.getSessionId());
+			expect(pinnedCredentialId(providerSessionId)).toBe(accountA.credentialId);
+			expect(session.pinCurrentProviderAccount(accountB.credentialId)).toBe("restricted");
+			expect(session.drainCurrentProviderAccount(accountB.credentialId)).toBe("restricted");
+			expect(session.drainCurrentProviderAccount(accountA.credentialId)).toBe("drained");
+			expect(await storage.keys.get("anthropic", providerSessionId)).toBe("access-a");
+			// Tools read the auth store under the session file's id (security scans, web search); it stays restricted too.
+			for (const sessionId of [manager.getSessionId(), providerSessionId]) {
+				expect(storage.oauth.accounts("anthropic", sessionId).map(account => account.accountId)).toEqual([
+					"account-a",
+				]);
+				expect((await storage.oauth.access("anthropic", sessionId))?.accountId).toBe("account-a");
+			}
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a restricted session ignores a recorded pin outside its pool without persisting a missing-account pin", async () => {
+		serveStoredTokens();
+		const warn = vi.spyOn(logger, "warn");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		const hashB = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		manager.appendCredentialPin("anthropic", hashB!, true);
+		const lease = storage.sessions.restrict("anthropic", sessionId, [identityKey("a")]);
+
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+		expect(store.getCache(`${SESSION_PIN_CACHE_PREFIX}anthropic:${sessionId}`)).toBeNull();
+		expect(await storage.keys.get("anthropic", sessionId)).toBe("access-a");
+		expect(
+			warn.mock.calls.filter(([message]) => String(message).startsWith("Session account restriction")),
+		).toHaveLength(1);
+
+		// The pool account that served the session does not replace the ignored user pin in the file,
+		recordCredentialPin(storage, manager, sessionId, "anthropic");
+		expect(manager.getCredentialPins().get("anthropic")).toMatchObject({ hash: hashB, exclusive: true });
+		// so a resume without the restriction restores it.
+		storage.sessions.unrestrict("anthropic", sessionId, lease);
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+		expect(pinnedCredentialId(sessionId)).toBe(storedAccount("b").credentialId);
+	});
+
+	test("unpinning removes a recorded pin a restriction ignores, after one info notice", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const hashB = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		manager.appendCredentialPin("anthropic", hashB!, true);
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, manager.getSessionId());
+		const session = createSession(manager, scope);
+		try {
+			const notices: string[] = [];
+			session.subscribe(event => {
+				if (event.type === "notice" && event.level === "info") notices.push(event.message);
+			});
+			session.freshSession();
+			session.freshSession();
+			expect(notices).toHaveLength(1);
+
+			expect(session.unpinCurrentProviderAccount()).toBe("unpinned");
+			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("recording never appends an automatic entry over the user's pin", () => {
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		const hashB = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		manager.appendCredentialPin("anthropic", hashB!, true);
+
+		// No sticky is recorded, so the identity lookup falls back to the first stored account.
+		recordCredentialPin(storage, manager, sessionId, "anthropic");
+
+		expect(manager.getCredentialPins().get("anthropic")).toMatchObject({ hash: hashB, exclusive: true });
 	});
 
 	test("RPC mode reports an unavailable pin found while the session is built as a notice frame", async () => {

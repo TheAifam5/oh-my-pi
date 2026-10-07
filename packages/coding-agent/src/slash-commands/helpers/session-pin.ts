@@ -81,6 +81,8 @@ export function describeSessionPinOutcome(outcome: SessionPinOutcome, label: str
 			return "Cannot pin an account while the session is streaming.";
 		case "overridden":
 			return `Not pinned: a --api-key or models.yml apiKey override is active for ${providerName}.`;
+		case "restricted":
+			return `Not pinned: ${label} is outside the ${providerName} account pool this session is restricted to.`;
 		case "unavailable":
 			return `${label} is no longer available to pin.`;
 		case "not-persistable":
