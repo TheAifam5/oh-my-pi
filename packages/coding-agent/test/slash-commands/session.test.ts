@@ -50,7 +50,7 @@ describe("/session slash command", () => {
 		const account = { credentialId: 7, type: "oauth", accountId: "acc-b", active: false, pinned: false };
 		const session = {
 			listCurrentProviderAccounts: vi.fn(async () => ({ provider: "openai-codex", accounts: [account] })),
-			drainCurrentProviderAccount: vi.fn(() => true),
+			drainCurrentProviderAccount: vi.fn(() => "drained"),
 			settings: {},
 			modelRegistry: { authStorage: {} },
 		};

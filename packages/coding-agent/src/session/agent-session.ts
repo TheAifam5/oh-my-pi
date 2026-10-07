@@ -295,6 +295,7 @@ import type {
 	SendUserMessageOptions,
 	SessionHandoffOptions,
 	SessionAccountList,
+	SessionDrainOutcome,
 	SessionPinOutcome,
 	SessionStats,
 	SessionUnpinOutcome,
@@ -954,6 +955,13 @@ export class AgentSession implements SettingsScope {
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
+	/**
+	 * Every provider session id this session has used; their inherited auth affinity is forgotten on dispose.
+	 * Grows by one id per `/fresh` or context reset over the session's lifetime.
+	 */
+	readonly #providerSessionIds = new Set<string>();
+	/** `sessionId\0provider` (session file id) already told that an account restriction overrides its recorded pin. */
+	readonly #ignoredPinNotices = new Set<string>();
 	/** OAuth account pools enforced on this session's key lookups; lifted on dispose. */
 	#accountPoolScope: SessionAccountPoolScope | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
@@ -5975,18 +5983,32 @@ export class AgentSession implements SettingsScope {
 		// Restore the session's recorded provider accounts before the first
 		// request routes: sticky rows are process-local under a remote auth
 		// broker, and losing them re-ranks onto a different account, cold-missing
-		// the account-scoped prompt cache. Skipped for fresh provider sessions —
-		// those explicitly want new routing identity.
-		if (!this.#freshProviderSessionId) {
-			for (const provider of seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid)) {
-				const message = `The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`;
-				// A notice emitted before anyone subscribes (construction) is lost; the header renders configWarnings later.
-				if (this.#eventListeners.length > 0) {
-					this.emitNotice("warning", message, ACCOUNT_PIN_NOTICE_SOURCE);
-				} else {
-					this.#accountPinWarnings.set(provider, message);
-					this.configWarnings.push(message);
-				}
+		// the account-scoped prompt cache. A fresh provider session wants new
+		// automatic routing, but keeps the user's exclusive pins: they are keyed
+		// by the provider session id, so the new id is pinned again.
+		this.#providerSessionIds.add(sid);
+		const unavailable = seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid, {
+			exclusiveOnly: this.#freshProviderSessionId !== undefined,
+			onIgnored: provider => {
+				const key = `${currentSessionId}\0${provider}`;
+				// Shown once per session file and provider, to a listener; a notice before anyone subscribes is lost.
+				if (this.#eventListeners.length === 0 || this.#ignoredPinNotices.has(key)) return;
+				this.#ignoredPinNotices.add(key);
+				this.emitNotice(
+					"info",
+					`The account pinned to this session for ${provider} is outside the account pool this session is restricted to; the pool's accounts are used instead.`,
+					ACCOUNT_PIN_NOTICE_SOURCE,
+				);
+			},
+		});
+		for (const provider of unavailable) {
+			const message = `The account pinned to this session for ${provider} is unavailable; requests that use stored ${provider} accounts fail until you run /session unpin or pin another account.`;
+			// A notice emitted before anyone subscribes (construction) is lost; the header renders configWarnings later.
+			if (this.#eventListeners.length > 0) {
+				this.emitNotice("warning", message, ACCOUNT_PIN_NOTICE_SOURCE);
+			} else {
+				this.#accountPinWarnings.set(provider, message);
+				this.configWarnings.push(message);
 			}
 		}
 		// Keep every live advisor's provider identity in lockstep with the primary's
@@ -6393,7 +6415,7 @@ export class AgentSession implements SettingsScope {
 		// otherwise in the deferred pass below. Each lease lifts only the
 		// restriction it installed, never one a revival has installed on the
 		// same provider session id since.
-		if (drained) this.#accountPoolScope?.release();
+		if (drained) this.#releaseAccountState();
 
 		// The deadline does not cancel the drain: a handler parked in a slow
 		// extension hook resumes afterwards and would repopulate exactly the
@@ -6409,9 +6431,20 @@ export class AgentSession implements SettingsScope {
 				await this.agent.waitForIdle();
 				await this.#drainInFlightEventHandlers();
 				this.#releaseRetainedSessionMemory();
-				this.#accountPoolScope?.release();
+				this.#releaseAccountState();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
+	}
+
+	/**
+	 * Lift the account pools and forget the auth affinity inherited into this
+	 * session's provider ids. Inherited pins stay persisted, so a revival that
+	 * reuses an id reads them again.
+	 */
+	#releaseAccountState(): void {
+		this.#accountPoolScope?.release();
+		const sessions = this.#modelRegistry.authStorage?.sessions;
+		for (const sessionId of this.#providerSessionIds) sessions?.forgetInherited(sessionId);
 	}
 
 	/** Drop the in-memory conversation state after the terminal dispose flush. */
@@ -13328,9 +13361,10 @@ export class AgentSession implements SettingsScope {
 		if (this.isStreaming) return "streaming";
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.sessions.pin(provider, this.sessionId, credentialId)) {
-			// The auth store refuses a pin only for a missing row or an active runtime/config key override.
+			// The auth store refuses a pin for a missing row, an account outside the session's account pool, or an active runtime/config key override.
 			const stored = authStorage.sessions.accounts(provider).some(account => account.credentialId === credentialId);
-			return stored ? "overridden" : "unavailable";
+			if (!stored) return "unavailable";
+			return authStorage.sessions.admits(provider, this.sessionId, credentialId) ? "overridden" : "restricted";
 		}
 		if (!recordExclusiveCredentialPin(authStorage, this.sessionManager, provider, credentialId, true)) {
 			authStorage.sessions.unpin(provider, this.sessionId);
@@ -13343,13 +13377,17 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Drain `credentialId` first for the current model provider in this session
 	 * only, or with `null` drain no account, overriding `auth.accountPolicies`.
-	 * Returns false without a model, while streaming, or when the row is not a
-	 * stored OAuth account.
+	 * Nothing changes unless the outcome is `drained`: `restricted` for a stored
+	 * account outside the session's account pool, `unavailable` without a model,
+	 * while streaming, or when the row is not a stored OAuth account.
 	 */
-	drainCurrentProviderAccount(credentialId: number | null): boolean {
+	drainCurrentProviderAccount(credentialId: number | null): SessionDrainOutcome {
 		const provider = this.model?.provider;
-		if (!provider || this.isStreaming) return false;
-		return this.#modelRegistry.authStorage.sessions.drain(provider, this.sessionId, credentialId);
+		if (!provider || this.isStreaming) return "unavailable";
+		const sessions = this.#modelRegistry.authStorage.sessions;
+		if (sessions.drain(provider, this.sessionId, credentialId)) return "drained";
+		const stored = credentialId !== null && sessions.accounts(provider).some(a => a.credentialId === credentialId);
+		return stored && !sessions.admits(provider, this.sessionId, credentialId) ? "restricted" : "unavailable";
 	}
 
 	/**
@@ -13366,13 +13404,15 @@ export class AgentSession implements SettingsScope {
 	unpinProviderAccount(provider: string): SessionUnpinOutcome {
 		if (this.isStreaming) return "streaming";
 		const authStorage = this.#modelRegistry.authStorage;
-		if (!authStorage.sessions.unpin(provider, this.sessionId)) {
+		const recorded = this.sessionManager.getCredentialPins().get(provider);
+		const unpinned = authStorage.sessions.unpin(provider, this.sessionId);
+		// A recorded user pin with no live pin (ignored by an account restriction) is still removed, or a resume or `/fresh` would restore it.
+		if (recorded?.exclusive) this.sessionManager.appendCredentialPin(provider, recorded.hash, false);
+		if (!unpinned && !recorded?.exclusive) {
 			return authStorage.sessions.accounts(provider, this.sessionId).some(account => account.pinned)
 				? "project-pin"
 				: "none";
 		}
-		const recorded = this.sessionManager.getCredentialPins().get(provider);
-		if (recorded?.exclusive) this.sessionManager.appendCredentialPin(provider, recorded.hash, false);
 		this.#retractAccountPinWarnings(provider);
 		return "unpinned";
 	}

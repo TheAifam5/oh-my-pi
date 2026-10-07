@@ -562,7 +562,17 @@ export interface SessionAccountList {
 }
 
 /** Result of pinning an account for the current provider; only `pinned` changes anything. */
-export type SessionPinOutcome = "pinned" | "no-model" | "streaming" | "overridden" | "unavailable" | "not-persistable";
+export type SessionPinOutcome =
+	| "pinned"
+	| "no-model"
+	| "streaming"
+	| "overridden"
+	| "restricted"
+	| "unavailable"
+	| "not-persistable";
+
+/** Result of overriding the session's drained account for the current provider; only `drained` changes anything. */
+export type SessionDrainOutcome = "drained" | "restricted" | "unavailable";
 
 /** Result of removing the session's account pin for the current provider. */
 export type SessionUnpinOutcome = "unpinned" | "no-model" | "streaming" | "project-pin" | "none";

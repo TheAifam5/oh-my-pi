@@ -289,8 +289,13 @@ async function handleSessionDrainCommand(
 			return;
 		}
 	}
-	if (!session.drainCurrentProviderAccount(target?.credentialId ?? null)) {
-		lines.push("Cannot change the drained account right now.");
+	const drained = session.drainCurrentProviderAccount(target?.credentialId ?? null);
+	if (drained !== "drained") {
+		lines.push(
+			drained === "restricted"
+				? `Not changed: ${subject} is outside the ${provider} account pool this session is restricted to.`
+				: "Cannot change the drained account right now.",
+		);
 		await output(lines.join("\n"));
 		return;
 	}
