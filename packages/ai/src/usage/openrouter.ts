@@ -1,8 +1,9 @@
 /**
- * OpenRouter API key spending cap usage provider.
+ * OpenRouter API key spending cap and free-model daily request usage provider.
  *
  * The response shape follows the official API reference:
  * https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key
+ * and the free-model counter semantics follow https://openrouter.ai/docs/api/reference/limits
  */
 import { ProviderHttpError } from "../error";
 import type { UsageFetchContext, UsageFetchParams, UsageLimit, UsageProvider, UsageReport } from "../usage";
@@ -68,6 +69,38 @@ function keyLimit(data: Record<string, unknown>, now: number): UsageLimit | unde
 	};
 }
 
+/** A non-negative finite count, or `undefined`. */
+function count(value: unknown): number | undefined {
+	const parsed = finiteNumber(value);
+	return parsed !== undefined && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * The account's free-model request counter for the current UTC day;
+ * `undefined` unless `used`, `limit`, and `remaining` are all non-negative numbers.
+ * The counter gates only `:free` model variants, which a usage scope cannot
+ * express, so it never reports `exhausted` and never blocks paid models on the key.
+ */
+function freeModelDailyLimit(data: Record<string, unknown>, now: number): UsageLimit | undefined {
+	const counter = data.free_model_daily_requests;
+	if (!isRecord(counter)) return undefined;
+	const used = count(counter.used);
+	const limit = count(counter.limit);
+	const remaining = count(counter.remaining);
+	if (used === undefined || limit === undefined || remaining === undefined) return undefined;
+	const usedFraction = limit > 0 ? Math.min(1, Math.max(0, (limit - Math.min(limit, remaining)) / limit)) : 1;
+	const status = usageStatus(usedFraction);
+	return {
+		id: "openrouter:free-model-daily-requests",
+		label: "Free model daily requests",
+		scope: { provider: PROVIDER, windowId: "daily", shared: true },
+		window: { id: "daily", label: RESET_WINDOW_LABELS.daily, resetsAt: limitResetAt("daily", now) },
+		amount: { used, limit, remaining, usedFraction, remainingFraction: 1 - usedFraction, unit: "requests" },
+		status: status === "exhausted" ? "warning" : status,
+		notes: ["applies to :free models only"],
+	};
+}
+
 async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== PROVIDER) return null;
 	const credential = params.credential;
@@ -104,11 +137,13 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 	if (!data) return null;
 
 	const fetchedAt = Date.now();
-	const cap = keyLimit(data, fetchedAt);
+	const limits = [keyLimit(data, fetchedAt), freeModelDailyLimit(data, fetchedAt)].filter(
+		(limit): limit is UsageLimit => limit !== undefined,
+	);
 	return {
 		provider: PROVIDER,
 		fetchedAt,
-		limits: cap ? [cap] : [],
+		limits,
 		// `is_free_tier` describes the account (it has never purchased credits), not the key.
 		metadata: typeof data.is_free_tier === "boolean" ? { isFreeTier: data.is_free_tier } : {},
 	};

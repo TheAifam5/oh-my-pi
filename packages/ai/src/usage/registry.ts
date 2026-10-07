@@ -26,7 +26,12 @@ import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
 import { opencodeGoBilling, opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
 import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
-import { siliconflowBilling, siliconflowUsageProvider } from "./siliconflow";
+import {
+	siliconflowBilling,
+	siliconflowCnBilling,
+	siliconflowCnUsageProvider,
+	siliconflowUsageProvider,
+} from "./siliconflow";
 import { syntheticBilling, syntheticUsageProvider } from "./synthetic";
 import { umansUsageProvider } from "./umans";
 import { veniceBilling, veniceUsageProvider } from "./venice";
@@ -70,6 +75,7 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	vercelAiGatewayUsageProvider,
 	veniceUsageProvider,
 	siliconflowUsageProvider,
+	siliconflowCnUsageProvider,
 	deepinfraUsageProvider,
 ];
 
@@ -124,6 +130,7 @@ export const DEFAULT_BILLING_READERS: readonly ProviderBilling[] = [
 	vercelAiGatewayBilling,
 	veniceBilling,
 	siliconflowBilling,
+	siliconflowCnBilling,
 	deepinfraBilling,
 	zaiBilling,
 	xaiOauthBilling,

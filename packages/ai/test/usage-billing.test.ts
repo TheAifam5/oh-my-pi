@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { isUsageLimitReached } from "@oh-my-pi/pi-ai/auth/usage-report";
 import { TeamsTier } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
@@ -539,6 +540,69 @@ describe("OpenRouter billing", () => {
 		expect(proxied.seen).toEqual([
 			{ url: "https://proxy.example/openrouter/v1/key", authorization: "Bearer sk-or-v1-test" },
 		]);
+	});
+
+	describe("free-model daily requests", () => {
+		const freeKey = {
+			label: "k",
+			usage: 1.2,
+			limit: null,
+			limit_remaining: null,
+			limit_reset: null,
+			is_free_tier: false,
+			is_management_key: false,
+			free_model_daily_requests: { used: 12, limit: 1000, remaining: 988 },
+		};
+
+		it("reports the account's free-model counter resetting at the next midnight UTC", async () => {
+			const report = await keyReport(freeKey);
+			expect(report.limits).toEqual([
+				{
+					id: "openrouter:free-model-daily-requests",
+					label: "Free model daily requests",
+					scope: { provider: "openrouter", windowId: "daily", shared: true },
+					window: { id: "daily", label: "Daily", resetsAt: limitResetAt("daily", report.fetchedAt) },
+					amount: {
+						used: 12,
+						limit: 1000,
+						remaining: 988,
+						usedFraction: 0.012,
+						remainingFraction: 0.988,
+						unit: "requests",
+					},
+					status: "ok",
+					notes: ["applies to :free models only"],
+				},
+			]);
+			const resetsAt = report.limits[0]?.window?.resetsAt ?? 0;
+			expect(new Date(resetsAt).getUTCHours()).toBe(0);
+			expect(resetsAt - report.fetchedAt).toBeGreaterThan(0);
+			expect(resetsAt - report.fetchedAt).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+		});
+
+		it("warns on a spent counter without blocking the key's paid models", async () => {
+			const report = await keyReport({
+				...freeKey,
+				free_model_daily_requests: { used: 50, limit: 50, remaining: 0 },
+			});
+			expect(report.limits[0]).toMatchObject({ amount: { remaining: 0, usedFraction: 1 }, status: "warning" });
+			expect(isUsageLimitReached(report.limits)).toBe(false);
+		});
+
+		it("emits no counter when a field is missing, negative, or not finite", async () => {
+			const malformed: unknown[] = [
+				undefined,
+				null,
+				{ used: 12, limit: 1000 },
+				{ used: 12, limit: -1, remaining: 988 },
+				{ used: "12", limit: 1000, remaining: 988 },
+				{ used: 12, limit: 1000, remaining: null },
+			];
+			for (const counter of malformed) {
+				const report = await keyReport({ ...freeKey, free_model_daily_requests: counter });
+				expect(report.limits).toEqual([]);
+			}
+		});
 	});
 
 	it("returns no report for a payload without data or a server error", async () => {

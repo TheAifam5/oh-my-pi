@@ -1375,6 +1375,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/nano
 ### Auth & usage
 - **API Key & Environment Variables**: Authenticates via `NANO_GPT_API_KEY` (resolved via `getEnvApiKey` in `packages/ai/src/stream.ts` and configured in catalog descriptors `packages/catalog/src/compat/rules/providers/nanogpt.kdl`).
 - **Interactive Login**: Declared in `packages/catalog/src/compat/rules/auth/nanogpt.kdl` as a `login "api-key"` rule (`packages/ai/src/registry/engine/api-key.ts`), prompting for an API key linked from `https://nano-gpt.com/api` and validating credentials via `validate "models-endpoint"` against `https://nano-gpt.com/api/v1/models`.
+- **Usage & billing**: `nanogptUsageProvider` (`packages/ai/src/usage/nanogpt.ts`) reads the USD balance (`POST /api/check-balance`) and the subscription quota (`GET /api/subscription/v1/usage`) with the inference key. Daily/weekly input-token and daily-image counters become windowed limits; a token-based trial's `tokens` counter becomes the windowless `nanogpt:subscription:trial-tokens` limit capped by `tokenLimits.total`. A spent quota reads `warning` instead of `exhausted` while `routing.recommendedMode` still offers `subscription` or `paygo`.
 
 ### Catalog model handling
 - **Provider entry (`nanogpt`)**: `packages/catalog/src/compat/rules/providers/nanogpt.kdl` declares default model `openai/gpt-5.5`. Environment keys: `NANO_GPT_API_KEY`.
@@ -1592,6 +1593,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/open
 ### Auth & usage
 - **Auth Key Validation via `/api/v1/auth/key`**: Declared in `packages/catalog/src/compat/rules/auth/openrouter.kdl` as a `login "oauth-code"` rule (`packages/ai/src/registry/engine/oauth-code.ts`) with `paste-key` validation targeted at `https://openrouter.ai/api/v1/auth/key`. Public `/api/v1/models` returns HTTP 200 for unauthenticated requests, so `/api/v1/auth/key` is used as the canonical identity check (returning 200 for valid keys, 401 otherwise). Key resolution checks `OPENROUTER_API_KEY` via `getEnvApiKey` in `packages/ai/src/stream.ts`.
 - **Authoritative Reported Cost Reconciling**: `applyProviderReportedCost` in `packages/ai/src/providers/openai-shared.ts` extracts `rawUsage.cost` echoed by OpenRouter and ClinePass. If estimated token cost is finite and positive, input, output, cache-read, and cache-write costs are scaled by `reportedCost / estimatedCost` to match the exact billable total; otherwise, `usage.cost.input` is assigned the reported cost directly.
+- **Usage limits**: `openrouterUsageProvider` (`packages/ai/src/usage/openrouter.ts`) reads `GET /key` and reports the key's spending cap (`openrouter:key-limit`) and the account's `free_model_daily_requests` counter (`openrouter:free-model-daily-requests`, resetting at midnight UTC). The free-model counter only gates `:free` model variants, which a usage scope cannot isolate, so it reports at most `warning` and never marks the key exhausted.
 
 ### Catalog model handling
 - **Provider entry (`openrouter`)**: `packages/catalog/src/compat/rules/providers/openrouter.kdl` declares default model `openai/gpt-5.5`. Environment keys: `OPENROUTER_API_KEY`.
@@ -1678,6 +1680,7 @@ SiliconFlow is a high-performance AI inference platform providing access to open
 - **API Key Login**: Authenticates via API key stored in `SILICONFLOW_API_KEY` (or `SILICONFLOW_CN_API_KEY` for `siliconflow-cn`). Interactively declared in `packages/catalog/src/compat/rules/auth/siliconflow.kdl` and `siliconflow-cn.kdl` as `login "api-key"` rules (`packages/ai/src/registry/engine/api-key.ts`).
 - **Endpoint Validation**: Credentials are validated during login via a `models-endpoint` request to `https://api.siliconflow.com/v1/models` (`https://api.siliconflow.cn/v1/models`).
 - **Console URLs**: Key creation instructions point to `https://cloud.siliconflow.com/account/ak` (`https://cloud.siliconflow.cn/account/ak` for China region).
+- **Account balance**: `siliconflowUsageProvider` and `siliconflowCnUsageProvider` (`packages/ai/src/usage/siliconflow.ts`) read `totalBalance` from `GET /v1/user/info` on `api.siliconflow.com` and `api.siliconflow.cn` respectively, each only for keys configured for its own host. The reference states no currency, so the balance is reported as credits; a zero balance never blocks the key because free models may still serve.
 
 ### Catalog model handling
 - **Provider entry (`siliconflow`)**: `packages/catalog/src/compat/rules/providers/siliconflow.kdl` declares default model `zai-org/GLM-5.1`. Environment keys: `SILICONFLOW_API_KEY`.

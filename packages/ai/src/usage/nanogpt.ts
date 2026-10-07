@@ -8,7 +8,7 @@
  * The balance docs name an `x-api-key` header without saying it takes the
  * inference key; the subscription usage docs say it does.
  */
-import type { UsageLimit, UsageProvider, UsageReport, UsageStatus } from "../usage";
+import type { UsageLimit, UsageProvider, UsageReport, UsageStatus, UsageUnit } from "../usage";
 import { isRecord } from "../utils";
 import { accountBalanceUsageProvider, balanceLimit, decimalString, finiteNumber } from "./account-balance";
 import { type BillingSource, knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
@@ -22,14 +22,30 @@ const MIN_RESET_AT_MS = Date.UTC(2001, 0, 1);
 /** `resetAt` values from 2100-01-01T00:00:00Z on are not epoch milliseconds. */
 const MAX_RESET_AT_MS = Date.UTC(2100, 0, 1);
 
+/** A subscription quota counter and where its cap is reported. */
+interface Quota {
+	field: string;
+	id: string;
+	label: string;
+	unit: UsageUnit;
+	/** Periodic window; a quota without one is a single non-renewing pool. */
+	window?: { id: string; label: string; durationMs: number };
+	/** Reads the numeric cap from the response; `limits` holds the caps of periodic quotas. */
+	cap(payload: Record<string, unknown>, caps: Record<string, unknown>): number | undefined;
+	/** Accepts the counter nested under `limits` when it is missing at the top level. */
+	nestedUnderLimits: boolean;
+}
+
 /** Subscription quota counters; images have no usage unit of their own. */
-const QUOTAS = [
+const QUOTAS: readonly Quota[] = [
 	{
 		field: "dailyInputTokens",
 		id: "nanogpt:subscription:daily-input-tokens",
 		label: "Daily input tokens",
 		unit: "tokens",
 		window: { id: "daily", label: "Daily", durationMs: DAY_MS },
+		cap: (_payload, caps) => finiteNumber(caps.dailyInputTokens),
+		nestedUnderLimits: true,
 	},
 	{
 		field: "weeklyInputTokens",
@@ -37,6 +53,8 @@ const QUOTAS = [
 		label: "Weekly input tokens",
 		unit: "tokens",
 		window: { id: "weekly", label: "Weekly", durationMs: WEEK_MS },
+		cap: (_payload, caps) => finiteNumber(caps.weeklyInputTokens),
+		nestedUnderLimits: true,
 	},
 	{
 		field: "dailyImages",
@@ -44,8 +62,22 @@ const QUOTAS = [
 		label: "Daily images",
 		unit: "unknown",
 		window: { id: "daily", label: "Daily", durationMs: DAY_MS },
+		cap: (_payload, caps) => finiteNumber(caps.dailyImages),
+		nestedUnderLimits: true,
 	},
-] as const;
+	{
+		// Token-based trials report one `tokens` counter capped by `tokenLimits.total`.
+		field: "tokens",
+		id: "nanogpt:subscription:trial-tokens",
+		label: "Trial tokens",
+		unit: "tokens",
+		cap: payload => (isRecord(payload.tokenLimits) ? finiteNumber(payload.tokenLimits.total) : undefined),
+		nestedUnderLimits: false,
+	},
+];
+
+/** `scope.windowId` of a quota without a periodic window. */
+const POOL_WINDOW_ID = "lifetime";
 
 /** Documented `routing.recommendedMode` values. */
 const RECOMMENDED_MODES = new Set(["subscription", "paygo", "unavailable"]);
@@ -66,7 +98,7 @@ const balanceUsageProvider = accountBalanceUsageProvider({
 });
 
 function quotaLimit(
-	quota: (typeof QUOTAS)[number],
+	quota: Quota,
 	counter: Record<string, unknown>,
 	cap: number | undefined,
 	payable: boolean,
@@ -77,6 +109,7 @@ function quotaLimit(
 	if (used === undefined && reported === undefined) return undefined;
 	const limit = cap !== undefined && cap >= 0 ? cap : undefined;
 	const remaining = reported === undefined ? undefined : Math.max(0, reported);
+	// Documented as a fraction that may exceed 1.
 	const percentUsed = finiteNumber(counter.percentUsed);
 	const usedFraction =
 		percentUsed !== undefined
@@ -92,8 +125,8 @@ function quotaLimit(
 	return {
 		id: quota.id,
 		label: quota.label,
-		scope: { provider: PROVIDER, windowId: quota.window.id, shared: true },
-		window: { ...quota.window, ...(resetsAt !== undefined ? { resetsAt } : {}) },
+		scope: { provider: PROVIDER, windowId: quota.window?.id ?? POOL_WINDOW_ID, shared: true },
+		...(quota.window ? { window: { ...quota.window, ...(resetsAt !== undefined ? { resetsAt } : {}) } } : {}),
 		amount: {
 			...(used !== undefined ? { used } : {}),
 			...(limit !== undefined ? { limit } : {}),
@@ -120,9 +153,10 @@ function parseSubscriptionUsage(
 	const limits: UsageLimit[] = [];
 	for (const quota of QUOTAS) {
 		// Counters are documented at the top level with numeric caps under `limits`; accept them nested there too.
-		const counter = isRecord(payload[quota.field]) ? payload[quota.field] : caps[quota.field];
+		const topLevel = payload[quota.field];
+		const counter = isRecord(topLevel) ? topLevel : quota.nestedUnderLimits ? caps[quota.field] : undefined;
 		if (!isRecord(counter)) continue;
-		const limit = quotaLimit(quota, counter, finiteNumber(caps[quota.field]), payable);
+		const limit = quotaLimit(quota, counter, quota.cap(payload, caps), payable);
 		if (limit) limits.push(limit);
 	}
 	const period = isRecord(payload.period) ? payload.period : {};

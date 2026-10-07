@@ -9,7 +9,13 @@ import { deepseekBilling, deepseekUsageProvider } from "@oh-my-pi/pi-ai/usage/de
 import { moonshotBilling, moonshotUsageProvider } from "@oh-my-pi/pi-ai/usage/moonshot";
 import { nanogptBilling, nanogptUsageProvider } from "@oh-my-pi/pi-ai/usage/nanogpt";
 import { novitaBilling, novitaUsageProvider } from "@oh-my-pi/pi-ai/usage/novita";
-import { siliconflowBilling, siliconflowUsageProvider } from "@oh-my-pi/pi-ai/usage/siliconflow";
+import { defaultBillingReader, defaultUsageProvider } from "@oh-my-pi/pi-ai/usage/registry";
+import {
+	siliconflowBilling,
+	siliconflowCnBilling,
+	siliconflowCnUsageProvider,
+	siliconflowUsageProvider,
+} from "@oh-my-pi/pi-ai/usage/siliconflow";
 import { veniceBilling, veniceUsageProvider } from "@oh-my-pi/pi-ai/usage/venice";
 import { vercelAiGatewayBilling, vercelAiGatewayUsageProvider } from "@oh-my-pi/pi-ai/usage/vercel-ai-gateway";
 
@@ -425,6 +431,71 @@ describe("NanoGPT balance and subscription", () => {
 		]);
 	});
 
+	describe("token-based trial", () => {
+		/** Schema-derived, not a docs example: "Token-based trials also include `usageUnits`, `tokenLimits`, and `tokens`." */
+		const trial = {
+			active: true,
+			state: "active",
+			usageUnits: "tokens",
+			tokenLimits: { total: 1_000_000 },
+			limits: { dailyInputTokens: null, weeklyInputTokens: null, dailyImages: null },
+			dailyInputTokens: null,
+			weeklyInputTokens: null,
+			tokens: { used: 250_000, remaining: 750_000, percentUsed: 0.25, resetAt: null, degraded: false },
+			routing: { recommendedMode: "subscription" },
+		};
+		const spent = { ...trial, tokens: { ...trial.tokens, used: 1_000_000, remaining: 0, percentUsed: 1 } };
+
+		it("reports the trial pool as one windowless token limit capped by tokenLimits.total", async () => {
+			const { report } = await nanogptReport({ error: "no balance" }, trial);
+			expect(report?.limits).toEqual([
+				{
+					id: "nanogpt:subscription:trial-tokens",
+					label: "Trial tokens",
+					scope: { provider: "nanogpt", windowId: "lifetime", shared: true },
+					amount: {
+						used: 250_000,
+						limit: 1_000_000,
+						remaining: 750_000,
+						usedFraction: 0.25,
+						remainingFraction: 0.75,
+						unit: "tokens",
+					},
+					status: "ok",
+				},
+			]);
+		});
+
+		it("blocks the key on a spent pool only when routing has no billing mode left", async () => {
+			const unavailable = await nanogptReport(
+				{ error: "no balance" },
+				{ ...spent, routing: { recommendedMode: "unavailable" } },
+			);
+			expect(unavailable.report?.limits[0]?.status).toBe("exhausted");
+			expect(isUsageLimitReached(unavailable.report?.limits ?? [])).toBe(true);
+			const paygo = await nanogptReport(
+				{ error: "no balance" },
+				{ ...spent, routing: { recommendedMode: "paygo" } },
+			);
+			expect(paygo.report?.limits[0]?.status).toBe("warning");
+			expect(isUsageLimitReached(paygo.report?.limits ?? [])).toBe(false);
+		});
+
+		it("omits a degraded trial counter and never reads the trial cap from limits", async () => {
+			const degraded = {
+				...trial,
+				tokens: { used: null, remaining: null, percentUsed: null, resetAt: null, degraded: true },
+			};
+			expect((await nanogptReport({ error: "no balance" }, degraded)).report?.limits).toEqual([]);
+			const { tokenLimits: _cap, ...uncapped } = trial;
+			const misplaced = { ...uncapped, limits: { tokens: 5 } };
+			const { report } = await nanogptReport({ error: "no balance" }, misplaced);
+			expect(report?.limits.map(limit => [limit.id, limit.amount.limit])).toEqual([
+				["nanogpt:subscription:trial-tokens", undefined],
+			]);
+		});
+	});
+
 	// The docs do not say how the subscription endpoint answers a key without a subscription,
 	// so a 401 from either endpoint is transient and never purges the key.
 	it("treats a 401 from either endpoint as transient and stays out of credential health checks", async () => {
@@ -603,6 +674,45 @@ describe("SiliconFlow balance", () => {
 	it("purges a rejected key", async () => {
 		await expect(fetchReport(siliconflowUsageProvider, { code: 401 }, { status: 401 })).rejects.toThrow(
 			"SiliconFlow api.siliconflow.com/v1/user/info returned 401",
+		);
+	});
+});
+
+describe("SiliconFlow China balance", () => {
+	/** Same body shape as the international reference; no China-platform example is verified. */
+	const body = {
+		code: 20000,
+		message: "OK",
+		status: true,
+		data: { id: "u", balance: "0.88", status: "normal", chargeBalance: "88.00", totalBalance: "88.88" },
+	};
+
+	it("reads a China-platform key's balance from its own host as credits", async () => {
+		const { report, seen } = await fetchReport(siliconflowCnUsageProvider, body);
+		expect(bearer(seen)).toEqual([
+			{ url: "https://api.siliconflow.cn/v1/user/info", method: "GET", authorization: `Bearer ${KEY}` },
+		]);
+		expect(report?.limits.map(limit => [limit.id, limit.amount.unit, limit.amount.currency])).toEqual([
+			["siliconflow-cn:balance", "credits", undefined],
+		]);
+		expect(defaultUsageProvider("siliconflow-cn")).toBe(siliconflowCnUsageProvider);
+		expect(defaultBillingReader("siliconflow-cn")).toBe(siliconflowCnBilling);
+		expect(await billingOf(siliconflowCnUsageProvider, siliconflowCnBilling, body)).toEqual([
+			{ mode: "prepaid-credits", state: "available", allowance: { kind: "credits", remaining: credits(8888, 2) } },
+		]);
+	});
+
+	it("never sends the key to the international host", async () => {
+		const { report, seen } = await fetchReport(siliconflowCnUsageProvider, body, {
+			baseUrl: "https://api.siliconflow.com/v1",
+		});
+		expect(report).toBeNull();
+		expect(seen).toEqual([]);
+	});
+
+	it("purges a rejected key", async () => {
+		await expect(fetchReport(siliconflowCnUsageProvider, { code: 401 }, { status: 401 })).rejects.toThrow(
+			"SiliconFlow China api.siliconflow.cn/v1/user/info returned 401",
 		);
 	});
 });
