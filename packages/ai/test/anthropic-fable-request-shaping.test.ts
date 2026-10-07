@@ -97,6 +97,7 @@ type CapturedPayload = {
 			| string
 			| Array<{
 					type?: string;
+					text?: string;
 					cache_control?: { type: "ephemeral"; ttl?: "1h" | "5m" };
 					tool?: { type: string; name: string };
 			  }>;
@@ -206,6 +207,63 @@ describe("Anthropic preserved-thinking request shaping", () => {
 			type: "tool_removal",
 			tool: { type: "tool_reference", name: wireToolName },
 		});
+	});
+
+	it("keeps the previous request's cacheable prefix identical, ignoring breakpoint markers, when a tool is enabled mid-session", async () => {
+		const model = makeAnthropicModel("claude-fable-5-1");
+		const opts = { thinkingEnabled: true, reasoning: Effort.High, cacheRetention: "long" as const };
+		const findTool = { ...READ_TOOL, name: "find", description: "Find files." };
+		const first = await captureTurn(model, opts, { ...CONTEXT, tools: [READ_TOOL] });
+		const history = [
+			...CONTEXT.messages,
+			answered("sunny", first),
+			{ role: "user" as const, content: "continue", timestamp: Date.now() },
+		];
+		const previous = await captureTurn(model, opts, { ...CONTEXT, messages: history, tools: [READ_TOOL] });
+		const next = await capturePayload(model, opts, {
+			...CONTEXT,
+			messages: [
+				...history,
+				answered("done", previous),
+				{ role: "user" as const, content: "now find it", timestamp: Date.now() },
+			],
+			tools: [READ_TOOL, findTool],
+		});
+
+		// Breakpoints move between requests and are not part of the cached bytes.
+		const stripMarks = (value: unknown): string =>
+			JSON.stringify(value, (key, entry) => (key === "cache_control" ? undefined : entry));
+		type WireMessage = NonNullable<CapturedPayload["messages"]>[number];
+		const carriesBreakpoint = (message: WireMessage | undefined): boolean =>
+			Array.isArray(message?.content) && message.content.some(block => block.cache_control !== undefined);
+		// Only a breakpoint turns a string body into one text block; Anthropic treats the
+		// two forms as the same content (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking).
+		const asBlocks = (message: WireMessage): WireMessage =>
+			typeof message.content === "string"
+				? { ...message, content: [{ type: "text", text: message.content }] }
+				: message;
+		const comparableMessages = (messages: WireMessage[], other: WireMessage[]): string =>
+			stripMarks(
+				messages.map((message, index) =>
+					carriesBreakpoint(message) || carriesBreakpoint(other[index]) ? asBlocks(message) : message,
+				),
+			);
+		const nextTools = next.tools ?? [];
+		expect(stripMarks(nextTools.filter(tool => !tool.defer_loading))).toBe(stripMarks(previous.payload.tools));
+		expect(stripMarks(next.system)).toBe(stripMarks(previous.payload.system));
+		const previousMessages = previous.payload.messages ?? [];
+		const nextPrefix = (next.messages ?? []).slice(0, previousMessages.length);
+		expect(comparableMessages(nextPrefix, previousMessages)).toBe(comparableMessages(previousMessages, nextPrefix));
+
+		// The enabled tool is appended deferred and announced at the tail; a
+		// deferred definition carrying cache_control is a 400.
+		const appended = nextTools.at(-1);
+		if (!appended) throw new Error("expected an appended tool");
+		expect(appended.defer_loading).toBe(true);
+		expect("cache_control" in appended).toBe(false);
+		const tail = next.messages?.at(-1);
+		expect(tail?.role).toBe("system");
+		expect(tail?.content).toEqual([{ type: "tool_addition", tool: { type: "tool_reference", name: appended.name } }]);
 	});
 
 	it("never caches a turn-scoped system message", async () => {
