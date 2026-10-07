@@ -225,10 +225,18 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 	return { mappings, hasOmittedMappings };
 }
 
+/** Whether two skill sets render the same system-prompt `<skills>` listing. */
+function sameRenderedSkills(previous: readonly Skill[], next: readonly Skill[]): boolean {
+	const listing = (skills: readonly Skill[]) =>
+		skills.filter(skill => skill.hide !== true).map(skill => [skill.name, skill.description]);
+	return Bun.deepEquals(listing(previous), listing(next));
+}
+
 const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 const SESSION_AGENT_NOTICE_MESSAGE_TYPE = "session-agent-notice";
+const SETTINGS_PROMPT_REBUILD_DEFERRED_NOTICE = "Prompt settings change takes effect at /new or the next model switch.";
 
 /**
  * Structured payload persisted on each {@link XDEV_MOUNT_NOTICE_MESSAGE_TYPE}
@@ -365,6 +373,13 @@ export class SessionTools {
 	#promptSurfaceScope = new AsyncLocalStorage<PromptSurface>();
 	#toolRegistryMutationTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
+	/**
+	 * Model (`provider/id`) whose cached prefix kept a settings change out of the
+	 * committed prompt; set while that rebuild is pending, cleared by the next
+	 * committed rebuild. A pending deferral lands at the next switch to another
+	 * model, so A→B→A within the cache TTL rebuilds on the way back to A too.
+	 */
+	#settingsRebuildDeferredForModel: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	/**
@@ -587,6 +602,29 @@ export class SessionTools {
 			this.#host.model()?.thinking?.prefixBinding === true &&
 			this.#host.agent.state.messages.some(message => message.role === "assistant")
 		);
+	}
+
+	/**
+	 * Applies a settings change the system prompt renders. A prefix-bound session
+	 * with an assistant turn keeps its prompt byte-stable: the rebuild stays pending
+	 * for the next committed one (a forced refresh, a new session, a model switch)
+	 * and an info notice says so. Every other session rebuilds now.
+	 */
+	async refreshBaseSystemPromptForSettingsChange(): Promise<void> {
+		if (this.#prefixBoundTurnSent()) {
+			this.#deferSettingsPromptRebuild();
+			return;
+		}
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/** Marks the rebuild pending; only the first deferral after a committed rebuild notifies. */
+	#deferSettingsPromptRebuild(): void {
+		const model = this.#host.model();
+		if (!model) return;
+		const alreadyPending = this.#settingsRebuildDeferredForModel !== undefined;
+		this.#settingsRebuildDeferredForModel = formatModelString(model);
+		if (!alreadyPending) this.#host.emitNotice("info", SETTINGS_PROMPT_REBUILD_DEFERRED_NOTICE, "settings");
 	}
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
 	clearAcpPermissionDecisions(): void {
@@ -882,13 +920,24 @@ export class SessionTools {
 		return `delegation-bias:${resolveDelegationBias(activeModel)}|inline-descriptors:${inlineDescriptors}`;
 	}
 
-	/** Rebuilds model-dependent tool prompts after a model change. */
+	/**
+	 * Rebuilds model-dependent tool prompts after a model change, and lands a
+	 * pending settings deferral when the active model differs from the one it was
+	 * deferred on (see {@link #settingsRebuildDeferredForModel}): switching away
+	 * and back within the cache TTL then rebuilds instead of reusing A's prefix.
+	 */
 	async syncAfterModelChange(previousEditMode: EditMode): Promise<void> {
 		const currentEditMode = this.resolveActiveEditMode();
 		const editModeChanged = previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit");
 		// The system prompt selects model-specific policy even when it does not display the model id.
 		const modelChanged = this.#currentPromptModelKey() !== this.#promptModelKey;
-		if (editModeChanged || modelChanged) {
+		// Another model has no cached prefix for this prompt, so a deferred settings change lands here.
+		const activeModel = this.#host.model();
+		const deferredRebuildDue =
+			this.#settingsRebuildDeferredForModel !== undefined &&
+			activeModel !== undefined &&
+			formatModelString(activeModel) !== this.#settingsRebuildDeferredForModel;
+		if (editModeChanged || modelChanged || deferredRebuildDue) {
 			await this.refreshBaseSystemPrompt();
 		}
 	}
@@ -1354,6 +1403,7 @@ export class SessionTools {
 				invalidateToolSchemaMetadata(this.#host.agent.state.tools);
 				this.#lastAppliedToolSignature = rebuiltSignature;
 				this.#promptModelKey = this.#currentPromptModelKey();
+				this.#settingsRebuildDeferredForModel = undefined;
 				this.#setBasePromptXdevNames(rebuiltXdevCatalogNames);
 				// The rebuilt prompt is a fresh roster snapshot. Keep the complete
 				// pending delta for a turn override that hides it, while separately
@@ -1776,9 +1826,15 @@ export class SessionTools {
 		};
 	}
 
-	/** Rediscovers reloadable skills and refreshes prompt metadata. */
-	async refreshSkills(): Promise<void> {
+	/**
+	 * Rediscovers reloadable skills and refreshes prompt metadata. With
+	 * `settingsChange`, a prefix-bound session with an assistant turn skips the
+	 * rebuild when the rendered skill listing is unchanged and otherwise defers it
+	 * as {@link refreshBaseSystemPromptForSettingsChange} does.
+	 */
+	async refreshSkills({ settingsChange = false }: { settingsChange?: boolean } = {}): Promise<void> {
 		resetCapabilities();
+		const previousSkills = this.#skills;
 		if (this.#skillsReloadable) {
 			const skillsSettings = cfgSkills.get(this.#host.settings);
 			const discovered = await loadSkills({
@@ -1795,7 +1851,11 @@ export class SessionTools {
 				setActiveSkills(this.#skills);
 			}
 		}
-		await this.refreshBaseSystemPrompt();
+		if (!settingsChange || !this.#prefixBoundTurnSent()) {
+			await this.refreshBaseSystemPrompt();
+		} else if (!sameRenderedSkills(previousSkills, this.#skills)) {
+			this.#deferSettingsPromptRebuild();
+		}
 		this.#host.notifyCommandMetadataChanged();
 	}
 
@@ -2094,6 +2154,7 @@ export class SessionTools {
 				this.#basePromptReflectsRosterDelta = true;
 				this.#pendingToolRosterDeltaAfterBase = undefined;
 				this.#promptModelKey = this.#currentPromptModelKey();
+				this.#settingsRebuildDeferredForModel = undefined;
 				this.#lastAppliedToolSignature = signature;
 				return true;
 			},

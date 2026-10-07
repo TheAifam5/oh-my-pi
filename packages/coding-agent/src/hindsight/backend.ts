@@ -76,7 +76,7 @@ export const hindsightBackend: MemoryBackend = {
 		await installPrimaryState(session, settings, new Set());
 	},
 
-	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, settings, session, xdevMountedNames): Promise<string | undefined> {
 		const config = loadHindsightConfig(settings);
 		if (!isHindsightConfigured(config)) return undefined;
 
@@ -88,7 +88,8 @@ export const hindsightBackend: MemoryBackend = {
 		// Order: static instructions → mental models (stable, curated) → recall
 		// (volatile per turn). Stable context first so the LLM's prior is
 		// anchored on curated knowledge.
-		const parts = [prompt.render(hindsightInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) })];
+		const mounted = xdevMountedNames ? [...xdevMountedNames].map(name => ({ name })) : session?.getXdevToolEntries();
+		const parts = [prompt.render(hindsightInstructions, { toolRefs: memoryToolRefs(mounted) })];
 		if (mentalModelsSnippet) parts.push(mentalModelsSnippet);
 		if (recallSnippet) parts.push(recallSnippet);
 		return parts.join("\n\n");

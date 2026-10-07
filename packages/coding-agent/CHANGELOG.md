@@ -10,10 +10,15 @@
 
 - Fixed relative file links in Tern assistant replies opening against the folder omp was started in after `/wt` or `/move`; they now open the file in the session's working directory ([#14879](https://github.com/can1357/oh-my-pi/pull/14879) by [@H4vC](https://github.com/H4vC))
 
+### Changed
+
+- On models that bind thinking to the cached prompt prefix, such as Claude Sonnet 5.5 and Opus 5.5, cosmetic prompt settings (personality, model name, workspace tree, xd:// docs, rendering, vault) changed after the first reply now apply at the next `/new` or model switch, with a one-time notice, instead of rewriting the cached prompt immediately; tool-affecting, TTSR, and Hide Secrets settings still apply immediately.
+
 ### Fixed
 
 - Fixed switching models during a streaming Codex turn retrying the cancelled request and falling back to another model instead of keeping the selected one.
 - Fixed enabling or disabling a tool mid-session on Claude models forcing a full prompt-cache rewrite.
+- Fixed the system prompt naming the memory tools `recall`, `retain`, and `reflect` differently at startup than after the first refresh, which made Mnemopi and Hindsight sessions rewrite the whole prompt cache on the first settings or extension change.
 
 ## [18.8.3] - 2026-10-07
 

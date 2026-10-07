@@ -37,7 +37,7 @@ import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { sanitizeNoticeLine } from "./utils/notice-text";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
-import { combine } from "./config/registry";
+import { combine, type SettingValueOf, settingValuesEqual } from "./config/registry";
 import { cfgBashAutoBackgroundEnabled } from "./exec/settings";
 import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
@@ -92,6 +92,75 @@ export const cfgSystemPromptInputs = combine({
 	ttsrDisabledRules: cfgTtsrDisabledRules,
 	secretsEnabled: cfgSecretsEnabled,
 });
+
+/** A key of {@link cfgSystemPromptInputs}. */
+export type SystemPromptInput = keyof SettingValueOf<typeof cfgSystemPromptInputs>;
+
+/**
+ * When a change of each {@link cfgSystemPromptInputs} input rebuilds the prompt. `immediate`: live
+ * tool getters, the wire dialect, TTSR enforcement, or outbound obfuscation already act on the change
+ * (or it only takes effect inside a rebuild). `deferrable`: only the rendered prompt text reads it, so
+ * a prefix-bound session that already answered may wait for the next committed rebuild.
+ */
+const SYSTEM_PROMPT_INPUT_REBUILD: Record<SystemPromptInput, "immediate" | "deferrable"> = {
+	personality: "deferrable",
+	includeModelInPrompt: "deferrable",
+	includeWorkspaceTree: "deferrable",
+	inlineToolDescriptors: "immediate",
+	toolsFormat: "immediate",
+	intentTracing: "immediate",
+	// Mount notices read these live while the base prompt waits; that touches notice text only.
+	xdevDocs: "deferrable",
+	xdevInlineDevices: "deferrable",
+	vaultEnabled: "deferrable",
+	renderMermaid: "deferrable",
+	renderSvg: "deferrable",
+	autoGraph: "deferrable",
+	reactions: "deferrable",
+	asyncEnabled: "immediate",
+	bashAutoBackground: "immediate",
+	evalAutoBackground: "immediate",
+	taskEager: "immediate",
+	taskBatch: "immediate",
+	ttsrEnabled: "immediate",
+	ttsrBuiltinRules: "immediate",
+	ttsrDisabledRules: "immediate",
+	// The obfuscator switches at once, so the prompt line explaining its tokens follows at once.
+	secretsEnabled: "immediate",
+};
+
+function systemPromptInputsOfClass(kind: "immediate" | "deferrable"): ReadonlySet<SystemPromptInput> {
+	return new Set(
+		(Object.keys(SYSTEM_PROMPT_INPUT_REBUILD) as SystemPromptInput[]).filter(
+			input => SYSTEM_PROMPT_INPUT_REBUILD[input] === kind,
+		),
+	);
+}
+
+/** Inputs whose change always rebuilds the prompt at once (see {@link SYSTEM_PROMPT_INPUT_REBUILD}). */
+export const IMMEDIATE_SYSTEM_PROMPT_INPUTS = systemPromptInputsOfClass("immediate");
+
+/** Inputs whose rebuild a prefix-bound session may defer (see {@link SYSTEM_PROMPT_INPUT_REBUILD}). */
+export const DEFERRABLE_SYSTEM_PROMPT_INPUTS = systemPromptInputsOfClass("deferrable");
+
+/** Inputs whose value differs between two {@link cfgSystemPromptInputs} snapshots. */
+export function changedSystemPromptInputs(
+	next: SettingValueOf<typeof cfgSystemPromptInputs>,
+	previous: SettingValueOf<typeof cfgSystemPromptInputs>,
+): SystemPromptInput[] {
+	return (Object.keys(next) as SystemPromptInput[]).filter(input => !settingValuesEqual(next[input], previous[input]));
+}
+
+/**
+ * Whether a change of the `changed` inputs may wait for the next prompt rebuild: every changed
+ * input is deferrable and none is immediate. An unclassified input rebuilds immediately.
+ */
+export function isDeferrableSystemPromptInputChange(changed: readonly SystemPromptInput[]): boolean {
+	return (
+		changed.length > 0 &&
+		changed.every(input => DEFERRABLE_SYSTEM_PROMPT_INPUTS.has(input) && !IMMEDIATE_SYSTEM_PROMPT_INPUTS.has(input))
+	);
+}
 
 /** Bundled personality specs, keyed by the `personality` setting value. */
 const PERSONALITY_SPECS: Record<Exclude<Personality, "none">, string> = {

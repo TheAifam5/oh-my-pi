@@ -6976,8 +6976,9 @@ export class AgentSession implements SettingsScope {
 	 * Rediscovers skills and file-based slash commands for the current cwd, rebuilds the
 	 * system prompt, and notifies command-metadata listeners (TUI autocomplete, RPC/ACP
 	 * command lists). Serialized so overlapping reloads apply in call order.
+	 * `settingsChange` applies the prefix-binding rebuild gate of {@link SessionTools.refreshSkills}.
 	 */
-	refreshSkillsAndCommands(): Promise<void> {
+	refreshSkillsAndCommands(options?: { settingsChange?: boolean }): Promise<void> {
 		const refresh = this.#skillsAndCommandsRefresh
 			.catch(() => {})
 			.then(async () => {
@@ -6988,7 +6989,7 @@ export class AgentSession implements SettingsScope {
 				});
 				// Resets the capability cache again, rediscovers skills, rebuilds the prompt,
 				// and fires the command-metadata notification after both lists are current.
-				await this.#tools.refreshSkills();
+				await this.#tools.refreshSkills(options);
 			});
 		this.#skillsAndCommandsRefresh = refresh;
 		return refresh;
@@ -7085,6 +7086,11 @@ export class AgentSession implements SettingsScope {
 	/** Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. */
 	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf);
+	}
+
+	/** Settings-change prompt rebuild (see {@link SessionTools.refreshBaseSystemPromptForSettingsChange}). */
+	refreshBaseSystemPromptForSettingsChange(): Promise<void> {
+		return this.#tools.refreshBaseSystemPromptForSettingsChange();
 	}
 
 	/** Replaces connected MCP tools and enables them immediately. */

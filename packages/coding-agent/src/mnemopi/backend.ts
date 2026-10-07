@@ -136,10 +136,11 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 	},
 
-	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, settings, session, xdevMountedNames): Promise<string | undefined> {
 		const state = getMnemopiSessionState(session);
 		const primary = state?.aliasOf ?? state;
-		const parts = [prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) })];
+		const mounted = xdevMountedNames ? [...xdevMountedNames].map(name => ({ name })) : session?.getXdevToolEntries();
+		const parts = [prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(mounted) })];
 		if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
 		const rendered = parts.join("\n\n").trim();
 		if (!rendered) return undefined;

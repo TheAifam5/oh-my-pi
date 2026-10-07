@@ -249,6 +249,8 @@ import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
 	cfgSystemPromptInputs,
+	changedSystemPromptInputs,
+	isDeferrableSystemPromptInputChange,
 	type ContextFileOverride,
 	composeAppendPrompt,
 	formatContextFileOverrideNotice,
@@ -4066,8 +4068,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			}
 			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
+			// The initial build runs before `session` exists; the mount set is passed
+			// so startup and rebuilds render the same memory tool references.
 			const memoryInstructions = memoryBackend
-				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
+				? await memoryBackend.buildDeveloperInstructions(
+						agentDir,
+						settings,
+						session,
+						toolSession.xdev?.mountedNames ?? new Set(),
+					)
 				: undefined;
 			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
@@ -5073,7 +5082,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// `tools.format` catalog dialect, personality, …), so a bulk change rebuilds once.
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
-		// reports its state.
+		// reports its state. A prefix-bound session that already answered defers the
+		// rebuild when only prompt-rendered inputs changed (see
+		// DEFERRABLE_SYSTEM_PROMPT_INPUTS).
 		cfgSystemPromptInputs.listen(session, async (next, previous) => {
 			if (next.secretsEnabled !== previous.secretsEnabled) {
 				try {
@@ -5091,7 +5102,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 			if (session.isDisposed) return;
 			try {
-				await session.refreshBaseSystemPrompt();
+				if (isDeferrableSystemPromptInputChange(changedSystemPromptInputs(next, previous))) {
+					await session.refreshBaseSystemPromptForSettingsChange();
+				} else {
+					await session.refreshBaseSystemPrompt();
+				}
 			} catch (error) {
 				session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
 			}
@@ -5402,7 +5417,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const next = extensionReconcile
 					.catch(() => {})
 					.then(reconcileExtensionSources)
-					.then(() => session.refreshSkillsAndCommands());
+					.then(() => session.refreshSkillsAndCommands({ settingsChange: true }));
 				extensionReconcile = next;
 				return next;
 			});
