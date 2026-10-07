@@ -83,8 +83,19 @@ export interface SecurityCoordinatorHost {
 	modelRegistry: ModelRegistry;
 	activeModel?: Model;
 	sessionId?: string;
+	/**
+	 * Provider session id the auth store's account restriction is keyed on, read at
+	 * each account check; `sessionId` when absent.
+	 */
+	restrictionSessionId?: () => string | undefined;
 	agentId?: string;
 	asyncJobManager?: AsyncJobManager;
+}
+
+/** Reads the session id whose account restriction scan accounts must satisfy. */
+function restrictionSessionIdOf(host: SecurityCoordinatorHost): () => string | undefined {
+	const { restrictionSessionId, sessionId } = host;
+	return () => restrictionSessionId?.() ?? sessionId;
 }
 
 export interface SecurityPreflightInput {
@@ -127,6 +138,8 @@ export interface SecurityScanSession {
 
 export interface SecurityScanSessionFactoryInput {
 	host: SecurityCoordinatorHost;
+	/** Reads the restriction id of the session that started the scan, at each request. */
+	restrictionSessionId: () => string | undefined;
 	plan: SecurityScanPlan;
 	executionRoot: string;
 	scanId: string;
@@ -253,6 +266,7 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 			authStorage: input.host.authStorage,
 			auth: input.plan.account,
 			providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
+			sessionId: input.restrictionSessionId,
 		}),
 		providerSessionId,
 		sessionManager: input.sessionManager,
@@ -374,6 +388,8 @@ async function prepareSecurityExecutionTarget(
 
 export class SecurityCoordinator {
 	readonly #host: SecurityCoordinatorHost;
+	/** The latest caller's restriction id reader; see {@link refreshHost}. */
+	#restrictionSessionId: () => string | undefined;
 	readonly #createSession: SecurityScanSessionFactory;
 	readonly #openStore: (repositoryRoot: string) => Promise<SecurityStore>;
 	readonly #gitAdapter: SecurityGitAdapter;
@@ -384,12 +400,22 @@ export class SecurityCoordinator {
 
 	constructor(host: SecurityCoordinatorHost, dependencies: SecurityCoordinatorDependencies = {}) {
 		this.#host = host;
+		this.#restrictionSessionId = restrictionSessionIdOf(host);
 		this.#createSession = dependencies.createSession ?? createDefaultSecuritySession;
 		this.#openStore = dependencies.openStore ?? (cwd => SecurityStore.openForCwd(cwd));
 		this.#gitAdapter = dependencies.gitAdapter ?? DEFAULT_SECURITY_GIT_ADAPTER;
 		this.#now = dependencies.now ?? (() => new Date());
 		this.#createOperationId = dependencies.createOperationId ?? createOperationId;
 	}
+	/**
+	 * Check later preflights and starts against the account restriction of
+	 * `host`, the latest session to use this coordinator. A scan already started
+	 * keeps the restriction of the session that started it.
+	 */
+	refreshHost(host: SecurityCoordinatorHost): void {
+		this.#restrictionSessionId = restrictionSessionIdOf(host);
+	}
+
 	async #ensureRecovered(): Promise<void> {
 		this.#recovery ??= this.#recoverInterruptedOperations();
 		await this.#recovery;
@@ -434,7 +460,12 @@ export class SecurityCoordinator {
 		}
 		const model = input.model ?? this.#host.activeModel;
 		if (!model) throw new Error("Security scan preflight requires an active model");
-		const account = selectSecurityAuth(this.#host.authStorage, model, input.credentialId, this.#host.sessionId);
+		const account = selectSecurityAuth(
+			this.#host.authStorage,
+			model,
+			input.credentialId,
+			this.#restrictionSessionId(),
+		);
 		const store = await this.#openStore(this.#host.cwd);
 		const workRoot = path.join(store.projectDirectory, "work");
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
@@ -464,10 +495,26 @@ export class SecurityCoordinator {
 		if (!cfgSecurityEnabled.get(this.#host.settings)) {
 			throw new Error("Security is disabled; enable security.enabled before starting a scan");
 		}
+		// The scan stays bound to the restriction of the session starting it, read at each request.
+		const restrictionSessionId = this.#restrictionSessionId;
 		await this.#ensureRecovered();
 		const store = await this.#openStore(this.#host.cwd);
 		const plan = await store.getPlan(input.planId);
 		if (!plan) throw new Error(`Unknown security scan plan: ${input.planId}`);
+		// A stored plan may name any account; a session restricted to an account pool starts only plans for its pool.
+		if ("credentialId" in plan.account) {
+			const sessions = this.#host.authStorage.sessions;
+			const sessionId = restrictionSessionId();
+			const { provider, credentialId } = plan.account;
+			if (sessionId === undefined) {
+				throw new Error(`Security scan plan ${plan.id} uses a stored ${provider} account and needs a session`);
+			}
+			if (sessions.isRestricted(provider, sessionId) && !sessions.admits(provider, sessionId, credentialId)) {
+				throw new Error(
+					`Security scan plan ${plan.id} uses a ${provider} account outside the account pool this session is restricted to`,
+				);
+			}
+		}
 		await assertSecurityScanPlanFresh(
 			plan,
 			{
@@ -492,7 +539,7 @@ export class SecurityCoordinator {
 		this.#operations.set(operationId, record);
 		ACTIVE_SECURITY_OPERATIONS.add(operationId);
 		const run = async (signal: AbortSignal, reportProgress?: (text: string) => Promise<void>): Promise<void> => {
-			await this.#run(record, plan, store, signal, reportProgress);
+			await this.#run(record, plan, store, restrictionSessionId, signal, reportProgress);
 		};
 		const manager = this.#host.asyncJobManager;
 		if (manager) {
@@ -564,6 +611,7 @@ export class SecurityCoordinator {
 		record: SecurityOperationRecord,
 		plan: SecurityScanPlan,
 		store: SecurityStore,
+		restrictionSessionId: () => string | undefined,
 		signal: AbortSignal,
 		reportProgress?: (text: string) => Promise<void>,
 	): Promise<void> {
@@ -615,6 +663,7 @@ export class SecurityCoordinator {
 			});
 			session = await this.#createSession({
 				host: this.#host,
+				restrictionSessionId,
 				plan,
 				scanId: record.snapshot.scanId,
 				executionRoot: executionTarget.cwd,
@@ -715,7 +764,10 @@ const COORDINATORS = new Map<string, SecurityCoordinator>();
 export function getSecurityCoordinator(host: SecurityCoordinatorHost): SecurityCoordinator {
 	const key = `${path.resolve(host.cwd)}\u0000${host.sessionId ?? "sessionless"}`;
 	const existing = COORDINATORS.get(key);
-	if (existing) return existing;
+	if (existing) {
+		existing.refreshHost(host);
+		return existing;
+	}
 	const coordinator = new SecurityCoordinator(host);
 	COORDINATORS.set(key, coordinator);
 	return coordinator;

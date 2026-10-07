@@ -10,6 +10,11 @@ import type { SecurityAccountRef, SecurityAuthRef } from "./contracts";
 export interface ExactSecurityOAuthOptions {
 	authStorage: AuthStorage;
 	account: SecurityAccountRef;
+	/**
+	 * Provider session id whose account restriction the row must satisfy, read at
+	 * every resolution; `undefined` makes the row unavailable.
+	 */
+	sessionId: () => string | undefined;
 }
 
 /** Model identity fields used to select a supported scan authentication route. */
@@ -23,6 +28,8 @@ export interface SecurityAuthResolverOptions {
 	authStorage: AuthStorage;
 	auth: SecurityAuthRef;
 	providerResolver: NonNullable<AgentOptions["getApiKey"]>;
+	/** {@link ExactSecurityOAuthOptions.sessionId} for an exact OAuth row. */
+	sessionId: () => string | undefined;
 }
 
 function isOAuthAccount(auth: SecurityAuthRef): auth is SecurityAccountRef {
@@ -114,13 +121,25 @@ export function selectSecurityAuth(
 	throw new Error(`Security scans require a stored OAuth account for ${model.provider}`);
 }
 
-/** Resolves one pinned OAuth row and verifies that its durable identity has not changed. */
+/**
+ * Resolves one pinned OAuth row and verifies that its durable identity has not changed.
+ * A row `options.sessionId`'s account restriction excludes is unavailable, and so is
+ * every row without a session id: these paths never fall back to unrestricted access.
+ */
 export async function resolveExactSecurityOAuthAccess(
 	authStorage: AuthStorage,
 	account: SecurityAccountRef,
-	options: { forceRefresh: boolean; refreshReason?: OAuthRefreshReason; signal?: AbortSignal },
+	options: {
+		forceRefresh: boolean;
+		refreshReason?: OAuthRefreshReason;
+		signal?: AbortSignal;
+		sessionId: string | undefined;
+	},
 ): Promise<Extract<OAuthAccessResolution, { ok: true }>> {
-	const resolution = await authStorage.oauth.accessById(account.provider, account.credentialId, options);
+	const resolution =
+		options.sessionId === undefined
+			? undefined
+			: await authStorage.oauth.accessById(account.provider, account.credentialId, options);
 	if (!resolution) throw new Error("The pinned security OAuth credential is unavailable");
 	assertSecurityIdentityMatches(account, resolution);
 	if (!resolution.ok) throw new Error("The pinned security OAuth credential could not be resolved");
@@ -137,7 +156,7 @@ export async function resolveExactSecurityOAuthAccess(
 export function createExactSecurityOAuthResolver(
 	options: ExactSecurityOAuthOptions,
 ): NonNullable<AgentOptions["getApiKey"]> {
-	const { account, authStorage } = options;
+	const { account, authStorage, sessionId } = options;
 	return model => {
 		if (model.provider !== account.provider) {
 			throw new Error("Security scan authentication provider mismatch");
@@ -148,6 +167,7 @@ export function createExactSecurityOAuthResolver(
 				forceRefresh: context.error !== undefined,
 				refreshReason: AIError.status(context.error) === 401 ? "auth-recovery" : undefined,
 				signal: context.signal,
+				sessionId: sessionId(),
 			});
 			return resolution.accessToken;
 		};
@@ -161,8 +181,8 @@ export function createExactSecurityOAuthResolver(
 export function createSecurityAuthResolver(
 	options: SecurityAuthResolverOptions,
 ): NonNullable<AgentOptions["getApiKey"]> {
-	const { auth, authStorage, providerResolver } = options;
-	if (isOAuthAccount(auth)) return createExactSecurityOAuthResolver({ authStorage, account: auth });
+	const { auth, authStorage, providerResolver, sessionId } = options;
+	if (isOAuthAccount(auth)) return createExactSecurityOAuthResolver({ authStorage, account: auth, sessionId });
 	return model => {
 		if (model.provider !== auth.provider) {
 			throw new Error("Security scan authentication provider mismatch");

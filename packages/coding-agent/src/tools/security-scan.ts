@@ -89,15 +89,24 @@ function requireValue(value: string | undefined, label: string): string {
 	return value.trim();
 }
 
+/** The session id auth-store account restrictions are keyed on: the provider session id when known. */
+function restrictionSessionId(session: ToolSession): string | undefined {
+	return session.getProviderSessionId?.() ?? session.getSessionId?.() ?? undefined;
+}
+
 function cloudClientForSession(session: ToolSession, credentialId?: number): CodexSecurityCloudClient {
 	if (!session.authStorage) throw new ToolError("Codex Security cloud requires the authentication registry");
 	const account = selectSecurityOAuthAccount(
 		session.authStorage,
 		"openai-codex",
 		credentialId,
-		session.getSessionId?.() ?? undefined,
+		restrictionSessionId(session),
 	);
-	return new CodexSecurityCloudClient({ authStorage: session.authStorage, account });
+	return new CodexSecurityCloudClient({
+		authStorage: session.authStorage,
+		account,
+		sessionId: () => restrictionSessionId(session),
+	});
 }
 
 function textResult(text: string, details: SecurityScanToolDetails): AgentToolResult<SecurityScanToolDetails> {
@@ -137,6 +146,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				modelRegistry: this.session.modelRegistry,
 				activeModel: this.session.getActiveModel?.(),
 				sessionId: this.session.getSessionId?.() ?? undefined,
+				restrictionSessionId: () => restrictionSessionId(this.session),
 				agentId: this.session.getAgentId?.() ?? undefined,
 				asyncJobManager: this.session.asyncJobManager,
 			});

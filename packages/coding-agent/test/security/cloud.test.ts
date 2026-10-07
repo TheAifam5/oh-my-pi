@@ -87,6 +87,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: storage,
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: fetchMock,
 		});
@@ -121,6 +122,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(jwt("user-exact")),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: fetchMock,
 		});
@@ -225,6 +227,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: fetchMock,
 		});
@@ -261,6 +264,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: async input => {
 				const url = new URL(String(input));
@@ -290,6 +294,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: async input => {
 				const url = new URL(String(input));
@@ -338,6 +343,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: fetchMock,
 		});
@@ -351,6 +357,7 @@ describe("Codex Security cloud client", () => {
 		const client = new CodexSecurityCloudClient({
 			authStorage: authStorage(),
 			account: ACCOUNT,
+			sessionId: () => "session-a",
 			baseUrl: "https://example.test/backend-api/aardvark",
 			fetch: async () => new Response("secret backend detail", { status: 403 }),
 		});
