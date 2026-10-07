@@ -466,6 +466,11 @@ type CodexWebSocketSessionState = {
 	lastFallbackAt?: number;
 	prewarmed: boolean;
 	stats: OpenAICodexWebSocketDebugStats;
+	/**
+	 * Reason the owning provider-session state was closed. Sticky: a closed
+	 * state never opens another socket or sends another request.
+	 */
+	closedReason?: string;
 };
 
 interface CodexTurnStateCell {
@@ -473,6 +478,10 @@ interface CodexTurnStateCell {
 }
 
 interface CodexProviderSessionState extends ProviderSessionState {
+	/** Set by `close()`; a closed state is replaced, never reused, by the next request. */
+	closed: boolean;
+	/** Isolated transport states serving this state's session; closed with it. */
+	childStates: Set<CodexProviderSessionState>;
 	webSocketSessions: Map<string, CodexWebSocketSessionState>;
 	webSocketPublicToPrivate: Map<string, string>;
 	metadataSessions: Map<string, CodexMetadataSessionState>;
@@ -1051,7 +1060,12 @@ interface CodexStreamCompletion {
 	firstTokenTime?: number;
 }
 
-function createCodexProviderSessionState(): CodexProviderSessionState {
+/**
+ * Create a provider-session state. A `parent` (the shared session state an
+ * isolated compaction transport serves) closes this state when it closes;
+ * closing this state first detaches it from the parent.
+ */
+function createCodexProviderSessionState(parent?: CodexProviderSessionState): CodexProviderSessionState {
 	const state: CodexProviderSessionState = {
 		webSocketSessions: new Map(),
 		webSocketPublicToPrivate: new Map(),
@@ -1071,8 +1085,15 @@ function createCodexProviderSessionState(): CodexProviderSessionState {
 			state.metadataSessions.delete(normalizedSessionId);
 			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
 		},
+		childStates: new Set(),
+		closed: false,
 		close: () => {
+			state.closed = true;
+			parent?.childStates.delete(state);
+			// Each child detaches itself while closing; Set iteration tolerates that deletion.
+			for (const child of state.childStates) child.close();
 			for (const session of state.webSocketSessions.values()) {
+				session.closedReason ??= "session_disposed";
 				session.connection?.cancel("session_disposed");
 			}
 			state.webSocketSessions.clear();
@@ -1081,6 +1102,7 @@ function createCodexProviderSessionState(): CodexProviderSessionState {
 			state.effortControls.clear();
 		},
 	};
+	parent?.childStates.add(state);
 	return state;
 }
 
@@ -1103,7 +1125,7 @@ function getCodexProviderSessionState(
 ): CodexProviderSessionState | undefined {
 	if (!providerSessionState) return undefined;
 	const existing = providerSessionState.get(CODEX_PROVIDER_SESSION_STATE_KEY);
-	if (isCodexProviderSessionState(existing)) return existing;
+	if (isCodexProviderSessionState(existing) && !existing.closed) return existing;
 	const created = createCodexProviderSessionState();
 	providerSessionState.set(CODEX_PROVIDER_SESSION_STATE_KEY, created);
 	return created;
@@ -1475,7 +1497,7 @@ function createCodexRequestContext(
 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
 	const isolatedTransportState =
 		contextOptions.isolateCompactionTransport && options?.codexCompaction
-			? createCodexProviderSessionState()
+			? createCodexProviderSessionState(providerSessionState)
 			: undefined;
 	const transportProviderSessionState = isolatedTransportState ?? providerSessionState;
 	const responsesLite = resolveCodexResponsesLite(options?.responsesLite);
@@ -1869,6 +1891,7 @@ async function openCodexWebSocketTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	assertCodexSessionStateOpen(websocketState);
 	const steered = websocketState.acceptedSteering;
 	websocketState.acceptedSteering = undefined;
 	const canAppendBeforeRequest = websocketState.canAppend === true;
@@ -1887,6 +1910,7 @@ async function openCodexWebSocketTransport(
 		await getCodexAttestationHeader(requestContext.accountId),
 		requestContext.transformedBody,
 	);
+	assertCodexSessionStateOpen(websocketState);
 	let websocketConnection = await getOrCreateCodexWebSocketConnection(
 		websocketState,
 		requestContext.turnState,
@@ -2040,6 +2064,7 @@ async function openCodexSseTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	assertCodexSessionStateOpen(state);
 	const open = async (wireBody: RequestBody) => {
 		// Keep the 400 dump honest: record the body actually sent on the wire.
 		requestContext.rawRequestDump.body = wireBody;
@@ -3505,6 +3530,14 @@ function resetCodexWebSocketAppendState(state: CodexWebSocketSessionState): void
 	state.lastResponseItems = undefined;
 }
 
+/** Throws {@link CodexSessionClosedError} once the session closed the provider state owning `state`. */
+function assertCodexSessionStateOpen(state: CodexWebSocketSessionState | undefined): void {
+	if (state?.closedReason === undefined) return;
+	throw new CodexSessionClosedError(
+		`Codex request cancelled because the session closed its provider connection (${state.closedReason})`,
+	);
+}
+
 function recordCodexWebSocketFailure(state: CodexWebSocketSessionState, activateFallback: boolean): void {
 	resetCodexWebSocketAppendState(state);
 	// Never tear down a CONNECTING socket: it belongs to a concurrent caller's
@@ -3943,6 +3976,10 @@ class CodexWebSocketConnection {
 	#queue: Array<Record<string, unknown> | Error | null> = [];
 	#waiters: Array<() => void> = [];
 	#connectPromise?: Promise<void>;
+	/** Rejects the in-flight handshake with the session-closed error; set only while `connect()` waits. */
+	#cancelPendingConnect?: () => void;
+	/** Reason passed to {@link cancel}; once set, this connection never opens or sends again. */
+	#sessionClosedReason?: string;
 	#activeRequest = false;
 	#streamObserver?: (event: RawSseEvent) => void;
 	#heartbeatInterval: NodeJS.Timeout | undefined;
@@ -4038,27 +4075,40 @@ class CodexWebSocketConnection {
 		}
 	}
 
+	/** Throws {@link CodexSessionClosedError} once the provider-session owner cancelled this connection. */
+	assertSessionOpen(): void {
+		if (this.#sessionClosedReason !== undefined) throw this.#sessionClosedError();
+	}
+
 	/**
-	 * Close on behalf of the provider-session owner. A request streaming on this
-	 * socket ends with {@link CodexSessionClosedError} instead of the retriable
-	 * transport error the close event queues behind it.
+	 * Close on behalf of the provider-session owner. A pending handshake, a
+	 * request not yet sent, and a request streaming on this socket all end with
+	 * {@link CodexSessionClosedError} instead of a retriable or fatal transport
+	 * error; the connection refuses every later connect and request.
 	 */
 	cancel(reason: string): void {
+		this.#sessionClosedReason ??= reason;
 		if (this.#activeRequest) {
-			this.#push(
-				new CodexSessionClosedError(
-					`Codex request cancelled because the session closed its provider connection (${reason})`,
-				),
-			);
+			this.#push(this.#sessionClosedError());
 		}
+		this.#cancelPendingConnect?.();
 		this.close(reason);
 	}
 
+	#sessionClosedError(cause?: unknown): CodexSessionClosedError {
+		return new CodexSessionClosedError(
+			`Codex request cancelled because the session closed its provider connection (${this.#sessionClosedReason})`,
+			cause === undefined ? undefined : { cause },
+		);
+	}
+
 	async connect(signal?: AbortSignal): Promise<void> {
+		this.assertSessionOpen();
 		if (this.isOpen()) return;
 		if (this.#connectPromise) {
 			logger.time("codexWs:awaitSharedHandshake");
 			await this.#connectPromise;
+			this.assertSessionOpen();
 			return;
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
@@ -4085,6 +4135,12 @@ class CodexWebSocketConnection {
 				reject(new CodexWebSocketTransportError(`request was aborted`, { cause: signal?.reason }));
 			}
 			this.close("aborted");
+		};
+		this.#cancelPendingConnect = () => {
+			if (settled) return;
+			settled = true;
+			clearPending();
+			reject(this.#sessionClosedError());
 		};
 		if (signal) {
 			if (signal.aborted) {
@@ -4183,9 +4239,16 @@ class CodexWebSocketConnection {
 		logger.time("codexWs:awaitTcpHandshake");
 		try {
 			await promise;
+		} catch (error) {
+			if (this.#sessionClosedReason !== undefined && !(error instanceof CodexSessionClosedError)) {
+				throw this.#sessionClosedError(error);
+			}
+			throw error;
 		} finally {
 			this.#connectPromise = undefined;
+			this.#cancelPendingConnect = undefined;
 		}
+		this.assertSessionOpen();
 	}
 
 	async *streamRequest(
@@ -4194,6 +4257,7 @@ class CodexWebSocketConnection {
 		signal?: AbortSignal,
 		onSseEvent?: (event: RawSseEvent) => void,
 	): AsyncGenerator<Record<string, unknown>> {
+		this.assertSessionOpen();
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 		}
@@ -4244,6 +4308,8 @@ class CodexWebSocketConnection {
 				this.#debugResponseLog = debugSession
 					? await debugSession.openResponseLog("WebSocket 101 Switching Protocols", this.#handshakeHeaders)
 					: undefined;
+				// The session may have closed during the debug-session awaits above.
+				this.assertSessionOpen();
 
 				const requestPayload = JSON.stringify(request);
 				notifyCodexWebSocketOutbound(onSseEvent, request, requestPayload);
@@ -4675,6 +4741,7 @@ async function getOrCreateCodexWebSocketConnection(
 	provider: string,
 	signal?: AbortSignal,
 ): Promise<CodexWebSocketConnection> {
+	assertCodexSessionStateOpen(state);
 	const proxy = getProxyForUrl(provider, new URL(url));
 	const headerRecord = headersToRecord(headers);
 	// Join an in-flight handshake instead of tearing it down: closing a
@@ -4688,11 +4755,15 @@ async function getOrCreateCodexWebSocketConnection(
 		if (!pending || pending.isOpen() || !pending.isConnecting()) break;
 		try {
 			await pending.connect(signal);
-		} catch {
+		} catch (error) {
+			if (error instanceof CodexSessionClosedError) throw error;
 			// The handshake owner surfaces its own failure; re-evaluate below
 			// (state.connection may have been replaced or cleared).
 		}
 	}
+	// A closed state was discarded by the session; it never opens a socket.
+	assertCodexSessionStateOpen(state);
+	state.connection?.assertSessionOpen();
 	if (state.connection?.isOpen()) {
 		if (!state.connection.matchesAuth(headerRecord)) {
 			state.connection.close("token-refresh");
@@ -4756,6 +4827,7 @@ async function openCodexSseEventStream(
 		await getCodexAttestationHeader(accountId),
 		body,
 	);
+	assertCodexSessionStateOpen(state);
 	// `wrapCodexSseStream` arms the iterator-level idle watchdog only after this
 	// fetch resolves. Each transport attempt needs its own pre-response timer:
 	// the retry loop's base signal remains reserved for caller cancellation, so

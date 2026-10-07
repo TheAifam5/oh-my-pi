@@ -1,18 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { completeSimple, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import {
 	buildTransformedCodexRequestBody,
 	createOpenAICodexCompatibilityMetadata,
 	getOpenAICodexTransportDetails,
 	getOpenAICodexWebSocketDebugStats,
+	type OpenAICodexTransportDetails,
 	openCodexCompactionEventStream,
 	prewarmOpenAICodexResponses,
 	resetOpenAICodexHistoryAfterCompaction,
 	streamOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
+	AssistantMessage,
 	CodexCompactionRequestContext,
 	Context,
 	FetchImpl,
@@ -21,6 +24,7 @@ import type {
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
+import * as requestDebug from "@oh-my-pi/pi-ai/utils/request-debug";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -6202,6 +6206,336 @@ describe("openai-codex streaming", () => {
 		// The coding-agent retries bare abort sentinels as reasonless aborts.
 		expect(result.errorMessage).not.toMatch(/^(?:Request was aborted|The operation was aborted)\.?$/);
 	});
+
+	describe("session closes its provider state before the request streams", () => {
+		type CloseWindow = "attestation" | "connecting" | "before-stream" | "request-debug";
+
+		/**
+		 * Run one request that the session closes in `window`, then a follow-up on
+		 * the same provider state; the follow-up must still use websockets.
+		 */
+		async function runSessionCloseRace(window: CloseWindow): Promise<{
+			result: AssistantMessage;
+			socketsBeforeFollowUp: number;
+			followUp: AssistantMessage;
+			socketsAfterFollowUp: number;
+			fetchCalls: number;
+			details: OpenAICodexTransportDetails;
+		}> {
+			const tempDir = TempDir.createSync("@pi-codex-stream-");
+			setAgentDir(tempDir.path());
+			const token = createCodexTestToken();
+			const fetchMock = vi.fn(async () => {
+				throw new Error("SSE must not run when the session closed its provider state");
+			});
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const closeSession = () => {
+				for (const state of providerSessionState.values()) state.close();
+			};
+
+			let constructorCount = 0;
+			let closeOnConstruct = window === "connecting";
+			class SessionCloseRaceWebSocket extends MockWebSocket {
+				constructor(url: string, options?: { headers?: WsHeaders }) {
+					super(url, options);
+					constructorCount += 1;
+					if (closeOnConstruct) {
+						closeOnConstruct = false;
+						// The handshake is still pending when the session closes.
+						setTimeout(closeSession, 0);
+						return;
+					}
+					this.scheduleOpen();
+				}
+
+				override send(): void {
+					this.emitCodexResponse({ messageId: "msg_follow_up", responseId: "resp_follow_up", text: "Hello" });
+				}
+
+				override close(): void {
+					const wasLive = this.readyState === MockWebSocket.OPEN || this.readyState === MockWebSocket.CONNECTING;
+					super.close();
+					if (wasLive) this.emit("close", { code: 1000 } as unknown as Event);
+				}
+			}
+			global.WebSocket = SessionCloseRaceWebSocket as unknown as typeof WebSocket;
+
+			if (window === "request-debug") {
+				vi.spyOn(requestDebug, "isRequestDebugEnabled").mockReturnValue(true);
+				vi.spyOn(requestDebug, "createRequestDebugSession").mockImplementation(async () => {
+					closeSession();
+					return {
+						id: 1,
+						requestPath: "unused.json",
+						responsePath: "unused.res.log",
+						openResponseLog: async () => ({ write: () => {}, close: async () => {} }),
+						wrapResponse: async response => response,
+					};
+				});
+			}
+
+			if (window === "attestation") {
+				// The session closes the brand-new state before any connection exists.
+				setCodexAttestationProvider(async () => {
+					closeSession();
+					return undefined;
+				});
+			}
+
+			const model = createCodexTestModel("https://chatgpt.com/backend-api");
+			const sessionId = `ws-session-close-${window}`;
+			let result: AssistantMessage;
+			try {
+				result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+					fetch: fetchMock as FetchImpl,
+					apiKey: token,
+					sessionId,
+					providerSessionState,
+					onPayload:
+						window === "before-stream"
+							? payload => {
+									// The socket is open; the request has not started streaming.
+									closeSession();
+									return payload;
+								}
+							: undefined,
+				}).result();
+			} finally {
+				setCodexAttestationProvider(undefined);
+			}
+			const socketsBeforeFollowUp = constructorCount;
+
+			vi.restoreAllMocks();
+			vi.spyOn(piUtils, "getInstallId").mockReturnValue(TEST_INSTALLATION_ID);
+			const followUp = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+				fetch: fetchMock as FetchImpl,
+				apiKey: token,
+				sessionId,
+				providerSessionState,
+			}).result();
+
+			return {
+				result,
+				socketsBeforeFollowUp,
+				followUp,
+				socketsAfterFollowUp: constructorCount,
+				fetchCalls: fetchMock.mock.calls.length,
+				details: getOpenAICodexTransportDetails(model, { sessionId, providerSessionState }),
+			};
+		}
+
+		for (const window of ["attestation", "connecting", "before-stream", "request-debug"] as const) {
+			it(`ends the request as a non-retriable abort without disabling websockets (${window})`, async () => {
+				const run = await runSessionCloseRace(window);
+				// A state closed before its first connection never opens a socket.
+				const requestSockets = window === "attestation" ? 0 : 1;
+
+				expect(run.result.stopReason).toBe("error");
+				expect(AIError.is(run.result.errorId, AIError.Flag.Abort)).toBe(true);
+				expect(AIError.retriable(run.result.errorId)).toBe(false);
+				expect(run.result.errorMessage).toContain("session closed its provider connection");
+				expect(run.socketsBeforeFollowUp).toBe(requestSockets);
+				expect(run.fetchCalls).toBe(0);
+
+				expect(run.followUp.stopReason).toBe("stop");
+				expect(run.socketsAfterFollowUp).toBe(requestSockets + 1);
+				expect(run.details.websocketDisabled).toBe(false);
+				expect(run.details.lastTransport).toBe("websocket");
+				expect(run.details.fallbackCount).toBe(0);
+			});
+		}
+	});
+
+	it("keeps internal socket closes retriable and the state reusable", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE must not run for a retriable websocket close");
+		});
+
+		const sockets: InternalCloseWebSocket[] = [];
+		let abortOnSend: AbortController | undefined;
+		class InternalCloseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				sockets.push(this);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				if (sockets.length === 1) {
+					// The server drops the first socket mid-request; the replay replaces
+					// the dead connection through `close("reconnect")`.
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1006 } as unknown as Event);
+					return;
+				}
+				if (abortOnSend) {
+					// The caller cancels mid-request; the connection closes with `close("aborted")`.
+					const controller = abortOnSend;
+					abortOnSend = undefined;
+					setTimeout(() => controller.abort(), 0);
+					return;
+				}
+				const responseId = `resp_internal_${sockets.length}`;
+				this.emitCodexResponse({ messageId: `msg_internal_${sockets.length}`, responseId, text: "Hello" });
+			}
+		}
+		global.WebSocket = InternalCloseWebSocket as unknown as typeof WebSocket;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-internal-close-session",
+			providerSessionState,
+		};
+		const replayed = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(replayed.stopReason).toBe("stop");
+		expect(sockets).toHaveLength(2);
+
+		// A socket silent past the reuse window is replaced through `close("stale-reuse")`.
+		setSystemTime(new Date(Date.now() + 120_000));
+		let reused: AssistantMessage;
+		try {
+			reused = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		} finally {
+			setSystemTime();
+		}
+		expect(reused.stopReason).toBe("stop");
+		expect(sockets).toHaveLength(3);
+
+		// A caller abort closes the socket but leaves the state usable for the next request.
+		abortOnSend = new AbortController();
+		const aborted = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			...options,
+			signal: abortOnSend.signal,
+		}).result();
+		expect(aborted.stopReason).toBe("aborted");
+		const afterAbort = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(afterAbort.stopReason).toBe("stop");
+		expect(sockets).toHaveLength(4);
+		expect(fetchMock).not.toHaveBeenCalled();
+		const details = getOpenAICodexTransportDetails(model, { sessionId: options.sessionId, providerSessionState });
+		expect(details.websocketDisabled).toBe(false);
+		expect(details.lastTransport).toBe("websocket");
+	});
+
+	it("ends a caller joining an in-flight handshake with the session-closed abort", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE must not run after the session closed its provider state");
+		});
+
+		let constructorCount = 0;
+		class PendingHandshakeWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+			}
+
+			override close(): void {
+				const wasPending = this.readyState === MockWebSocket.CONNECTING;
+				super.close();
+				if (wasPending) this.emit("close", { code: 1000 } as unknown as Event);
+			}
+		}
+		global.WebSocket = PendingHandshakeWebSocket as unknown as typeof WebSocket;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		// Prewarm and the request share one handshake; whichever arrives second joins it.
+		const prewarm = prewarmOpenAICodexResponses(model, {
+			apiKey: token,
+			sessionId: "ws-join-close-session",
+			providerSessionState,
+		}).catch((error: unknown) => error);
+		const streamResult = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-join-close-session",
+			providerSessionState,
+		}).result();
+		await Bun.sleep(5);
+		for (const state of providerSessionState.values()) state.close();
+
+		const prewarmError = await prewarm;
+		const result = await streamResult;
+		expect(prewarmError).toBeInstanceOf(AIError.AbortError);
+		expect(result.stopReason).toBe("error");
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.retriable(result.errorId)).toBe(false);
+		expect(constructorCount).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	for (const closeDuringCompaction of [true, false]) {
+		it(`${closeDuringCompaction ? "aborts" : "completes"} an isolated compaction request when the session ${closeDuringCompaction ? "closes" : "stays open"}`, async () => {
+			const tempDir = TempDir.createSync("@pi-codex-stream-");
+			setAgentDir(tempDir.path());
+			const token = createCodexTestToken();
+			const fetchMock = vi.fn(async () => {
+				throw new Error("SSE fallback must not run for an isolated compaction");
+			});
+			const providerSessionState = new Map<string, ProviderSessionState>();
+
+			let constructorCount = 0;
+			class CompactionWebSocket extends MockWebSocket {
+				constructor(url: string, options?: { headers?: WsHeaders }) {
+					super(url, options);
+					constructorCount += 1;
+					this.scheduleOpen();
+				}
+
+				override send(): void {
+					if (closeDuringCompaction) {
+						for (const state of providerSessionState.values()) state.close();
+					}
+					setTimeout(() => {
+						if (this.readyState !== MockWebSocket.OPEN) return;
+						this.emitCodexResponse({ messageId: "msg_compact", responseId: "resp_compact", text: "Summary" });
+					}, 10);
+				}
+
+				override close(): void {
+					const wasLive = this.readyState === MockWebSocket.OPEN;
+					super.close();
+					if (wasLive) this.emit("close", { code: 1000 } as unknown as Event);
+				}
+			}
+			global.WebSocket = CompactionWebSocket as unknown as typeof WebSocket;
+
+			const model = createCodexTestModel("https://chatgpt.com/backend-api");
+			const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+				fetch: fetchMock as FetchImpl,
+				apiKey: token,
+				sessionId: "ws-isolated-compaction-session",
+				providerSessionState,
+				codexCompaction: {
+					operationId: "isolated-compaction",
+					trigger: "auto",
+					reason: "context_limit",
+					implementation: "responses",
+					phase: "pre_turn",
+					strategy: "memento",
+				},
+			}).result();
+
+			expect(constructorCount).toBe(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+			if (closeDuringCompaction) {
+				expect(result.stopReason).toBe("error");
+				expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+				expect(AIError.retriable(result.errorId)).toBe(false);
+			} else {
+				expect(result.stopReason).toBe("stop");
+			}
+		});
+	}
 
 	it("surfaces a connection-limit error instead of replaying a delivered tool call over SSE", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
