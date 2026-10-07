@@ -121,12 +121,15 @@ export interface MemoryBackend {
 	 * Markdown injected as the system-prompt append section.
 	 * Returned on every prompt rebuild via `refreshBaseSystemPrompt()`.
 	 * `cwd` is the session's project directory and selects project-scoped memory.
+	 * `xdevMountedNames` is the `xd://` mount set the prompt renders tool
+	 * references against; omitted, the session's mounted devices are used.
 	 */
 	buildDeveloperInstructions(
 		agentDir: string,
 		cwd: string,
 		settings: Settings,
 		session?: AgentSession,
+		xdevMountedNames?: ReadonlySet<string>,
 	): Promise<string | undefined>;
 
 	/** Wipe all persisted state for this backend (slash `/memory clear`). */
