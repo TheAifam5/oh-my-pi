@@ -8,6 +8,7 @@ import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-model
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { COPILOT_API_HEADERS } from "@oh-my-pi/pi-catalog/wire/github-copilot";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { cfgExtendedContext } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -200,6 +201,76 @@ describe("ModelRegistry refresh with credential-scoped discovery", () => {
 			expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
 
 			await registry.refresh("online-if-uncached");
+			expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
+		});
+
+		test.each([
+			["credential removed, no models.yml", "credential", false],
+			["credential removed, unchanged models.yml", "credential", true],
+			["provider disabled, unchanged models.yml", "disabled", true],
+		] as const)(
+			"drops a credential-scoped discovered slice that a full refresh does not re-discover (%s)",
+			async (_label, cause, withConfig) => {
+				if (withConfig) await Bun.write(tempDir.join("models.yml"), JSON.stringify({ providers: {} }));
+				const registry = await createHydratedRegistry();
+
+				if (cause === "credential") authStorage.keys.removeRuntime("github-copilot");
+				else cfgDisabledProviders.set(settings, ["github-copilot"]);
+				await registry.refresh("offline");
+
+				const copilotIds = providerModelIds(registry, "github-copilot");
+				expect(copilotIds).not.toContain(COPILOT_SERVED_ID);
+				expect(copilotIds).not.toContain(COPILOT_WINDOWED_ID);
+				expect(copilotIds).toContain("claude-fable-5");
+			},
+		);
+
+		test("keeps a credentialed provider's discovered slice visible while a full refresh re-discovers", async () => {
+			await Bun.write(tempDir.join("models.yml"), JSON.stringify({ providers: {} }));
+			const discoveryGate = Promise.withResolvers<void>();
+			const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), {
+				// Holds the synthetic catalog fetch, so the whole re-discovery stays pending.
+				fetch: async input => {
+					await discoveryGate.promise;
+					return syntheticModelsFetch()(input);
+				},
+				settings,
+			});
+			await registry.hydrateCredentialScopedModelCaches();
+			const copilotIds = providerModelIds(registry, "github-copilot");
+			expect(copilotIds).toContain(COPILOT_SERVED_ID);
+
+			const refresh = registry.refresh("online-if-uncached");
+			try {
+				await Bun.sleep(20);
+				expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
+			} finally {
+				discoveryGate.resolve();
+				await refresh;
+			}
+			expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
+			expect(providerModelIds(registry, "synthetic")).toEqual([SYNTHETIC_SERVED_ID]);
+		});
+
+		test("reapplying model policies with an unchanged models config rebuilds policy fields and keeps discovered models", async () => {
+			await Bun.write(tempDir.join("models.yml"), JSON.stringify({ providers: {} }));
+			const registry = await createHydratedRegistry();
+			const copilotIds = providerModelIds(registry, "github-copilot");
+			// A static catalog model is rebuilt only by the static reload, not by re-discovery.
+			const staticWindow = () => registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow;
+			expect(registry.find("github-copilot", COPILOT_WINDOWED_ID)?.contextWindow).toBe(272_000);
+			expect(staticWindow()).toBe(272_000);
+
+			cfgExtendedContext.set(settings, true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("github-copilot", COPILOT_WINDOWED_ID)?.contextWindow).toBe(1_050_000);
+			expect(staticWindow()).toBe(1_000_000);
+			expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
+
+			cfgExtendedContext.set(settings, false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("github-copilot", COPILOT_WINDOWED_ID)?.contextWindow).toBe(272_000);
+			expect(staticWindow()).toBe(272_000);
 			expect(providerModelIds(registry, "github-copilot")).toEqual(copilotIds);
 		});
 

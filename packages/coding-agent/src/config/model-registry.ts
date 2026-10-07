@@ -499,9 +499,13 @@ export class ModelRegistry {
 		}
 		// A provider-scoped refresh re-discovers only `providerId`; other providers'
 		// discovered slices (credential-scoped built-ins have no other restore path)
-		// must survive the static rebuild. A full refresh re-discovers every provider
-		// and must rebuild them under the current model policies.
-		this.#reloadStaticModels(providerId ? { preserveRuntimeDiscovery: true } : undefined);
+		// must survive the static rebuild. A full refresh rebuilds the static layer
+		// under the current model policies past the models config mtime gate and
+		// keeps the discovered slices visible while re-discovery runs;
+		// {@link refresh} then drops the slices re-discovery did not replace.
+		this.#reloadStaticModels(
+			providerId ? { preserveRuntimeDiscovery: true } : { force: true, preserveRuntimeDiscovery: true },
+		);
 	}
 
 	#installProviderApiKey(provider: string, keyConfig: string, options?: { fallback?: boolean }): void {
@@ -563,7 +567,31 @@ export class ModelRegistry {
 		// as a background reconcile, and must not spawn `!command` helpers.
 		this.#reloadStaticModelsForRefresh(options);
 		this.#suppressedSelectors.clear();
-		await this.#refreshRuntimeDiscoveries(strategy);
+		const rediscovered = new Set<string>();
+		await this.#refreshRuntimeDiscoveries(strategy, undefined, rediscovered);
+		this.#dropStaleDiscoveredSlices(rediscovered);
+	}
+
+	/**
+	 * After a full re-discovery, drop every discovered slice whose provider was
+	 * not re-discovered (credential removed, provider disabled, or discovery
+	 * yielding nothing) and restore that provider's static models.
+	 */
+	#dropStaleDiscoveredSlices(rediscovered: ReadonlySet<string>): void {
+		const stale = new Set<string>();
+		for (const model of this.#runtimeDiscoveredModels) {
+			if (!rediscovered.has(model.provider)) stale.add(model.provider);
+		}
+		for (const provider of this.#runtimeAuthoritativeProviders) {
+			if (!rediscovered.has(provider)) stale.add(provider);
+		}
+		if (stale.size === 0) return;
+		this.#runtimeDiscoveredModels = this.#runtimeDiscoveredModels.filter(model => !stale.has(model.provider));
+		for (const provider of stale) {
+			this.#runtimeAuthoritativeProviders.delete(provider);
+			this.#providerDiscoveryStates.delete(provider);
+		}
+		this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
 	}
 
 	/**
@@ -596,10 +624,10 @@ export class ModelRegistry {
 
 	/**
 	 * Rebuild the catalog after a policy-affecting setting change (e.g.
-	 * `extendedContext`). Forces the static reload past the models.yml mtime
-	 * gate, then restores runtime-discovered models from the SQLite cache —
-	 * offline, a settings flip must never hit the network. Concurrent calls
-	 * coalesce onto one rebuild.
+	 * `extendedContext`) through an offline full {@link refresh}: the static
+	 * layer is rebuilt under the current policies and runtime-discovered models
+	 * are re-derived from the SQLite cache — a settings flip never hits the
+	 * network. Concurrent calls coalesce onto one rebuild.
 	 */
 	reapplyModelPolicies(): Promise<void> {
 		this.#policyReapply ??= this.#runPolicyReapply();
@@ -608,7 +636,6 @@ export class ModelRegistry {
 
 	async #runPolicyReapply(): Promise<void> {
 		try {
-			this.#lastStaticLoadMtime = null;
 			await this.refresh("offline");
 		} finally {
 			this.#policyReapply = undefined;
@@ -1870,9 +1897,11 @@ export class ModelRegistry {
 		};
 	}
 
+	/** @param rediscovered - Receives every provider whose discovered slice this pass replaced. */
 	async #refreshRuntimeDiscoveries(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
+		rediscovered?: Set<string>,
 	): Promise<void> {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
@@ -1915,6 +1944,7 @@ export class ModelRegistry {
 		for (const provider of replacedConfiguredProviders) touchedProviders.add(provider);
 		for (const provider of builtInDiscovery.replaceRuntimeProviders) touchedProviders.add(provider);
 		for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
+		for (const provider of touchedProviders) rediscovered?.add(provider);
 		const referenceModels = this.#composeDiscoveryReferenceModels(touchedProviders);
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
