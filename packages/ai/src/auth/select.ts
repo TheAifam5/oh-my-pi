@@ -798,7 +798,11 @@ export class CredentialSelector {
 		return orderUsageRankedCandidates(ranked, args.planGate !== undefined);
 	}
 
-	/** The OAuth account `sessionId` drains first for `provider`: the session override, else the account policy. */
+	/**
+	 * The OAuth account `sessionId` drains first for `provider`: the session override, else the account policy.
+	 * None when the session's restriction does not allow that account, so the session never reads or writes
+	 * its drain state.
+	 */
 	#drainTarget(provider: string, sessionId: string | undefined, modelId: string | undefined): DrainTarget | undefined {
 		const override = this.#deps.affinity.drainOverride(provider, sessionId);
 		if (override === null) return undefined;
@@ -826,6 +830,7 @@ export class CredentialSelector {
 				({ index, policy } = found);
 			}
 		}
+		if (!this.#deps.affinity.allows(provider, sessionId, entries[index]!.credential)) return undefined;
 		const policyFunding = policy?.drain ? policy : undefined;
 		return {
 			index,

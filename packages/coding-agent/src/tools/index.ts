@@ -354,6 +354,12 @@ export interface ToolSession {
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get tool-state session ID (distinct from the owning session for advisors). */
 	getSessionId?: () => string | null;
+	/**
+	 * Get the provider session id the agent's requests carry, which auth-store account
+	 * restrictions are keyed on; differs from {@link getSessionId} after `/fresh` or with an
+	 * explicit `providerSessionId`.
+	 */
+	getProviderSessionId?: () => string | undefined;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */

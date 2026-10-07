@@ -1,8 +1,20 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test, vi } from "bun:test";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
+import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { createExactSecurityOAuthResolver, createSecurityAuthResolver, selectSecurityAuth } from "../../src/security";
-import type { AuthStorage } from "../../src/session/auth-storage";
+import { Settings } from "../../src/config/settings";
+import {
+	CodexSecurityCloudClient,
+	createExactSecurityOAuthResolver,
+	createSecurityAuthResolver,
+	resolveExactSecurityOAuthAccess,
+	selectSecurityAuth,
+} from "../../src/security";
+import { AuthStorage, SqliteAuthCredentialStore } from "../../src/session/auth-storage";
+import type { ToolSession } from "../../src/tools";
+import { SecurityScanTool } from "../../src/tools/security-scan";
 
 function model() {
 	const value = getBundledModel("openai-codex", "gpt-5.6-sol");
@@ -24,6 +36,97 @@ describe("exact security OAuth resolver", () => {
 		);
 		expect(selected).toEqual({ provider: "openai-codex", credentialId: 42, accountId: "workspace-b" });
 		expect(listOAuthAccounts).toHaveBeenCalledWith("openai-codex", "session-a");
+	});
+
+	test("a restricted session cannot select or resolve an account outside its pool", async () => {
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+		try {
+			const credential = (suffix: string) => ({
+				type: "oauth" as const,
+				access: `access-${suffix}`,
+				refresh: `refresh-${suffix}`,
+				expires: Date.now() + 60 * 60_000,
+				accountId: `workspace-${suffix}`,
+				email: `${suffix}@example.com`,
+			});
+			await authStorage.credentials.set("openai-codex", [credential("a"), credential("b")]);
+			const [inside, outside] = authStorage.oauth.accounts("openai-codex");
+			const insideKey = resolveCredentialIdentityKey("openai-codex", credential("a"));
+			if (!inside || !outside || !insideKey) throw new Error("expected stored accounts");
+			authStorage.sessions.restrict("openai-codex", "session-a", [insideKey]);
+
+			expect(() => selectSecurityAuth(authStorage, model(), outside.credentialId, "session-a")).toThrow(
+				`Security OAuth credential ${outside.credentialId} is not available`,
+			);
+			expect(selectSecurityAuth(authStorage, model(), undefined, "session-a")).toMatchObject({
+				credentialId: inside.credentialId,
+			});
+			let current: string | undefined = "session-a";
+			const exact = (credentialId: number) =>
+				createExactSecurityOAuthResolver({
+					authStorage,
+					account: { provider: "openai-codex", credentialId },
+					sessionId: () => current,
+				})(model()) as ApiKeyResolver;
+			const insideResolver = exact(inside.credentialId);
+			const outsideResolver = exact(outside.credentialId);
+			const request = { lastChance: false, error: undefined };
+			expect(await insideResolver(request)).toBe("access-a");
+			await expect(outsideResolver(request)).rejects.toThrow("credential is unavailable");
+			// The restriction id is read at each request, not when the resolver was built.
+			current = "unrestricted-session";
+			expect(await outsideResolver(request)).toBe("access-b");
+			// No session id never means unrestricted on these paths.
+			current = undefined;
+			await expect(insideResolver(request)).rejects.toThrow("credential is unavailable");
+			await expect(
+				resolveExactSecurityOAuthAccess(
+					authStorage,
+					{ provider: "openai-codex", credentialId: inside.credentialId },
+					{
+						forceRefresh: false,
+						sessionId: undefined,
+					},
+				),
+			).rejects.toThrow("credential is unavailable");
+
+			const fetched = vi.fn(async () => new Response("{}"));
+			const cloud = new CodexSecurityCloudClient({
+				authStorage,
+				account: { provider: "openai-codex", credentialId: outside.credentialId },
+				sessionId: () => current,
+				fetch: fetched,
+			});
+			for (const sessionId of ["session-a", undefined]) {
+				current = sessionId;
+				await expect(cloud.listAllConfigurations()).rejects.toThrow("credential is unavailable");
+			}
+			expect(fetched).not.toHaveBeenCalled();
+			// Each request reads the current restriction id.
+			current = "unrestricted-session";
+			await cloud.listAllConfigurations().catch(() => undefined);
+			expect(fetched).toHaveBeenCalled();
+			current = "session-a";
+
+			// The tool checks the provider session id the restriction is keyed on, not the session file's id.
+			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network disabled"));
+			const tool = new SecurityScanTool({
+				settings: Settings.isolated({ "security.enabled": true }),
+				authStorage,
+				getSessionId: () => "session-file",
+				getProviderSessionId: () => "session-a",
+			} as unknown as ToolSession);
+			await expect(
+				tool.execute("call", { action: "cloud_scans", credential_id: outside.credentialId }),
+			).rejects.toThrow(`Security OAuth credential ${outside.credentialId} is not available`);
+		} finally {
+			authStorage.close();
+			vi.restoreAllMocks();
+		}
 	});
 
 	test("plans provider-owned authentication for recognized Bedrock routes without OAuth", () => {
@@ -57,6 +160,7 @@ describe("exact security OAuth resolver", () => {
 			authStorage: {} as unknown as AuthStorage,
 			auth: { provider: bedrockModel.provider, api: bedrockModel.api },
 			providerResolver,
+			sessionId: () => undefined,
 		});
 		expect(resolver(bedrockModel)).toBe("provider-owned");
 		expect(() => resolver(mantleModel)).toThrow("provider mismatch");
@@ -75,6 +179,7 @@ describe("exact security OAuth resolver", () => {
 		const resolver = createExactSecurityOAuthResolver({
 			authStorage,
 			account: { provider: "openai-codex", credentialId: 42, accountId: "workspace-a" },
+			sessionId: () => "session-a",
 		});
 		const apiKey = resolver(model());
 		expect(typeof apiKey).toBe("function");
@@ -96,6 +201,7 @@ describe("exact security OAuth resolver", () => {
 		const resolver = createExactSecurityOAuthResolver({
 			authStorage,
 			account: { provider: "openai-codex", credentialId: 42, accountId: "workspace-a" },
+			sessionId: () => "session-a",
 		});
 		const wrongProviderModel = { ...model(), provider: "anthropic" } as unknown as Parameters<typeof resolver>[0];
 		expect(() => resolver(wrongProviderModel)).toThrow("provider mismatch");
@@ -135,7 +241,7 @@ describe("exact security OAuth resolver", () => {
 					}),
 				},
 			} as unknown as AuthStorage;
-			const resolver = createExactSecurityOAuthResolver({ authStorage, account });
+			const resolver = createExactSecurityOAuthResolver({ authStorage, account, sessionId: () => "session-a" });
 			const exact = resolver(model()) as ApiKeyResolver;
 			await expect(exact({ lastChance: false, error: undefined })).rejects.toThrow("identity mismatch");
 		}
@@ -155,6 +261,7 @@ describe("exact security OAuth resolver", () => {
 		const resolver = createExactSecurityOAuthResolver({
 			authStorage,
 			account: { provider: "openai-codex", credentialId: 42, accountId: "workspace-a" },
+			sessionId: () => "session-a",
 		});
 		const exact = resolver(model()) as ApiKeyResolver;
 		let caught: unknown;

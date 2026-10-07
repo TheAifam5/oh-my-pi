@@ -20,6 +20,8 @@
 - Fixed enabling or disabling a tool mid-session on Claude models forcing a full prompt-cache rewrite.
 - Fixed the system prompt naming the memory tools `recall`, `retain`, and `reflect` differently at startup than after the first refresh, which made Mnemopi and Hindsight sessions rewrite the whole prompt cache on the first settings or extension change.
 - Fixed browsing providers in the models hub reverting an already-refreshed provider such as GitHub Copilot to its bundled model list.
+- Fixed subagents restricted to an account pool reaching accounts outside the pool through security scans and Codex Security cloud commands.
+- Fixed subagents restricted to an account pool starting a saved security scan plan for an account outside the pool.
 
 ## [18.8.3] - 2026-10-07
 

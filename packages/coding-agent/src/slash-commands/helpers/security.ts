@@ -43,6 +43,7 @@ function coordinatorFor(runtime: SlashCommandRuntime) {
 		modelRegistry: runtime.session.modelRegistry,
 		activeModel: runtime.session.model,
 		sessionId: runtime.session.sessionId,
+		restrictionSessionId: () => runtime.session.sessionId,
 		agentId: runtime.session.getAgentId(),
 		asyncJobManager: runtime.session.asyncJobManager,
 	});
@@ -263,7 +264,7 @@ function parseCloudOptions(rest: string, subcommand: string): CloudCliOptions {
 function cloudClientFor(runtime: SlashCommandRuntime, credentialId?: number): CodexSecurityCloudClient {
 	const authStorage = runtime.session.modelRegistry.authStorage;
 	const account = selectSecurityOAuthAccount(authStorage, "openai-codex", credentialId, runtime.session.sessionId);
-	return new CodexSecurityCloudClient({ authStorage, account });
+	return new CodexSecurityCloudClient({ authStorage, account, sessionId: () => runtime.session.sessionId });
 }
 
 async function handleCloudCommand(runtime: SlashCommandRuntime, rest: string): Promise<void> {

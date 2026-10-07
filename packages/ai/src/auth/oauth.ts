@@ -20,6 +20,7 @@ import type {
 	OAuthAccountSummary,
 	OAuthApi,
 	OAuthCredential,
+	OAuthExactAccessOptions,
 	OAuthLoginController,
 	OAuthLoginIdentity,
 	OAuthRefreshByIdOptions,
@@ -187,8 +188,11 @@ export class OAuthAccounts implements OAuthApi {
 		};
 	}
 
-	/** Stored OAuth credentials for `provider` in stable order, paired with their full-list index and row id. */
-	#getStoredOAuthSelections(provider: string): StoredOAuthSelection[] {
+	/**
+	 * Stored OAuth credentials for `provider` in stable order, paired with their full-list index and row id;
+	 * with `sessionId`, only those the session's restriction allows.
+	 */
+	#getStoredOAuthSelections(provider: string, sessionId?: string): StoredOAuthSelection[] {
 		return this.#deps.pool
 			.entries(provider)
 			.map((entry, index) => ({
@@ -196,7 +200,10 @@ export class OAuthAccounts implements OAuthApi {
 				credential: entry.credential,
 				index,
 			}))
-			.filter((entry): entry is StoredOAuthSelection => entry.credential.type === "oauth");
+			.filter(
+				(entry): entry is StoredOAuthSelection =>
+					entry.credential.type === "oauth" && this.#deps.affinity.allows(provider, sessionId, entry.credential),
+			);
 	}
 
 	/** Refresh one stored OAuth selection and shape it as an {@link OAuthAccessResolution}. */
@@ -263,7 +270,8 @@ export class OAuthAccounts implements OAuthApi {
 	 * selector displayed by a "pick the Nth account" UI as `position + 1`.
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
-	 * `active`. No account is active before that session has resolved or pinned a
+	 * `active`, and an account the session's restriction does not allow is left
+	 * out. No account is active before that session has resolved or pinned a
 	 * credential.
 	 */
 	accounts(provider: string, sessionId?: string): OAuthAccountSummary[] {
@@ -276,7 +284,7 @@ export class OAuthAccounts implements OAuthApi {
 				? this.#deps.pool.entries(provider)[sessionCredential.index]?.id
 				: undefined;
 		const activeLastUsedAtMs = activeCredentialId !== undefined ? sessionCredential?.lastUsedAtMs : undefined;
-		return this.#getStoredOAuthSelections(provider).map((selection, position) => {
+		return this.#getStoredOAuthSelections(provider, sessionId).map((selection, position) => {
 			const active = selection.credentialId === activeCredentialId;
 			return {
 				position,
@@ -299,15 +307,16 @@ export class OAuthAccounts implements OAuthApi {
 	 * Refreshes credentials through the same broker/local path as
 	 * {@link OAuthAccounts.access}, but does not rank, round-robin, or
 	 * stop after the first usable account. Intended for diagnostics that must
-	 * exercise each stored account exactly once.
+	 * exercise each stored account exactly once. With `options.sessionId`, an
+	 * account that session's restriction does not allow is left out.
 	 */
-	async accessAll(provider: string, options?: AuthApiKeyOptions): Promise<OAuthAccessResolution[]> {
+	async accessAll(provider: string, options?: OAuthExactAccessOptions): Promise<OAuthAccessResolution[]> {
 		if (this.#deps.overrides.has(provider)) {
 			return [];
 		}
 		const providerKey = providerTypeKey(provider, "oauth");
 		return Promise.all(
-			this.#getStoredOAuthSelections(provider).map(selection =>
+			this.#getStoredOAuthSelections(provider, options?.sessionId).map(selection =>
 				this.#resolveStoredOAuthAccess(provider, selection, providerKey, options),
 			),
 		);
@@ -321,18 +330,19 @@ export class OAuthAccounts implements OAuthApi {
 	 * requested row, preserving exact-account affinity for operations whose
 	 * provenance and policy boundary are tied to one workspace.
 	 *
-	 * Returns `undefined` when the row does not exist for `provider` or an
-	 * explicit runtime/config API-key override suppresses OAuth.
+	 * Returns `undefined` when the row does not exist for `provider`, an
+	 * explicit runtime/config API-key override suppresses OAuth, or
+	 * `options.sessionId` is restricted to accounts that exclude the row.
 	 */
 	async accessById(
 		provider: string,
 		credentialId: number,
-		options?: AuthApiKeyOptions,
+		options?: OAuthExactAccessOptions,
 	): Promise<OAuthAccessResolution | undefined> {
 		if (this.#deps.overrides.has(provider)) {
 			return undefined;
 		}
-		const selection = this.#getStoredOAuthSelections(provider).find(
+		const selection = this.#getStoredOAuthSelections(provider, options?.sessionId).find(
 			candidate => candidate.credentialId === credentialId,
 		);
 		if (!selection) return undefined;

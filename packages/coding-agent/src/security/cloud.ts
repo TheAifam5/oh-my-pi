@@ -42,6 +42,11 @@ export type CodexSecurityCloudFetch = (input: string | URL | Request, init?: Req
 export interface CodexSecurityCloudClientOptions {
 	authStorage: AuthStorage;
 	account: SecurityAccountRef;
+	/**
+	 * Provider session id whose account restriction the pinned row must satisfy, read at
+	 * every request; `undefined` makes the row unavailable.
+	 */
+	sessionId: () => string | undefined;
 	baseUrl?: string;
 	fetch?: CodexSecurityCloudFetch;
 }
@@ -182,6 +187,7 @@ interface CloudRequestOptions {
 export class CodexSecurityCloudClient {
 	readonly #authStorage: AuthStorage;
 	readonly #account: SecurityAccountRef;
+	readonly #sessionId: () => string | undefined;
 	readonly #baseUrl: string;
 	readonly #fetch: CodexSecurityCloudFetch;
 
@@ -191,6 +197,7 @@ export class CodexSecurityCloudClient {
 		}
 		this.#authStorage = options.authStorage;
 		this.#account = options.account;
+		this.#sessionId = options.sessionId;
 		this.#baseUrl = (options.baseUrl ?? DEFAULT_CLOUD_BASE_URL).replace(/\/$/, "");
 		this.#fetch = options.fetch ?? fetch;
 	}
@@ -204,6 +211,7 @@ export class CodexSecurityCloudClient {
 			const access = await resolveExactSecurityOAuthAccess(this.#authStorage, this.#account, {
 				forceRefresh: attempt > 0,
 				signal: options.signal,
+				sessionId: this.#sessionId(),
 			});
 			const body = typeof options.body === "function" ? options.body(access.accessToken) : options.body;
 			const headers: Record<string, string> = {

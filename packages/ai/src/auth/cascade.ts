@@ -346,9 +346,12 @@ export class KeyCascade implements KeysApi {
 	 * probes move on to their next candidate; request paths use
 	 * {@link KeyCascade.getWithCredential}, which surfaces it.
 	 *
-	 * @throws AIError.AccountUnavailableError when a pin or preference names no
-	 * stored account, the pinned account is outside the session's restriction,
-	 * or the pinned account cannot produce a key.
+	 * A restricted session ignores a pin it cannot show inside its allowlist
+	 * (see {@link SessionAffinity.exclusivePin}) and selects inside the allowlist.
+	 *
+	 * @throws AIError.AccountUnavailableError when a pin names no stored account
+	 * (for a restricted session, only a pin recorded for an allowed account), or
+	 * the pinned account cannot produce a key.
 	 */
 	async get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		try {

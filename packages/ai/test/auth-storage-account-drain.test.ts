@@ -377,6 +377,42 @@ describe("AuthStorage account drain", () => {
 		}
 	});
 
+	test("a restricted session never touches the drain state of an account outside its allowlist", async () => {
+		const plain = "unit-drain-restricted";
+		const db = new Database(":memory:");
+		const unranked = new AuthStorage(new SqliteAuthCredentialStore(db), {
+			accountPolicies: [{ provider: plain, account: { accountId: "acc-c" }, drain: true }],
+		});
+		try {
+			await unranked.credentials.set(plain, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+			const target = unranked.sessions.accounts(plain).find(account => account.accountId === "acc-c");
+			unranked.blocks.upsert({
+				credentialId: target?.credentialId ?? -1,
+				providerKey: `${plain}:oauth`,
+				blockScope: "",
+				blockedUntilMs: Date.now() + 2 * MINUTE,
+			});
+			unranked.sessions.restrict(plain, SESSION, ["account:acc-a", "account:acc-b"]);
+			// A restricted session cannot set an override naming the outside account.
+			expect(unranked.sessions.drain(plain, SESSION, target?.credentialId ?? -1)).toBe(false);
+			// One inherited from an unrestricted parent still leaves its drain state alone.
+			expect(unranked.sessions.drain(plain, "parent", target?.credentialId ?? -1)).toBe(true);
+			unranked.sessions.inherit("parent", "overridden");
+			unranked.sessions.restrict(plain, "overridden", ["account:acc-a", "account:acc-b"]);
+
+			for (const sessionId of [SESSION, "overridden"]) {
+				expect(["access-a", "access-b"]).toContain((await unranked.keys.get(plain, sessionId)) ?? "");
+			}
+			expect(db.query("SELECT key FROM cache WHERE key LIKE 'drain:state:%'").all()).toEqual([]);
+
+			// An unrestricted session drains the blocked target as before.
+			expect(["access-a", "access-b"]).toContain((await unranked.keys.get(plain, "unrestricted")) ?? "");
+			expect(db.query("SELECT key FROM cache WHERE key LIKE 'drain:state:%'").all()).toHaveLength(1);
+		} finally {
+			unranked.close();
+		}
+	});
+
 	test("pool account order runs after the member account and before the drain target; unknown names are skipped", async () => {
 		const warn = vi.spyOn(logger, "warn");
 		used.set("acc-a", 0.2);

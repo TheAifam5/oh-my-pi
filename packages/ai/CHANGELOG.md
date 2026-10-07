@@ -5,6 +5,8 @@
 ### Fixed
 
 - Fixed switching models during a streaming Codex turn retrying the cancelled request and falling back to another model instead of keeping the selected one.
+- Fixed `oauth.accounts` listing accounts outside a session's account restriction; `oauth.accessById` and `oauth.accessAll` accept a `sessionId` option that applies it.
+- Fixed sessions restricted to an account pool changing the shared drain state of an account outside their pool.
 
 ## [18.8.3] - 2026-10-07
 

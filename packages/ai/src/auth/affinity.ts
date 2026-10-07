@@ -63,8 +63,75 @@ type SessionRestriction = { readonly allowed: ReadonlySet<string>; readonly leas
  */
 export type SessionRestrictions = Map<string, Map<string, SessionRestriction>>;
 
-/** An exclusive session pin: the pinned row id, or `null` for an account no longer stored. */
-type SessionPin = { provider: string; sessionId: string; credentialId: number | null };
+/** An exclusive session pin of one session and provider. */
+type SessionPin = {
+	/** The pinned row id, or `null` for an account no longer stored. */
+	credentialId: number | null;
+	/**
+	 * {@link identityHash} of the pinned account's OAuth identity key, when known. A
+	 * restricted session fails closed on a pin whose account is gone only when an
+	 * allowed key has this hash; otherwise the pin cannot be shown to be inside
+	 * its allowlist and is ignored.
+	 */
+	identityHash?: string;
+	/**
+	 * Set on a copy {@link SessionAffinity.forgetInherited} may drop once persisted:
+	 * one {@link SessionAffinity.inherit} wrote, or one read back from the store.
+	 */
+	releasable?: true;
+	/** False when writing the persisted row failed, so this in-memory copy is the only one. */
+	persisted: boolean;
+};
+
+/** A session drain override: a row id, or `null` for no drain target. */
+type DrainOverride = { credentialId: number | null; releasable?: true; persisted: boolean };
+
+/**
+ * One-way digest of an OAuth identity key, so persisted pin rows never hold an
+ * email or account id. Pins persisted with a plaintext `identityKey` field read
+ * as identity unknown.
+ */
+export function identityHash(identityKey: string): string {
+	return Bun.SHA256.hash(identityKey, "hex");
+}
+
+/** Value of `sessionId`/`provider` in a session-keyed map of provider maps. */
+function nestedGet<V>(map: Map<string, Map<string, V>>, sessionId: string, provider: string): V | undefined {
+	return map.get(sessionId)?.get(provider);
+}
+
+/** Set (or with `undefined`, delete) the value of `sessionId`/`provider`, dropping an emptied session map. */
+function nestedSet<V>(
+	map: Map<string, Map<string, V>>,
+	sessionId: string,
+	provider: string,
+	value: V | undefined,
+): void {
+	let providers = map.get(sessionId);
+	if (value === undefined) {
+		providers?.delete(provider);
+		if (providers?.size === 0) map.delete(sessionId);
+		return;
+	}
+	if (!providers) {
+		providers = new Map();
+		map.set(sessionId, providers);
+	}
+	providers.set(provider, value);
+}
+
+/** Drop the releasable, persisted entries of `sessionId`, keeping its own and any whose row failed to persist. */
+function dropReleasable<V extends { releasable?: true; persisted: boolean }>(
+	map: Map<string, Map<string, V>>,
+	sessionId: string,
+): void {
+	const providers = map.get(sessionId);
+	if (!providers) return;
+	for (const [provider, value] of providers) {
+		if (value.releasable && value.persisted) providers.delete(provider);
+	}
+	if (providers.size === 0) map.delete(sessionId);
+}
 
 /** Whether two stored credentials are the same account: same API key, or same OAuth identity and scope. */
 function sameAccount(left: AuthCredential, right: AuthCredential): boolean {
@@ -90,17 +157,17 @@ export class SessionAffinity implements SessionsApi {
 	/** Persisted sticky rows per provider, keyed by session id, so unchanged re-records skip the write. */
 	#persistedSticky: Map<string, LRUCache<string, PersistedSticky>> = new Map();
 	/**
-	 * Exclusive session pins by cache key: the pinned row id, or `null` for an account no longer stored.
-	 * Not LRU-bounded: entries exist only for explicitly pinned sessions, and this map is the only copy
-	 * {@link adoptPins} carries across a store swap and the only copy when the pin row failed to persist,
-	 * so evicting one would let a pinned session route to a different account.
+	 * Exclusive session pins by session id, then provider.
+	 * Not LRU-bounded: entries exist only for pinned sessions, and an entry whose row failed to persist
+	 * is the only copy, so evicting one would let a pinned session route to a different account. Copies
+	 * {@link inherit} wrote leave memory through {@link forgetInherited} when the session ends.
 	 */
-	#exclusivePins: Map<string, SessionPin> = new Map();
+	#exclusivePins: Map<string, Map<string, SessionPin>> = new Map();
 	#pinSource: AccountPinSource | undefined;
 	/** `provider\0sessionId` whose pin a restriction overrode and was already logged; one bounded LRU. */
 	#restrictedPinWarnings = new LRUCache<string, true>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
-	/** Session drain overrides by `provider\0sessionId`, persisted in the store cache: the drained row id, or `null` for no drain target. */
-	#drainOverrides: Map<string, number | null> = new Map();
+	/** Session drain overrides by session id, then provider, persisted in the store cache. */
+	#drainOverrides: Map<string, Map<string, DrainOverride>> = new Map();
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
@@ -161,6 +228,19 @@ export class SessionAffinity implements SessionsApi {
 		return credential !== undefined && this.allows(provider, sessionId, credential);
 	}
 
+	admits(provider: string, sessionId: string | undefined, credentialId: number): boolean {
+		const credential = this.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
+		return credential !== undefined && this.allows(provider, sessionId, credential);
+	}
+
+	/** Whether an identity key in the allowlist of the restricted `sessionId` has the digest `hash`. */
+	#allowsIdentity(provider: string, sessionId: string, hash: string | undefined): boolean {
+		const allowed = this.#restrictions.get(provider)?.get(sessionId)?.allowed;
+		if (hash === undefined || allowed === undefined) return false;
+		for (const identityKey of allowed) if (identityHash(identityKey) === hash) return true;
+		return false;
+	}
+
 	/** Bounded per-provider session map, created on first use. */
 	static #sessionsFor<V>(maps: Map<string, LRUCache<string, V>>, provider: string): LRUCache<string, V> {
 		let sessions = maps.get(provider);
@@ -176,83 +256,137 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
-	 * Take over the pin source, the live exclusive pins, and the session drain
+	 * Take over the pin source, the exclusive pins, and the session drain
 	 * overrides of the affinity this one replaces (credential store swap). Row
 	 * ids are store-specific, so each moves to the stored credential with the
 	 * same identity (OAuth account or API key fingerprint); a pin with no such
 	 * credential fails closed, a drain override falls back to the account policy.
+	 *
+	 * The persisted pins and overrides of every session this process holds
+	 * state for are read from the previous store first, so one another process
+	 * wrote and this process never read carries over too. The rows of a session
+	 * this process holds nothing for stay behind: the store cannot list them.
 	 */
 	adoptPins(previous: SessionAffinity): void {
 		this.#pinSource = previous.#pinSource;
-		for (const pin of previous.#exclusivePins.values()) {
-			const credential =
-				pin.credentialId === null
-					? undefined
-					: previous.#pool.entries(pin.provider).find(entry => entry.id === pin.credentialId)?.credential;
-			const match = credential
-				? this.#pool.entries(pin.provider).find(entry => sameAccount(entry.credential, credential))
-				: undefined;
-			this.#writeSessionPin(pin.provider, pin.sessionId, match?.id ?? null);
-		}
-		for (const [key, credentialId] of previous.#drainOverrides) {
-			const [provider = "", sessionId = ""] = key.split("\0");
-			if (credentialId === null) {
-				this.#writeDrainOverride(provider, sessionId, null);
-				continue;
+		const providers = previous.#pool.providers();
+		for (const sessionId of previous.#knownSessionIds()) {
+			for (const provider of providers) {
+				previous.#sessionPin(provider, sessionId);
+				previous.drainOverride(provider, sessionId);
 			}
-			const credential = previous.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
-			const match = credential
-				? this.#pool.entries(provider).find(entry => sameAccount(entry.credential, credential))
-				: undefined;
-			// A drain target missing from the new store falls back to the account policy.
-			this.#writeDrainOverride(provider, sessionId, match?.id);
 		}
+		for (const [sessionId, pins] of previous.#exclusivePins) {
+			for (const [provider, pin] of pins) {
+				const credential =
+					pin.credentialId === null
+						? undefined
+						: previous.#pool.entries(provider).find(entry => entry.id === pin.credentialId)?.credential;
+				const match = credential
+					? this.#pool.entries(provider).find(entry => sameAccount(entry.credential, credential))
+					: undefined;
+				this.#writeSessionPin(provider, sessionId, {
+					credentialId: match?.id ?? null,
+					identityHash: pin.identityHash,
+					releasable: pin.releasable,
+				});
+			}
+		}
+		for (const [sessionId, overrides] of previous.#drainOverrides) {
+			for (const [provider, override] of overrides) {
+				if (override.credentialId === null) {
+					this.#writeDrainOverride(provider, sessionId, null, override.releasable);
+					continue;
+				}
+				const credentialId = override.credentialId;
+				const credential = previous.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
+				const match = credential
+					? this.#pool.entries(provider).find(entry => sameAccount(entry.credential, credential))
+					: undefined;
+				// A drain target missing from the new store falls back to the account policy.
+				this.#writeDrainOverride(provider, sessionId, match?.id, override.releasable);
+			}
+		}
+	}
+
+	/** Session ids this affinity holds a pin, override, sticky, or restriction for. */
+	#knownSessionIds(): Set<string> {
+		const sessionIds = new Set([...this.#exclusivePins.keys(), ...this.#drainOverrides.keys()]);
+		for (const sessions of this.#sessionLastCredential.values()) {
+			for (const sessionId of sessions.keys()) sessionIds.add(sessionId);
+		}
+		for (const sessions of this.#restrictions.values()) {
+			for (const sessionId of sessions.keys()) sessionIds.add(sessionId);
+		}
+		return sessionIds;
 	}
 
 	#pinKey(provider: string, sessionId: string): string {
 		return `${SESSION_PIN_CACHE_PREFIX}${provider}:${sessionId}`;
 	}
 
-	/** The session pin's row id, `null` for a pinned account no longer stored, `undefined` without a pin. */
-	#sessionPin(provider: string, sessionId: string): number | null | undefined {
-		const key = this.#pinKey(provider, sessionId);
-		const live = this.#exclusivePins.get(key);
-		if (live) return live.credentialId;
+	/** The session's exclusive pin for `provider`, or `undefined` without one. */
+	#sessionPin(provider: string, sessionId: string): SessionPin | undefined {
+		const live = nestedGet(this.#exclusivePins, sessionId, provider);
+		if (live) return live;
 		try {
-			const raw = this.#store.getCache(key);
+			const raw = this.#store.getCache(this.#pinKey(provider, sessionId));
 			if (!raw) return undefined;
-			const value = JSON.parse(raw) as { credentialId?: unknown };
-			const credentialId = typeof value.credentialId === "number" ? value.credentialId : null;
-			this.#exclusivePins.set(key, { provider, sessionId, credentialId });
-			return credentialId;
+			const value = JSON.parse(raw) as { credentialId?: unknown; identityHash?: unknown };
+			const pin: SessionPin = {
+				credentialId: typeof value.credentialId === "number" ? value.credentialId : null,
+				...(typeof value.identityHash === "string" ? { identityHash: value.identityHash } : {}),
+				// The row stays authoritative, so this copy is released like an inherited one.
+				releasable: true,
+				persisted: true,
+			};
+			nestedSet(this.#exclusivePins, sessionId, provider, pin);
+			return pin;
 		} catch (err) {
 			logger.debug("Failed to read exclusive session pin from persistent store cache", { err });
 			return undefined;
 		}
 	}
 
-	#writeSessionPin(provider: string, sessionId: string, credentialId: number | null | undefined): void {
+	#writeSessionPin(provider: string, sessionId: string, pin: Omit<SessionPin, "persisted"> | undefined): void {
 		const key = this.#pinKey(provider, sessionId);
-		if (credentialId === undefined) this.#exclusivePins.delete(key);
-		else this.#exclusivePins.set(key, { provider, sessionId, credentialId });
+		let persisted = false;
 		try {
-			if (credentialId === undefined) this.#store.setCache(key, "", 0);
+			if (pin === undefined) this.#store.setCache(key, "", 0);
 			else
 				this.#store.setCache(
 					key,
-					JSON.stringify({ credentialId }),
+					JSON.stringify({
+						credentialId: pin.credentialId,
+						...(pin.identityHash !== undefined ? { identityHash: pin.identityHash } : {}),
+					}),
 					Math.floor(Date.now() / 1000) + SESSION_STICKY_TTL_SEC,
 				);
+			persisted = true;
 		} catch (err) {
 			logger.debug("Failed to write exclusive session pin to persistent store cache", { err });
 		}
+		nestedSet(
+			this.#exclusivePins,
+			sessionId,
+			provider,
+			pin === undefined
+				? undefined
+				: {
+						credentialId: pin.credentialId,
+						...(pin.identityHash !== undefined ? { identityHash: pin.identityHash } : {}),
+						...(pin.releasable ? { releasable: true as const } : {}),
+						persisted,
+					},
+		);
 	}
 
 	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean {
 		if (!sessionId) return false;
 		if (typeof credentialId === "number") {
 			const target = this.#pool.entries(provider).find(entry => entry.id === credentialId);
-			if (target?.credential.type !== "oauth") return false;
+			// A restricted session may drain only an account of its allowlist.
+			if (target?.credential.type !== "oauth" || !this.allows(provider, sessionId, target.credential)) return false;
 		}
 		this.#writeDrainOverride(provider, sessionId, credentialId);
 		return true;
@@ -261,13 +395,15 @@ export class SessionAffinity implements SessionsApi {
 	/** The session's drain override: a row id, `null` for no drain target, `undefined` to follow account policy. */
 	drainOverride(provider: string, sessionId: string | undefined): number | null | undefined {
 		if (!sessionId) return undefined;
-		const key = `${provider}\0${sessionId}`;
-		if (this.#drainOverrides.has(key)) return this.#drainOverrides.get(key);
+		const live = nestedGet(this.#drainOverrides, sessionId, provider);
+		if (live) return live.credentialId;
 		// A miss is not cached, like #sessionPin: one primary-key lookup per selection picks up an override written later by another process.
 		try {
 			const raw = this.#store.getCache(sessionDrainKey(provider, sessionId));
 			const credentialId = raw ? parseSessionDrain(raw) : undefined;
-			if (credentialId !== undefined) this.#drainOverrides.set(key, credentialId);
+			if (credentialId !== undefined) {
+				nestedSet(this.#drainOverrides, sessionId, provider, { credentialId, releasable: true, persisted: true });
+			}
 			return credentialId;
 		} catch (err) {
 			logger.debug("Failed to read session drain override from persistent store cache", { err });
@@ -275,10 +411,13 @@ export class SessionAffinity implements SessionsApi {
 		}
 	}
 
-	#writeDrainOverride(provider: string, sessionId: string, credentialId: number | null | undefined): void {
-		const key = `${provider}\0${sessionId}`;
-		if (credentialId === undefined) this.#drainOverrides.delete(key);
-		else this.#drainOverrides.set(key, credentialId);
+	#writeDrainOverride(
+		provider: string,
+		sessionId: string,
+		credentialId: number | null | undefined,
+		releasable?: true,
+	): void {
+		let persisted = false;
 		try {
 			const cacheKey = sessionDrainKey(provider, sessionId);
 			if (credentialId === undefined) this.#store.setCache(cacheKey, "", 0);
@@ -288,9 +427,16 @@ export class SessionAffinity implements SessionsApi {
 					serializeSessionDrain(credentialId),
 					Math.floor(Date.now() / 1000) + SESSION_STICKY_TTL_SEC,
 				);
+			persisted = true;
 		} catch (err) {
 			logger.debug("Failed to write session drain override to persistent store cache", { err });
 		}
+		nestedSet(
+			this.#drainOverrides,
+			sessionId,
+			provider,
+			credentialId === undefined ? undefined : { credentialId, ...(releasable ? { releasable } : {}), persisted },
+		);
 	}
 
 	/** Whether a session or project pin exists for `provider`, ignoring key overrides. */
@@ -323,34 +469,43 @@ export class SessionAffinity implements SessionsApi {
 	 * account that is no longer stored fails closed instead of falling back.
 	 *
 	 * A session account restriction ({@link restrict}) is the narrower grant: a
-	 * stored pinned account outside its allowlist (inherited from a parent or
-	 * pinned before the restriction) does not apply while the restriction
-	 * holds, and selection stays inside the allowlist, the same way the
-	 * restriction replaces stickies. Each such override is logged once per
-	 * session.
+	 * pinned account outside its allowlist (inherited from a parent or pinned
+	 * before the restriction) does not apply while the restriction holds, and
+	 * selection stays inside the allowlist, the same way the restriction
+	 * replaces stickies. A restricted session also ignores a pinned account that
+	 * is no longer stored, or a project pin naming no stored account, unless the
+	 * pin records an identity in its allowlist: only then is the account known
+	 * to be one it may use. Each such override is logged once per session.
 	 *
-	 * @throws AIError.AccountUnavailableError when the pinned account is not stored.
+	 * @throws AIError.AccountUnavailableError when the pinned account is not
+	 * stored and the session is unrestricted or the pin's identity is allowed.
 	 */
 	exclusivePin(provider: string, sessionId: string | undefined): AccountTarget | undefined {
 		if (!sessionId || this.#pinsSuppressed(provider, sessionId)) return undefined;
-		const pinnedId = this.#sessionPin(provider, sessionId);
+		const pin = this.#sessionPin(provider, sessionId);
+		const restricted = this.isRestricted(provider, sessionId);
 		let target: AccountTarget | undefined;
-		if (pinnedId !== undefined) {
+		if (pin !== undefined) {
+			const pinnedId = pin.credentialId;
 			const index = pinnedId === null ? -1 : this.#pool.entries(provider).findIndex(entry => entry.id === pinnedId);
 			const credential = this.#pool.credentials(provider)[index];
-			if (!credential) throw new AIError.AccountUnavailableError(provider);
-			target = { index, credential };
+			if (credential) target = { index, credential };
+			else if (!restricted || this.#allowsIdentity(provider, sessionId, pin.identityHash)) {
+				throw new AIError.AccountUnavailableError(provider);
+			}
 		} else {
 			const name = this.#pinSource?.project?.(provider, sessionId);
 			if (name === undefined) return undefined;
 			target = this.#named(provider, name);
-			if (!target) throw new AIError.AccountUnavailableError(provider, name);
+			if (!target && !restricted) throw new AIError.AccountUnavailableError(provider, name);
 		}
-		if (this.allows(provider, sessionId, target.credential)) return target;
+		if (target && this.allows(provider, sessionId, target.credential)) return target;
 		const warnKey = `${provider}\0${sessionId}`;
 		if (!this.#restrictedPinWarnings.has(warnKey)) {
 			this.#restrictedPinWarnings.set(warnKey, true);
-			logger.warn("Session account restriction overrides an account pin outside its allowlist", { provider });
+			logger.warn("Session account restriction overrides an account pin it cannot show inside its allowlist", {
+				provider,
+			});
 		}
 		return undefined;
 	}
@@ -665,14 +820,21 @@ export class SessionAffinity implements SessionsApi {
 		const target = stored[index];
 		if (!target || !this.allows(provider, sessionId, target.credential)) return false;
 		const restoredAtMs = options?.restoredAtMs;
-		if (restoredAtMs === undefined) this.#writeSessionPin(provider, sessionId, credentialId);
+		if (restoredAtMs === undefined) {
+			const identityKey =
+				target.credential.type === "oauth" ? resolveCredentialIdentityKey(provider, target.credential) : null;
+			this.#writeSessionPin(provider, sessionId, {
+				credentialId,
+				...(identityKey ? { identityHash: identityHash(identityKey) } : {}),
+			});
+		}
 		this.record(provider, sessionId, target.credential.type, index, restoredAtMs, restoredAtMs === undefined);
 		return true;
 	}
 
 	pinMissing(provider: string, sessionId: string): void {
 		if (!sessionId) return;
-		this.#writeSessionPin(provider, sessionId, null);
+		this.#writeSessionPin(provider, sessionId, { credentialId: null });
 		this.clear(provider, sessionId);
 	}
 
@@ -687,14 +849,22 @@ export class SessionAffinity implements SessionsApi {
 	inherit(sourceSessionId: string, targetSessionId: string): number {
 		if (!sourceSessionId || !targetSessionId || sourceSessionId === targetSessionId) return 0;
 		let inherited = 0;
-		for (const provider of this.#pool.providers()) this.#sessionPin(provider, sourceSessionId);
-		for (const pin of [...this.#exclusivePins.values()]) {
-			if (pin.sessionId === sourceSessionId) this.#writeSessionPin(pin.provider, targetSessionId, pin.credentialId);
-		}
-		for (const provider of this.#pool.providers()) this.drainOverride(provider, sourceSessionId);
-		for (const [key, credentialId] of [...this.#drainOverrides]) {
-			const [provider = "", sessionId] = key.split("\0");
-			if (sessionId === sourceSessionId) this.#writeDrainOverride(provider, targetSessionId, credentialId);
+		const providers = new Set([
+			...this.#pool.providers(),
+			...(this.#exclusivePins.get(sourceSessionId)?.keys() ?? []),
+			...(this.#drainOverrides.get(sourceSessionId)?.keys() ?? []),
+		]);
+		for (const provider of providers) {
+			const pin = this.#sessionPin(provider, sourceSessionId);
+			if (pin) {
+				this.#writeSessionPin(provider, targetSessionId, {
+					credentialId: pin.credentialId,
+					identityHash: pin.identityHash,
+					releasable: true,
+				});
+			}
+			const drain = this.drainOverride(provider, sourceSessionId);
+			if (drain !== undefined) this.#writeDrainOverride(provider, targetSessionId, drain, true);
 		}
 		for (const provider of this.#pool.providers()) {
 			const credential = this.get(provider, sourceSessionId);
@@ -710,6 +880,11 @@ export class SessionAffinity implements SessionsApi {
 			inherited += 1;
 		}
 		return inherited;
+	}
+
+	forgetInherited(sessionId: string): void {
+		dropReleasable(this.#exclusivePins, sessionId);
+		dropReleasable(this.#drainOverrides, sessionId);
 	}
 
 	/**

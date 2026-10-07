@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, type MockResponseSource, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -128,6 +129,53 @@ describe("native security coordinator", () => {
 		expect(plan.account).toEqual({ provider: "amazon-bedrock", api: "bedrock-converse-stream" });
 	});
 
+	test("a restricted session cannot start a saved plan for an account outside its pool", async () => {
+		const pooled = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(temporaryRoot, "pooled.db")));
+		try {
+			const credential = (suffix: string) => ({
+				type: "oauth" as const,
+				access: `access-${suffix}`,
+				refresh: `refresh-${suffix}`,
+				expires: Date.now() + 60 * 60_000,
+				accountId: `workspace-${suffix}`,
+				email: `${suffix}@example.invalid`,
+			});
+			await pooled.credentials.set("openai-codex", [credential("a"), credential("b")]);
+			const [, outside] = pooled.oauth.accounts("openai-codex");
+			const insideKey = resolveCredentialIdentityKey("openai-codex", credential("a"));
+			if (!outside || !insideKey) throw new Error("expected stored accounts");
+			const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+			const host = { cwd: repositoryRoot, settings, authStorage: pooled, modelRegistry, activeModel: mock.model };
+			const deps = { openStore: storeFactory, gitAdapter };
+			// The plan is saved while nothing restricts the planning session.
+			const plan = await new SecurityCoordinator({ ...host, sessionId: "planner" }, deps).preflight({
+				credentialId: outside.credentialId,
+			});
+
+			pooled.sessions.restrict("openai-codex", "restricted", [insideKey]);
+			pooled.sessions.restrict("openai-codex", "provider-session", [insideKey]);
+			const restricted = new SecurityCoordinator({ ...host, sessionId: "restricted" }, deps);
+			// The manager id is unrestricted; the provider session id the restriction is keyed on is not.
+			const explicit = new SecurityCoordinator(
+				{ ...host, sessionId: "manager-session", restrictionSessionId: () => "provider-session" },
+				deps,
+			);
+			// A coordinator cached under the same manager id checks the latest session's restriction.
+			const reused = new SecurityCoordinator(
+				{ ...host, sessionId: "manager-session", restrictionSessionId: () => "planner" },
+				deps,
+			);
+			reused.refreshHost({ ...host, sessionId: "manager-session", restrictionSessionId: () => "provider-session" });
+			for (const coordinator of [restricted, explicit, reused]) {
+				await expect(coordinator.start({ planId: plan.id })).rejects.toThrow(
+					"outside the account pool this session is restricted to",
+				);
+			}
+		} finally {
+			pooled.close();
+		}
+	});
+
 	test("scripted mock model publishes a canonical completed scan and restartable session", async () => {
 		const { coordinator, mock } = coordinatorWithMockSession([
 			{
@@ -184,6 +232,7 @@ describe("native security coordinator", () => {
 				authStorage,
 				modelRegistry,
 				activeModel: mock.model,
+				sessionId: "parent-session",
 			},
 			{
 				openStore: async () => store,
@@ -303,6 +352,7 @@ describe("native security coordinator", () => {
 				authStorage,
 				modelRegistry,
 				activeModel: mock.model,
+				sessionId: "parent-session",
 			},
 			{
 				openStore: storeFactory,

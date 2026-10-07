@@ -662,6 +662,12 @@ export interface OAuthAccountIdentity {
 /** Successful OAuth access or account-specific failure. */
 export type OAuthAccessResolution = ({ ok: true } & OAuthAccess) | ({ ok: false } & OAuthAccessFailure);
 
+/** Options of the exact-row OAuth reads ({@link OAuthApi.accessById}, {@link OAuthApi.accessAll}). */
+export type OAuthExactAccessOptions = AuthApiKeyOptions & {
+	/** Session whose account restriction applies; an unrestricted or absent session reads every stored row. */
+	sessionId?: string;
+};
+
 /**
  * Read-only identity of one stored OAuth account, in stable storage order.
  * Returned by {@link AuthStorage.oauth.accounts}; `position` (0-based) is the
@@ -1137,9 +1143,11 @@ export interface OAuthApi {
 	 * Refreshes credentials through the same broker/local path as
 	 * {@link AuthStorage.oauth.access}, but does not rank, round-robin, or
 	 * stop after the first usable account. Intended for diagnostics that must
-	 * exercise each stored account exactly once.
+	 * exercise each stored account exactly once. With `options.sessionId`, an
+	 * account that session's restriction ({@link SessionsApi.restrict}) does not
+	 * allow is left out.
 	 */
-	accessAll(provider: string, options?: AuthApiKeyOptions): Promise<OAuthAccessResolution[]>;
+	accessAll(provider: string, options?: OAuthExactAccessOptions): Promise<OAuthAccessResolution[]>;
 	/**
 	 * Resolve one stored OAuth credential by its durable storage row id.
 	 *
@@ -1148,13 +1156,14 @@ export interface OAuthApi {
 	 * requested row, preserving exact-account affinity for operations whose
 	 * provenance and policy boundary are tied to one workspace.
 	 *
-	 * Returns `undefined` when the row does not exist for `provider` or an
-	 * explicit runtime/config API-key override suppresses OAuth.
+	 * Returns `undefined` when the row does not exist for `provider`, an
+	 * explicit runtime/config API-key override suppresses OAuth, or
+	 * `options.sessionId` is restricted to accounts that exclude the row.
 	 */
 	accessById(
 		provider: string,
 		credentialId: number,
-		options?: AuthApiKeyOptions,
+		options?: OAuthExactAccessOptions,
 	): Promise<OAuthAccessResolution | undefined>;
 	/**
 	 * Read-only list of stored OAuth accounts for `provider` in stable storage
@@ -1163,8 +1172,9 @@ export interface OAuthApi {
 	 * account" UI should render `position + 1`.
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
-	 * `active`. No account is active before that session has resolved or pinned a
-	 * credential.
+	 * `active`, and an account the session's restriction does not allow is left
+	 * out (positions count only the listed accounts). No account is active before
+	 * that session has resolved or pinned a credential.
 	 */
 	accounts(provider: string, sessionId?: string): OAuthAccountSummary[];
 	/**
@@ -1275,7 +1285,9 @@ export interface SessionsApi {
 	/**
 	 * Record an exclusive session pin whose account is no longer stored, so the
 	 * session's requests to `provider` fail with `AccountUnavailableError`
-	 * instead of using another account until it is unpinned or re-pinned.
+	 * instead of using another account until it is unpinned or re-pinned. A
+	 * restricted session ignores such a pin, because its account cannot be shown
+	 * to be inside the allowlist; selection stays inside the allowlist.
 	 */
 	pinMissing(provider: string, sessionId: string): void;
 	/**
@@ -1296,6 +1308,23 @@ export interface SessionsApi {
 	 * source session.
 	 */
 	inherit(sourceSessionId: string, targetSessionId: string): number;
+	/**
+	 * Drop this process's in-memory copies of the exclusive pins and drain
+	 * overrides of `sessionId` that {@link inherit} copied in or that were read
+	 * back from the store, once that session has ended. Their persisted rows
+	 * stay, so a resumed session reads them again; pins and overrides this
+	 * process set for the session, and a copy whose row failed to persist, stay
+	 * in memory.
+	 */
+	forgetInherited(sessionId: string): void;
+	/** Whether {@link restrict} limits `sessionId` for `provider`. */
+	isRestricted(provider: string, sessionId: string | undefined): boolean;
+	/**
+	 * Whether the stored row `credentialId` may serve `sessionId` under its
+	 * restriction: every stored row of an unrestricted session, only an allowed
+	 * OAuth account of a restricted one. False for a row that is not stored.
+	 */
+	admits(provider: string, sessionId: string | undefined, credentialId: number): boolean;
 	/**
 	 * Restrict one session's credentials for `provider` to the OAuth accounts
 	 * whose identity key (`email:<address>|org:<id>` for org-scoped providers;
@@ -1331,7 +1360,7 @@ export interface SessionsApi {
 	 * Override, for this session only, which OAuth account of `provider` is
 	 * drained first: a stored row id, `null` for none, or `undefined` to follow
 	 * `auth.accountPolicies`. Returns false when the row is not a stored OAuth
-	 * account. Exclusive pins take precedence. The override persists in the
+	 * account, or one the session's restriction does not allow. Exclusive pins take precedence. The override persists in the
 	 * store cache like a session pin.
 	 */
 	drain(provider: string, sessionId: string, credentialId: number | null | undefined): boolean;
