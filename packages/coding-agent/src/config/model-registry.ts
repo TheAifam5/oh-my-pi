@@ -649,10 +649,10 @@ export class ModelRegistry {
 			}
 		}
 		await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
-		// Reconcile OTHER runtime providers (extension fetchDynamicModels managers)
-		// from cache with the default online-if-uncached strategy: no network while
-		// their cached row is fresh, so the scoped refresh above stays the only
-		// forced fetch.
+		// Discover OTHER extension fetchDynamicModels providers whose cache row is
+		// missing (registered after the last discovery) or past its TTL.
+		// online-if-uncached costs no network while their row is fresh, so the
+		// scoped refresh above stays the only forced fetch.
 		const otherRuntimeProviderIds = new Set(
 			[...this.#runtimeModelManagers.keys()].filter(runtimeId => runtimeId !== providerId),
 		);
