@@ -6,7 +6,16 @@
  */
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessageEvent,
+	Effort,
+	ImageContent,
+	Model,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
+	ToolExample,
+} from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -53,6 +62,7 @@ export type RpcCommand =
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "set_slow_mode"; enabled: boolean }
+	| { id?: string; type: "set_service_tier"; family: ServiceTierFamily; tier?: ServiceTier }
 	| {
 			id?: string;
 			type: "goal";
@@ -172,6 +182,10 @@ export interface RpcSessionState {
 	 * session, e.g. Claude low priority) or `session` (this session's flex tier). Absent when unsupported.
 	 */
 	slowModeScope?: "session" | "global";
+	/** The session's per-family service tiers; empty when none is selected. */
+	serviceTiers: ServiceTierByFamily;
+	/** Service tier the active model's requests resolve to; absent when none applies or no model is selected. */
+	effectiveServiceTier?: ServiceTier;
 	/** Usage-limit stage of the active model's account; absent outside wrap-up and low priority. */
 	usageLimit?: UsageLimitState;
 	tokensPerSecond: number | null;
@@ -452,6 +466,13 @@ export type RpcResponse =
 			data: { enabled: boolean; active: boolean };
 	  }
 	| { id?: string; type: "response"; command: "set_slow_mode"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_service_tier";
+			success: true;
+			data: { serviceTiers: ServiceTierByFamily };
+	  }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
 	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
 	| {

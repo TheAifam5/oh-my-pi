@@ -147,6 +147,17 @@ _SLOW_MODE_SCOPE_VALUES: Final[frozenset[str]] = frozenset({"session", "global"}
 _decode_slow_mode_scope = cast("Decoder[SlowModeScope]", literal(_SLOW_MODE_SCOPE_VALUES))
 
 
+ServiceTier: TypeAlias = Literal["auto", "default", "flex", "scale", "priority", "ultrafast"]
+_SERVICE_TIER_VALUES: Final[frozenset[str]] = frozenset({"auto", "default", "flex", "scale", "priority", "ultrafast"})
+_decode_service_tier = cast("Decoder[ServiceTier]", literal(_SERVICE_TIER_VALUES))
+
+
+ServiceTierFamily: TypeAlias = Literal["openai", "anthropic", "google"]
+"""Provider family with an independent service tier."""
+_SERVICE_TIER_FAMILY_VALUES: Final[frozenset[str]] = frozenset({"openai", "anthropic", "google"})
+_decode_service_tier_family = cast("Decoder[ServiceTierFamily]", literal(_SERVICE_TIER_FAMILY_VALUES))
+
+
 BtwStatus: TypeAlias = Literal["running", "complete", "cancelled", "error", "interrupted"]
 """Side-question turn lifecycle; `interrupted` marks a turn whose process died while it ran."""
 _BTW_STATUS_VALUES: Final[frozenset[str]] = frozenset({"running", "complete", "cancelled", "error", "interrupted"})
@@ -631,6 +642,14 @@ class GoalResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class ServiceTierByFamily:
+    """Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`."""
+    openai: ServiceTier | None = None
+    anthropic: ServiceTier | None = None
+    google: ServiceTier | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class UsageLimitLowPriority:
     """Requests are served on the provider's low-priority (slow) lane."""
     stage: Literal["low_priority"] = "low_priority"
@@ -671,6 +690,10 @@ class SessionState:
     """`/slow` is on for the active model; always `false` when `slowModeSupported` is `false`."""
     slow_mode_scope: SlowModeScope | None = None
     """Where the active model's `/slow` lives; absent when unsupported."""
+    service_tiers: ServiceTierByFamily = field(default_factory=lambda: parse_service_tier_by_family({}, "serviceTiers"))
+    """The session's per-family service tiers; empty when none is selected."""
+    effective_service_tier: ServiceTier | None = None
+    """Service tier the active model's requests resolve to; absent when none applies or no model is selected."""
     usage_limit: UsageLimitState | None = None
     """Usage-limit stage of the active model's account; absent outside wrap-up and low priority."""
     tokens_per_second: float | None = None
@@ -1928,6 +1951,15 @@ def parse_goal_result(value: object, path: str = "GoalResult") -> GoalResult:
     )
 
 
+def parse_service_tier_by_family(value: object, path: str = "ServiceTierByFamily") -> ServiceTierByFamily:
+    payload = expect_object(value, path)
+    return ServiceTierByFamily(
+        openai=optional(payload, "openai", _decode_service_tier, path),
+        anthropic=optional(payload, "anthropic", _decode_service_tier, path),
+        google=optional(payload, "google", _decode_service_tier, path),
+    )
+
+
 def parse_usage_limit_low_priority(value: object, path: str = "UsageLimitLowPriority") -> UsageLimitLowPriority:
     payload = expect_object(value, path)
     required(payload, "stage", cast('Decoder[Literal["low_priority"]]', literal(frozenset({"low_priority"}))), path)
@@ -1965,6 +1997,8 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         slow_mode_supported=defaulted(payload, "slowModeSupported", decode_bool, path, False),
         slow_mode_enabled=defaulted(payload, "slowModeEnabled", decode_bool, path, False),
         slow_mode_scope=optional(payload, "slowModeScope", _decode_slow_mode_scope, path),
+        service_tiers=defaulted(payload, "serviceTiers", parse_service_tier_by_family, path, parse_service_tier_by_family({}, path)),
+        effective_service_tier=optional(payload, "effectiveServiceTier", _decode_service_tier, path),
         usage_limit=optional(payload, "usageLimit", parse_usage_limit_state, path),
         tokens_per_second=defaulted(payload, "tokensPerSecond", nullable(decode_float), path, None),
         message_count=defaulted(payload, "messageCount", decode_int, path, 0),
@@ -3247,6 +3281,14 @@ class WireClient:
         params["enabled"] = enabled
         return required(expect_object(self._command("set_slow_mode", params), "set_slow_mode"), "enabled", decode_bool, "set_slow_mode")
 
+    def set_service_tier(self, family: ServiceTierFamily, *, tier: ServiceTier | None = None) -> ServiceTierByFamily:
+        """Set one provider family's service tier for the session, or clear it when `tier` is omitted; returns every family's tier."""
+        params: dict[str, object] = {}
+        params["family"] = family
+        if tier is not None:
+            params["tier"] = tier
+        return required(expect_object(self._command("set_service_tier", params), "set_service_tier"), "serviceTiers", parse_service_tier_by_family, "set_service_tier")
+
     def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None = None) -> GoalResult:
         """Read or change goal mode with the lifecycle of the interactive `/goal` command."""
         params: dict[str, object] = {}
@@ -3904,6 +3946,9 @@ __all__ = [
     "RpcNotification",
     "SelectOptionDetail",
     "SelectUiRequest",
+    "ServiceTier",
+    "ServiceTierByFamily",
+    "ServiceTierFamily",
     "SessionCredits",
     "SessionEntries",
     "SessionInfoUpdateEvent",
@@ -4076,6 +4121,7 @@ __all__ = [
     "parse_rpc_frame_error_event",
     "parse_select_option_detail",
     "parse_select_ui_request",
+    "parse_service_tier_by_family",
     "parse_session_credits",
     "parse_session_entries",
     "parse_session_info_update_event",

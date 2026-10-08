@@ -246,6 +246,7 @@ export type State = Assert<
 	AllTrue<{
 		sessionState: Outbound<RpcSessionState, Wire.SessionState>;
 		queuedMessages: Outbound<RpcSessionState["queuedMessages"], Wire.QueuedMessagesState>;
+		serviceTiers: Outbound<RpcSessionState["serviceTiers"], Wire.ServiceTierByFamily>;
 		dumpTool: Outbound<NonNullable<RpcSessionState["dumpTools"]>[number], Wire.ToolDescriptor>;
 		contextUsage: Outbound<ContextUsage, Wire.ContextUsage>;
 		todoPhase: Outbound<TodoPhase, Wire.TodoPhase>;

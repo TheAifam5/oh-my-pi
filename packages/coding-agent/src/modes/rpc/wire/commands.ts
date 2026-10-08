@@ -114,6 +114,13 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		unwrap: "enabled",
 	},
 	{
+		name: "set_service_tier",
+		doc: "Set one provider family's service tier for the session, or clear it when `tier` is omitted; returns every family's tier.",
+		params: { family: "ServiceTierFamily", "tier?": "ServiceTier" },
+		result: { serviceTiers: "ServiceTierByFamily" },
+		unwrap: "serviceTiers",
+	},
+	{
 		name: "goal",
 		doc: "Read or change goal mode with the lifecycle of the interactive `/goal` command.",
 		params: { op: "GoalOp", "objective?": "string", "token_budget?": "number.integer" },

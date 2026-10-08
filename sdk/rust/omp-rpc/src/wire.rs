@@ -3031,6 +3031,69 @@ impl SlowModeScope {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServiceTier {
+	#[serde(rename = "auto")]
+	Auto,
+	#[serde(rename = "default")]
+	Default,
+	#[serde(rename = "flex")]
+	Flex,
+	#[serde(rename = "scale")]
+	Scale,
+	#[serde(rename = "priority")]
+	Priority,
+	#[serde(rename = "ultrafast")]
+	Ultrafast,
+}
+
+impl ServiceTier {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Auto => "auto",
+			Self::Default => "default",
+			Self::Flex => "flex",
+			Self::Scale => "scale",
+			Self::Priority => "priority",
+			Self::Ultrafast => "ultrafast",
+		}
+	}
+}
+
+/// Provider family with an independent service tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServiceTierFamily {
+	#[serde(rename = "openai")]
+	Openai,
+	#[serde(rename = "anthropic")]
+	Anthropic,
+	#[serde(rename = "google")]
+	Google,
+}
+
+impl ServiceTierFamily {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Openai => "openai",
+			Self::Anthropic => "anthropic",
+			Self::Google => "google",
+		}
+	}
+}
+
+/// Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceTierByFamily {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub openai: Option<ServiceTier>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub anthropic: Option<ServiceTier>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub google: Option<ServiceTier>,
+}
+
 /// Requests are served on the provider's low-priority (slow) lane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimitLowPriority {
@@ -3128,6 +3191,12 @@ pub struct SessionState {
 	/// Where the active model's `/slow` lives; absent when unsupported.
 	#[serde(rename = "slowModeScope", default, skip_serializing_if = "Option::is_none")]
 	pub slow_mode_scope: Option<SlowModeScope>,
+	/// The session's per-family service tiers; empty when none is selected.
+	#[serde(rename = "serviceTiers", default = "default_session_state_service_tiers")]
+	pub service_tiers: ServiceTierByFamily,
+	/// Service tier the active model's requests resolve to; absent when none applies or no model is selected.
+	#[serde(rename = "effectiveServiceTier", default, skip_serializing_if = "Option::is_none")]
+	pub effective_service_tier: Option<ServiceTier>,
 	/// Usage-limit stage of the active model's account; absent outside wrap-up and low priority.
 	#[serde(rename = "usageLimit", default, skip_serializing_if = "Option::is_none")]
 	pub usage_limit: Option<UsageLimitState>,
@@ -5187,6 +5256,19 @@ pub struct SetSlowModeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetServiceTierParams {
+	pub family: ServiceTierFamily,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tier: Option<ServiceTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetServiceTierResult {
+	#[serde(rename = "serviceTiers")]
+	pub service_tiers: ServiceTierByFamily,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalParams {
 	pub op: GoalOp,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5886,6 +5968,10 @@ fn default_session_state_slow_mode_enabled() -> bool {
 	serde_json::from_str("false").expect("valid wire default")
 }
 
+fn default_session_state_service_tiers() -> ServiceTierByFamily {
+	serde_json::from_str("{}").expect("valid wire default")
+}
+
 fn default_session_state_tokens_per_second() -> Option<f64> {
 	serde_json::from_str("null").expect("valid wire default")
 }
@@ -6201,6 +6287,24 @@ impl Command for SetSlowModeCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<SetSlowModeResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.enabled)
+	}
+}
+
+/// Set one provider family's service tier for the session, or clear it when `tier` is omitted; returns every family's tier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetServiceTierCommand {
+	pub family: ServiceTierFamily,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tier: Option<ServiceTier>,
+}
+
+impl Command for SetServiceTierCommand {
+	const NAME: &'static str = "set_service_tier";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ServiceTierByFamily;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<SetServiceTierResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.service_tiers)
 	}
 }
 

@@ -175,6 +175,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "set_service_tier",
+				"doc": "Set one provider family's service tier for the session, or clear it when `tier` is omitted; returns every family's tier.",
+				"params": "SetServiceTierParams",
+				"result": "SetServiceTierResult",
+				"nullable": false,
+				"unwrap": "serviceTiers",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "goal",
 				"doc": "Read or change goal mode with the lifecycle of the interactive `/goal` command.",
 				"params": "GoalParams",
@@ -2507,6 +2518,41 @@
 			"type": "string",
 			"description": "Where `/slow` lives: persisted config shared by every session, or this session's flex tier."
 		},
+		"ServiceTier": {
+			"enum": [
+				"auto",
+				"default",
+				"flex",
+				"scale",
+				"priority",
+				"ultrafast"
+			],
+			"type": "string"
+		},
+		"ServiceTierFamily": {
+			"enum": [
+				"openai",
+				"anthropic",
+				"google"
+			],
+			"type": "string",
+			"description": "Provider family with an independent service tier."
+		},
+		"ServiceTierByFamily": {
+			"type": "object",
+			"properties": {
+				"openai": {
+					"$ref": "#/$defs/ServiceTier"
+				},
+				"anthropic": {
+					"$ref": "#/$defs/ServiceTier"
+				},
+				"google": {
+					"$ref": "#/$defs/ServiceTier"
+				}
+			},
+			"description": "Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`."
+		},
 		"UsageLimitLowPriority": {
 			"type": "object",
 			"properties": {
@@ -2623,6 +2669,15 @@
 				"slowModeScope": {
 					"$ref": "#/$defs/SlowModeScope",
 					"description": "Where the active model's `/slow` lives; absent when unsupported."
+				},
+				"serviceTiers": {
+					"$ref": "#/$defs/ServiceTierByFamily",
+					"description": "The session's per-family service tiers; empty when none is selected.",
+					"default": {}
+				},
+				"effectiveServiceTier": {
+					"$ref": "#/$defs/ServiceTier",
+					"description": "Service tier the active model's requests resolve to; absent when none applies or no model is selected."
 				},
 				"usageLimit": {
 					"$ref": "#/$defs/UsageLimitState",
@@ -6035,6 +6090,31 @@
 			},
 			"required": [
 				"enabled"
+			]
+		},
+		"SetServiceTierParams": {
+			"type": "object",
+			"properties": {
+				"family": {
+					"$ref": "#/$defs/ServiceTierFamily"
+				},
+				"tier": {
+					"$ref": "#/$defs/ServiceTier"
+				}
+			},
+			"required": [
+				"family"
+			]
+		},
+		"SetServiceTierResult": {
+			"type": "object",
+			"properties": {
+				"serviceTiers": {
+					"$ref": "#/$defs/ServiceTierByFamily"
+				}
+			},
+			"required": [
+				"serviceTiers"
 			]
 		},
 		"GoalParams": {

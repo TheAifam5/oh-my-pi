@@ -20,6 +20,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -2130,6 +2131,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					slowModeSupported: session.isSlowModeSupported(),
 					slowModeEnabled: session.isSlowModeEnabled(),
 					slowModeScope: session.getSlowModeScope(),
+					serviceTiers: { ...session.serviceTierByFamily },
+					effectiveServiceTier: session.model ? session.effectiveServiceTier(session.model) : undefined,
 					usageLimit: session.getUsageLimitState(),
 					messageCount: session.messages.length,
 					systemPrompt: session.systemPrompt,
@@ -2166,6 +2169,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "set_slow_mode", "Slow mode is unavailable for the current model.");
 				}
 				return success(id, "set_slow_mode", { enabled: session.isSlowModeEnabled() });
+			}
+
+			case "set_service_tier": {
+				const { family, tier } = command;
+				if (!isServiceTierFamily(family)) {
+					return error(id, "set_service_tier", `Invalid service tier family: ${String(family)}`);
+				}
+				if (tier !== undefined && !isServiceTierForFamily(family, tier)) {
+					return error(id, "set_service_tier", `Invalid service tier for ${family}: ${String(tier)}`);
+				}
+				session.setServiceTierFamily(family, tier);
+				return success(id, "set_service_tier", { serviceTiers: { ...session.serviceTierByFamily } });
 			}
 
 			case "goal": {

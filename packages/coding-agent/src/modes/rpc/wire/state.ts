@@ -87,6 +87,12 @@ export const stateDefs = {
 		"'session' | 'global'",
 		"Where `/slow` lives: persisted config shared by every session, or this session's flex tier.",
 	),
+	ServiceTier: "'auto' | 'default' | 'flex' | 'scale' | 'priority' | 'ultrafast'",
+	ServiceTierFamily: doc("'openai' | 'anthropic' | 'google'", "Provider family with an independent service tier."),
+	ServiceTierByFamily: doc(
+		{ "openai?": "ServiceTier", "anthropic?": "ServiceTier", "google?": "ServiceTier" },
+		"Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`.",
+	),
 	UsageLimitLowPriority: doc(
 		{
 			stage: "'low_priority'",
@@ -130,6 +136,14 @@ export const stateDefs = {
 			false,
 		),
 		"slowModeScope?": doc("SlowModeScope", "Where the active model's `/slow` lives; absent when unsupported."),
+		serviceTiers: absentAs(
+			doc("ServiceTierByFamily", "The session's per-family service tiers; empty when none is selected."),
+			{},
+		),
+		"effectiveServiceTier?": doc(
+			"ServiceTier",
+			"Service tier the active model's requests resolve to; absent when none applies or no model is selected.",
+		),
 		"usageLimit?": doc(
 			"UsageLimitState",
 			"Usage-limit stage of the active model's account; absent outside wrap-up and low priority.",

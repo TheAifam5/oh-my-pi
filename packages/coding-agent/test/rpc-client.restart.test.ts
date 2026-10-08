@@ -41,6 +41,7 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		const state = await client.getState();
 		expect(state.fastModeEnabled).toBe(false);
 		expect(state.fastModeActive).toBe(false);
+		expect(state.serviceTiers).toEqual({});
 		expect(state.tokensPerSecond).toBeNull();
 	}, 20_000);
 

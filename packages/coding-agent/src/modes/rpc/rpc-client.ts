@@ -7,7 +7,7 @@
 import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model, ServiceTier, ServiceTierByFamily, ServiceTierFamily } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -830,6 +830,7 @@ export class RpcClient {
 			fastModeActive: state.fastModeActive === true,
 			slowModeSupported: state.slowModeSupported === true,
 			slowModeEnabled: state.slowModeEnabled === true,
+			serviceTiers: state.serviceTiers ?? {},
 			goal: state.goal ?? null,
 			tokensPerSecond:
 				typeof state.tokensPerSecond === "number" && Number.isFinite(state.tokensPerSecond)
@@ -854,6 +855,16 @@ export class RpcClient {
 	async setSlowMode(enabled: boolean): Promise<boolean> {
 		const response = await this.#send({ type: "set_slow_mode", enabled });
 		return this.#getData<{ enabled: boolean }>(response).enabled;
+	}
+
+	/**
+	 * Set one provider family's service tier for the session, or clear it when
+	 * `tier` is omitted. Rejects a tier the family does not accept; returns every
+	 * family's tier after the change.
+	 */
+	async setServiceTier(family: ServiceTierFamily, tier?: ServiceTier): Promise<ServiceTierByFamily> {
+		const response = await this.#send({ type: "set_service_tier", family, tier });
+		return this.#getData<{ serviceTiers: ServiceTierByFamily }>(response).serviceTiers;
 	}
 
 	/**

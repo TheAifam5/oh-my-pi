@@ -2441,6 +2441,76 @@ func (v *SlowModeScope) UnmarshalJSON(data []byte) error {
 	return unknownValue("SlowModeScope", s)
 }
 
+type ServiceTier string
+
+const (
+	ServiceTierAuto      ServiceTier = "auto"
+	ServiceTierDefault   ServiceTier = "default"
+	ServiceTierFlex      ServiceTier = "flex"
+	ServiceTierScale     ServiceTier = "scale"
+	ServiceTierPriority  ServiceTier = "priority"
+	ServiceTierUltrafast ServiceTier = "ultrafast"
+)
+
+func (v *ServiceTier) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ServiceTier")
+	if err != nil {
+		return err
+	}
+	switch value := ServiceTier(s); value {
+	case ServiceTierAuto, ServiceTierDefault, ServiceTierFlex, ServiceTierScale, ServiceTierPriority, ServiceTierUltrafast:
+		*v = value
+		return nil
+	}
+	return unknownValue("ServiceTier", s)
+}
+
+// Provider family with an independent service tier.
+type ServiceTierFamily string
+
+const (
+	ServiceTierFamilyOpenai    ServiceTierFamily = "openai"
+	ServiceTierFamilyAnthropic ServiceTierFamily = "anthropic"
+	ServiceTierFamilyGoogle    ServiceTierFamily = "google"
+)
+
+func (v *ServiceTierFamily) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ServiceTierFamily")
+	if err != nil {
+		return err
+	}
+	switch value := ServiceTierFamily(s); value {
+	case ServiceTierFamilyOpenai, ServiceTierFamilyAnthropic, ServiceTierFamilyGoogle:
+		*v = value
+		return nil
+	}
+	return unknownValue("ServiceTierFamily", s)
+}
+
+// Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`.
+type ServiceTierByFamily struct {
+	Openai    *ServiceTier `json:"openai,omitempty"`
+	Anthropic *ServiceTier `json:"anthropic,omitempty"`
+	Google    *ServiceTier `json:"google,omitempty"`
+}
+
+func (v *ServiceTierByFamily) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ServiceTierByFamily", v.decodeFrom)
+}
+
+func (v *ServiceTierByFamily) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ServiceTierByFamily
+	d := fieldDecoder{raw: raw, owner: "ServiceTierByFamily"}
+	d.optional("openai", &out.Openai)
+	d.optional("anthropic", &out.Anthropic)
+	d.optional("google", &out.Google)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 // Requests are served on the provider's low-priority (slow) lane.
 type UsageLimitLowPriority struct {
 	// Epoch seconds when the limit that was hit resets.
@@ -2564,6 +2634,10 @@ type SessionState struct {
 	SlowModeEnabled bool `json:"slowModeEnabled"`
 	// Where the active model's `/slow` lives; absent when unsupported.
 	SlowModeScope *SlowModeScope `json:"slowModeScope,omitempty"`
+	// The session's per-family service tiers; empty when none is selected.
+	ServiceTiers ServiceTierByFamily `json:"serviceTiers"`
+	// Service tier the active model's requests resolve to; absent when none applies or no model is selected.
+	EffectiveServiceTier *ServiceTier `json:"effectiveServiceTier,omitempty"`
 	// Usage-limit stage of the active model's account; absent outside wrap-up and low priority.
 	UsageLimit         *UsageLimitState `json:"usageLimit,omitempty"`
 	TokensPerSecond    *float64         `json:"tokensPerSecond"`
@@ -2606,6 +2680,8 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("slowModeSupported", &out.SlowModeSupported, `false`)
 	d.defaulted("slowModeEnabled", &out.SlowModeEnabled, `false`)
 	d.optional("slowModeScope", &out.SlowModeScope)
+	d.defaulted("serviceTiers", &out.ServiceTiers, `{}`)
+	d.optional("effectiveServiceTier", &out.EffectiveServiceTier)
 	d.optional("usageLimit", &out.UsageLimit)
 	d.defaulted("tokensPerSecond", &out.TokensPerSecond, `null`)
 	d.defaulted("messageCount", &out.MessageCount, `0`)
@@ -6939,6 +7015,25 @@ func (v *SetSlowModeResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type SetServiceTierResult struct {
+	ServiceTiers ServiceTierByFamily `json:"serviceTiers"`
+}
+
+func (v *SetServiceTierResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SetServiceTierResult", v.decodeFrom)
+}
+
+func (v *SetServiceTierResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SetServiceTierResult
+	d := fieldDecoder{raw: raw, owner: "SetServiceTierResult"}
+	d.required("serviceTiers", &out.ServiceTiers)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type SetAskDialogResult struct {
 	Enabled bool `json:"enabled"`
 }
@@ -7603,6 +7698,19 @@ func (c Commands) SetSlowMode(ctx context.Context, p SetSlowModeCommand) (bool, 
 	var out SetSlowModeResult
 	err := c.call(ctx, "set_slow_mode", p, 0, &out)
 	return out.Enabled, err
+}
+
+// SetServiceTierCommand holds the parameters of "set_service_tier".
+type SetServiceTierCommand struct {
+	Family ServiceTierFamily `json:"family"`
+	Tier   *ServiceTier      `json:"tier,omitempty"`
+}
+
+// SetServiceTier sends "set_service_tier": Set one provider family's service tier for the session, or clear it when `tier` is omitted; returns every family's tier.
+func (c Commands) SetServiceTier(ctx context.Context, p SetServiceTierCommand) (ServiceTierByFamily, error) {
+	var out SetServiceTierResult
+	err := c.call(ctx, "set_service_tier", p, 0, &out)
+	return out.ServiceTiers, err
 }
 
 // GoalCommand holds the parameters of "goal".

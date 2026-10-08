@@ -303,6 +303,7 @@ describe("RpcInputDispatcher", () => {
 						fastModeActive: false,
 						slowModeSupported: false,
 						slowModeEnabled: false,
+						serviceTiers: {},
 						tokensPerSecond: null,
 						messageCount: 0,
 						queuedMessageCount: 0,

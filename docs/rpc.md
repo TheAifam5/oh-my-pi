@@ -146,6 +146,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "set_slow_mode", enabled: boolean }`
+- `{ id?, type: "set_service_tier", family: "openai" | "anthropic" | "google", tier?: "auto" | "default" | "flex" | "scale" | "priority" | "ultrafast" }`
 - `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
 - `{ id?, type: "set_ask_dialog", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
@@ -477,6 +478,16 @@ priority, `providers.anthropic.slowMode`), or `session` for this session's
 per-family flex tier. It is absent when unsupported. Re-read all three after a
 model change; a `global` change made by another session emits no event.
 
+`serviceTiers` is the session's selected service tier per provider family
+(`openai`, `anthropic`, `google`); a family without a selection is absent, and
+a fresh session reports `{}`. `/fast`, `set_fast_mode`, and
+`set_service_tier` change this map, as does `/slow` (or `set_slow_mode`) on
+OpenAI- and Google-family models. A request uses
+only the entry for its model's family. `effectiveServiceTier` is the tier the
+active model's requests resolve to, including the Fireworks priority setting;
+it is absent when none applies or no model is selected. Servers that predate
+these fields omit them; clients treat a missing `serviceTiers` as `{}`.
+
 `usageLimit` reports the active model's account past its usage limit, in a
 provider-neutral shape. `stage` is `wrap_up` during a short allowance after the
 limit or `low_priority` once the account is served on spare capacity.
@@ -504,6 +515,7 @@ field is absent outside both stages. No event carries it, so re-read
   "slowModeSupported": true,
   "slowModeEnabled": true,
   "slowModeScope": "global",
+  "serviceTiers": { "openai": "flex" },
   "usageLimit": {
     "stage": "low_priority",
     "resetsAtSec": 1770000000,
@@ -633,6 +645,41 @@ another provider's persisted setting. A non-boolean `enabled` is rejected with
 `"set_slow_mode requires boolean enabled"`. A change made mid-run applies from
 the next request (stopping an active Claude low-priority window takes effect
 immediately); no event announces it, so re-read `get_state`.
+
+### `set_service_tier` payload
+
+`set_service_tier` sets one provider family's service tier for the session,
+independent of the active model, so a client can select a tier for a family
+before switching to one of its models. Omit `tier` to clear the family's
+selection.
+
+```json
+{ "id": "req_tier", "type": "set_service_tier", "family": "openai", "tier": "scale" }
+```
+
+On success, `data.serviceTiers` is the whole map after the change:
+
+```json
+{
+  "id": "req_tier",
+  "type": "response",
+  "command": "set_service_tier",
+  "success": true,
+  "data": { "serviceTiers": { "openai": "scale" } }
+}
+```
+
+`openai` accepts every tier, `anthropic` only `priority` (fast mode), and
+`google` only `flex` or `priority`. Any other pair fails with
+`"Invalid service tier for <family>: <tier>"`, and an unknown family fails with
+`"Invalid service tier family: <family>"`; a failed request changes nothing.
+The change is recorded in the session and applies from the next request. Unlike
+`set_fast_mode`, it does not check whether the active model realizes the tier;
+read `effectiveServiceTier` and `fastModeActive` from `get_state` for the
+resulting state.
+The TypeScript client exposes
+`setServiceTier(family, tier?): Promise<ServiceTierByFamily>`, and the Python
+client `set_service_tier(family, *, tier=None) -> ServiceTierByFamily`.
 
 ### `set_fast_mode` payload
 

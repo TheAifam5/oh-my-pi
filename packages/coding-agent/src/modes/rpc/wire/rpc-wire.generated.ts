@@ -467,6 +467,18 @@ export interface GoalResult {
 /** Where `/slow` lives: persisted config shared by every session, or this session's flex tier. */
 export type SlowModeScope = "session" | "global";
 
+export type ServiceTier = "auto" | "default" | "flex" | "scale" | "priority" | "ultrafast";
+
+/** Provider family with an independent service tier. */
+export type ServiceTierFamily = "openai" | "anthropic" | "google";
+
+/** Selected service tier per provider family; a request uses only its model's family entry. `anthropic` accepts only `priority`, `google` only `flex` or `priority`. */
+export interface ServiceTierByFamily {
+	openai?: ServiceTier;
+	anthropic?: ServiceTier;
+	google?: ServiceTier;
+}
+
 /** Requests are served on the provider's low-priority (slow) lane. */
 export interface UsageLimitLowPriority {
 	stage: "low_priority";
@@ -508,6 +520,10 @@ export interface SessionState {
 	slowModeEnabled?: boolean;
 	/** Where the active model's `/slow` lives; absent when unsupported. */
 	slowModeScope?: SlowModeScope;
+	/** The session's per-family service tiers; empty when none is selected. */
+	serviceTiers?: ServiceTierByFamily;
+	/** Service tier the active model's requests resolve to; absent when none applies or no model is selected. */
+	effectiveServiceTier?: ServiceTier;
 	/** Usage-limit stage of the active model's account; absent outside wrap-up and low priority. */
 	usageLimit?: UsageLimitState;
 	tokensPerSecond?: number | null;
@@ -1537,6 +1553,15 @@ export interface SetSlowModeResult {
 	enabled: boolean;
 }
 
+export interface SetServiceTierParams {
+	family: ServiceTierFamily;
+	tier?: ServiceTier;
+}
+
+export interface SetServiceTierResult {
+	serviceTiers: ServiceTierByFamily;
+}
+
 export interface GoalParams {
 	op: GoalOp;
 	objective?: string;
@@ -1824,6 +1849,7 @@ export interface RpcWireCommands {
 	get_state: { params: undefined; result: SessionState };
 	set_fast_mode: { params: SetFastModeParams; result: FastModeResult };
 	set_slow_mode: { params: SetSlowModeParams; result: SetSlowModeResult };
+	set_service_tier: { params: SetServiceTierParams; result: SetServiceTierResult };
 	goal: { params: GoalParams; result: GoalResult };
 	set_ask_dialog: { params: SetAskDialogParams; result: SetAskDialogResult };
 	get_available_commands: { params: undefined; result: GetAvailableCommandsResult };
