@@ -14,7 +14,11 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "../session/retry-fallback-chains";
-import { getSelectorFallbackChains, noteRetryFallbackEntryResolution } from "../session/retry-fallback-selector-chains";
+import {
+	getSelectorFallbackChains,
+	noteRetryFallbackEntryResolution,
+	type RetryFallbackEntryLookup,
+} from "../session/retry-fallback-selector-chains";
 import { type RolePoolPick, RolePoolUnavailableError } from "../session/pool-selection";
 import {
 	createRolePoolCall,
@@ -75,6 +79,7 @@ function expandFallbackCandidates(
 	availableModels: Model<Api>[],
 	seen: Set<string>,
 	out: OnlineTinyCandidate[],
+	entryLookup: RetryFallbackEntryLookup | undefined,
 ): void {
 	const add = (role: string, model: Model<Api>): boolean => {
 		const key = candidateKey(model);
@@ -107,13 +112,12 @@ function expandFallbackCandidates(
 			const exact = isExactRetryFallbackEntry(candidate.raw, chainKey, settings);
 			const resolved = resolveModelOverride([candidate.raw], registryShim, settings, { exact });
 			const fallback = resolved.model ?? context.modelLookup.find(candidate.provider, candidate.id);
-			if (exact) {
-				noteRetryFallbackEntryResolution(
-					settings,
-					candidate.raw,
-					fallback,
-					() => resolveModelOverride([candidate.raw], registryShim, settings).model,
-				);
+			if (exact && !candidate.wildcard) {
+				noteRetryFallbackEntryResolution(settings, candidate.raw, fallback, {
+					pool: "tiny",
+					nearest: () => resolveModelOverride([candidate.raw], registryShim, settings).model,
+					lookup: entryLookup,
+				});
 			}
 			if (!fallback) continue;
 			if (!add(role, fallback)) continue;
@@ -145,6 +149,8 @@ export function collectOnlineTinyCandidates(
 		tryAllRoles?: boolean;
 		/** Models a role resolves to instead of its configured value, primary first; empty skips the role. */
 		resolvedRoles?: ReadonlyMap<string, readonly Model<Api>[]>;
+		/** Classifies unmatched chain entries and defers their warning while discovery is pending. */
+		entryLookup?: RetryFallbackEntryLookup;
 	},
 ): OnlineTinyCandidate[] {
 	const seen = new Set<string>();
@@ -190,6 +196,7 @@ export function collectOnlineTinyCandidates(
 		availableModels,
 		seen,
 		out,
+		options?.entryLookup,
 	);
 	return out;
 }
@@ -257,6 +264,10 @@ export function expandOnlineTinyModelFallbacks(
 	model: Model<Api>,
 	settings: Settings,
 	availableModels: Model<Api>[],
+	options?: {
+		/** Classifies unmatched chain entries and defers their warning while discovery is pending. */
+		entryLookup?: RetryFallbackEntryLookup;
+	},
 ): Model<Api>[] {
 	const seen = new Set<string>([candidateKey(model)]);
 	const out: OnlineTinyCandidate[] = [{ role: "current", model }];
@@ -276,6 +287,7 @@ export function expandOnlineTinyModelFallbacks(
 		availableModels,
 		seen,
 		out,
+		options?.entryLookup,
 	);
 	return out.map(candidate => candidate.model);
 }

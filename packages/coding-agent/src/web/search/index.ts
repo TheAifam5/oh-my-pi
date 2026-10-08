@@ -180,7 +180,7 @@ async function executeSearch(
 					? [{ model: resolved.model, explicit: true, thinkingLevel: resolved.thinkingLevel }]
 					: [];
 			})()
-		: resolveRoleChain("web", settings, pool);
+		: resolveRoleChain("web", settings, pool, { entryLookup: modelRegistry });
 	const parsedQuery = parseSearchQuery(params.query);
 	let expanded = rankXAIProviders(
 		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),

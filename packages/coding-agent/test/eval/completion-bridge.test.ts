@@ -97,6 +97,7 @@ function makeSession(opts: SessionOptions = {}): ToolSession {
 	const modelRegistry = {
 		getAvailable: () => available,
 		find: (provider: string, id: string) => available.find(model => model.provider === provider && model.id === id),
+		isProviderDiscoveryPending: () => false,
 		getApiKey: async () => (opts.apiKey === undefined ? "test-key" : opts.apiKey),
 		resolver: () => async () => (opts.apiKey === undefined ? "test-key" : opts.apiKey),
 	} as unknown as ModelRegistry;

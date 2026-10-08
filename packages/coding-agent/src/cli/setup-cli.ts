@@ -167,9 +167,9 @@ interface SpeechComponent {
 }
 
 function resolveLocalSpeechModelId(role: "speech" | "dictation", settings: Settings, registry: ModelRegistry): string {
-	const candidate = resolveRoleChain(role, settings, roleCandidatePool(role, settings, registry)).find(
-		entry => entry.model.provider === "local",
-	);
+	const candidate = resolveRoleChain(role, settings, roleCandidatePool(role, settings, registry), {
+		entryLookup: registry,
+	}).find(entry => entry.model.provider === "local");
 	if (!candidate) throw new Error(`No local model is available for the ${role} role.`);
 	return candidate.model.id;
 }

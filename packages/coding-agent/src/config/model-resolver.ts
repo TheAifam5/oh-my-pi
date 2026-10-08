@@ -59,7 +59,11 @@ import {
 import type { Settings } from "./settings";
 
 import { cfgDisabledProviders, cfgEnabledModels, cfgModelProviderOrder } from "./model-settings";
-import { getSelectorFallbackChains, noteRetryFallbackEntryResolution } from "../session/retry-fallback-selector-chains";
+import {
+	getSelectorFallbackChains,
+	noteRetryFallbackEntryResolution,
+	type RetryFallbackEntryLookup,
+} from "../session/retry-fallback-selector-chains";
 
 function isKnownProvider(provider: string): provider is KnownProvider {
 	return provider in DEFAULT_MODEL_PER_PROVIDER;
@@ -1030,7 +1034,8 @@ export function parseModelPattern(
 	pattern: string,
 	availableModels: Model<Api>[],
 	preferences?: ModelMatchPreferences,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean },
+	/** `exact` accepts only exact matches; fuzzy and substring matching never run. */
+	options?: { allowInvalidThinkingSelectorFallback?: boolean; exact?: boolean },
 ): ParsedModelResult {
 	return matchPatternWithContext(
 		pattern,
@@ -1623,13 +1628,15 @@ export interface RoleChainCandidate {
  * Resolve a role's primary and retry candidates in effective attempt order.
  *
  * `options.leading`, when given, replaces the role's configured value as the head of the chain;
- * the retry candidates follow it, deduplicated by route against it.
+ * the retry candidates follow it, deduplicated by route against it. `options.entryLookup` lets the
+ * warning for a configured entry without an exact match tell a provider lacking credentials apart
+ * and wait while the provider's discovery is pending.
  */
 export function resolveRoleChain(
 	role: string,
 	settings: Settings,
 	pool: Model<Api>[],
-	options: { leading?: readonly RoleChainCandidate[] } = {},
+	options: { leading?: readonly RoleChainCandidate[]; entryLookup?: RetryFallbackEntryLookup } = {},
 ): RoleChainCandidate[] {
 	const configuredRoles = settings.getModelRoles();
 	const configured = settings.getModelRole(role)?.trim();
@@ -1661,12 +1668,11 @@ export function resolveRoleChain(
 	for (const { selector, explicit, exact } of selectors) {
 		const resolved = resolveModelRoleValue(selector, pool, { settings, exact });
 		if (exact) {
-			noteRetryFallbackEntryResolution(
-				settings,
-				selector,
-				resolved.model,
-				() => resolveModelRoleValue(selector, pool, { settings }).model,
-			);
+			noteRetryFallbackEntryResolution(settings, selector, resolved.model, {
+				pool: "role-chain",
+				nearest: () => resolveModelRoleValue(selector, pool, { settings }).model,
+				lookup: options.entryLookup,
+			});
 		}
 		if (!resolved.model) continue;
 		const key = formatModelStringWithRouting(resolved.model);

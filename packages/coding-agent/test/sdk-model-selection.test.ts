@@ -1156,6 +1156,62 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("skips a startup fallback chain entry that names no model exactly", async () => {
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				slow: ["runtime-provider/runtime-fall", "runtime-provider/runtime-model"],
+			},
+		});
+		settings.setModelRole("slow", "missing-provider/missing-model");
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("runtime-provider", "test-key");
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "partial-entry-models.yml"));
+		const parsed = parseArgs(["--model", "slow"]);
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: number | string | null) => {
+			throw new Error(`buildSessionOptions unexpectedly exited with ${code}`);
+		});
+		try {
+			const cliOptions = await buildCliSessionOptions(
+				parsed,
+				[],
+				SessionManager.inMemory(),
+				modelRegistry,
+				settings,
+			);
+			const { session } = await createAgentSession({
+				...cliOptions,
+				cwd: tempDir,
+				agentDir: tempDir,
+				authStorage,
+				modelRegistry,
+				settings,
+				disableExtensionDiscovery: true,
+				extensions: [providerExtension],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				rules: [],
+				preloadedCustomToolPaths: [],
+				toolNames: ["read"],
+			});
+
+			try {
+				// `runtime-fall` would pattern-match `runtime-fallback-model`; the startup walk skips it like the session does.
+				expect(session.model?.provider).toBe("runtime-provider");
+				expect(session.model?.id).toBe("runtime-model");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			exitSpy.mockRestore();
+		}
+	});
+
 	test("preserves deferred bare role fallback chains", async () => {
 		const settings = Settings.isolated();
 		settings.setModelRole("task", "runtime-provider/runtime-model,runtime-provider/runtime-fallback-model");

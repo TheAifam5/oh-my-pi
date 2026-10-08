@@ -141,7 +141,7 @@ function getTitleModels(
 	const availableModels = roleCandidatePool("tiny", settings, registry);
 	if (availableModels.length === 0) return [];
 	if (TITLE_ROLES.every(role => rolePoolTarget(settings, role) === undefined)) {
-		const models = collectOnlineTinyCandidates(TITLE_ROLES, settings, availableModels).map(
+		const models = collectOnlineTinyCandidates(TITLE_ROLES, settings, availableModels, { entryLookup: registry }).map(
 			candidate => candidate.model,
 		);
 		return withCurrentModelFallbacks(models, settings, availableModels, currentModel);

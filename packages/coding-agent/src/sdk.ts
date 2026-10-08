@@ -74,6 +74,7 @@ import {
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
+	isExactRetryFallbackEntry,
 	type ModelMatchPreferences,
 	parseModelPattern,
 	pickDefaultAvailableModel,
@@ -3283,9 +3284,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						const primaryPatterns: Array<{
 							pattern: string;
 							retryFallback: InitialRetryFallbackState | undefined;
+							/** Chain entries match exactly, as in-session fallback resolves them. */
+							exact: boolean;
 						}> = configuredPatterns.map(pattern => ({
 							pattern,
 							retryFallback: undefined,
+							exact: false,
 						}));
 						if (!resolved.configuredRole || !cfgRetryModelFallback.get(settings)) {
 							return primaryPatterns;
@@ -3335,7 +3339,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								allowMissingPrimary: true,
 							})
 								.filter(candidate => !excludedMembers.has(candidate.raw))
-								.map(candidate => ({ pattern: candidate.raw, retryFallback })),
+								.map(candidate => ({
+									pattern: candidate.raw,
+									retryFallback,
+									exact: isExactRetryFallbackEntry(candidate.raw, chainKey, settings),
+								})),
 						];
 					}
 					if (resolved.model) {
@@ -3346,25 +3354,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 									resolved.thinkingLevel,
 								),
 								retryFallback: undefined,
+								exact: false,
 							},
 						];
 					}
 					return resolveConfiguredModelPatterns([trimmedSelector], settings).map(pattern => ({
 						pattern,
 						retryFallback: undefined,
+						exact: false,
 					}));
 				}),
 			);
 			const resolutionModels = expandedModelPatterns.some(
-				({ pattern }) => parseModelPattern(pattern, availableModels, matchPreferences).model,
+				({ pattern, exact }) => parseModelPattern(pattern, availableModels, matchPreferences, { exact }).model,
 			)
 				? availableModels
 				: allEnabledModels;
 			let usageFallbackTriggered = false;
 			let usageFallbackReason: { from: string; reason: string } | undefined;
 			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
-				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
-				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
+				const { pattern, retryFallback, exact } = expandedModelPatterns[patternIndex];
+				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences, { exact });
 				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
 				let hasUsageFallbackCandidate = false;
 				for (
@@ -3376,6 +3386,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						expandedModelPatterns[candidateIndex].pattern,
 						resolutionModels,
 						matchPreferences,
+						{ exact: expandedModelPatterns[candidateIndex].exact },
 					);
 					if (candidate.model && hasModelAuth(candidate.model)) {
 						hasUsageFallbackCandidate = true;
@@ -3482,7 +3493,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					const seenSelectors = new Set<string>([primarySelector]);
 					const fallbackSelectors: string[] = [];
 					for (const fallbackEntry of expandedModelPatterns.slice(patternIndex + 1)) {
-						const fallback = parseModelPattern(fallbackEntry.pattern, resolutionModels, matchPreferences);
+						const fallback = parseModelPattern(fallbackEntry.pattern, resolutionModels, matchPreferences, {
+							exact: fallbackEntry.exact,
+						});
 						if (!fallback.model) continue;
 						const fallbackSelector = formatModelSelectorValue(
 							formatModelStringWithRouting(fallback.model),

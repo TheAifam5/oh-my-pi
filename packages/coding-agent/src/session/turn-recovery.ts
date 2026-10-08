@@ -2133,9 +2133,9 @@ export class TurnRecovery {
 
 	/**
 	 * Resolves a fallback-chain selector to the model it names. Chain entries and model-group members
-	 * are exact references, never matched to a fuzzy neighbor; an entry without an exact match yields
-	 * no candidate and is logged once. The role's own `modelRoles` assignment and role-alias entries
-	 * outside a model group keep pattern matching.
+	 * are exact references, never matched to a fuzzy neighbor; a configured entry without an exact
+	 * match yields no candidate and is logged once. The role's own `modelRoles` assignment and
+	 * role-alias entries outside a model group keep pattern matching.
 	 */
 	resolveRetryFallbackCandidate(role: string, selector: RetryFallbackSelector): Model | undefined {
 		const settings = this.#host.settings;
@@ -2147,14 +2147,13 @@ export class TurnRecovery {
 				isExactRetryFallbackEntry(selector.raw, role, settings));
 		const resolved = resolveModelOverride([selector.raw], registry, settings, { exact });
 		const model = resolved.model ?? registry.find(selector.provider, selector.id);
-		// A provider still discovering its models may add the entry; neither warn nor re-arm until it settles.
-		if (exact && !registry.isProviderDiscoveryPending(selector.provider)) {
-			noteRetryFallbackEntryResolution(
-				settings,
-				selector.raw,
-				model,
-				() => resolveModelOverride([selector.raw], registry, settings).model,
-			);
+		// A wildcard-synthesized selector is no configured entry; the target provider lacking the id is routine.
+		if (exact && !selector.wildcard) {
+			noteRetryFallbackEntryResolution(settings, selector.raw, model, {
+				pool: "session",
+				nearest: () => resolveModelOverride([selector.raw], registry, settings).model,
+				lookup: registry,
+			});
 		}
 		return model;
 	}

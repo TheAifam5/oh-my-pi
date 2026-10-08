@@ -124,6 +124,7 @@ describe("retry fallback selector resolution", () => {
 				provider: "google-vertex",
 				id: "gemini-3.5-flash",
 				thinkingLevel: undefined,
+				wildcard: true,
 			},
 		]);
 	});

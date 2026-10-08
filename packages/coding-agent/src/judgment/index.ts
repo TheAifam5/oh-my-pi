@@ -212,7 +212,9 @@ function cachedJudgeRoleChain(
 		return cached;
 	}
 	warnRolePoolProjection(settings, "judge");
-	const roleChain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry));
+	const roleChain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry), {
+		entryLookup: registry,
+	});
 	const entry = {
 		settings,
 		revision,
@@ -420,7 +422,9 @@ function unfitBox(box: BoxEdges, content: BoxEdges): BoxEdges {
 
 function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
 	warnRolePoolProjection(settings, "judge");
-	return textJudgeRoleChain(resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry)));
+	return textJudgeRoleChain(
+		resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry), { entryLookup: registry }),
+	);
 }
 
 /**

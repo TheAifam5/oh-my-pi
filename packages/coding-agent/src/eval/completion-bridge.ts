@@ -224,13 +224,12 @@ function appendFallbackCandidates(
 	})) {
 		const exact = isExactRetryFallbackEntry(entry.raw, chainKey, deps.settings);
 		const candidate = resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings, { exact }).model;
-		if (exact && deps.settings) {
-			noteRetryFallbackEntryResolution(
-				deps.settings,
-				entry.raw,
-				candidate,
-				() => resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings).model,
-			);
+		if (exact && deps.settings && !entry.wildcard) {
+			noteRetryFallbackEntryResolution(deps.settings, entry.raw, candidate, {
+				pool: "eval",
+				nearest: () => resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings).model,
+				lookup: deps.modelRegistry,
+			});
 		}
 		if (!candidate || deps.disabledProviders.has(candidate.provider)) continue;
 		const reasoning = reasoningForCandidate(deps.tier, candidate, entry.thinkingLevel, parent);

@@ -300,11 +300,15 @@ function resolveSubagentRetryFallbackCandidates(
  * model patterns are already expanded. Direct callers may still supply an
  * unexpanded alias through `modelOverride` or `agent.model`; retain that
  * existing path by deriving the role only when no preserved role was supplied.
+ *
+ * Entries are judged the way the child will resolve them under its `childChainKey`: exactly,
+ * except role aliases.
  */
-function resolveSubagentInheritedRetryFallbackChain(
+export function resolveSubagentInheritedRetryFallbackChain(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
+	childChainKey: string,
 ): string[] | undefined {
 	const configuredChains = getSelectorFallbackChains(settings);
 	// An explicitly emptied role chain means "no fallbacks", not "inherit
@@ -316,7 +320,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	return fallbackChain.filter(entry => {
 		const resolved = resolveModelOverride([entry], modelRegistry, settings, {
-			exact: isExactRetryFallbackEntry(entry, role ?? "default", settings),
+			exact: isExactRetryFallbackEntry(entry, childChainKey, settings),
 		});
 		return !resolved.model || !disabledProviders.has(resolved.model.provider);
 	});
@@ -4513,7 +4517,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1 || rolePoolPick
-					? resolveSubagentInheritedRetryFallbackChain(subagentSettings, modelRegistry, spawnRole)
+					? resolveSubagentInheritedRetryFallbackChain(
+							subagentSettings,
+							modelRegistry,
+							spawnRole,
+							subagentRetryFallbackRole(id),
+						)
 					: undefined;
 			const {
 				model,

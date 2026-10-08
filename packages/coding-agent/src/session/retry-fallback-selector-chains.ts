@@ -1,39 +1,84 @@
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { MAX_THINKING_SUFFIX_OPTIONS, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { isModelGroupForm, modelGroupPathKey } from "../config/model-groups";
+import { cfgDisabledProviders } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import { cfgRetryFallbackChains } from "./settings";
 
 /** `Settings.warnState.items` id remembering the model-group chain keys already logged. */
 const GROUP_CHAIN_WARN_ID = `${cfgRetryFallbackChains.id}#model-group`;
 
-/** `Settings.warnState.items` id remembering the fallback-chain entries already logged as unmatched. */
+/** `Settings.warnState.items` id prefix remembering, per candidate pool, the entries logged as unmatched. */
 const UNMATCHED_ENTRY_WARN_ID = `${cfgRetryFallbackChains.id}#unmatched-entry`;
 
 /**
- * Records the outcome of resolving a `retry.fallbackChains` entry exactly. A miss is logged once per
- * entry and settings instance, naming the model pattern matching would have chosen (`nearest`, called
- * only when the warning is emitted); a later match re-arms the warning.
+ * Candidate set a consumer resolves fallback-chain entries against. Consumers with different sets
+ * (live session registry, a role's credentialed pool, a caller's tiny-model pool, the eval bridge's
+ * available models) can disagree about one entry, so each keeps its own re-arm state.
+ */
+export type RetryFallbackEntryPool = "session" | "role-chain" | "tiny" | "eval";
+
+const ENTRY_POOLS: readonly RetryFallbackEntryPool[] = ["session", "role-chain", "tiny", "eval"];
+
+/** Registry facts that classify an unmatched entry; `ModelRegistry` satisfies it. */
+export interface RetryFallbackEntryLookup {
+	/** Whether `provider` may still add models through in-flight discovery. */
+	isProviderDiscoveryPending(provider: string): boolean;
+	/** Exact catalog model, whether or not its provider has credentials. */
+	find(provider: string, id: string): Model<Api> | undefined;
+}
+
+/**
+ * Records the outcome of resolving a `retry.fallbackChains` entry exactly against `pool`.
+ *
+ * A miss is logged once per entry and settings instance, across every pool. The message tells a
+ * disabled provider, a catalog model whose provider has no usable credentials (known only with
+ * `lookup`), and an entry that names no model apart; the last names the model pattern matching
+ * would have chosen (`nearest`, called only when the warning is emitted). A miss while the entry's
+ * provider is still discovering models neither warns nor records anything. A match re-arms only
+ * the warning recorded for the same pool, so pools that disagree about an entry do not alternate.
  */
 export function noteRetryFallbackEntryResolution(
 	settings: Settings,
 	entry: string,
 	resolved: Model<Api> | undefined,
-	nearest: () => Model<Api> | undefined,
+	context: {
+		pool: RetryFallbackEntryPool;
+		nearest: () => Model<Api> | undefined;
+		lookup?: RetryFallbackEntryLookup;
+	},
 ): void {
 	const items = settings.warnState.items;
-	let logged = items.get(UNMATCHED_ENTRY_WARN_ID);
+	const poolId = `${UNMATCHED_ENTRY_WARN_ID}:${context.pool}`;
 	if (resolved) {
-		logged?.delete(entry);
+		items.get(poolId)?.delete(entry);
 		return;
 	}
-	if (logged?.has(entry)) return;
+	const parsed = parseModelString(entry, MAX_THINKING_SUFFIX_OPTIONS);
+	if (parsed && context.lookup?.isProviderDiscoveryPending(parsed.provider)) return;
+	if (ENTRY_POOLS.some(pool => items.get(`${UNMATCHED_ENTRY_WARN_ID}:${pool}`)?.has(entry))) return;
+	let logged = items.get(poolId);
 	if (!logged) {
 		logged = new Set();
-		items.set(UNMATCHED_ENTRY_WARN_ID, logged);
+		items.set(poolId, logged);
 	}
 	logged.add(entry);
-	const neighbor = nearest();
+	if (parsed && cfgDisabledProviders.get(settings).includes(parsed.provider)) {
+		logger.warn("Settings: retry.fallbackChains entry names a disabled provider; the entry is skipped", {
+			entry,
+			provider: parsed.provider,
+		});
+		return;
+	}
+	if (parsed && context.lookup?.find(parsed.provider, parsed.id)) {
+		logger.warn(
+			"Settings: retry.fallbackChains entry names a model whose provider has no usable credentials; the entry is skipped",
+			{ entry, provider: parsed.provider },
+		);
+		return;
+	}
+	const neighbor = context.nearest();
 	logger.warn("Settings: retry.fallbackChains entry matches no model exactly; the entry is skipped", {
 		entry,
 		nearest: neighbor ? `${neighbor.provider}/${neighbor.id}` : undefined,

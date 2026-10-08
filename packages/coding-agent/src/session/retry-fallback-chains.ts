@@ -86,6 +86,8 @@ export interface RetryFallbackSelector {
 	provider: string;
 	id: string;
 	thinkingLevel: ThinkingLevel | undefined;
+	/** Set when a `provider/*` entry synthesized this selector from the failing model's id; `raw` is not a configured entry. */
+	wildcard?: true;
 }
 
 /** Minimal model lookup needed by fallback-chain resolution. */
@@ -680,7 +682,7 @@ function parseRetryFallbackChainEntry(
 	} else {
 		id = current.id;
 	}
-	return { raw: `${provider}/${id}`, provider, id, thinkingLevel: undefined };
+	return { raw: `${provider}/${id}`, provider, id, thinkingLevel: undefined, wildcard: true };
 }
 
 /** The effective chain for `chainKey`: its primary selector followed by its entries. */

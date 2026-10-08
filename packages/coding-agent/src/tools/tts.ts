@@ -58,7 +58,7 @@ export function resolveSpeechCandidates(
 	wantsMp3: boolean,
 ): RoleChainCandidate[] {
 	const pool = roleCandidatePool("speech", settingsInstance, modelRegistry);
-	const candidates = resolveRoleChain("speech", settingsInstance, pool);
+	const candidates = resolveRoleChain("speech", settingsInstance, pool, { entryLookup: modelRegistry });
 	if (!wantsMp3) return candidates;
 
 	const nonExplicit = candidates.filter(candidate => !candidate.explicit);
