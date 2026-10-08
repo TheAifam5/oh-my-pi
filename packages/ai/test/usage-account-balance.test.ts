@@ -481,6 +481,41 @@ describe("NanoGPT balance and subscription", () => {
 			expect(isUsageLimitReached(paygo.report?.limits ?? [])).toBe(false);
 		});
 
+		it("bills an active trial as free funding drawn before the balance", async () => {
+			const balance = {
+				mode: "prepaid-credits",
+				state: "available",
+				allowance: { kind: "money", remaining: usd(12946) },
+			} as const;
+			expect(await billingOfNanogpt(trial)).toEqual([{ mode: "free", state: "available" }, balance]);
+			// A degraded counter still identifies the trial.
+			const degraded = { ...trial, tokens: { used: null, remaining: null, percentUsed: null, degraded: true } };
+			expect(await billingOfNanogpt(degraded)).toEqual([{ mode: "free", state: "available" }, balance]);
+			// The docs leave a trial's `active` flag unspecified, so a live `state` counts as active.
+			expect((await billingOfNanogpt({ ...trial, active: false })).map(source => source.mode)).toEqual([
+				"free",
+				"prepaid-credits",
+			]);
+			const inactive = { ...trial, active: false, state: "inactive" };
+			expect((await billingOfNanogpt(inactive)).map(source => source.mode)).toEqual(["prepaid-credits"]);
+			const { active: _active, ...noVerdict } = trial;
+			expect((await billingOfNanogpt(noVerdict)).map(source => source.mode)).toEqual(["prepaid-credits"]);
+		});
+
+		it("falls through a spent trial to paygo and leaves no funding when routing has none", async () => {
+			expect(await billingOfNanogpt({ ...spent, routing: { recommendedMode: "paygo" } })).toEqual([
+				{ mode: "free", state: "exhausted" },
+				{ mode: "prepaid-credits", state: "available", allowance: { kind: "money", remaining: usd(12946) } },
+			]);
+			// Spent pool evidence wins over routing that still names the subscription.
+			expect((await billingOfNanogpt(spent)).map(source => source.state)).toEqual(["exhausted", "available"]);
+			const unavailable = await billingOfNanogpt({ ...spent, routing: { recommendedMode: "unavailable" } });
+			expect(unavailable.map(source => [source.mode, source.state])).toEqual([
+				["free", "exhausted"],
+				["prepaid-credits", "exhausted"],
+			]);
+		});
+
 		it("omits a degraded trial counter and never reads the trial cap from limits", async () => {
 			const degraded = {
 				...trial,

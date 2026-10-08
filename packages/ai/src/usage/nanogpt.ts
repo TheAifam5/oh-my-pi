@@ -16,6 +16,7 @@ import { DAY_MS, usageStatus, WEEK_MS } from "./shared";
 
 const PROVIDER = "nanogpt";
 const BALANCE_LIMIT_ID = "nanogpt:balance";
+const TRIAL_LIMIT_ID = "nanogpt:subscription:trial-tokens";
 const INFERENCE_HOST = "nano-gpt.com";
 /** Earliest `resetAt` accepted as epoch milliseconds: 2001-01-01T00:00:00Z. */
 const MIN_RESET_AT_MS = Date.UTC(2001, 0, 1);
@@ -68,7 +69,7 @@ const QUOTAS: readonly Quota[] = [
 	{
 		// Token-based trials report one `tokens` counter capped by `tokenLimits.total`.
 		field: "tokens",
-		id: "nanogpt:subscription:trial-tokens",
+		id: TRIAL_LIMIT_ID,
 		label: "Trial tokens",
 		unit: "tokens",
 		cap: payload => (isRecord(payload.tokenLimits) ? finiteNumber(payload.tokenLimits.total) : undefined),
@@ -161,10 +162,16 @@ function parseSubscriptionUsage(
 	}
 	const period = isRecord(payload.period) ? payload.period : {};
 	const periodEnd = typeof period.currentPeriodEnd === "string" ? Date.parse(period.currentPeriodEnd) : Number.NaN;
+	// Documented as present only for token-based trials; read even when the counter is degraded.
+	const trial =
+		payload.usageUnits === "tokens" &&
+		(isRecord(payload.tokens) ||
+			(isRecord(payload.tokenLimits) && finiteNumber(payload.tokenLimits.total) !== undefined));
 	return {
 		limits,
 		metadata: {
 			subscriptionActive: payload.active,
+			...(trial ? { subscriptionTrial: true } : {}),
 			...(typeof payload.state === "string" ? { subscriptionState: payload.state } : {}),
 			...(mode !== undefined ? { recommendedMode: mode } : {}),
 			...(typeof routing.paidSpendPolicyAllowsBalance === "boolean"
@@ -203,21 +210,35 @@ export const nanogptUsageProvider: UsageProvider = {
 	},
 };
 
+/** `subscriptionState` values of a live subscription or trial. */
+const LIVE_STATES = new Set(["active", "grace"]);
+
 /**
- * NanoGPT billing: an active subscription, drawn first, whose state follows
+ * NanoGPT billing: an active subscription (`subscription-included`) or
+ * token-based trial (`free`), drawn first, whose state follows
  * `routing.recommendedMode`, then the prepaid USD balance, disabled when the
  * key's policy forbids paid-balance spending and exhausted when routing reports
- * no usable billing mode.
+ * no usable billing mode. A trial also reads `exhausted` once its token pool
+ * reports nothing left.
  */
 export const nanogptBilling: ProviderBilling = {
 	id: PROVIDER,
 	readBilling(report) {
 		const metadata = report.metadata ?? {};
 		const sources: BillingSource[] = [];
-		if (metadata.subscriptionActive === true) {
+		const trial = metadata.subscriptionTrial === true;
+		// The docs do not say how a trial reports `active`, so a trial in a live `state` counts as active too.
+		const live =
+			metadata.subscriptionActive === true ||
+			(trial && typeof metadata.subscriptionState === "string" && LIVE_STATES.has(metadata.subscriptionState));
+		if (live) {
 			const mode = metadata.recommendedMode;
-			const state = mode === "subscription" ? "available" : mode === undefined ? "unknown" : "exhausted";
-			sources.push({ mode: "subscription-included", state });
+			let state: BillingSource["state"] =
+				mode === "subscription" ? "available" : mode === undefined ? "unknown" : "exhausted";
+			const pool = trial ? report.limits.find(limit => limit.id === TRIAL_LIMIT_ID) : undefined;
+			// The pool limit's status is softened while routing offers paygo, so read the amount.
+			if (pool && (pool.amount.remaining === 0 || pool.amount.limit === 0)) state = "exhausted";
+			sources.push({ mode: trial ? "free" : "subscription-included", state });
 		}
 		const balance = report.limits.find(limit => limit.id === BALANCE_LIMIT_ID);
 		if (balance) {

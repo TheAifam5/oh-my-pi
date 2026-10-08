@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { type BillingResult, type BillingSource } from "@oh-my-pi/pi-ai";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { nanogptUsageProvider } from "@oh-my-pi/pi-ai/usage/nanogpt";
 import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
 import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -180,6 +181,50 @@ describe("group funding verdicts from provider billing readers", () => {
 			billingClass: "metered",
 		});
 		expect(fundingVerdict(["included", "metered"], [billingOf(report(50))])).toEqual({
+			kind: "skipped",
+			reason: { kind: "exhausted" },
+		});
+	});
+
+	it("funds a NanoGPT trial as free credits and falls through to the balance once the pool is spent", async () => {
+		const trialReport = async (remaining: number, recommendedMode: string) => {
+			const fetch = (async (input: string | URL | Request) =>
+				Response.json(
+					String(input).endsWith("/subscription/v1/usage")
+						? {
+								active: true,
+								state: "active",
+								usageUnits: "tokens",
+								tokenLimits: { total: 1_000_000 },
+								tokens: { used: 1_000_000 - remaining, remaining, percentUsed: 1 - remaining / 1_000_000 },
+								routing: { recommendedMode },
+							}
+						: { usd_balance: "5.00" },
+				)) as unknown as FetchImpl;
+			const report = await nanogptUsageProvider.fetchUsage(
+				{ provider: "nanogpt", credential: { type: "api_key", apiKey: "sk-test" } },
+				{ fetch },
+			);
+			if (!report) throw new Error("fixture did not parse");
+			return [billingOf(report)];
+		};
+
+		expect(fundingVerdict(["included", "free", "metered"], await trialReport(500_000, "subscription"))).toEqual({
+			kind: "funded",
+			stage: 1,
+			billingClass: "free",
+		});
+		expect(chargesLocalBudget(["free", "metered"], await trialReport(500_000, "subscription"))).toBe(false);
+		expect(fundingVerdict(["free", "metered"], await trialReport(0, "paygo"))).toEqual({
+			kind: "funded",
+			stage: 1,
+			billingClass: "metered",
+		});
+		expect(fundingVerdict(["free"], await trialReport(0, "paygo"))).toEqual({
+			kind: "skipped",
+			reason: { kind: "exhausted" },
+		});
+		expect(fundingVerdict(["free", "metered"], await trialReport(0, "unavailable"))).toEqual({
 			kind: "skipped",
 			reason: { kind: "exhausted" },
 		});
