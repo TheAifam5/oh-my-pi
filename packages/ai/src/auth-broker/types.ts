@@ -13,7 +13,13 @@ import type {
 	DisabledCredentialSummary,
 	StoredCredentialBlock,
 } from "../auth-storage";
-import type { ClientUsageClientSummary, ClientUsageReport, UsageHistoryEntry, UsageReport } from "../usage";
+import type {
+	AccountUsageTotal,
+	ClientUsageClientSummary,
+	ClientUsageReport,
+	UsageHistoryEntry,
+	UsageReport,
+} from "../usage";
 
 /** GET /v1/healthz response body. */
 export interface HealthzResponse {
@@ -70,6 +76,16 @@ export interface ClientUsageReportResponse {
 export interface ClientUsageSummaryResponse {
 	generatedAt: number;
 	clients: ClientUsageClientSummary[];
+}
+
+/** GET /v1/usage/accounts?sinceMs= response body — account-attributed usage of every client. */
+export interface AccountUsageResponse {
+	generatedAt: number;
+	/** The window start the totals count after (exclusive), as requested. */
+	sinceMs: number;
+	accounts: AccountUsageTotal[];
+	/** True when more (provider, account) pairs had usage than the response carries. */
+	truncated: boolean;
 }
 
 /** POST /v1/credential/:id/refresh response body. */
@@ -209,6 +225,63 @@ export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-bloc
  * without the routes answer 404, which clients treat as local-only caching.
  */
 export const AUTH_BROKER_CAPABILITY_SHARED_CACHE = "shared-cache";
+
+/**
+ * Client reads fleet account totals (`GET /v1/usage/accounts`). Advisory:
+ * brokers without the route answer 404, which clients treat as local-only limits.
+ */
+export const AUTH_BROKER_CAPABILITY_ACCOUNT_USAGE = "account-usage";
+
+/** Most account and provider filters one `GET /v1/usage/accounts` may carry, each. */
+export const ACCOUNT_USAGE_MAX_FILTERS = 64;
+
+/**
+ * Most (provider, account) pairs one `GET /v1/usage/accounts` response
+ * carries: every pair the largest filter can name, so a filtered answer is
+ * never truncated.
+ */
+export const ACCOUNT_USAGE_MAX_ROWS = ACCOUNT_USAGE_MAX_FILTERS * ACCOUNT_USAGE_MAX_FILTERS;
+
+/** Most entries one `POST /v1/usage/observed` report may carry. */
+export const OBSERVED_USAGE_MAX_ENTRIES = 1000;
+
+/** Longest install id, hostname, app, provider, or model one observed-usage report may carry. */
+export const OBSERVED_USAGE_MAX_FIELD_LENGTH = 256;
+
+/** Longest account usage key an observed-usage entry may carry. */
+export const OBSERVED_USAGE_MAX_ACCOUNT_LENGTH = 256;
+
+/** Largest request count one observed-usage entry may carry. */
+export const OBSERVED_USAGE_MAX_REQUESTS = 1_000_000;
+
+/** Largest token count of each kind one observed-usage entry may carry. */
+export const OBSERVED_USAGE_MAX_TOKENS = 1_000_000_000_000;
+
+/** Largest USD cost one observed-usage entry may carry. */
+export const OBSERVED_USAGE_MAX_COST_USD = 1_000_000;
+
+/**
+ * How far an entry's `at` may lie ahead of the broker's clock; a later one is
+ * recorded at the broker's now, so it cannot sit in future windows.
+ */
+export const OBSERVED_USAGE_MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+/**
+ * Longest window account usage is kept and totalled over (35 days, past any
+ * calendar month): older attributed rows are pruned, an older `sinceMs` is
+ * raised to it, and an attributed entry older than it is dropped.
+ */
+export const ACCOUNT_USAGE_HORIZON_MS = 35 * 24 * 60 * 60_000;
+
+// C0 and C1 control characters, which no account usage key contains.
+const ACCOUNT_CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Whether `value` is an acceptable account usage key on the wire: 1–256 characters, no control characters. */
+export function isObservedUsageAccount(value: string): boolean {
+	return (
+		value.length > 0 && value.length <= OBSERVED_USAGE_MAX_ACCOUNT_LENGTH && !ACCOUNT_CONTROL_CHARACTER.test(value)
+	);
+}
 
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";

@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { type AuthAccountPolicies, AuthStorage } from "@oh-my-pi/pi-ai";
+import { type AuthAccountPolicies, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthBrokerClient, RemoteAuthCredentialStore, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
 import { apiKeyFingerprint } from "@oh-my-pi/pi-ai/auth/policy";
 import { createAuthGatewayRouter, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
@@ -10,6 +11,7 @@ import type { Api, FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/type
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { encodeGatewayJobId } from "@oh-my-pi/pi-ai/providers/video-server";
 import {
+	brokerAccountUsage,
 	installGatewayAccountLimits,
 	openGatewayLedger,
 	openGatewayLedgerDatabase,
@@ -154,14 +156,31 @@ const embed = { model: embedding.id, input: "hello" };
 describe("auth-gateway account limits", () => {
 	test("records each call under its account and refuses the call past a requests limit", async () => {
 		const gw = await gateway([policy("openai", [{ metric: "requests", max: 1, window: DAY, onLimit: "skip" }])]);
+		const observe = vi.spyOn(gw.storage.usage, "observe");
 
 		expect((await gw.post("/v1/embeddings", embed)).status).toBe(200);
 		expect(gw.rows()).toEqual([{ account: `key:${apiKeyFingerprint(KEY)}` }]);
+		// The broker observation carries the same account, for fleet-wide totals.
+		expect(observe.mock.calls.map(([entry]) => entry.account)).toEqual([`key:${apiKeyFingerprint(KEY)}`]);
 
 		const refused = await gw.post("/v1/embeddings", embed);
 		expect(refused.status).toBe(429);
 		expect(await refused.text()).toContain("local limit");
 		expect(gw.rows()).toHaveLength(1);
+	});
+
+	test("refuses a call once the account's fleet-wide broker total reaches the limit", async () => {
+		const gw = await gateway([policy("openai", [{ metric: "requests", max: 2, window: DAY, onLimit: "skip" }])]);
+		const account = `key:${apiKeyFingerprint(KEY)}`;
+		// Clients of the same broker on other machines already made two calls on the account.
+		const fleet = vi
+			.spyOn(gw.storage.usage, "sharedAccountTotals")
+			.mockReturnValue({ provider: "openai", account, costUsd: 0, requests: 2, tokens: 0 });
+
+		const refused = await gw.post("/v1/embeddings", embed);
+		expect(refused.status).toBe(429);
+		expect(gw.rows()).toEqual([]);
+		expect(fleet).toHaveBeenCalledWith("openai", account, expect.any(Number), expect.any(Number));
 	});
 
 	test("counts a call that reports only a cost against a usd limit", async () => {
@@ -309,5 +328,75 @@ describe("auth-gateway stdio account limits", () => {
 		await router.settled();
 		await limits?.close();
 		expect(agentStorage.usageLedger.totals([{ provider: "openai" }], 0).requests).toBe(1n);
+	});
+});
+
+describe("auth-gateway fleet account usage", () => {
+	test("reads an account's broker totals in limit units, and nothing from a broker without them", async () => {
+		const tempDir = await TempDir.create("@pi-gateway-fleet-");
+		const brokerStorage = new AuthStorage(await SqliteAuthCredentialStore.open(tempDir.join("agent.db")));
+		const broker = startAuthBroker({
+			storage: brokerStorage,
+			bind: "127.0.0.1:0",
+			bearerTokens: ["fleet"],
+			disableRefresher: true,
+		});
+		const legacy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => Response.json({ error: "no route" }, { status: 404 }),
+		});
+		const remotes: RemoteAuthCredentialStore[] = [];
+		const gatewayStorage = (url: string) => {
+			const remote = new RemoteAuthCredentialStore({
+				client: new AuthBrokerClient({ url, token: "fleet", maxRetries: 0 }),
+				streamSnapshots: false,
+				backgroundIdleMs: 50,
+			});
+			remotes.push(remote);
+			return { remote, storage: new AuthStorage(remote) };
+		};
+		try {
+			const at = Date.now() - 5 * 60_000;
+			brokerStorage.usage.recordClient({
+				installId: "other-host",
+				entries: [
+					{
+						at,
+						provider: "openai",
+						model: "m",
+						requests: 2,
+						inputTokens: 7,
+						outputTokens: 3,
+						cacheReadTokens: 50,
+						cacheWriteTokens: 0,
+						costUsd: 1.0000000001,
+						account: "work",
+					},
+				],
+			});
+			const live = gatewayStorage(broker.url);
+			const usage = brokerAccountUsage(live.storage);
+			expect(usage("openai", "work", at - 60_000, Date.now())).toBeUndefined();
+			await live.remote.syncAccountUsage();
+			// USD rounds up to whole nano-USD, so a fleet cap is never under-counted.
+			expect(usage("openai", "work", at - 60_000, Date.now())).toEqual({
+				costNanos: 1_000_000_001n,
+				requests: 2n,
+				tokens: 10n,
+			});
+
+			const old = gatewayStorage(`http://127.0.0.1:${legacy.port}`);
+			const oldUsage = brokerAccountUsage(old.storage);
+			oldUsage("openai", "work", at - 60_000, Date.now());
+			await old.remote.syncAccountUsage();
+			expect(oldUsage("openai", "work", at - 60_000, Date.now())).toBeUndefined();
+		} finally {
+			for (const remote of remotes) remote.close();
+			legacy.stop(true);
+			await broker.close();
+			brokerStorage.close();
+			await tempDir.remove();
+		}
 	});
 });

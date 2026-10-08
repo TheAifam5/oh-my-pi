@@ -340,6 +340,58 @@ describe("local limits setting", () => {
 		expect(JSON.stringify(warn.mock.calls)).not.toContain("work");
 	});
 
+	it("raises an account limit to the larger fleet-wide count over the same window, never the sum", async () => {
+		const storage = await AgentStorage.open(path.join(tempDir.path(), "agent.db"));
+		const now = new Date(2026, 9, 8, 15, 30).getTime();
+		for (let index = 0; index < 2; index += 1) {
+			storage.usageLedger.record({
+				atMs: now - 1_000,
+				provider: "openai",
+				model: "m",
+				account: "work",
+				costNanos: 1_000_000_000,
+				inputTokens: 1,
+				outputTokens: 1,
+			});
+		}
+		let fleet: { costNanos: bigint; requests: bigint; tokens: bigint } | undefined;
+		const asked: number[] = [];
+		const source = createAccountLimitSource(
+			() => storage.usageLedger,
+			(provider, account, sinceMs) => {
+				expect([provider, account]).toEqual(["openai", "work"]);
+				asked.push(sinceMs);
+				return fleet;
+			},
+		);
+		const limit = (
+			metric: LocalLimit["metric"],
+			max: string | number,
+			window: LocalLimit["window"],
+		): LocalLimit[] => [{ metric, max, window, onLimit: "skip" }];
+		const day = { type: "calendar", period: "day" } as const;
+
+		// Local 2 and fleet 3 (which includes this ledger's own 2): 3 of 5, not 5.
+		fleet = { costNanos: 0n, requests: 3n, tokens: 0n };
+		expect(source.refuses("openai", "work", limit("requests", 5, day), now)).toBeUndefined();
+		fleet = { costNanos: 0n, requests: 5n, tokens: 0n };
+		expect(source.refuses("openai", "work", limit("requests", 5, day), now)).toBe("reached");
+		// Without fleet totals the ledger alone decides.
+		fleet = undefined;
+		expect(source.refuses("openai", "work", limit("requests", 3, day), now)).toBeUndefined();
+		expect(source.refuses("openai", "work", limit("requests", 2, day), now)).toBe("reached");
+		// The fleet count follows the limit's metric.
+		fleet = { costNanos: 4_000_000_000n, requests: 0n, tokens: 0n };
+		expect(source.refuses("openai", "work", limit("usd", "3.00", day), now)).toBe("reached");
+		expect(source.refuses("openai", "work", limit("tokens", 5, day), now)).toBeUndefined();
+
+		// The fleet window starts where the ledger's does: a calendar day includes its first millisecond.
+		asked.length = 0;
+		source.refuses("openai", "work", limit("requests", 9, day), now);
+		source.refuses("openai", "work", limit("requests", 9, { type: "rolling", durationMs: 3_600_000 }), now);
+		expect(asked).toEqual([new Date(2026, 9, 8).getTime() - 1, now - 3_600_000]);
+	});
+
 	it("keeps global account limits when project account policies replace the global ones", async () => {
 		const limits = [{ metric: "requests", max: 1, window: DAY }];
 		fs.writeFileSync(

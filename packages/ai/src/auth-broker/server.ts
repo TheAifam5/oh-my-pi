@@ -15,8 +15,10 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { AuthCredentialSnapshotEntry, AuthStorage, StoredCredentialBlock } from "../auth-storage";
 import { parseBind } from "../utils/parse-bind";
 import { resolvePeer } from "../utils/resolve-peer";
+import type { AccountUsageTotal } from "../usage";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
+	AccountUsageResponse,
 	ClientUsageReportRequest,
 	CredentialBlockResponse,
 	CredentialBlockSnapshot,
@@ -36,6 +38,11 @@ import type {
 	SnapshotStreamSnapshotEvent,
 } from "./types";
 import {
+	ACCOUNT_USAGE_HORIZON_MS,
+	ACCOUNT_USAGE_MAX_FILTERS,
+	ACCOUNT_USAGE_MAX_ROWS,
+	isObservedUsageAccount,
+	OBSERVED_USAGE_MAX_FUTURE_SKEW_MS,
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	DEFAULT_AUTH_BROKER_BIND,
@@ -212,6 +219,8 @@ const STATIC_ROUTES: Record<string, true> = {
 	"/v1/usage/observed": true,
 	"/v1/usage/clients": true,
 	"/v1/usage/stale": true,
+	"/v1/usage/accounts": true,
+	"/v1/cache": true,
 	"/v1/credentials/disabled": true,
 	"/v1/credential": true,
 };
@@ -222,6 +231,9 @@ function loggablePath(pathname: string): string {
 	const dynamic = [REFRESH_ROUTE, DISABLE_ROUTE, BLOCK_ROUTE, BLOCKS_ROUTE].some(route => route.test(pathname));
 	return dynamic ? pathname : "<unrouted>";
 }
+
+/** Largest accepted `POST /v1/usage/observed` body, in bytes. */
+const CLIENT_USAGE_REPORT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 const SHARED_CACHE_ROUTE = "/v1/cache";
 /** Interval between sweeps of expired cache rows on the broker's store. */
@@ -947,6 +959,21 @@ async function serveSharedCache(
 	return json(200, response);
 }
 
+/**
+ * `report` held to the broker's clock: an entry stamped more than
+ * {@link OBSERVED_USAGE_MAX_FUTURE_SKEW_MS} ahead is recorded at `nowMs`, so
+ * it cannot sit in every future window, and an account-attributed entry older
+ * than {@link ACCOUNT_USAGE_HORIZON_MS} is dropped.
+ */
+function boundObservedUsage(report: ClientUsageReportRequest, nowMs: number): ClientUsageReportRequest {
+	const entries = report.entries.flatMap(entry => {
+		if (entry.at > nowMs + OBSERVED_USAGE_MAX_FUTURE_SKEW_MS) return [{ ...entry, at: nowMs }];
+		if (entry.account !== undefined && entry.at < nowMs - ACCOUNT_USAGE_HORIZON_MS) return [];
+		return [entry];
+	});
+	return { ...report, entries };
+}
+
 /** Boot the broker. Caller owns lifecycle; `handle.close()` to stop. */
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
@@ -1037,11 +1064,13 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					return json(200, { generatedAt: Date.now(), entries });
 				}
 				if (req.method === "POST" && pathname === "/v1/usage/observed") {
-					const parsed = await parseBody(req, clientUsageReportRequestSchema);
+					const parsed = await parseBody(req, clientUsageReportRequestSchema, {
+						maxBytes: CLIENT_USAGE_REPORT_MAX_BODY_BYTES,
+					});
 					if (!parsed.ok) return parsed.response;
 					// Arktype's inferred union collides the `entries` field with
 					// Array.prototype.entries; the schema already validated the shape.
-					const report = parsed.data as ClientUsageReportRequest;
+					const report = boundObservedUsage(parsed.data as ClientUsageReportRequest, Date.now());
 					try {
 						const recorded = opts.storage.usage.recordClient(report);
 						if (!recorded) return json(501, { error: "broker store does not persist client usage" });
@@ -1063,6 +1092,47 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const sinceMsParsed = sinceMsRaw === null ? Number.NaN : Number.parseInt(sinceMsRaw, 10);
 					const summary = opts.storage.usage.clientSummary(Number.isFinite(sinceMsParsed) ? sinceMsParsed : 0);
 					return json(200, { generatedAt: Date.now(), clients: summary.clients });
+				}
+				if (req.method === "GET" && pathname === "/v1/usage/accounts") {
+					const sinceMsRaw = url.searchParams.get("sinceMs");
+					const requestedSinceMs =
+						sinceMsRaw !== null && /^\d{1,16}$/.test(sinceMsRaw) ? Number(sinceMsRaw) : undefined;
+					if (requestedSinceMs === undefined) {
+						return json(400, { error: "sinceMs must be a non-negative integer" });
+					}
+					const accounts = url.searchParams.getAll("account");
+					const providers = url.searchParams.getAll("provider");
+					if (
+						accounts.length === 0 ||
+						accounts.length > ACCOUNT_USAGE_MAX_FILTERS ||
+						providers.length > ACCOUNT_USAGE_MAX_FILTERS ||
+						!accounts.every(isObservedUsageAccount) ||
+						!providers.every(isObservedUsageAccount)
+					) {
+						return json(400, {
+							error: `1-${ACCOUNT_USAGE_MAX_FILTERS} account filters and at most ${ACCOUNT_USAGE_MAX_FILTERS} provider filters of 1-256 characters`,
+						});
+					}
+					// Rows older than the horizon are pruned; an earlier start would only scan for them.
+					const sinceMs = Math.max(requestedSinceMs, Date.now() - ACCOUNT_USAGE_HORIZON_MS);
+					let rows: AccountUsageTotal[] | undefined;
+					try {
+						rows = opts.storage.usage.clientAccountUsage(sinceMs, ACCOUNT_USAGE_MAX_ROWS + 1, {
+							accounts,
+							...(providers.length > 0 ? { providers } : {}),
+						});
+					} catch (error) {
+						logger.warn("auth-broker account usage query failed", { peer, error: String(error) });
+						return json(503, { error: "account usage is unavailable" });
+					}
+					if (rows === undefined) return json(501, { error: "broker store does not record account usage" });
+					const body: AccountUsageResponse = {
+						generatedAt: Date.now(),
+						sinceMs,
+						accounts: rows.slice(0, ACCOUNT_USAGE_MAX_ROWS),
+						truncated: rows.length > ACCOUNT_USAGE_MAX_ROWS,
+					};
+					return json(200, body, { "Cache-Control": "no-store" });
 				}
 				if (req.method === "POST" && pathname === "/v1/usage/stale") {
 					const provider = url.searchParams.get("provider") || undefined;

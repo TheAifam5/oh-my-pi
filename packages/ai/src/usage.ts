@@ -231,6 +231,30 @@ export interface ObservedUsageEntry {
 	cacheWriteTokens: number;
 	/** Estimated USD cost of the folded requests (0 when unknown). */
 	costUsd: number;
+	/**
+	 * Account usage key (`accountUsageKey`) of the account that served the
+	 * folded requests, when known. An attributed entry folds only requests of
+	 * one wall-clock minute, so the broker can total an account's usage over a
+	 * limit window to the minute; brokers that predate it ignore the field.
+	 */
+	account?: string;
+}
+
+/** One account's usage across every broker client over a window. */
+export interface AccountUsageTotal {
+	provider: string;
+	/** Account usage key (`accountUsageKey`). */
+	account: string;
+	costUsd: number;
+	requests: number;
+	/** Input plus output tokens; cache reads and writes are not counted. */
+	tokens: number;
+}
+
+/** Providers and accounts an account usage query is narrowed to; an absent list keeps all. */
+export interface AccountUsageFilter {
+	providers?: readonly string[];
+	accounts?: readonly string[];
 }
 
 /** One client's observed-usage report, keyed by its stable install id. */

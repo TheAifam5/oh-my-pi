@@ -202,16 +202,31 @@ function readTotals(ledger: UsageLedger, scopes: readonly UsageScope[], sinceMs:
 }
 
 /**
- * What `target` has counted in its window at `nowMs`, in counter units (nano-USD for `usd`).
+ * Another source's count for `target` of the calls after `sinceMs`, in counter units, or undefined
+ * when it has none; {@link evaluateLimits} takes the larger of it and the ledger's count.
+ */
+export type RemoteLimitCount = (target: LimitTarget, sinceMs: number, nowMs: number) => bigint | undefined;
+
+/**
+ * What `target` has counted in its window at `nowMs`, in counter units (nano-USD for `usd`): the
+ * ledger's count, raised to `remote`'s when that is larger.
  *
  * @throws Error when no ledger is open or the read fails.
  */
-function countedUsage(ledger: UsageLedger | undefined, target: LimitTarget, nowMs: number): bigint {
+function countedUsage(
+	ledger: UsageLedger | undefined,
+	target: LimitTarget,
+	nowMs: number,
+	remote?: RemoteLimitCount,
+): bigint {
 	if (!ledger) throw new Error("no usage ledger is open");
 	const { window } = target.limit;
 	const start = localLimitWindowStart(window, nowMs);
 	// The ledger counts calls after `sinceMs`; a calendar window includes its first millisecond.
-	return metricTotal(readTotals(ledger, target.scopes, window.type === "calendar" ? start - 1 : start), target.limit);
+	const sinceMs = window.type === "calendar" ? start - 1 : start;
+	const local = metricTotal(readTotals(ledger, target.scopes, sinceMs), target.limit);
+	const shared = remote?.(target, sinceMs, nowMs);
+	return shared !== undefined && shared > local ? shared : local;
 }
 
 /** A limit and what its counter holds now, for display. */
@@ -353,6 +368,7 @@ export function evaluateLimits(
 	ledger: UsageLedger | undefined,
 	targets: readonly LimitTarget[],
 	nowMs: number,
+	remote?: RemoteLimitCount,
 ): LimitEvaluation {
 	const refused: LimitRefusal[] = [];
 	const warned: LimitTarget[] = [];
@@ -360,7 +376,7 @@ export function evaluateLimits(
 	for (const target of targets) {
 		let reached: boolean;
 		try {
-			reached = countedUsage(ledger, target, nowMs) >= localLimitCap(target.limit);
+			reached = countedUsage(ledger, target, nowMs, remote) >= localLimitCap(target.limit);
 		} catch (error) {
 			if (target.limit.onLimit === "skip") {
 				logger.debug("Local limit usage could not be read", { limit: target.label, error: String(error) });
@@ -397,13 +413,36 @@ function accountLogId(account: string): string {
 	return `#${Bun.hash(account).toString(16).padStart(16, "0").slice(0, 8)}`;
 }
 
+/** Usage of an account across every client of a shared source (the auth broker), in limit units. */
+export interface SharedAccountUsage {
+	costNanos: bigint;
+	requests: bigint;
+	tokens: bigint;
+}
+
+/**
+ * Fleet-wide usage of `account` on `provider` after `sinceMs`, or undefined when unknown;
+ * synchronous, from totals the source refreshes on its own.
+ */
+export type SharedAccountUsageSource = (
+	provider: string,
+	account: string,
+	sinceMs: number,
+	nowMs: number,
+) => SharedAccountUsage | undefined;
+
 /**
  * The account limit source the auth store consults ({@link AccountLimitSource}): each limit counts
- * the calls `account` made to `provider` in the usage `ledger()`. A reached `warn` limit is logged
- * once per calendar period, or for a rolling window once until it drops below its cap; usage that
- * cannot be read refuses with `unreadable`, logged once per account.
+ * the calls `account` made to `provider` in the usage `ledger()`, or the account's fleet-wide usage
+ * from `shared` when that is larger (never their sum: the fleet totals include this ledger's own
+ * calls). A reached `warn` limit is logged once per calendar period, or for a rolling window once
+ * until it drops below its cap; usage that cannot be read from the ledger refuses with
+ * `unreadable`, logged once per account.
  */
-export function createAccountLimitSource(ledger: () => UsageLedger | undefined): AccountLimitSource {
+export function createAccountLimitSource(
+	ledger: () => UsageLedger | undefined,
+	shared?: SharedAccountUsageSource,
+): AccountLimitSource {
 	const warnedWindows = new Set<string>();
 	const warnedUnreadable = new Set<string>();
 	return {
@@ -417,7 +456,15 @@ export function createAccountLimitSource(ledger: () => UsageLedger | undefined):
 				limit,
 				scopes: [{ provider, account }],
 			}));
-			const { refused, warned, quiet } = evaluateLimits(ledger(), targets, nowMs);
+			const remote: RemoteLimitCount | undefined = shared
+				? (target, sinceMs, at) => {
+						const usage = shared(provider, account, sinceMs, at);
+						if (!usage) return undefined;
+						const { metric } = target.limit;
+						return metric === "usd" ? usage.costNanos : metric === "requests" ? usage.requests : usage.tokens;
+					}
+				: undefined;
+			const { refused, warned, quiet } = evaluateLimits(ledger(), targets, nowMs, remote);
 			for (const target of quiet) {
 				if (target.limit.window.type === "rolling") warnedWindows.delete(limitWarningKey(target, nowMs));
 			}

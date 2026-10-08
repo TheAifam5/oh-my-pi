@@ -29,6 +29,8 @@ import type {
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type {
+	AccountUsageFilter,
+	AccountUsageTotal,
 	ClientProviderUsage,
 	ClientUsageReport,
 	ClientUsageSummary,
@@ -56,6 +58,76 @@ const USAGE_HISTORY_BUCKET_MS = 60 * 60_000;
  * instead of one row per 10s flush.
  */
 const CLIENT_USAGE_BUCKET_MS = 5 * 60_000;
+
+/**
+ * Account-attributed client usage merges only within one aligned wall-clock
+ * minute per (install, app, provider, model, account), so a row's
+ * `recorded_at` (the newest request in it) stays inside its minute and a
+ * limit window totals the account's usage to the minute: at most 1440 rows
+ * per day per active account and model of a client.
+ */
+const CLIENT_ACCOUNT_USAGE_BUCKET_MS = 60_000;
+
+/** Age past which account-attributed client usage rows are pruned (the longest enforceable window). */
+const CLIENT_ACCOUNT_USAGE_RETENTION_MS = 35 * 24 * 60 * 60_000;
+
+/** Least interval between prunes of old account-attributed client usage rows. */
+const CLIENT_ACCOUNT_USAGE_PRUNE_INTERVAL_MS = 10 * 60_000;
+
+/** Ceiling of each client usage counter column (2^53 - 1); merges saturate at it. */
+const CLIENT_USAGE_MAX_COUNTER = Number.MAX_SAFE_INTEGER;
+
+/** Ceiling of a client usage row's USD cost; merges saturate at it. */
+const CLIENT_USAGE_MAX_COST_USD = 1e15;
+
+/** Most installs whose usage counts are kept in memory; the least recently reporting is recounted when it returns. */
+const CLIENT_USAGE_COUNTS_CACHE_MAX = 1024;
+
+/** Least interval between warnings about client usage dropped past the per-install caps. */
+const CLIENT_USAGE_DROP_WARN_INTERVAL_MS = 10 * 60_000;
+
+/** Newest unattributed row of one series at or after a floor; searches `idx_client_usage_unattributed_series`. */
+export const CLIENT_USAGE_UNATTRIBUTED_BUCKET_SQL = `SELECT id FROM client_usage
+	WHERE install_id = ? AND app = ? AND provider = ? AND model = ? AND account IS NULL AND recorded_at >= ?
+	ORDER BY recorded_at DESC LIMIT 1`;
+
+/** Newest attributed row of one series within a range; searches `idx_client_usage_attributed_series`. */
+export const CLIENT_USAGE_ATTRIBUTED_BUCKET_SQL = `SELECT id FROM client_usage
+	WHERE install_id = ? AND app = ? AND provider = ? AND model = ? AND account = ? AND account IS NOT NULL
+		AND recorded_at >= ? AND recorded_at < ?
+	ORDER BY recorded_at DESC LIMIT 1`;
+
+/** One install's recorded row counts and distinct accounts. */
+interface ClientUsageCounts {
+	attributed: number;
+	unattributed: number;
+	accounts: Set<string>;
+}
+
+/** Per-install bounds on recorded client usage rows; see {@link SqliteAuthCredentialStoreOptions}. */
+interface ClientUsageLimits {
+	attributedRowsPerInstall: number;
+	accountsPerInstall: number;
+	unattributedRowsPerInstall: number;
+}
+
+const DEFAULT_CLIENT_USAGE_LIMITS: ClientUsageLimits = {
+	attributedRowsPerInstall: 500_000,
+	accountsPerInstall: 256,
+	unattributedRowsPerInstall: 100_000,
+};
+
+/** Options for {@link SqliteAuthCredentialStore}. */
+export interface SqliteAuthCredentialStoreOptions {
+	/**
+	 * Per-install bounds on the broker's recorded client usage. Past the row
+	 * caps new usage folds into the newest row of its series (totals kept,
+	 * timestamps coarsened); usage of accounts past the account cap is not
+	 * recorded. Defaults: 500,000 attributed rows, 256 accounts, 100,000
+	 * unattributed rows.
+	 */
+	clientUsageLimits?: Partial<ClientUsageLimits>;
+}
 
 /**
  * The smallest string greater than every string that starts with `prefix`, in
@@ -436,6 +508,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#updateIfMatchesStmt: Statement;
 	#deleteByProviderStmt: Statement;
 	#hardDeleteStmt: Statement;
+	readonly #clientUsageLimits: ClientUsageLimits;
+	/** Usage counts by install id, least recently used first; see {@link #clientUsageCountsFor}. */
+	readonly #clientUsageCounts = new Map<string, ClientUsageCounts>();
+	#clientUsageDropWarnedAtMs = Number.NEGATIVE_INFINITY;
+	/** Last prune of old account-attributed client usage; the first write after open prunes. */
+	#clientAccountUsagePrunedAtMs = Number.NEGATIVE_INFINITY;
 	#getCacheStmt: Statement;
 	#getCacheIncludingExpiredStmt: Statement;
 	#upsertCacheStmt: Statement;
@@ -467,8 +545,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#localAuthRevision: number;
 	#closed = false;
 
-	constructor(db: Database) {
+	constructor(db: Database, options: SqliteAuthCredentialStoreOptions = {}) {
 		this.#db = db;
+		this.#clientUsageLimits = { ...DEFAULT_CLIENT_USAGE_LIMITS, ...options.clientUsageLimits };
 		this.#initializeSchema();
 		this.#dataVersion = this.#readDataVersion();
 		this.#authRevision = this.#readAuthRevision();
@@ -709,6 +788,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			CREATE INDEX IF NOT EXISTS idx_client_usage_recorded ON client_usage(recorded_at);
 		`);
 		this.#ensureClientUsageAppColumn();
+		this.#ensureClientUsageAccountColumn();
 
 		if (!this.#authCredentialsTableExists()) {
 			this.#createAuthCredentialsTable();
@@ -1937,8 +2017,79 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
+	#ensureClientUsageAccountColumn(): void {
+		const columns = this.#db.query("PRAGMA table_info(client_usage)").all() as Array<{ name: string }>;
+		if (!columns.some(column => column.name === "account")) {
+			this.#db.run("ALTER TABLE client_usage ADD COLUMN account TEXT");
+		}
+		this.#db.run(
+			"CREATE INDEX IF NOT EXISTS idx_client_usage_account ON client_usage(account, recorded_at) WHERE account IS NOT NULL",
+		);
+		// Bucket lookups on the write path search every column they filter on, so a capped install's
+		// widened lookup reads one series instead of scanning the install's rows.
+		this.#db.run(
+			`CREATE INDEX IF NOT EXISTS idx_client_usage_attributed_series
+			 ON client_usage(install_id, app, provider, model, account, recorded_at) WHERE account IS NOT NULL`,
+		);
+		this.#db.run(
+			`CREATE INDEX IF NOT EXISTS idx_client_usage_unattributed_series
+			 ON client_usage(install_id, app, provider, model, recorded_at) WHERE account IS NULL`,
+		);
+		this.#db.run(
+			"CREATE INDEX IF NOT EXISTS idx_client_usage_install_account ON client_usage(install_id, account) WHERE account IS NOT NULL",
+		);
+	}
+
+	/**
+	 * Row and account counts of `installId`'s recorded usage, counted once and
+	 * then kept current by the writer; dropped whenever a prune removes rows.
+	 */
+	#clientUsageCountsFor(installId: string): ClientUsageCounts {
+		const cached = this.#clientUsageCounts.get(installId);
+		if (cached) {
+			// Re-inserted so the map's order is least recently used first.
+			this.#clientUsageCounts.delete(installId);
+			this.#clientUsageCounts.set(installId, cached);
+			return cached;
+		}
+		const totals = this.#db
+			.query(
+				"SELECT COUNT(account) AS attributed, COUNT(*) - COUNT(account) AS unattributed FROM client_usage WHERE install_id = ?",
+			)
+			.get(installId) as { attributed: number; unattributed: number };
+		const accounts = this.#db
+			.query("SELECT DISTINCT account FROM client_usage WHERE install_id = ? AND account IS NOT NULL")
+			.all(installId) as Array<{ account: string }>;
+		const counts: ClientUsageCounts = {
+			attributed: totals.attributed,
+			unattributed: totals.unattributed,
+			accounts: new Set(accounts.map(row => row.account)),
+		};
+		this.#clientUsageCounts.set(installId, counts);
+		while (this.#clientUsageCounts.size > CLIENT_USAGE_COUNTS_CACHE_MAX) {
+			this.#clientUsageCounts.delete(this.#clientUsageCounts.keys().next().value!);
+		}
+		return counts;
+	}
+
+	/** Drop account-attributed client usage rows older than the retention horizon, at most once per prune interval. */
+	#pruneClientAccountUsage(nowMs: number): void {
+		if (nowMs - this.#clientAccountUsagePrunedAtMs < CLIENT_ACCOUNT_USAGE_PRUNE_INTERVAL_MS) return;
+		this.#clientAccountUsagePrunedAtMs = nowMs;
+		const pruned = this.#db
+			.query("DELETE FROM client_usage WHERE account IS NOT NULL AND recorded_at < ?")
+			.run(nowMs - CLIENT_ACCOUNT_USAGE_RETENTION_MS);
+		if (pruned.changes > 0) this.#clientUsageCounts.clear();
+	}
+
 	recordClientUsage(report: ClientUsageReport): void {
 		const now = Date.now();
+		// One transaction per report: a report's lookups and writes share one snapshot and one commit.
+		this.#db.transaction(() => this.#recordClientUsageRows(report, now))();
+		this.#pruneClientAccountUsage(now);
+	}
+
+	#recordClientUsageRows(report: ClientUsageReport, now: number): void {
 		this.#db
 			.query(
 				`INSERT INTO clients (install_id, hostname, first_seen, last_seen) VALUES (?, ?, ?, ?)
@@ -1946,54 +2097,125 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			)
 			.run(report.installId, report.hostname ?? null, now, now);
 		const app = report.app?.trim() ?? "";
-		const findBucket = this.#db.query(
-			`SELECT id FROM client_usage
-			 WHERE install_id = ? AND app = ? AND provider = ? AND model = ? AND recorded_at >= ?
-			 ORDER BY recorded_at DESC LIMIT 1`,
+		const limits = this.#clientUsageLimits;
+		// Counters saturate instead of overflowing SQLite's 64-bit integers on repeated merges.
+		const addAmounts = `requests = MIN(requests + ?, ${CLIENT_USAGE_MAX_COUNTER}),
+			input_tokens = MIN(input_tokens + ?, ${CLIENT_USAGE_MAX_COUNTER}),
+			output_tokens = MIN(output_tokens + ?, ${CLIENT_USAGE_MAX_COUNTER}),
+			cache_read_tokens = MIN(cache_read_tokens + ?, ${CLIENT_USAGE_MAX_COUNTER}),
+			cache_write_tokens = MIN(cache_write_tokens + ?, ${CLIENT_USAGE_MAX_COUNTER}),
+			cost_usd = MIN(cost_usd + ?, ${CLIENT_USAGE_MAX_COST_USD})`;
+		const findBucket = this.#db.query(CLIENT_USAGE_UNATTRIBUTED_BUCKET_SQL);
+		const findAccountBucket = this.#db.query(CLIENT_USAGE_ATTRIBUTED_BUCKET_SQL);
+		// A merge never moves a row's timestamp back, so a backdated entry cannot age a row out of windows.
+		const mergeRow = this.#db.query(
+			`UPDATE client_usage SET recorded_at = MAX(recorded_at, ?), ${addAmounts} WHERE id = ?`,
 		);
-		const merge = this.#db.query(
-			`UPDATE client_usage SET recorded_at = ?, requests = requests + ?, input_tokens = input_tokens + ?,
-				output_tokens = output_tokens + ?, cache_read_tokens = cache_read_tokens + ?,
-				cache_write_tokens = cache_write_tokens + ?, cost_usd = cost_usd + ? WHERE id = ?`,
+		const insertAccount = this.#db.query(
+			`INSERT INTO client_usage (recorded_at, install_id, app, provider, model, account, requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		const insert = this.#db.query(
 			`INSERT INTO client_usage (recorded_at, install_id, app, provider, model, requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
+		const counts = this.#clientUsageCountsFor(report.installId);
+		let dropped = 0;
 		for (const entry of report.entries) {
-			// Merge into the newest row of the same (install, provider, model)
-			// bucket so 10s client flushes don't accrete one row apiece forever.
-			const bucketFloor = entry.at - CLIENT_USAGE_BUCKET_MS;
-			const existing = findBucket.get(report.installId, app, entry.provider, entry.model, bucketFloor) as {
-				id: number;
-			} | null;
-			if (existing) {
-				merge.run(
-					entry.at,
-					entry.requests,
-					entry.inputTokens,
-					entry.outputTokens,
-					entry.cacheReadTokens,
-					entry.cacheWriteTokens,
-					entry.costUsd,
-					existing.id,
-				);
-				continue;
-			}
-			insert.run(
-				entry.at,
-				report.installId,
-				app,
-				entry.provider,
-				entry.model,
+			const amounts = [
 				entry.requests,
 				entry.inputTokens,
 				entry.outputTokens,
 				entry.cacheReadTokens,
 				entry.cacheWriteTokens,
 				entry.costUsd,
-			);
+			] as const;
+			const { account } = entry;
+			if (account !== undefined) {
+				// An install's distinct accounts are capped; usage of accounts past the cap is not recorded.
+				if (!counts.accounts.has(account)) {
+					if (counts.accounts.size >= limits.accountsPerInstall) {
+						dropped += 1;
+						continue;
+					}
+					counts.accounts.add(account);
+				}
+				const bucketStart = Math.floor(entry.at / CLIENT_ACCOUNT_USAGE_BUCKET_MS) * CLIENT_ACCOUNT_USAGE_BUCKET_MS;
+				const full = counts.attributed >= limits.attributedRowsPerInstall;
+				// Past the row cap a minute folds into the newest row of its series, which only over-counts later windows.
+				const bucket = findAccountBucket.get(
+					report.installId,
+					app,
+					entry.provider,
+					entry.model,
+					account,
+					full ? 0 : bucketStart,
+					full ? Number.MAX_SAFE_INTEGER : bucketStart + CLIENT_ACCOUNT_USAGE_BUCKET_MS,
+				) as { id: number } | null;
+				if (bucket) mergeRow.run(entry.at, ...amounts, bucket.id);
+				else if (full) dropped += 1;
+				else {
+					insertAccount.run(entry.at, report.installId, app, entry.provider, entry.model, account, ...amounts);
+					counts.attributed += 1;
+				}
+				continue;
+			}
+			// Merge into the newest row of the same (install, provider, model)
+			// bucket so 10s client flushes don't accrete one row apiece forever;
+			// past the install's row cap, into the newest row of the series at all.
+			const full = counts.unattributed >= limits.unattributedRowsPerInstall;
+			const bucketFloor = full ? 0 : entry.at - CLIENT_USAGE_BUCKET_MS;
+			const existing = findBucket.get(report.installId, app, entry.provider, entry.model, bucketFloor) as {
+				id: number;
+			} | null;
+			if (existing) {
+				mergeRow.run(entry.at, ...amounts, existing.id);
+				continue;
+			}
+			if (full) {
+				dropped += 1;
+				continue;
+			}
+			insert.run(entry.at, report.installId, app, entry.provider, entry.model, ...amounts);
+			counts.unattributed += 1;
 		}
+		if (dropped > 0 && now - this.#clientUsageDropWarnedAtMs >= CLIENT_USAGE_DROP_WARN_INTERVAL_MS) {
+			this.#clientUsageDropWarnedAtMs = now;
+			logger.warn("Client usage past per-install caps was not recorded", {
+				installId: report.installId,
+				dropped,
+			});
+		}
+	}
+
+	getClientAccountUsage(sinceMs: number, limit: number, filter?: AccountUsageFilter): AccountUsageTotal[] {
+		const providers = filter?.providers ?? [];
+		const accounts = filter?.accounts ?? [];
+		const placeholders = (values: readonly string[]) => values.map(() => "?").join(", ");
+		// TOTAL sums as floating point, so no number of rows can overflow it.
+		const rows = this.#db
+			.query(
+				`SELECT provider, account, TOTAL(cost_usd) AS cost_usd, TOTAL(requests) AS requests,
+					TOTAL(input_tokens) + TOTAL(output_tokens) AS tokens
+				 FROM client_usage WHERE account IS NOT NULL AND recorded_at > ?
+				 ${providers.length > 0 ? `AND provider IN (${placeholders(providers)})` : ""}
+				 ${accounts.length > 0 ? `AND account IN (${placeholders(accounts)})` : ""}
+				 GROUP BY provider, account ORDER BY TOTAL(cost_usd) DESC, provider, account LIMIT ?`,
+			)
+			.all(sinceMs, ...providers, ...accounts, Math.max(0, Math.trunc(limit))) as Array<{
+			provider: string;
+			account: string;
+			cost_usd: number;
+			requests: number;
+			tokens: number;
+		}>;
+		return rows.map(row => ({
+			provider: row.provider,
+			account: row.account,
+			costUsd: row.cost_usd,
+			requests: row.requests,
+			tokens: row.tokens,
+		}));
 	}
 
 	getClientUsageSummary(sinceMs: number): ClientUsageSummary {
@@ -2002,11 +2224,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			.all() as Array<{ install_id: string; hostname: string | null; first_seen: number; last_seen: number }>;
 		const aggregates = this.#db
 			.query(
-				`SELECT install_id, app, provider, SUM(requests) requests, SUM(input_tokens) input_tokens,
-					SUM(output_tokens) output_tokens, SUM(cache_read_tokens) cache_read_tokens,
-					SUM(cache_write_tokens) cache_write_tokens, SUM(cost_usd) cost_usd
+				`SELECT install_id, app, provider, TOTAL(requests) requests, TOTAL(input_tokens) input_tokens,
+					TOTAL(output_tokens) output_tokens, TOTAL(cache_read_tokens) cache_read_tokens,
+					TOTAL(cache_write_tokens) cache_write_tokens, TOTAL(cost_usd) cost_usd
 				 FROM client_usage WHERE recorded_at >= ? GROUP BY install_id, app, provider
-				 ORDER BY install_id, SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) DESC`,
+				 ORDER BY install_id, TOTAL(input_tokens) + TOTAL(output_tokens) + TOTAL(cache_read_tokens) + TOTAL(cache_write_tokens) DESC`,
 			)
 			.all(sinceMs) as Array<{
 			install_id: string;

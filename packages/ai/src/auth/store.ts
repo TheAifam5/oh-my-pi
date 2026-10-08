@@ -1,6 +1,8 @@
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type {
+	AccountUsageFilter,
+	AccountUsageTotal,
 	ClientUsageIdentity,
 	ClientUsageReport,
 	ClientUsageSummary,
@@ -195,6 +197,20 @@ export interface UsageLedgerStore {
 	recordClientUsage(report: ClientUsageReport): void;
 	/** Broker host: aggregate recorded per-client usage since a timestamp. */
 	getClientUsageSummary(sinceMs: number): ClientUsageSummary;
+	/**
+	 * Broker host: usage every client attributed to an account, per
+	 * (provider, account), over requests stamped after `sinceMs` (epoch ms),
+	 * at most `limit` rows, highest cost first; `filter` keeps only the listed
+	 * providers and accounts.
+	 */
+	getClientAccountUsage(sinceMs: number, limit: number, filter?: AccountUsageFilter): AccountUsageTotal[];
+	/**
+	 * Client hook: the fleet-wide usage of `account` on `provider` after
+	 * `sinceMs`, from the latest broker totals, or undefined when none recent
+	 * enough is known. Synchronous; remote stores refresh the totals in the
+	 * background.
+	 */
+	accountUsageTotals(provider: string, account: string, sinceMs: number, nowMs: number): AccountUsageTotal | undefined;
 }
 
 /** Broker-delegated OAuth refresh and usage-report operations. */

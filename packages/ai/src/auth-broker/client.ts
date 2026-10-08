@@ -9,7 +9,9 @@
 import { type } from "@oh-my-pi/omptype";
 import { readSseEvents } from "@oh-my-pi/pi-utils";
 import type { AuthCredential, DisabledCredentialSummary, OAuthRefreshReason } from "../auth-storage";
+import type { AccountUsageFilter } from "../usage";
 import type {
+	AccountUsageResponse,
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
@@ -35,12 +37,16 @@ import type {
 } from "./types";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_ACCOUNT_USAGE,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AUTH_BROKER_CAPABILITY_SHARED_CACHE,
+	ACCOUNT_USAGE_MAX_ROWS,
+	OBSERVED_USAGE_MAX_ACCOUNT_LENGTH,
 } from "./types";
 import { parseGenerationTag } from "./protocol";
 import { SHARED_CACHE_MAX_LISTING_BYTES } from "./shared-cache";
 import {
+	accountUsageResponseSchema,
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
 	credentialBlockResponseSchema,
@@ -61,6 +67,7 @@ import {
 
 /** Response schema per endpoint, keyed by the name `#request` callers pass. */
 const RESPONSE_SCHEMAS = {
+	accountUsageResponseSchema,
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
 	credentialBlockResponseSchema,
@@ -131,6 +138,13 @@ const DEFAULT_MAX_RETRIES = 1;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 /** Largest `GET /v1/cache` response read: the broker's worst-case listing with a quarter's margin. */
 const SHARED_CACHE_MAX_RESPONSE_BYTES = Math.ceil(SHARED_CACHE_MAX_LISTING_BYTES * 1.25);
+/**
+ * Largest `GET /v1/usage/accounts` response read: every pair a maximal filter
+ * names, each with a maximal provider and account (at most three UTF-8 bytes
+ * per code unit) and the row envelope.
+ */
+const ACCOUNT_USAGE_MAX_RESPONSE_BYTES =
+	ACCOUNT_USAGE_MAX_ROWS * (2 * 3 * OBSERVED_USAGE_MAX_ACCOUNT_LENGTH + 128) + 256;
 
 /**
  * `response`'s body as text, read in chunks and abandoned once it passes
@@ -356,6 +370,27 @@ export class AuthBrokerClient {
 		return this.#request<ClientUsageSummaryResponse>("GET", path, {
 			schema: "clientUsageSummaryResponseSchema",
 			signal,
+		});
+	}
+
+	/**
+	 * Account-attributed usage of every broker client after `sinceMs`
+	 * (`GET /v1/usage/accounts`), narrowed to `filter`'s providers and
+	 * accounts; 404 from brokers that do not total it.
+	 */
+	fetchAccountUsage(
+		sinceMs: number,
+		signal?: AbortSignal,
+		filter: AccountUsageFilter = {},
+	): Promise<AccountUsageResponse> {
+		const params = new URLSearchParams({ sinceMs: String(Math.trunc(sinceMs)) });
+		for (const provider of filter.providers ?? []) params.append("provider", provider);
+		for (const account of filter.accounts ?? []) params.append("account", account);
+		return this.#request<AccountUsageResponse>("GET", `/v1/usage/accounts?${params.toString()}`, {
+			schema: "accountUsageResponseSchema",
+			headers: { [AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_ACCOUNT_USAGE },
+			signal,
+			maxResponseBytes: ACCOUNT_USAGE_MAX_RESPONSE_BYTES,
 		});
 	}
 

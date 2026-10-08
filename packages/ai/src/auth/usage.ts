@@ -6,6 +6,8 @@ import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import { resolveUsedFraction } from "../usage";
 import type {
+	AccountUsageFilter,
+	AccountUsageTotal,
 	ClientUsageReport,
 	ClientUsageSummary,
 	CredentialRankingContext,
@@ -499,6 +501,7 @@ export class UsageService implements UsageApi {
 						cacheReadTokens: entry.usage.cacheRead,
 						cacheWriteTokens: entry.usage.cacheWrite,
 						costUsd: Number.isFinite(entry.costUsd) ? (entry.costUsd ?? 0) : 0,
+						...(entry.account !== undefined ? { account: entry.account } : {}),
 					},
 				],
 				entry.client,
@@ -522,6 +525,19 @@ export class UsageService implements UsageApi {
 	/** Broker host: aggregate recorded per-client usage since `sinceMs`. */
 	clientSummary(sinceMs: number): ClientUsageSummary {
 		return this.#deps.store.getClientUsageSummary?.(sinceMs) ?? { clients: [] };
+	}
+
+	clientAccountUsage(sinceMs: number, limit: number, filter?: AccountUsageFilter): AccountUsageTotal[] | undefined {
+		return this.#deps.store.getClientAccountUsage?.(sinceMs, limit, filter);
+	}
+
+	sharedAccountTotals(
+		provider: string,
+		account: string,
+		sinceMs: number,
+		nowMs: number,
+	): AccountUsageTotal | undefined {
+		return this.#deps.store.accountUsageTotals?.(provider, account, sinceMs, nowMs);
 	}
 
 	/** Merge rate-limit headers into the latest account report. */

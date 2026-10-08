@@ -8,6 +8,8 @@ import type {
 } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type {
+	AccountUsageFilter,
+	AccountUsageTotal,
 	ClientUsageIdentity,
 	ClientUsageReport,
 	ClientUsageSummary,
@@ -840,6 +842,8 @@ export type ObservedUsageInput = {
 	at?: number;
 	/** Attribution override; defaults to this process's install identity. */
 	client?: ClientUsageIdentity;
+	/** Account usage key (`accountUsageKey`) of the account that served the request, when known. */
+	account?: string;
 };
 
 /** Mark a session credential blocked with caller and provider timing. */
@@ -1489,6 +1493,23 @@ export interface UsageApi {
 	recordClient(report: ClientUsageReport): boolean;
 	/** Aggregate client-observed usage since a timestamp. */
 	clientSummary(sinceMs: number): ClientUsageSummary;
+	/**
+	 * Broker host: account-attributed usage of every client after `sinceMs`
+	 * (epoch ms), per (provider, account), at most `limit` rows; undefined
+	 * when the store does not record it.
+	 */
+	clientAccountUsage(sinceMs: number, limit: number, filter?: AccountUsageFilter): AccountUsageTotal[] | undefined;
+	/**
+	 * Fleet-wide usage of `account` on `provider` after `sinceMs` as last
+	 * reported by the auth broker; undefined without a broker that reports it
+	 * or without recent enough totals. Synchronous and eventually consistent.
+	 */
+	sharedAccountTotals(
+		provider: string,
+		account: string,
+		sinceMs: number,
+		nowMs: number,
+	): AccountUsageTotal | undefined;
 	/**
 	 * The {@link UsageProvider} registered for `provider`, or undefined when the
 	 * provider has no usage endpoint at all. Lets callers tell "a credential we

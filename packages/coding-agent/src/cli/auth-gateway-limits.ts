@@ -9,7 +9,7 @@ import type { AuthAccountPolicies, AuthStorage } from "@oh-my-pi/pi-ai";
 import type { AuthGatewayRouteOptions } from "@oh-my-pi/pi-ai/auth-gateway";
 import { isAccountEvidenceLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import { isEnoent, openSqliteDatabase } from "@oh-my-pi/pi-utils";
-import { createAccountLimitSource } from "../session/local-limits";
+import { createAccountLimitSource, type SharedAccountUsageSource } from "../session/local-limits";
 import { recordUsageEntry, UsageLedger, usageEntryOf } from "../session/usage-ledger";
 
 /** Account limits a gateway enforces against its own usage ledger. */
@@ -27,11 +27,33 @@ export interface GatewayLedger {
 	close(): void;
 }
 
+/** A non-negative whole count from a broker-reported number; non-finite or negative reads as 0. */
+function wholeCount(value: number): bigint {
+	return Number.isFinite(value) && value > 0 ? BigInt(Math.ceil(value)) : 0n;
+}
+
+/**
+ * Fleet-wide account usage from `storage`'s auth broker, in limit units (USD rounded up to whole
+ * nano-USD); undefined for an account the broker has no recent totals for, or without a broker.
+ */
+export function brokerAccountUsage(storage: AuthStorage): SharedAccountUsageSource {
+	return (provider, account, sinceMs, nowMs) => {
+		const total = storage.usage.sharedAccountTotals(provider, account, sinceMs, nowMs);
+		if (!total) return undefined;
+		return {
+			costNanos: wholeCount(total.costUsd * 1e9),
+			requests: wholeCount(total.requests),
+			tokens: wholeCount(total.tokens),
+		};
+	};
+}
+
 /**
  * Enforce the account-policy limits that count calls (`usd`, `requests`, `tokens`) on `storage`
- * against the usage ledger `openLedger` provides, and return the hook that records the gateway's
- * calls there; undefined, without opening the ledger, when no policy has such a limit. A failed
- * ledger write is logged and never fails the request it records.
+ * against the usage ledger `openLedger` provides, raised to the account's fleet-wide usage when
+ * `storage` is backed by an auth broker that totals it, and return the hook that records the
+ * gateway's calls there; undefined, without opening the ledger, when no policy has such a limit. A
+ * failed ledger write is logged and never fails the request it records.
  */
 export async function installGatewayAccountLimits(
 	storage: AuthStorage,
@@ -43,7 +65,7 @@ export async function installGatewayAccountLimits(
 	}
 	const opened = await openLedger();
 	const { ledger } = opened;
-	storage.usage.setLimitSource(createAccountLimitSource(() => ledger));
+	storage.usage.setLimitSource(createAccountLimitSource(() => ledger, brokerAccountUsage(storage)));
 	const pendingWrites = new Set<Promise<void>>();
 	return {
 		onUsage(model, usage, account) {

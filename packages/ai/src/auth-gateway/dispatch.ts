@@ -363,6 +363,7 @@ export async function recordGatewayUsage(
 	if (!hasRecordableUsage(usage)) return true;
 	const { storage, onUsage } = opts;
 	const { at, observe = true } = options;
+	const account = serving.key;
 	if (observe) {
 		storage.usage.observe({
 			provider: model.provider,
@@ -371,10 +372,10 @@ export async function recordGatewayUsage(
 			usage: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite },
 			costUsd: usage.cost.total,
 			client,
+			account,
 		});
 	}
 	if (!onUsage) return true;
-	const account = serving.key;
 	if (account === undefined) {
 		logger.debug("auth-gateway usage has no stored account", { provider: model.provider, model: model.id });
 	}

@@ -24,6 +24,7 @@ import {
 	type SnapshotCredential,
 } from "../auth-storage";
 import type {
+	AccountUsageResponse,
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
@@ -52,6 +53,14 @@ import type {
 	UsageHistoryResponse,
 	UsageResponse,
 	UsageStaleResponse,
+} from "./types";
+import {
+	isObservedUsageAccount,
+	OBSERVED_USAGE_MAX_COST_USD,
+	OBSERVED_USAGE_MAX_ENTRIES,
+	OBSERVED_USAGE_MAX_FIELD_LENGTH,
+	OBSERVED_USAGE_MAX_REQUESTS,
+	OBSERVED_USAGE_MAX_TOKENS,
 } from "./types";
 
 // ─── Credential payloads ─────────────────────────────────────────────────────
@@ -305,25 +314,31 @@ export const usageHistoryResponseSchema: FluentType<UsageHistoryResponse> = type
 	entries: usageHistoryEntrySchema.array(),
 });
 
+// Unknown keys are ignored, not rejected: brokers accept entries from newer clients and drop fields they predate.
+const tokenCountSchema = type("number").atLeast(0).atMost(OBSERVED_USAGE_MAX_TOKENS);
+const reportFieldSchema = type("string").atMostLength(OBSERVED_USAGE_MAX_FIELD_LENGTH);
 const observedUsageEntrySchema = type({
-	at: "number",
-	provider: "string",
-	model: "string",
-	requests: "number",
-	inputTokens: "number",
-	outputTokens: "number",
-	cacheReadTokens: "number",
-	cacheWriteTokens: "number",
-	costUsd: "number",
+	at: type("number").atLeast(0),
+	provider: reportFieldSchema,
+	model: reportFieldSchema,
+	requests: type("number").atLeast(0).atMost(OBSERVED_USAGE_MAX_REQUESTS),
+	inputTokens: tokenCountSchema,
+	outputTokens: tokenCountSchema,
+	cacheReadTokens: tokenCountSchema,
+	cacheWriteTokens: tokenCountSchema,
+	costUsd: type("number").atLeast(0).atMost(OBSERVED_USAGE_MAX_COST_USD),
+	"account?": type("string").narrow(
+		(value, ctx) => isObservedUsageAccount(value) || ctx.mustBe("1-256 characters without control characters"),
+	),
 });
 
 /** Broker `POST /v1/usage/observed` request — one client's batched observed usage. */
 export const clientUsageReportRequestSchema: FluentType<ClientUsageReportRequest> = type({
 	"+": "reject",
-	installId: "string",
-	"hostname?": "string",
-	"app?": "string",
-	entries: observedUsageEntrySchema.array(),
+	installId: reportFieldSchema,
+	"hostname?": reportFieldSchema,
+	"app?": reportFieldSchema,
+	entries: observedUsageEntrySchema.array().atMostLength(OBSERVED_USAGE_MAX_ENTRIES),
 });
 
 export const clientUsageReportResponseSchema: FluentType<ClientUsageReportResponse> = type({
@@ -346,6 +361,22 @@ const clientUsageClientSummarySchema = type({
 		cacheWriteTokens: "number",
 		costUsd: "number",
 	}).array(),
+});
+
+/** Broker `GET /v1/usage/accounts` response — account-attributed usage of every client over a window. */
+export const accountUsageResponseSchema: FluentType<AccountUsageResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	sinceMs: "number",
+	accounts: type({
+		"+": "reject",
+		provider: "string",
+		account: "string",
+		costUsd: "number",
+		requests: "number",
+		tokens: "number",
+	}).array(),
+	truncated: "boolean",
 });
 
 /** Broker `GET /v1/usage/clients` response — per-client token burn aggregates. */

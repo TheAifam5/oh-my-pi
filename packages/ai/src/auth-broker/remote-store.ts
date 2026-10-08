@@ -32,10 +32,11 @@ import {
 import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
-import type { ClientUsageIdentity, ObservedUsageEntry, UsageReport } from "../usage";
+import type { AccountUsageTotal, ClientUsageIdentity, ObservedUsageEntry, UsageReport } from "../usage";
 import { raceSignal } from "../auth/abort";
 import { type AuthBrokerClient, AuthBrokerError, AuthBrokerStreamUnsupportedError } from "./client";
 import { compareCredentialBlockSnapshots } from "./protocol";
+import { isObservedUsageAccount, OBSERVED_USAGE_MAX_ENTRIES, OBSERVED_USAGE_MAX_FIELD_LENGTH } from "./types";
 import {
 	isSharedCacheKey,
 	isSharedCacheValue,
@@ -149,6 +150,24 @@ const SHARED_CACHE_BACKOFF_MAX_MS = 30_000;
 const SHARED_CACHE_FULL_COOLDOWN_MS = 5 * 60_000;
 /** How long a broker feature that answered 404 or 501 stays off before it is probed again. */
 const FEATURE_REPROBE_MS = 10 * 60_000;
+/** Most accounts whose fleet totals are polled; the least recently checked is dropped past it. */
+const ACCOUNT_USAGE_MAX_ACCOUNTS = 64;
+/** Most distinct pending observed-usage buckets; entries for new buckets past it are dropped until the next flush. */
+const OBSERVED_USAGE_MAX_PENDING = 4096;
+/** Width of the wall-clock buckets account-attributed observed usage is folded into. */
+const OBSERVED_ACCOUNT_BUCKET_MS = 60_000;
+/** Least interval between fleet account total polls, which account limit checks trigger. */
+const ACCOUNT_USAGE_POLL_MS = 15_000;
+/** Age past which fleet account totals are no longer used. */
+const ACCOUNT_USAGE_MAX_AGE_MS = 60_000;
+/** Most window starts whose fleet totals are polled; the least recently asked for is dropped past it. */
+const ACCOUNT_USAGE_MAX_WINDOWS = 8;
+/**
+ * Widest gap between a requested window start and an earlier polled one
+ * served in its place; an earlier start only adds usage, so the stand-in
+ * over-counts by at most this much time and never misses usage in the window.
+ */
+const ACCOUNT_USAGE_START_SLACK_MS = 5 * 60_000;
 
 function toCredentialBlockSnapshot(block: StoredCredentialBlock): CredentialBlockSnapshot {
 	return {
@@ -365,8 +384,8 @@ export interface RemoteAuthCredentialStoreOptions {
 	 */
 	sharedCacheRetry?: { initialBackoffMs?: number; maxBackoffMs?: number; deadlineMs?: number };
 	/**
-	 * How long a broker feature (the shared cache) that answered 404 or 501
-	 * stays off before it is probed again. Internal-only —
+	 * How long a broker feature (shared cache, fleet account totals) that
+	 * answered 404 or 501 stays off before it is probed again. Internal-only —
 	 * tests shorten it. Default 10 minutes.
 	 */
 	featureReprobeMs?: number;
@@ -469,6 +488,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	readonly #sharedCacheBackoffMs: number;
 	readonly #sharedCacheMaxBackoffMs: number;
 	readonly #sharedCacheDeadlineMs: number;
+	/** Until this time account limits stay local: set when the broker answered 404 or 501 on `/v1/usage/accounts`. */
+	#accountUsageDisabledUntilMs = 0;
+	/** Accounts checked, as `provider\0account`, by last check time; least recent first. */
+	#accountUsageAccounts = new Map<string, number>();
+	#accountUsageTruncationLogged = false;
+	/** Minute-floored window starts asked for, by last request time; least recent first. */
+	#accountUsageWanted = new Map<number, number>();
+	/** Fleet totals by polled window start, with the accounts each poll asked for. */
+	#accountUsageTotals = new Map<
+		number,
+		{ fetchedAtMs: number; truncated: boolean; requested: Set<string>; byAccount: Map<string, AccountUsageTotal> }
+	>();
+	#accountUsagePoll: Promise<void> | undefined;
+	#accountUsagePolledAtMs = Number.NEGATIVE_INFINITY;
 
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
@@ -1971,8 +2004,24 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	recordObservedUsage(entries: ObservedUsageEntry[], client?: ClientUsageIdentity): void {
 		if (this.#closed || this.#observedUsageUnsupported) return;
 		const identity = client ?? { installId: getInstallId(), hostname: os.hostname(), app: getAppName() };
-		for (const entry of entries) {
-			const key = `${identity.installId}\u0000${identity.app ?? ""}\u0000${entry.provider}\u0000${entry.model}`;
+		for (const reported of entries) {
+			// The broker rejects a whole report over one overlong field; such an entry is not reported.
+			if (
+				reported.provider.length > OBSERVED_USAGE_MAX_FIELD_LENGTH ||
+				reported.model.length > OBSERVED_USAGE_MAX_FIELD_LENGTH
+			) {
+				continue;
+			}
+			// The broker rejects a whole report over one malformed account key; such an entry goes unattributed.
+			const entry =
+				reported.account !== undefined && !isObservedUsageAccount(reported.account)
+					? { ...reported, account: undefined }
+					: reported;
+			let key = `${identity.installId}\u0000${identity.app ?? ""}\u0000${entry.provider}\u0000${entry.model}`;
+			// An attributed entry folds only one minute's requests, so the broker can total its account per limit window.
+			if (entry.account !== undefined) {
+				key += `\u0000${entry.account}\u0000${Math.floor(entry.at / OBSERVED_ACCOUNT_BUCKET_MS)}`;
+			}
 			const pending = this.#observedUsage.get(key);
 			if (pending) {
 				pending.entry.at = Math.max(pending.entry.at, entry.at);
@@ -1982,6 +2031,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				pending.entry.cacheReadTokens += entry.cacheReadTokens;
 				pending.entry.cacheWriteTokens += entry.cacheWriteTokens;
 				pending.entry.costUsd += entry.costUsd;
+			} else if (this.#observedUsage.size >= OBSERVED_USAGE_MAX_PENDING) {
+				logger.debug("auth-broker observed usage buffer full; entry dropped", { provider: entry.provider });
 			} else {
 				this.#observedUsage.set(key, { client: identity, entry: { ...entry } });
 			}
@@ -2030,12 +2081,19 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			if (group) group.entries.push(entry);
 			else groups.set(key, { client, entries: [entry] });
 		}
+		// The broker takes at most OBSERVED_USAGE_MAX_ENTRIES entries per report and bounded identity fields.
+		const reports: Array<{ client: ClientUsageIdentity; entries: ObservedUsageEntry[] }> = [];
 		for (const { client, entries } of groups.values()) {
+			for (let start = 0; start < entries.length; start += OBSERVED_USAGE_MAX_ENTRIES) {
+				reports.push({ client, entries: entries.slice(start, start + OBSERVED_USAGE_MAX_ENTRIES) });
+			}
+		}
+		for (const { client, entries } of reports) {
 			try {
 				await this.#client.reportClientUsage({
-					installId: client.installId,
-					hostname: client.hostname,
-					app: client.app,
+					installId: client.installId.slice(0, OBSERVED_USAGE_MAX_FIELD_LENGTH),
+					hostname: client.hostname?.slice(0, OBSERVED_USAGE_MAX_FIELD_LENGTH),
+					app: client.app?.slice(0, OBSERVED_USAGE_MAX_FIELD_LENGTH),
 					entries,
 				});
 			} catch (error) {
@@ -2054,6 +2112,133 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (!this.#closed) this.recordObservedUsage(entries, client);
 			}
 		}
+	}
+
+	/**
+	 * Fleet-wide usage of `account` on `provider` after `sinceMs`, from the
+	 * broker's latest `/v1/usage/accounts` totals. The window start is floored
+	 * to the minute, and a start polled up to five minutes earlier stands in
+	 * until this one is polled, so totals over-count rather than miss usage.
+	 * Undefined while no totals from the last minute cover the window and
+	 * account, when the broker's answer was truncated without the account, or
+	 * when the broker does not total account usage (404/501; probed again after
+	 * ten minutes). Asking registers the window and the account (polls ask only
+	 * for the 64 accounts checked most recently) and triggers a background poll
+	 * at most every 15 s.
+	 */
+	accountUsageTotals(
+		provider: string,
+		account: string,
+		sinceMs: number,
+		_nowMs: number,
+	): AccountUsageTotal | undefined {
+		const nowMs = Date.now();
+		if (this.#closed || nowMs < this.#accountUsageDisabledUntilMs || !Number.isFinite(sinceMs)) return undefined;
+		const start = Math.max(0, Math.floor(sinceMs / 60_000) * 60_000);
+		const accountKey = `${provider}\u0000${account}`;
+		this.#accountUsageWanted.delete(start);
+		this.#accountUsageWanted.set(start, nowMs);
+		while (this.#accountUsageWanted.size > ACCOUNT_USAGE_MAX_WINDOWS) {
+			const oldest = this.#accountUsageWanted.keys().next().value!;
+			this.#accountUsageWanted.delete(oldest);
+		}
+		this.#accountUsageAccounts.delete(accountKey);
+		this.#accountUsageAccounts.set(accountKey, nowMs);
+		while (this.#accountUsageAccounts.size > ACCOUNT_USAGE_MAX_ACCOUNTS) {
+			const oldest = this.#accountUsageAccounts.keys().next().value!;
+			this.#accountUsageAccounts.delete(oldest);
+		}
+		this.#maybePollAccountUsage(nowMs);
+		let best:
+			| { start: number; truncated: boolean; requested: Set<string>; byAccount: Map<string, AccountUsageTotal> }
+			| undefined;
+		for (const [polledStart, polled] of this.#accountUsageTotals) {
+			if (polledStart > start || start - polledStart > ACCOUNT_USAGE_START_SLACK_MS) continue;
+			if (nowMs - polled.fetchedAtMs > ACCOUNT_USAGE_MAX_AGE_MS) continue;
+			if (!best || polledStart > best.start) best = { start: polledStart, ...polled };
+		}
+		if (!best) return undefined;
+		const total = best.byAccount.get(accountKey);
+		if (total) return total;
+		// Asked for and absent from a complete response: no client reported usage for the account in the window.
+		if (!best.requested.has(accountKey) || best.truncated) return undefined;
+		return { provider, account, costUsd: 0, requests: 0, tokens: 0 };
+	}
+
+	#maybePollAccountUsage(nowMs: number): void {
+		if (this.#closed || nowMs < this.#accountUsageDisabledUntilMs) return;
+		if (this.#accountUsagePoll || nowMs - this.#accountUsagePolledAtMs < ACCOUNT_USAGE_POLL_MS) return;
+		this.#accountUsagePolledAtMs = nowMs;
+		const poll = this.#pollAccountUsage().finally(() => {
+			if (this.#accountUsagePoll === poll) this.#accountUsagePoll = undefined;
+		});
+		this.#accountUsagePoll = poll;
+	}
+
+	async #pollAccountUsage(): Promise<void> {
+		const signal = this.#backgroundAbort.signal;
+		// Most recently asked-for windows first, each narrowed to the accounts checked.
+		const starts = [...this.#accountUsageWanted.keys()].reverse();
+		const requested = new Set(this.#accountUsageAccounts.keys());
+		const providers = new Set<string>();
+		const accounts = new Set<string>();
+		for (const key of requested) {
+			const separator = key.indexOf("\u0000");
+			providers.add(key.slice(0, separator));
+			accounts.add(key.slice(separator + 1));
+		}
+		for (const start of starts) {
+			try {
+				const response = await this.#client.fetchAccountUsage(start, signal, {
+					providers: [...providers],
+					accounts: [...accounts],
+				});
+				const byAccount = new Map<string, AccountUsageTotal>();
+				for (const total of response.accounts) byAccount.set(`${total.provider}\u0000${total.account}`, total);
+				if (response.truncated && !this.#accountUsageTruncationLogged) {
+					this.#accountUsageTruncationLogged = true;
+					logger.warn(
+						"auth-broker account usage answer was truncated; accounts missing from it count locally only",
+						{
+							accounts: accounts.size,
+						},
+					);
+				}
+				this.#accountUsageTotals.set(start, {
+					fetchedAtMs: Date.now(),
+					truncated: response.truncated,
+					requested,
+					byAccount,
+				});
+			} catch (error) {
+				if (this.#closed) return;
+				const status = error instanceof AuthBrokerError ? error.status : undefined;
+				if (status === 404 || status === 501) {
+					this.#accountUsageDisabledUntilMs = Date.now() + this.#featureReprobeMs;
+					this.#accountUsageTotals.clear();
+					logger.debug("auth-broker does not total account usage; account limits stay local until re-probed", {
+						status,
+					});
+					return;
+				}
+				logger.debug("auth-broker account usage poll failed", { status, error: String(error) });
+				return;
+			}
+		}
+		for (const start of this.#accountUsageTotals.keys()) {
+			if (!this.#accountUsageWanted.has(start)) this.#accountUsageTotals.delete(start);
+		}
+	}
+
+	/**
+	 * Re-poll fleet account totals now for every window asked for so far,
+	 * after any poll already running. Resolves without throwing.
+	 */
+	async syncAccountUsage(): Promise<void> {
+		await this.#accountUsagePoll;
+		this.#accountUsagePolledAtMs = Number.NEGATIVE_INFINITY;
+		this.#maybePollAccountUsage(Date.now());
+		await this.#accountUsagePoll;
 	}
 
 	close(): void {
@@ -2079,6 +2264,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#sharedCacheLocalWrites.clear();
 		this.#cache.clear();
 		this.#cacheCharacters = 0;
+		this.#accountUsageTotals.clear();
+		this.#accountUsageWanted.clear();
+		this.#accountUsageAccounts.clear();
 		this.#usageOverlays.clear();
 	}
 }
