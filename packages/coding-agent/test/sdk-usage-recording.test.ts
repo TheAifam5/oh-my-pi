@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "bun:test";
+import { afterEach, expect, it, vi } from "bun:test";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { completeSimple } from "@oh-my-pi/pi-ai/stream";
@@ -7,6 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AuthAccountSummary } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { flushBackgroundUsage } from "@oh-my-pi/pi-coding-agent/session/stream-usage-observer";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -92,4 +93,19 @@ it("still records usage when the cache ledger cannot be written", async () => {
 	await completeSimple(background, { messages: [{ role: "user", content: "title this", timestamp: 1 }] });
 	await endSession(active);
 	expect(storage.usageLedger.totals([{ provider: mock.provider }], 0).requests).toBe(2n);
+});
+
+it("attributes a main session turn to the account that served it when reporting usage to a broker", async () => {
+	const mock = createMockModel({ responses: [{ content: ["done"], usage: { input: 5, output: 2 } }] });
+	const { session: active } = await startSession(mock);
+	const authStorage = registry!.authStorage;
+	vi.spyOn(authStorage.sessions, "accounts").mockReturnValue([
+		{ active: true, accountId: "acct-served" } as AuthAccountSummary,
+	]);
+	const observe = vi.spyOn(authStorage.usage, "observe");
+
+	await active.prompt("hello");
+	await endSession(active);
+	expect(observe).toHaveBeenCalledTimes(1);
+	expect(observe.mock.calls[0]![0]).toMatchObject({ provider: mock.provider, account: "acct-served" });
 });

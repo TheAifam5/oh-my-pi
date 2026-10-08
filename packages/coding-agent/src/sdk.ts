@@ -188,6 +188,7 @@ import {
 import { settingsAccountPinSource } from "./session/account-pins";
 import type { AccountLimitSource } from "@oh-my-pi/pi-ai/auth-storage";
 import type { AgentStorage } from "./session/agent-storage";
+import { brokerAccountUsage } from "./cli/auth-gateway-limits";
 import { createAccountLimitSource } from "./session/local-limits";
 import { installStreamUsageObserver } from "./session/stream-usage-observer";
 import {
@@ -1511,11 +1512,12 @@ function isCustomTool(tool: CustomTool | ToolDefinition): tool is CustomTool {
 }
 
 /**
- * Account limit source over `storage`'s usage ledger, read at call time. Defined at module scope so
+ * Account limit source over `storage`'s usage ledger, read at call time, raised to the account's
+ * fleet-wide usage when `authStorage` is backed by a broker that totals it. Defined at module scope so
  * the shared auth storage it is installed on retains only `storage`, never the installing session.
  */
-function storageAccountLimitSource(storage: AgentStorage): AccountLimitSource {
-	return createAccountLimitSource(() => storage.usageLedger);
+function storageAccountLimitSource(storage: AgentStorage, authStorage: AuthStorage): AccountLimitSource {
+	return createAccountLimitSource(() => storage.usageLedger, brokerAccountUsage(authStorage));
 }
 
 /**
@@ -1974,7 +1976,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// Account limits count calls in the usage ledger every session on this agent.db shares; a session
 	// without storage leaves an installed source in place.
 	const storage = settings.getStorage();
-	if (storage) authStorage.usage.setLimitSource(storageAccountLimitSource(storage));
+	if (storage) authStorage.usage.setLimitSource(storageAccountLimitSource(storage, authStorage));
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
 	// listener set non-empty from construction, which defeats AuthStorage's no-listener

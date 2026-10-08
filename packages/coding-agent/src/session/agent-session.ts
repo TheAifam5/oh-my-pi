@@ -84,6 +84,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { accountUsageKey } from "@oh-my-pi/pi-ai/auth/policy";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
@@ -4917,10 +4918,15 @@ export class AgentSession implements SettingsScope {
 				await this.#recovery.onAssistantSettledSuccessfully(assistantMsg);
 				// Broker deployments: report this request's burn so the broker can
 				// attribute token usage per install. No-op with a local auth store.
+				const servingAccount = this.#modelRegistry.authStorage.sessions
+					.accounts(assistantMsg.provider, this.sessionId)
+					.find(account => account.active);
+				const account = servingAccount ? accountUsageKey(servingAccount) : undefined;
 				this.#modelRegistry.authStorage.usage.observe({
 					provider: assistantMsg.provider,
 					model: assistantMsg.model,
 					at: assistantMsg.timestamp,
+					...(account === undefined ? {} : { account }),
 					usage: {
 						input: assistantMsg.usage.input,
 						output: assistantMsg.usage.output,
