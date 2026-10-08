@@ -27,6 +27,7 @@ import {
 	disabledProviderIds,
 	formatModelStringWithRouting,
 	resolveAgentAdvisorRolePattern,
+	isExactRetryFallbackEntry,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
@@ -314,7 +315,9 @@ function resolveSubagentInheritedRetryFallbackChain(
 	}
 	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	return fallbackChain.filter(entry => {
-		const resolved = resolveModelOverride([entry], modelRegistry, settings);
+		const resolved = resolveModelOverride([entry], modelRegistry, settings, {
+			exact: isExactRetryFallbackEntry(entry, role ?? "default", settings),
+		});
 		return !resolved.model || !disabledProviders.has(resolved.model.provider);
 	});
 }

@@ -10,7 +10,11 @@ import {
 	concreteThinkingLevel,
 	resolveThinkingLevelForModel,
 } from "@oh-my-pi/pi-tui/thinking";
-import { resolveConfiguredModelPatterns, resolveModelRoleValue } from "../config/model-resolver";
+import {
+	isExactRetryFallbackEntry,
+	resolveConfiguredModelPatterns,
+	resolveModelRoleValue,
+} from "../config/model-resolver";
 import { getRoleInfo, isKindRole } from "../config/model-roles";
 
 import {
@@ -369,7 +373,10 @@ export function validateRetryFallbackChains(
 		const resolvesForKindRole = (selectorStr: string, pool: Model[] | undefined): boolean =>
 			pool !== undefined &&
 			kindRole !== undefined &&
-			resolveModelRoleValue(selectorStr, pool.filter(kindRole.accepts), { settings }).model !== undefined;
+			resolveModelRoleValue(selectorStr, pool.filter(kindRole.accepts), {
+				settings,
+				exact: isExactRetryFallbackEntry(selectorStr, key, settings),
+			}).model !== undefined;
 		for (const selectorStr of chain) {
 			if (typeof selectorStr !== "string") {
 				report(`Fallback chain for ${keyKind} '${key}' contains a non-string selector.`);

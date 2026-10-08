@@ -1,3 +1,4 @@
+import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { isModelGroupForm, modelGroupPathKey } from "../config/model-groups";
 import type { Settings } from "../config/settings";
@@ -5,6 +6,39 @@ import { cfgRetryFallbackChains } from "./settings";
 
 /** `Settings.warnState.items` id remembering the model-group chain keys already logged. */
 const GROUP_CHAIN_WARN_ID = `${cfgRetryFallbackChains.id}#model-group`;
+
+/** `Settings.warnState.items` id remembering the fallback-chain entries already logged as unmatched. */
+const UNMATCHED_ENTRY_WARN_ID = `${cfgRetryFallbackChains.id}#unmatched-entry`;
+
+/**
+ * Records the outcome of resolving a `retry.fallbackChains` entry exactly. A miss is logged once per
+ * entry and settings instance, naming the model pattern matching would have chosen (`nearest`, called
+ * only when the warning is emitted); a later match re-arms the warning.
+ */
+export function noteRetryFallbackEntryResolution(
+	settings: Settings,
+	entry: string,
+	resolved: Model<Api> | undefined,
+	nearest: () => Model<Api> | undefined,
+): void {
+	const items = settings.warnState.items;
+	let logged = items.get(UNMATCHED_ENTRY_WARN_ID);
+	if (resolved) {
+		logged?.delete(entry);
+		return;
+	}
+	if (logged?.has(entry)) return;
+	if (!logged) {
+		logged = new Set();
+		items.set(UNMATCHED_ENTRY_WARN_ID, logged);
+	}
+	logged.add(entry);
+	const neighbor = nearest();
+	logger.warn("Settings: retry.fallbackChains entry matches no model exactly; the entry is skipped", {
+		entry,
+		nearest: neighbor ? `${neighbor.provider}/${neighbor.id}` : undefined,
+	});
+}
 
 /**
  * Configured `retry.fallbackChains` without its model-group entries (a mapping or a `+group`

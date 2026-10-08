@@ -59,7 +59,7 @@ import {
 import type { Settings } from "./settings";
 
 import { cfgDisabledProviders, cfgEnabledModels, cfgModelProviderOrder } from "./model-settings";
-import { getSelectorFallbackChains } from "../session/retry-fallback-selector-chains";
+import { getSelectorFallbackChains, noteRetryFallbackEntryResolution } from "../session/retry-fallback-selector-chains";
 
 function isKnownProvider(provider: string): provider is KnownProvider {
 	return provider in DEFAULT_MODEL_PER_PROVIDER;
@@ -1099,6 +1099,17 @@ export function resolveExplicitModelRole(
 }
 
 /**
+ * Whether an entry of the `retry.fallbackChains.<chainKey>` walk must name its model exactly. The
+ * chain role's own `modelRoles` assignment and a role alias entry (`@smol`, `pi/slow`) are the
+ * user's role selectors, so they keep the pattern matching that role resolution uses.
+ */
+export function isExactRetryFallbackEntry(entry: string, chainKey: string, settings?: ModelRoleLookup): boolean {
+	const trimmed = entry.trim();
+	if (settings?.getModelRole(chainKey)?.trim() === trimmed) return false;
+	return resolveExplicitModelRole(trimmed, settings) === undefined;
+}
+
+/**
  * Split an optional `:<level>` suffix off a role-alias-shaped pattern.
  *
  * The colon floor is the matched alias prefix (so `pi/default` keeps its
@@ -1626,9 +1637,17 @@ export function resolveRoleChain(
 	const configuredFallbacks = getSelectorFallbackChains(settings)[role];
 	const hasConfiguredFallbackChain = Array.isArray(configuredFallbacks);
 	const fallbackSelectors = hasConfiguredFallbackChain ? configuredFallbacks : rolePriorityDefaults(role);
+	// Configured chain entries name models exactly; the role's own selector and the built-in priority
+	// patterns keep pattern matching.
 	const selectors = [
-		...(options.leading ? [] : [{ selector: primarySelector, explicit: Object.hasOwn(configuredRoles, role) }]),
-		...fallbackSelectors.map(selector => ({ selector, explicit: hasConfiguredFallbackChain })),
+		...(options.leading
+			? []
+			: [{ selector: primarySelector, explicit: Object.hasOwn(configuredRoles, role), exact: false }]),
+		...fallbackSelectors.map(selector => ({
+			selector,
+			explicit: hasConfiguredFallbackChain,
+			exact: hasConfiguredFallbackChain && isExactRetryFallbackEntry(selector, role, settings),
+		})),
 	];
 	const candidates: RoleChainCandidate[] = [];
 	const candidateByRoute = new Map<string, RoleChainCandidate>();
@@ -1639,8 +1658,16 @@ export function resolveRoleChain(
 		candidateByRoute.set(key, candidate);
 		candidates.push(candidate);
 	}
-	for (const { selector, explicit } of selectors) {
-		const resolved = resolveModelRoleValue(selector, pool, { settings });
+	for (const { selector, explicit, exact } of selectors) {
+		const resolved = resolveModelRoleValue(selector, pool, { settings, exact });
+		if (exact) {
+			noteRetryFallbackEntryResolution(
+				settings,
+				selector,
+				resolved.model,
+				() => resolveModelRoleValue(selector, pool, { settings }).model,
+			);
+		}
 		if (!resolved.model) continue;
 		const key = formatModelStringWithRouting(resolved.model);
 		const existing = candidateByRoute.get(key);

@@ -26,6 +26,7 @@ import {
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
+	isExactRetryFallbackEntry,
 	resolveModelFromString,
 	resolveModelOverride,
 } from "../config/model-resolver";
@@ -46,6 +47,7 @@ import {
 	shouldDisableReasoning,
 	toReasoningEffort,
 } from "@oh-my-pi/pi-tui/thinking";
+import { noteRetryFallbackEntryResolution } from "../session/retry-fallback-selector-chains";
 import type { JsStatusEvent } from "./js/shared/types";
 
 import { cfgDisabledProviders } from "../config/model-settings";
@@ -220,8 +222,16 @@ function appendFallbackCandidates(
 	for (const entry of findRetryFallbackCandidates(deps.context, chainKey, selector, model, {
 		allowMissingPrimary: true,
 	})) {
-		const resolved = resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings);
-		const candidate = resolved.model;
+		const exact = isExactRetryFallbackEntry(entry.raw, chainKey, deps.settings);
+		const candidate = resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings, { exact }).model;
+		if (exact && deps.settings) {
+			noteRetryFallbackEntryResolution(
+				deps.settings,
+				entry.raw,
+				candidate,
+				() => resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings).model,
+			);
+		}
 		if (!candidate || deps.disabledProviders.has(candidate.provider)) continue;
 		const reasoning = reasoningForCandidate(deps.tier, candidate, entry.thinkingLevel, parent);
 		const identity = candidateIdentity(candidate, reasoning);

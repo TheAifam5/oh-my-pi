@@ -1,6 +1,11 @@
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import { formatModelStringWithRouting, resolveModelOverride, resolveRoleSelection } from "../config/model-resolver";
+import {
+	formatModelStringWithRouting,
+	isExactRetryFallbackEntry,
+	resolveModelOverride,
+	resolveRoleSelection,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import {
 	expandDefaultRetryFallbackChains,
@@ -9,7 +14,7 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "../session/retry-fallback-chains";
-import { getSelectorFallbackChains } from "../session/retry-fallback-selector-chains";
+import { getSelectorFallbackChains, noteRetryFallbackEntryResolution } from "../session/retry-fallback-selector-chains";
 import { type RolePoolPick, RolePoolUnavailableError } from "../session/pool-selection";
 import {
 	createRolePoolCall,
@@ -97,10 +102,19 @@ function expandFallbackCandidates(
 		for (const candidate of findRetryFallbackCandidates(context, chainKey, primarySelector, model, {
 			allowMissingPrimary: true,
 		})) {
-			// Resolve raw selectors (including `@upstream` / fuzzy) the same way
-			// turn-recovery does, instead of exact (provider, id) lookup only.
-			const resolved = resolveModelOverride([candidate.raw], registryShim, settings);
+			// Resolve raw selectors (including `@upstream` and thinking suffixes) exactly, the
+			// same way turn-recovery does, instead of exact (provider, id) lookup only.
+			const exact = isExactRetryFallbackEntry(candidate.raw, chainKey, settings);
+			const resolved = resolveModelOverride([candidate.raw], registryShim, settings, { exact });
 			const fallback = resolved.model ?? context.modelLookup.find(candidate.provider, candidate.id);
+			if (exact) {
+				noteRetryFallbackEntryResolution(
+					settings,
+					candidate.raw,
+					fallback,
+					() => resolveModelOverride([candidate.raw], registryShim, settings).model,
+				);
+			}
 			if (!fallback) continue;
 			if (!add(role, fallback)) continue;
 			// After landing on this fallback, consult its own chain key so configs

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-ai";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -269,6 +269,24 @@ describe("runEvalCompletion", () => {
 			text: "fallback answer",
 			details: { model: "p/fallback", tier: "smol", structured: false },
 		});
+	});
+
+	it("skips a fallback chain entry that names no model exactly", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({ available: [SMOL, fallback] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/fall"] });
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "fallback answer" }));
+
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session })).rejects.toThrow(
+			"quota exhausted",
+		);
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol"]);
+		expect(warn.mock.calls.map(call => call[1])).toContainEqual({ entry: "p/fall", nearest: "p/fallback" });
 	});
 
 	it("retries the same model at a lower effort when the fallback chain suffixes it", async () => {

@@ -37,7 +37,11 @@ import {
 } from "@oh-my-pi/pi-utils";
 import type { GroupBudget } from "../config/model-groups";
 import type { ModelRegistry } from "../config/model-registry";
-import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
+import {
+	formatModelStringWithRouting,
+	isExactRetryFallbackEntry,
+	resolveModelOverride,
+} from "../config/model-resolver";
 
 import type { Settings } from "../config/settings";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
@@ -86,6 +90,7 @@ import {
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
 import { describeUsageFallback } from "./retry-fallback-reason";
+import { noteRetryFallbackEntryResolution } from "./retry-fallback-selector-chains";
 import {
 	chargeNeedsBillingEvidence,
 	chargesLocalBudget,
@@ -2127,16 +2132,31 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Resolves a fallback-chain selector to the model it names. Members of a model group are exact
-	 * references, never matched to a fuzzy neighbor; selector-list entries and the role's own
-	 * `modelRoles` assignment keep pattern matching.
+	 * Resolves a fallback-chain selector to the model it names. Chain entries and model-group members
+	 * are exact references, never matched to a fuzzy neighbor; an entry without an exact match yields
+	 * no candidate and is logged once. The role's own `modelRoles` assignment and role-alias entries
+	 * outside a model group keep pattern matching.
 	 */
 	resolveRetryFallbackCandidate(role: string, selector: RetryFallbackSelector): Model | undefined {
-		const isRoleAssignment = this.#host.settings.getModelRole(role)?.trim() === selector.raw;
-		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings, {
-			exact: !isRoleAssignment && resolveRetryFallbackGroupPolicy(this.#host.settings, role) !== undefined,
-		});
-		return resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+		const settings = this.#host.settings;
+		const registry = this.#host.modelRegistry;
+		const isRoleAssignment = settings.getModelRole(role)?.trim() === selector.raw;
+		const exact =
+			!isRoleAssignment &&
+			(resolveRetryFallbackGroupPolicy(settings, role) !== undefined ||
+				isExactRetryFallbackEntry(selector.raw, role, settings));
+		const resolved = resolveModelOverride([selector.raw], registry, settings, { exact });
+		const model = resolved.model ?? registry.find(selector.provider, selector.id);
+		// A provider still discovering its models may add the entry; neither warn nor re-arm until it settles.
+		if (exact && !registry.isProviderDiscoveryPending(selector.provider)) {
+			noteRetryFallbackEntryResolution(
+				settings,
+				selector.raw,
+				model,
+				() => resolveModelOverride([selector.raw], registry, settings).model,
+			);
+		}
+		return model;
 	}
 
 	/**
