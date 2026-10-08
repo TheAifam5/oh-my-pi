@@ -164,6 +164,11 @@
           "description": "Keep drafts cleared with Ctrl+C in local Up/Down history until exit; disabling affects future clears",
           "type": "boolean",
           "default": true
+        },
+        "predictions": {
+          "description": "After a completed turn, ask the active model to predict your next message and show it as ghost text in the empty composer; Tab or Right inserts it without sending. Extra usage: every completed turn sends one more billed request over the whole conversation (counted in /stats)",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -270,6 +275,11 @@
           "description": "Emit OSC 9;4 indeterminate progress while the agent or context maintenance is running (always on in Tern)",
           "type": "boolean",
           "default": false
+        },
+        "programStatus": {
+          "description": "Report whether the agent is working, waiting on you, done, or failed over OSC 7501, for terminal tab indicators and agent inboxes",
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -381,6 +391,11 @@
             "preserve"
           ],
           "default": "rebuild"
+        },
+        "completeScrollback": {
+          "description": "Send transcript rows pushed off screen by a growing HUD or dialog straight to scrollback; when it shrinks, blank rows sit between the transcript and the input until new output fills them",
+          "type": "boolean",
+          "default": false
         },
         "textSizing": {
           "description": "Render Markdown H1 headings at 2x scale using Kitty's OSC 66 text-sizing protocol. Only takes effect on Kitty terminals; ignored everywhere else. Off by default.",
@@ -809,7 +824,7 @@
       "additionalProperties": false,
       "properties": {
         "timeout": {
-          "description": "Auto-select the recommended ask option after this many seconds (0 disables)",
+          "description": "Auto-select the recommended ask option after this many seconds (0 disables). Also bounds cfg:// approval prompts; an unanswered approval denies the write instead of auto-selecting",
           "type": "number",
           "default": 0
         },
@@ -886,6 +901,21 @@
           "description": "Start on the active model, then switch to a fast/cheap model (default the 'smol' role) at the first edit/write after the plan nudge's todo list exists — the strong model plans, commits the todos, and starts the implementation before handing off. Overridable per session with --prewalk / --no-prewalk.",
           "type": "boolean",
           "default": false
+        },
+        "auto": {
+          "description": "Ask the native judge resolved through the 'judge' role whether each new top-level user task front-loads its hard reasoning. Needs a native judge; without one nothing is classified. Independent of Enable Prewalk.",
+          "type": "string",
+          "enum": [
+            "off",
+            "suggest",
+            "on"
+          ],
+          "default": "off"
+        },
+        "autoTarget": {
+          "description": "Model or role (default '@smol') auto-prewalk hands off to at the first edit/write.",
+          "type": "string",
+          "default": "@smol"
         }
       }
     },
@@ -898,27 +928,6 @@
           "type": "object",
           "additionalProperties": true,
           "default": {}
-        },
-        "openai-codex": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "codeMode": {
-              "description": "Route Codex code_mode_only models (GPT-5.6) through eval. The direct tools are eval, ask, todo, yield, think, checkpoint, and rewind. Use eval cells for other session tools. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag.",
-              "type": "string",
-              "enum": [
-                "off",
-                "on",
-                "auto"
-              ],
-              "default": "off"
-            },
-            "codeModeDirectTools": {
-              "description": "Extra direct tools for Codex Code Mode. The standard direct tools are eval, ask, todo, yield, think, checkpoint, and rewind.",
-              "type": "array",
-              "default": []
-            }
-          }
         },
         "anthropic": {
           "type": "object",
@@ -1383,9 +1392,19 @@
           "default": false
         },
         "modelFallback": {
-          "description": "Allow retry recovery to switch to configured fallback models",
+          "description": "Allow retry recovery to switch to models in retry.fallbackChains after provider errors. Independent of Auto-Promote Context",
           "type": "boolean",
           "default": true
+        },
+        "fallbackOn": {
+          "description": "Which failed requests may switch to a configured fallback model",
+          "type": "string",
+          "enum": [
+            "any",
+            "usage-limit",
+            "except-usage-limit"
+          ],
+          "default": "any"
         },
         "usageAwareFallback": {
           "description": "Use reliable coding-plan quota reports to prefer same-provider accounts, then configured fallback models, before a hard usage limit. Ordinary configured API keys are excluded.",
@@ -1484,6 +1503,11 @@
             "bm_fable"
           ],
           "default": "af_heart"
+        },
+        "localSpeed": {
+          "description": "Speaking rate of the local TTS backend (tts tool, omp say). 1 = normal; clamped to 0.5–2.5",
+          "type": "number",
+          "default": 1
         }
       }
     },
@@ -1529,6 +1553,11 @@
             "bm_fable"
           ],
           "default": "af_heart"
+        },
+        "speed": {
+          "description": "Speaking rate when reading the assistant's output aloud. 1 = normal; clamped to 0.5–2.5",
+          "type": "number",
+          "default": 1
         }
       }
     },
@@ -1537,7 +1566,7 @@
       "additionalProperties": false,
       "properties": {
         "autoRedeem": {
-          "description": "Spend saved Codex rate-limit resets automatically: restore an account blocked by an exhausted 5h or weekly window when a turn is stuck and no other account can take over, and salvage credits that are about to expire. unset asks before the first spend, yes spends without prompting, and no disables both checks.",
+          "description": "Spend saved Codex rate-limit resets automatically: restore an account blocked by an exhausted 5h or weekly window when a turn is stuck and no other account can take over, and salvage credits that are about to expire. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables both checks.",
           "type": "string",
           "enum": [
             "unset",
@@ -1568,7 +1597,7 @@
       "additionalProperties": false,
       "properties": {
         "autoRedeem": {
-          "description": "Spend eligible Claude Cedar or Juniper resets automatically. Cedar is spent only for covered limits; Juniper can only recover a sole 5-hour block. unset asks before the first spend, yes spends without prompting, and no disables blocked recovery and expiry salvage.",
+          "description": "Spend eligible Claude Cedar or Juniper resets automatically. Cedar is spent only for covered limits; Juniper can only recover a sole 5-hour block. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables blocked recovery and expiry salvage.",
           "type": "string",
           "enum": [
             "unset",
@@ -1677,6 +1706,16 @@
           "type": "number",
           "default": 3
         },
+        "continueSeverity": {
+          "description": "Minimum severity of an advisor note that wakes the agent after it finished with a final answer. Lower-severity notes stay as a card at the end of the transcript and reach the agent with your next message.",
+          "type": "string",
+          "enum": [
+            "nit",
+            "concern",
+            "blocker"
+          ],
+          "default": "concern"
+        },
         "reviewMode": {
           "description": "Default advisor cadence when no WATCHDOG.yml roster is present. turn reviews every primary turn; agent-end reviews only final yields.",
           "type": "string",
@@ -1714,12 +1753,23 @@
         }
       }
     },
+    "contextFiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extra": {
+          "description": "Extra instruction filenames loaded beside AGENTS.md. Use a JSON list of names, not paths, e.g. [\"AGENTS.local.md\"]; [] disables extras. Start a new session to load them.",
+          "type": "array",
+          "default": []
+        }
+      }
+    },
     "contextPromotion": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "Promote to a larger-context model on context overflow instead of compacting",
+          "description": "Promote to the model's contextPromotionTarget on context overflow instead of compacting. Retry fallback switches are controlled by Retry Model Fallback",
           "type": "boolean",
           "default": false
         }
@@ -1770,6 +1820,15 @@
           "type": "number",
           "default": -1
         },
+        "modelThresholds": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "modelThresholdsEnabled": {
+          "type": "boolean",
+          "default": true
+        },
         "handoffSaveToDisk": {
           "description": "Save generated handoff documents to markdown files for the auto-handoff flow",
           "type": "boolean",
@@ -1819,7 +1878,7 @@
           "default": 200000
         },
         "idleTimeoutSeconds": {
-          "description": "Seconds to wait while idle before compacting",
+          "description": "Seconds to wait while idle before compacting; with a 1-hour prompt cache, compaction instead runs just before the cache expires",
           "type": "number",
           "default": 300
         },
@@ -1850,7 +1909,7 @@
           "default": "none"
         },
         "toolResults": {
-          "description": "Experimental: render large historical tool results as dense PNG image(s) instead of text (vision models only). Saves tokens on accumulated read/search output.",
+          "description": "Experimental: render large tool results, the newest one included, as dense PNG image(s) instead of text (vision models only). Saves tokens on accumulated search and command output; read results stay text unless the model is known to edit exactly from images.",
           "type": "boolean",
           "default": false
         },
@@ -1942,10 +2001,11 @@
           "default": {}
         },
         "approvalMode": {
-          "description": "Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves all tiers; user policy may still prompt or block.",
+          "description": "Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Ask and remember' also asks before file reads, and can remember a file or folder. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves all tiers; user policy may still prompt or block.",
           "type": "string",
           "enum": [
             "always-ask",
+            "always-ask-cached",
             "write",
             "yolo"
           ],
@@ -1983,7 +2043,7 @@
           "default": 0
         },
         "xdev": {
-          "description": "Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Sessions whose explicit tool list grants read but omits write mount devices through a device-only write transport (filesystem writes stay rejected). Disable to expose every enabled tool top-level.",
+          "description": "Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Sessions whose explicit tool list grants read but omits write mount devices through a device-only write transport (only local:// scratch stays writable besides devices). Disable to expose every enabled tool top-level.",
           "type": "boolean",
           "default": true
         },
@@ -2114,6 +2174,10 @@
         "model": {
           "description": "Model selector for extraction/consolidation, empty = smol role",
           "type": "string"
+        },
+        "minPromptLength": {
+          "type": "number",
+          "default": 16
         },
         "intervalMinutes": {
           "type": "number",
@@ -2788,6 +2852,15 @@
           "description": "Maximum screenshot height in pixels",
           "type": "number",
           "default": 2400
+        },
+        "backgroundFallback": {
+          "description": "What window input does when its background route is unavailable: rerun it in takeover and return focus to your app (macOS; elsewhere plain takeover), or refuse, which also keeps the agent from taking the foreground or opening macOS menus itself",
+          "type": "string",
+          "enum": [
+            "takeover",
+            "refuse"
+          ],
+          "default": "takeover"
         }
       }
     },
@@ -2912,6 +2985,11 @@
         "maxJobs": {
           "type": "number",
           "default": 100
+        },
+        "widgets": {
+          "description": "Draw a live widget for each running background job (charts, bars, status grids derived from its output) in the wait card, the jobs pill and the jobs sheet. The `widget` model role (default: `smol`) writes one spec per job; updates need no further model calls",
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -2964,7 +3042,7 @@
           "default": true
         },
         "shared": {
-          "description": "Share one language server per project across omp instances via the daemon broker (falls back to private servers when unavailable)",
+          "description": "Start language servers through the per-project daemon broker. Each connection gets its own server. While another omp instance in the project is running, a released server stays warm and the next connection reuses it instead of cold-starting (falls back to private servers when unavailable)",
           "type": "boolean",
           "default": true
         },
@@ -2987,10 +3065,18 @@
           "description": "Suppress post-edit LSP diagnostics already shown for a file; only surface new or changed ones",
           "type": "boolean",
           "default": true
+        },
+        "requestTimeout": {
+          "description": "Seconds to wait for a language server's diagnostics, hover and other answers when the agent sets no timeout; late post-edit diagnostics wait at least this long. Raise it for servers that are slow on a cold start. The lsp tool's timeout argument can still raise or lower it per call",
+          "type": "number",
+          "default": 10
         }
       }
     },
     "shellPath": {
+      "type": "string"
+    },
+    "shellCommandPrefix": {
       "type": "string"
     },
     "bash": {
@@ -3021,6 +3107,11 @@
               "default": 60000
             }
           }
+        },
+        "gitGuard": {
+          "description": "Refuse git commands that discard or move shared work in the bash tool: stash, reset --hard or to another commit, and checkout/switch/restore outside a merge or rebase conflict",
+          "type": "boolean",
+          "default": false
         },
         "patterns": {
           "description": "Ordered bash command approval rules. Each item has match and approval fields; only '*' wildcards are supported.",
@@ -3234,7 +3325,7 @@
           "additionalProperties": false,
           "properties": {
             "enabled": {
-              "description": "Run subagents in an isolated copy of the checkout and integrate their changes afterwards",
+              "description": "Allow per-task isolation with `isolated: true`; tasks without it run in the shared checkout",
               "type": "boolean",
               "default": false
             },
@@ -3278,6 +3369,11 @@
           "type": "boolean",
           "default": true
         },
+        "structured": {
+          "description": "Expose outputSchema/schemaMode on the task tool and return subagent results through the yield tool, validated against caller or agent output schemas. Off: task subagents have no yield tool and return their final message as plain text, except agents whose definition sets structured: true. Eval agent()/workpool spawns always keep structured results.",
+          "type": "boolean",
+          "default": false
+        },
         "speculativeLaunch": {
           "description": "Start each batch subagent as soon as its tasks[] item finishes streaming instead of waiting for the whole task call. Launched agents are aborted if the finished call fails validation, is blocked, or its arguments change. Requires auto-allowed task approval and no extension tool lifecycle handlers.",
           "type": "boolean",
@@ -3319,9 +3415,14 @@
           "default": 420000
         },
         "softRequestBudget": {
-          "description": "Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must yield its partial findings. 0 disables the guard. Bundled scout/sonic agents cap out at a lower built-in budget, so a value below that cap still applies to them.",
+          "description": "Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must hand back its partial findings. 0 disables the guard. Bundled scout/sonic agents cap out at a lower built-in budget, so a value below that cap still applies to them. A task.agentSoftRequestBudget entry replaces this budget for the agent it names.",
           "type": "number",
           "default": 200
+        },
+        "agentSoftRequestBudget": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
         },
         "softRequestBudgetNotice": {
           "description": "Inject one steering notice when a subagent crosses its soft request budget, asking it to wrap up before the 1.5x forced-yield stop.",
@@ -3423,6 +3524,26 @@
           "type": "boolean",
           "default": false
         },
+        "onStart": {
+          "description": "Whether fresh interactive sessions start in a new linked worktree",
+          "type": "string",
+          "enum": [
+            "off",
+            "ask",
+            "create"
+          ],
+          "default": "off"
+        },
+        "onExit": {
+          "description": "What to do on exit with worktrees created since omp started (on start or with `/wt`)",
+          "type": "string",
+          "enum": [
+            "keep",
+            "ask",
+            "remove"
+          ],
+          "default": "keep"
+        },
         "base": {
           "description": "Base directory for agent-managed worktrees — task-isolation copies, `github` PR checkouts, and `omp worktree` cleanup all live here. Unset uses ~/.omp/wt. Must be an absolute or ~-relative path; relative paths are ignored. The OMP_WORKTREE_DIR env var overrides this.",
           "type": "string"
@@ -3482,7 +3603,7 @@
       "additionalProperties": false,
       "properties": {
         "icons": {
-          "description": "Icon and short code that head new generated session titles",
+          "description": "Icon and short code that head new generated or /rename session titles",
           "type": "string",
           "enum": [
             "nf+emoji",
@@ -3974,6 +4095,14 @@
         "staleRetainDays": {
           "type": "number",
           "default": 30
+        },
+        "compress": {
+          "type": "boolean",
+          "default": false
+        },
+        "compressAfterDays": {
+          "type": "number",
+          "default": 7
         }
       }
     }
