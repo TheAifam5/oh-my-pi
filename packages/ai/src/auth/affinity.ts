@@ -34,6 +34,15 @@ const SESSION_STICKY_PERSIST_INTERVAL_MS = 60_000;
  * conversation; evicted sessions resume from their persisted sticky row.
  */
 const SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER = 256;
+/**
+ * How long a store miss for a session's pin, drain override, or sticky row is
+ * trusted before that row is read again. A write through this affinity
+ * invalidates the miss at once; a row another process writes for the same
+ * session is seen at most this late.
+ */
+const SESSION_ROW_MISS_TTL_MS = 1_500;
+/** Store misses remembered at once, across providers and row kinds. */
+const SESSION_ROW_MISSES_MAX = 1_024;
 
 /** What this process last wrote (or read) for one persisted sticky row. */
 type PersistedSticky = {
@@ -168,6 +177,12 @@ export class SessionAffinity implements SessionsApi {
 	#restrictedPinWarnings = new LRUCache<string, true>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
 	/** Session drain overrides by session id, then provider, persisted in the store cache. */
 	#drainOverrides: Map<string, Map<string, DrainOverride>> = new Map();
+	/**
+	 * Store cache keys of pin, drain, and sticky rows last read as absent, with the
+	 * `Date.now()` until which that miss is trusted ({@link SESSION_ROW_MISS_TTL_MS}).
+	 * Every write of a row through this affinity deletes its key.
+	 */
+	#rowMisses = new LRUCache<string, number>({ max: SESSION_ROW_MISSES_MAX });
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
@@ -202,6 +217,37 @@ export class SessionAffinity implements SessionsApi {
 		if (sessions?.get(sessionId)?.lease !== lease) return;
 		sessions.delete(sessionId);
 		if (sessions.size === 0) this.#restrictions.delete(provider);
+	}
+
+	restrictLike(sourceSessionId: string, targetSessionId: string): ReadonlyMap<string, SessionRestrictionLease> {
+		if (!sourceSessionId || !targetSessionId) {
+			throw new Error("sessions.restrictLike requires a source and a target session id");
+		}
+		const copies: Array<[string, readonly string[]]> = [];
+		for (const [provider, sessions] of this.#restrictions) {
+			const source = sessions.get(sourceSessionId);
+			if (source) copies.push([provider, [...source.allowed]]);
+		}
+		const leases = new Map<string, SessionRestrictionLease>();
+		for (const [provider, identityKeys] of copies) {
+			leases.set(provider, this.restrict(provider, targetSessionId, identityKeys));
+		}
+		return leases;
+	}
+
+	/** Whether the store row `key` was read as absent within {@link SESSION_ROW_MISS_TTL_MS}. */
+	#recentlyMissed(key: string): boolean {
+		const until = this.#rowMisses.get(key);
+		if (until === undefined) return false;
+		const remainingMs = until - Date.now();
+		// A wall clock stepped backwards (NTP, resume) would otherwise extend the miss by the step.
+		if (remainingMs > 0 && remainingMs <= SESSION_ROW_MISS_TTL_MS) return true;
+		this.#rowMisses.delete(key);
+		return false;
+	}
+
+	#noteMiss(key: string): void {
+		this.#rowMisses.set(key, Date.now() + SESSION_ROW_MISS_TTL_MS);
 	}
 
 	/** True when {@link restrict} limits `sessionId` for `provider`. */
@@ -275,6 +321,8 @@ export class SessionAffinity implements SessionsApi {
 	 */
 	adoptPins(previous: SessionAffinity): void {
 		this.#pinSource = previous.#pinSource;
+		// Read every row afresh: a cached miss would drop a pin another process wrote just now.
+		previous.#rowMisses.clear();
 		const providers = previous.#pool.providers();
 		for (const sessionId of previous.#knownSessionIds()) {
 			for (const provider of providers) {
@@ -331,13 +379,22 @@ export class SessionAffinity implements SessionsApi {
 		return `${SESSION_PIN_CACHE_PREFIX}${provider}:${sessionId}`;
 	}
 
-	/** The session's exclusive pin for `provider`, or `undefined` without one. */
+	/**
+	 * The session's exclusive pin for `provider`, or `undefined` without one. A
+	 * miss is cached for {@link SESSION_ROW_MISS_TTL_MS}, so a pin another process
+	 * writes for this session applies at most that late.
+	 */
 	#sessionPin(provider: string, sessionId: string): SessionPin | undefined {
 		const live = nestedGet(this.#exclusivePins, sessionId, provider);
 		if (live) return live;
+		const key = this.#pinKey(provider, sessionId);
+		if (this.#recentlyMissed(key)) return undefined;
 		try {
-			const raw = this.#store.getCache(this.#pinKey(provider, sessionId));
-			if (!raw) return undefined;
+			const raw = this.#store.getCache(key);
+			if (!raw) {
+				this.#noteMiss(key);
+				return undefined;
+			}
 			const value = JSON.parse(raw) as { credentialId?: unknown; identityHash?: unknown };
 			const pin: SessionPin = {
 				credentialId: typeof value.credentialId === "number" ? value.credentialId : null,
@@ -356,6 +413,7 @@ export class SessionAffinity implements SessionsApi {
 
 	#writeSessionPin(provider: string, sessionId: string, pin: Omit<SessionPin, "persisted"> | undefined): void {
 		const key = this.#pinKey(provider, sessionId);
+		this.#rowMisses.delete(key);
 		let persisted = false;
 		try {
 			if (pin === undefined) this.#store.setCache(key, "", 0);
@@ -398,17 +456,25 @@ export class SessionAffinity implements SessionsApi {
 		return true;
 	}
 
-	/** The session's drain override: a row id, `null` for no drain target, `undefined` to follow account policy. */
+	/**
+	 * The session's drain override: a row id, `null` for no drain target,
+	 * `undefined` to follow account policy. A miss is cached like
+	 * {@link #sessionPin}'s, so an override another process writes applies at most
+	 * {@link SESSION_ROW_MISS_TTL_MS} late.
+	 */
 	drainOverride(provider: string, sessionId: string | undefined): number | null | undefined {
 		if (!sessionId) return undefined;
 		const live = nestedGet(this.#drainOverrides, sessionId, provider);
 		if (live) return live.credentialId;
-		// A miss is not cached, like #sessionPin: one primary-key lookup per selection picks up an override written later by another process.
+		const key = sessionDrainKey(provider, sessionId);
+		if (this.#recentlyMissed(key)) return undefined;
 		try {
-			const raw = this.#store.getCache(sessionDrainKey(provider, sessionId));
+			const raw = this.#store.getCache(key);
 			const credentialId = raw ? parseSessionDrain(raw) : undefined;
 			if (credentialId !== undefined) {
 				nestedSet(this.#drainOverrides, sessionId, provider, { credentialId, releasable: true, persisted: true });
+			} else {
+				this.#noteMiss(key);
 			}
 			return credentialId;
 		} catch (err) {
@@ -424,8 +490,9 @@ export class SessionAffinity implements SessionsApi {
 		releasable?: true,
 	): void {
 		let persisted = false;
+		const cacheKey = sessionDrainKey(provider, sessionId);
+		this.#rowMisses.delete(cacheKey);
 		try {
-			const cacheKey = sessionDrainKey(provider, sessionId);
 			if (credentialId === undefined) this.#store.setCache(cacheKey, "", 0);
 			else
 				this.#store.setCache(
@@ -575,8 +642,10 @@ export class SessionAffinity implements SessionsApi {
 		} catch (error) {
 			if (!(error instanceof AIError.AccountUnavailableError)) throw error;
 		}
-		return this.#pool.entries(provider).map((entry, index) => {
+		return this.#pool.entries(provider).flatMap((entry, index): AuthAccountSummary[] => {
 			const credential = entry.credential;
+			// A restricted session lists only its allowlist; without a session id every row is listed.
+			if (sessionId !== undefined && !this.allows(provider, sessionId, credential)) return [];
 			const name = this.#policies.forStored(provider, credential)?.name;
 			const summary: AuthAccountSummary = {
 				credentialId: entry.id,
@@ -585,16 +654,18 @@ export class SessionAffinity implements SessionsApi {
 				pinned: pinnedIndex === index,
 				...(name !== undefined ? { name } : {}),
 			};
-			if (credential.type === "api_key") return { ...summary, keyFingerprint: apiKeyFingerprint(credential.key) };
-			return {
-				...summary,
-				accountId: credential.accountId,
-				email: credential.email,
-				projectId: credential.projectId,
-				enterpriseUrl: credential.enterpriseUrl,
-				orgId: credential.orgId,
-				orgName: credential.orgName,
-			};
+			if (credential.type === "api_key") return [{ ...summary, keyFingerprint: apiKeyFingerprint(credential.key) }];
+			return [
+				{
+					...summary,
+					accountId: credential.accountId,
+					email: credential.email,
+					projectId: credential.projectId,
+					enterpriseUrl: credential.enterpriseUrl,
+					orgId: credential.orgId,
+					orgName: credential.orgName,
+				},
+			];
 		});
 	}
 
@@ -654,6 +725,7 @@ export class SessionAffinity implements SessionsApi {
 
 		if (credentialId === undefined) return;
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
+		this.#rowMisses.delete(cacheKey);
 		const expiresAtSec = Math.floor(nowMs / 1000) + SESSION_STICKY_TTL_SEC;
 		const persistedSessions = SessionAffinity.#sessionsFor(this.#persistedSticky, provider);
 		const persisted = persistedSessions.get(sessionId);
@@ -708,9 +780,12 @@ export class SessionAffinity implements SessionsApi {
 			live.index = actualIndex;
 			return live;
 		}
+		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
+		// A sticky another process records for this session is adopted at most SESSION_ROW_MISS_TTL_MS late.
+		if (this.#recentlyMissed(cacheKey)) return undefined;
 		try {
-			const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 			const raw = this.#store.getCache(cacheKey);
+			if (!raw) this.#noteMiss(cacheKey);
 			if (raw) {
 				const val = JSON.parse(raw) as SessionCredential;
 
@@ -766,6 +841,7 @@ export class SessionAffinity implements SessionsApi {
 		}
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 		this.#persistedSticky.get(provider)?.delete(sessionId);
+		this.#rowMisses.delete(cacheKey);
 		try {
 			this.#store.setCache(cacheKey, "", 0);
 		} catch (err) {
@@ -895,6 +971,12 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	forgetInherited(sessionId: string): void {
+		for (const provider of this.#exclusivePins.get(sessionId)?.keys() ?? []) {
+			this.#rowMisses.delete(this.#pinKey(provider, sessionId));
+		}
+		for (const provider of this.#drainOverrides.get(sessionId)?.keys() ?? []) {
+			this.#rowMisses.delete(sessionDrainKey(provider, sessionId));
+		}
 		dropReleasable(this.#exclusivePins, sessionId);
 		dropReleasable(this.#drainOverrides, sessionId);
 	}

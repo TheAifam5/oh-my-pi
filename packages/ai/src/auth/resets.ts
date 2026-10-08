@@ -55,12 +55,12 @@ export class ResetCredits implements ResetsApi {
 		const baseUrl = options?.baseUrlResolver?.(provider);
 		if (provider !== "anthropic") return this.#listAccounts(provider, baseUrl, options);
 		options?.signal?.throwIfAborted();
-		const activeId = this.#deps.oauth
-			.accounts(provider, options?.sessionId)
-			.find(account => account.active)?.credentialId;
+		const accounts = this.#deps.oauth.accounts(provider, options?.sessionId);
+		const activeId = accounts.find(account => account.active)?.credentialId;
 		// Discovery is sequential and probes the active account first, so only
-		// callers sharing that account can share one pass.
-		const key = JSON.stringify([provider, baseUrl, activeId]);
+		// callers sharing that account can share one pass, and only callers whose
+		// restrictions list the same accounts.
+		const key = JSON.stringify([provider, baseUrl, activeId, accounts.map(account => account.credentialId)]);
 		let pending = this.#listInFlight.get(key);
 		if (!pending) {
 			pending = this.#listAccounts(provider, baseUrl, { ...options, signal: undefined }).finally(() =>
@@ -132,7 +132,10 @@ export class ResetCredits implements ResetsApi {
 			return { ...identity, ok: false, code: "unsupported_provider" };
 		}
 		const baseUrl = options.baseUrlResolver?.(provider);
-		const match = await this.#deps.oauth.accessById(provider, target.credentialId, { signal: options.signal });
+		const match = await this.#deps.oauth.accessById(provider, target.credentialId, {
+			signal: options.signal,
+			sessionId: options.sessionId,
+		});
 		if (!match) return { ...identity, ok: false, code: "no_account" };
 		const resolvedIdentity = {
 			provider,

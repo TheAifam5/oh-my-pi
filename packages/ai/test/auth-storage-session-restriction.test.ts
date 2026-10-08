@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { identityHash, SESSION_PIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
+import { SESSION_DRAIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/drain-state";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
@@ -292,6 +293,130 @@ describe("AuthStorage session account restrictions", () => {
 
 		expect(await storage.keys.get(PROVIDER, "session")).toBe("access-b");
 		expect(storage.sessions.accounts(PROVIDER, "session").find(account => account.pinned)?.accountId).toBe("acc-b");
+	});
+
+	test("a restricted session lists only its allowed accounts; the owner's list without a session lists every row", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		storage.sessions.restrict(PROVIDER, "child", ["account:acc-b"]);
+		expect(await storage.keys.get(PROVIDER, "child")).toBe("access-b");
+
+		const listed = storage.sessions.accounts(PROVIDER, "child");
+		expect(listed.map(account => [account.email, account.active])).toEqual([["b@example.com", true]]);
+		expect(storage.sessions.accounts(PROVIDER).map(account => account.email)).toEqual([
+			"a@example.com",
+			"b@example.com",
+			"c@example.com",
+		]);
+		expect(storage.sessions.accounts(PROVIDER, "unrestricted")).toHaveLength(3);
+	});
+
+	test("restrictLike copies a session's restriction until its own leases are lifted", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		const hostLease = storage.sessions.restrict(PROVIDER, "host", ["account:acc-b"]);
+
+		const leases = storage.sessions.restrictLike("host", "scan");
+		expect([...leases.keys()]).toEqual([PROVIDER]);
+		expect(await storage.keys.get(PROVIDER, "scan")).toBe("access-b");
+		expect(storage.sessions.accounts(PROVIDER, "scan").map(account => account.accountId)).toEqual(["acc-b"]);
+		// The copy outlives the host's own restriction until its leases are lifted.
+		storage.sessions.unrestrict(PROVIDER, "host", hostLease);
+		expect(await storage.keys.get(PROVIDER, "scan")).toBe("access-b");
+		for (const [provider, lease] of leases) storage.sessions.unrestrict(provider, "scan", lease);
+		expect(await storage.keys.get(PROVIDER, "scan")).toBe("runtime-key");
+		expect(storage.sessions.restrictLike("unrestricted", "other").size).toBe(0);
+	});
+
+	test("an unpinned session reads its pin and drain rows at most once per miss window", async () => {
+		setSystemTime(new Date("2026-10-07T10:00:00Z"));
+		try {
+			await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+			const [store] = stores;
+			if (!store) throw new Error("expected a store");
+			const getCache = vi.spyOn(store, "getCache");
+			const rowReads = (prefix: string) =>
+				getCache.mock.calls.filter(([key]) => key === `${prefix}${PROVIDER}:session`).length;
+			const pinned = () => storage.sessions.accounts(PROVIDER, "session").some(account => account.pinned);
+			for (let request = 0; request < 5; request += 1) {
+				expect(await storage.keys.get(PROVIDER, "session")).toBeDefined();
+			}
+			expect(rowReads(SESSION_PIN_CACHE_PREFIX)).toBe(1);
+			expect(rowReads(SESSION_DRAIN_CACHE_PREFIX)).toBe(1);
+
+			// A write through this process applies at once.
+			const accountB = storage.oauth.accounts(PROVIDER)[1];
+			expect(storage.sessions.pin(PROVIDER, "session", accountB?.credentialId ?? -1)).toBe(true);
+			expect(pinned()).toBe(true);
+			expect(storage.sessions.unpin(PROVIDER, "session")).toBe(true);
+			expect(pinned()).toBe(false);
+
+			// Another process's pin is seen once the miss window has passed.
+			const peer = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db")));
+			try {
+				await peer.credentials.reload();
+				expect(peer.sessions.pin(PROVIDER, "session", peer.oauth.accounts(PROVIDER)[0]?.credentialId ?? -1)).toBe(
+					true,
+				);
+			} finally {
+				peer.close();
+			}
+			expect(pinned()).toBe(false);
+			setSystemTime(new Date("2026-10-07T10:00:02Z"));
+			expect(pinned()).toBe(true);
+			expect(await storage.keys.get(PROVIDER, "session")).toBe("access-a");
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("a wall clock stepped backwards does not extend a cached pin miss", async () => {
+		setSystemTime(new Date("2026-10-07T10:00:00Z"));
+		try {
+			await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+			const pinned = () => storage.sessions.accounts(PROVIDER, "session").some(account => account.pinned);
+			expect(pinned()).toBe(false);
+			setSystemTime(new Date("2026-10-07T09:00:00Z"));
+			const peer = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db")));
+			try {
+				await peer.credentials.reload();
+				expect(peer.sessions.pin(PROVIDER, "session", peer.oauth.accounts(PROVIDER)[1]?.credentialId ?? -1)).toBe(
+					true,
+				);
+			} finally {
+				peer.close();
+			}
+			setSystemTime(new Date("2026-10-07T09:00:02Z"));
+			expect(pinned()).toBe(true);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("a store swap carries a pin another process wrote within the miss window", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.sessions.restrict(PROVIDER, "session", ["account:acc-a", "account:acc-b"]);
+		// This process reads the session as unpinned, caching the miss.
+		expect(storage.sessions.accounts(PROVIDER, "session").some(account => account.pinned)).toBe(false);
+		const peer = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db")));
+		await peer.credentials.reload();
+		expect(peer.sessions.pin(PROVIDER, "session", peer.oauth.accounts(PROVIDER)[1]?.credentialId ?? -1)).toBe(true);
+		peer.close();
+
+		const replacement = await SqliteAuthCredentialStore.open(path.join(tempDir, "replacement.db"));
+		stores.push(replacement);
+		await replacement.replaceAuthCredentials(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		await storage.replaceStore(replacement);
+
+		expect(storage.sessions.accounts(PROVIDER, "session").find(account => account.pinned)?.accountId).toBe("acc-b");
+	});
+
+	test("a restricted session without a sticky is described by an allowed account only", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.sessions.restrict(PROVIDER, "session", ["account:acc-b"]);
+		const described = storage.keys.describe(PROVIDER, "session") ?? "";
+		expect(described).toContain("b@example.com");
+		expect(described).not.toContain("a@example.com");
+		expect(storage.keys.describe(PROVIDER)).toContain("a@example.com");
 	});
 
 	test("keeps restrictions across a credential store replacement", async () => {

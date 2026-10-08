@@ -558,6 +558,7 @@ export interface ModelUsageHealth {
 /** Requested model, session, and reserve threshold for usage health. */
 export interface ModelUsageHealthOptions {
 	modelId?: string;
+	/** Session asking; a restricted session's health covers only the accounts its restriction allows. */
 	sessionId?: string;
 	baseUrl?: string;
 	reserveFraction: number;
@@ -892,6 +893,8 @@ export type ListResetCreditsOptions = {
 /** Select a saved reset credit and optional provider endpoint. */
 export type RedeemResetCreditOptions = {
 	target: ResetCreditTarget;
+	/** Session redeeming; a target account its restriction does not allow is refused as `no_account`. */
+	sessionId?: string;
 	baseUrlResolver?: (provider: string) => string | undefined;
 	signal?: AbortSignal;
 };
@@ -1340,7 +1343,13 @@ export interface SessionsApi {
 	 * `AccountUnavailableError`.
 	 */
 	setAccountPinSource(source: AccountPinSource | undefined): void;
-	/** Stored credentials for `provider` in storage order, with names and the session's active and pinned marks. */
+	/**
+	 * Stored credentials for `provider` in storage order, with names and the
+	 * session's active and pinned marks. A session restricted by {@link restrict}
+	 * lists only the accounts its restriction allows. Without `sessionId`, every
+	 * stored row is listed with no session marks: the owner's view for account
+	 * management, never for a session's own selection.
+	 */
 	accounts(provider: string, sessionId?: string): AuthAccountSummary[];
 	/**
 	 * Copy stored credential affinities from one live session to another.
@@ -1400,6 +1409,15 @@ export interface SessionsApi {
 	 * {@link restrict} list names.
 	 */
 	permits(provider: string, sessionId: string, credentialId: number): boolean;
+	/**
+	 * Restrict `targetSessionId` exactly as `sourceSessionId` is restricted now:
+	 * one {@link restrict} call per provider the source is restricted for, with
+	 * the same allowlist. Returns the lease of each copy by provider; the caller
+	 * passes each to {@link unrestrict} when the target session ends. A source
+	 * restricted for no provider copies nothing. Later changes to the source's
+	 * restriction are not followed.
+	 */
+	restrictLike(sourceSessionId: string, targetSessionId: string): ReadonlyMap<string, SessionRestrictionLease>;
 	/**
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released

@@ -105,10 +105,12 @@ export class CredentialHealth implements HealthApi {
 			return { state: "unknown", accounts: [] };
 		}
 
-		const stored = this.#deps.pool.entries(provider).map((entry, index) => ({
-			entry,
-			index,
-		}));
+		// A restricted session's health covers only its allowlist: no other account's token
+		// reaches the usage endpoint, and no other account makes the model look healthy.
+		const stored = this.#deps.pool
+			.entries(provider)
+			.map((entry, index) => ({ entry, index }))
+			.filter(({ entry }) => this.#deps.affinity.allows(provider, options.sessionId, entry.credential));
 		const oauthPool = stored.filter(({ entry }) => entry.credential.type === "oauth");
 		const apiKeyPool = stored.filter(({ entry }) => entry.credential.type === "api_key");
 		const loginApiKeyPool = apiKeyPool.filter(

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import {
 	type ApiKeyCredential,
 	type AuthCredential,
@@ -156,6 +157,44 @@ describe("AuthStorage model usage health", () => {
 		});
 		expect(health.state).toBe("healthy");
 		expect(health.accounts.map(account => account.state)).toEqual(["depleted", "healthy"]);
+	});
+
+	it("a restricted session's health covers only its pool and never fetches usage for another account", async () => {
+		const fetched: string[] = [];
+		const reports: Record<string, UsageReport> = {
+			"account-1": report("account-1", [limit("short", 1)]),
+			"account-2": report("account-2", [limit("short", 0.4)]),
+		};
+		const rows = [oauthRow(1), oauthRow(2)];
+		const storage = new AuthStorage(makeStore(rows), {
+			usageProviderResolver: provider =>
+				provider === "anthropic"
+					? {
+							id: "anthropic",
+							fetchUsage: async params => {
+								const account = params.credential.accountId ?? "";
+								fetched.push(account);
+								return reports[account] ?? null;
+							},
+						}
+					: undefined,
+			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+		const insideKey = resolveCredentialIdentityKey("anthropic", rows[0]!.credential);
+		if (!insideKey) throw new Error("expected an identity key");
+		storage.sessions.restrict("anthropic", "pooled", [insideKey]);
+
+		const health = await storage.health.model("anthropic", {
+			modelId: "claude",
+			sessionId: "pooled",
+			reserveFraction: 0.1,
+		});
+		expect(health.state).toBe("depleted");
+		expect(health.accounts.map(account => account.credentialId)).toEqual([1]);
+		expect(fetched).toEqual(["account-1"]);
 	});
 
 	it("does not declare depletion while any pooled sibling is unknown", async () => {

@@ -656,7 +656,13 @@ export class KeyCascade implements KeysApi {
 		): string | undefined => {
 			const typed = stored
 				.map((entry, index) => ({ entry, index }))
-				.filter(({ entry }) => entry.credential.type === type && (filter?.(entry.credential) ?? true));
+				.filter(
+					({ entry }) =>
+						entry.credential.type === type &&
+						(filter?.(entry.credential) ?? true) &&
+						// A restricted session is described only by an account its restriction allows.
+						this.#deps.affinity.allows(provider, sessionId, entry.credential),
+				);
 			if (typed.length === 0) return undefined;
 			const sticky = session?.type === type ? typed.find(entry => entry.index === session.index) : undefined;
 			const chosen = sticky?.entry ?? typed[0].entry;

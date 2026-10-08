@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import { AuthStorage, type OAuthCredential, type ResetCreditTarget } from "@oh-my-pi/pi-ai/auth-storage";
 import { claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
 import { isRecord } from "@oh-my-pi/pi-ai/utils";
@@ -217,6 +218,42 @@ describe("Claude saved reset account safety", () => {
 		const statuses = await surviving;
 		expect(statuses.map(status => status.report?.metadata?.orgId).sort()).toEqual(["org-a", "org-b"]);
 		expect(f.usageRequests).toEqual(["?cedar_ember=1&skip_spend=1", "?cedar_ember=1&skip_spend=1"]);
+	});
+
+	it("a restricted session neither lists nor redeems resets of accounts outside its pool", async () => {
+		const f = await fixture();
+		const insideKey = resolveCredentialIdentityKey("anthropic", {
+			type: "oauth",
+			access: "token-org-a",
+			refresh: "refresh-org-a",
+			expires: 0,
+			accountId: "shared-account",
+			email: "same@example.com",
+			orgId: "org-a",
+		});
+		if (!insideKey) throw new Error("Expected an org-a identity key");
+		f.storage.sessions.restrict("anthropic", "pooled", [insideKey]);
+
+		const refused = await f.storage.resets.redeem({
+			target: f.target,
+			sessionId: "pooled",
+			baseUrlResolver: f.baseUrlResolver,
+		});
+		expect(refused.code).toBe("no_account");
+		expect(f.posts).toEqual([]);
+
+		// An unrestricted pass in flight is not shared with the restricted session.
+		const arrived = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		f.state.usageArrived = arrived.resolve;
+		f.state.usageGate = release.promise;
+		const options = { provider: "anthropic", baseUrlResolver: f.baseUrlResolver };
+		const unrestricted = f.storage.resets.list({ ...options, sessionId: "owner" });
+		await arrived.promise;
+		const pooled = f.storage.resets.list({ ...options, sessionId: "pooled" });
+		release.resolve();
+		expect((await pooled).map(status => status.orgId)).toEqual(["org-a"]);
+		expect((await unrestricted).map(status => status.orgId).sort()).toEqual(["org-a", "org-b"]);
 	});
 
 	it("returns provider throttle timing without spending or retrying discovery", async () => {
