@@ -982,7 +982,7 @@ export class AgentSession implements SettingsScope {
 	#observedSessionId: string | undefined;
 	/** Provider session id whose settings-backed account pins are registered, and their teardown. */
 	#accountPins: { sessionId: string; unregister: () => void } | undefined;
-	/** Unavailable-pin warnings this session holds in `configWarnings`, by provider. */
+	/** Unavailable or restriction-ignored pin warnings this session holds in `configWarnings`, by provider. */
 	#accountPinWarnings = new Map<string, string>();
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
@@ -2978,8 +2978,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Unavailable-pin warnings found while no listener was attached; they are held in
-	 * `configWarnings` instead of emitted as notices, and dropped once the pin is resolved.
+	 * Unavailable-pin warnings, and pins an account restriction ignores, found while no
+	 * listener was attached; they are held in `configWarnings` instead of emitted as
+	 * notices, and dropped once the pin is resolved.
 	 */
 	get accountPinWarnings(): readonly string[] {
 		return Array.from(this.#accountPinWarnings.values());
@@ -6506,15 +6507,19 @@ export class AgentSession implements SettingsScope {
 		const unavailable = seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid, {
 			exclusiveOnly: this.#freshProviderSessionId !== undefined,
 			onIgnored: provider => {
+				const message = `The account pinned to this session for ${provider} is outside the account pool this session is restricted to; the pool's accounts are used instead.`;
+				// Found while the session is built: held like an unavailable pin, which the
+				// header, RPC mode, and headless stderr report once a host attaches.
+				if (this.#eventListeners.length === 0) {
+					this.#accountPinWarnings.set(provider, message);
+					this.configWarnings.push(message);
+					return;
+				}
 				const key = `${currentSessionId}\0${provider}`;
-				// Shown once per session file and provider, to a listener; a notice before anyone subscribes is lost.
-				if (this.#eventListeners.length === 0 || this.#ignoredPinNotices.has(key)) return;
+				// Shown once per session file and provider.
+				if (this.#ignoredPinNotices.has(key)) return;
 				this.#ignoredPinNotices.add(key);
-				this.emitNotice(
-					"info",
-					`The account pinned to this session for ${provider} is outside the account pool this session is restricted to; the pool's accounts are used instead.`,
-					ACCOUNT_PIN_NOTICE_SOURCE,
-				);
+				this.emitNotice("info", message, ACCOUNT_PIN_NOTICE_SOURCE);
 			},
 		});
 		for (const provider of unavailable) {
@@ -14583,6 +14588,7 @@ export class AgentSession implements SettingsScope {
 	async redeemResetCredit(target: ResetCreditTarget, signal?: AbortSignal): Promise<ResetCreditRedeemOutcome> {
 		return this.#modelRegistry.authStorage.resets.redeem({
 			target,
+			sessionId: this.sessionId,
 			baseUrlResolver: provider => this.#modelRegistry.getProviderBaseUrl?.(provider),
 			signal,
 		});
@@ -14838,6 +14844,7 @@ export class AgentSession implements SettingsScope {
 			try {
 				const redeemOptions = {
 					target: action.target,
+					sessionId: this.sessionId,
 					baseUrlResolver: (candidate: string) => this.#modelRegistry.getProviderBaseUrl?.(candidate),
 					// Caller cancellation must not leave an ambiguous consume in flight.
 					signal: AbortSignal.timeout(15_000),

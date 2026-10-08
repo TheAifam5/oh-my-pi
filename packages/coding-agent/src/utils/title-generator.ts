@@ -362,7 +362,8 @@ async function generateTitleOnlineWithModels(
 			call,
 		);
 	}
-	registry.authStorage.sessions.inherit(credentialSourceSessionId, sessionId);
+	const sessions = registry.authStorage.sessions;
+	sessions.inherit(credentialSourceSessionId, sessionId);
 	const unshareAccountPins = shareSessionAccountPins(credentialSourceSessionId, sessionId);
 	try {
 		return await generateTitleFromModels(
@@ -377,6 +378,8 @@ async function generateTitleOnlineWithModels(
 		);
 	} finally {
 		unshareAccountPins();
+		// Only the inherited, persisted copies leave memory; their rows stay for the next title request.
+		sessions.forgetInherited(sessionId);
 	}
 }
 

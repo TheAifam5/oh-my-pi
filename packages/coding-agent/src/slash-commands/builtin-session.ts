@@ -270,6 +270,11 @@ async function handleSessionDrainCommand(
 		return;
 	}
 	const subject = target ? `${provider} account #${target.credentialId}` : undefined;
+	// The session's list holds only its pool's accounts; the saved policy also never names one outside it.
+	if (target && !session.modelRegistry.authStorage.sessions.admits(provider, session.sessionId, target.credentialId)) {
+		await output(`Not changed: ${subject} is outside the ${provider} account pool this session is restricted to.`);
+		return;
+	}
 	const lines: string[] = [];
 	// Save first: a rejected policy leaves the session drain unchanged too, so the two never diverge.
 	if (save) {

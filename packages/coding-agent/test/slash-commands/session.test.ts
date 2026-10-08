@@ -51,8 +51,9 @@ describe("/session slash command", () => {
 		const session = {
 			listCurrentProviderAccounts: vi.fn(async () => ({ provider: "openai-codex", accounts: [account] })),
 			drainCurrentProviderAccount: vi.fn(() => "drained"),
+			sessionId: "session-1",
 			settings: {},
-			modelRegistry: { authStorage: {} },
+			modelRegistry: { authStorage: { sessions: { admits: () => true } } },
 		};
 		const showStatus = vi.fn();
 		const save = vi.spyOn(accountAdmin, "setAccountDrain").mockReturnValue({});

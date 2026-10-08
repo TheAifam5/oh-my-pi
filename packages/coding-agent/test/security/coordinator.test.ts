@@ -176,6 +176,136 @@ describe("native security coordinator", () => {
 		}
 	});
 
+	test("the scan session carries the starting session's account restriction until the scan ends", async () => {
+		const pooled = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(temporaryRoot, "pooled.db")));
+		try {
+			const credential = (suffix: string) => ({
+				type: "oauth" as const,
+				access: `access-${suffix}`,
+				refresh: `refresh-${suffix}`,
+				expires: Date.now() + 60 * 60_000,
+				accountId: `workspace-${suffix}`,
+				email: `${suffix}@example.invalid`,
+			});
+			await pooled.credentials.set("openai-codex", [credential("a"), credential("b")]);
+			const insideKey = resolveCredentialIdentityKey("openai-codex", credential("a"));
+			if (!insideKey) throw new Error("expected an identity key");
+			pooled.sessions.restrict("openai-codex", "host-provider-session", [insideKey]);
+			const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+			let seenByScan: { restricted: boolean; accounts: (string | undefined)[] } | undefined;
+			let scanSessionId = "";
+			const coordinator = new SecurityCoordinator(
+				{
+					cwd: repositoryRoot,
+					settings,
+					authStorage: pooled,
+					modelRegistry,
+					activeModel: mock.model,
+					sessionId: "manager-session",
+					restrictionSessionId: () => "host-provider-session",
+				},
+				{
+					openStore: storeFactory,
+					gitAdapter,
+					createSession: async input => {
+						scanSessionId = `security:${input.scanId}`;
+						seenByScan = {
+							restricted: pooled.sessions.isRestricted("openai-codex", scanSessionId),
+							accounts: pooled.oauth.accounts("openai-codex", scanSessionId).map(account => account.accountId),
+						};
+						return {
+							prompt: async () => true,
+							waitForIdle: async () => {},
+							abort: async () => {},
+							dispose: async () => {},
+						};
+					},
+				},
+			);
+			const plan = await coordinator.preflight({ model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			expect((await coordinator.wait(started.operationId)).phase).toBe("partial");
+
+			expect(seenByScan).toEqual({ restricted: true, accounts: ["workspace-a"] });
+			expect(pooled.sessions.isRestricted("openai-codex", scanSessionId)).toBe(false);
+			expect(pooled.sessions.isRestricted("openai-codex", "host-provider-session")).toBe(true);
+		} finally {
+			pooled.close();
+		}
+	});
+
+	test("the scan id stays restricted when the scan session lifts its own restriction on dispose", async () => {
+		const pooled = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(temporaryRoot, "pooled.db")));
+		try {
+			const credential = (suffix: string) => ({
+				type: "oauth" as const,
+				access: `access-${suffix}`,
+				refresh: `refresh-${suffix}`,
+				expires: Date.now() + 60 * 60_000,
+				accountId: `workspace-${suffix}`,
+				email: `${suffix}@example.invalid`,
+			});
+			await pooled.credentials.set("openai-codex", [credential("a"), credential("b")]);
+			const insideKey = resolveCredentialIdentityKey("openai-codex", credential("a"));
+			if (!insideKey) throw new Error("expected an identity key");
+			pooled.sessions.restrict("openai-codex", "host-provider-session", [insideKey]);
+			const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+			let scanSessionId = "";
+			let restrictedAfterDispose: boolean | undefined;
+			const coordinator = new SecurityCoordinator(
+				{
+					cwd: repositoryRoot,
+					settings,
+					authStorage: pooled,
+					modelRegistry,
+					activeModel: mock.model,
+					sessionId: "manager-session",
+					restrictionSessionId: () => "host-provider-session",
+				},
+				{
+					openStore: storeFactory,
+					gitAdapter,
+					createSession: async input => {
+						scanSessionId = `security:${input.scanId}`;
+						// A nested pool scope installs its own lease on the scan id and lifts it on dispose.
+						let own = pooled.sessions.restrict("openai-codex", scanSessionId, [insideKey]);
+						return {
+							prompt: async () => {
+								// A lookup during the scan installs it again, after the coordinator's claims.
+								own = pooled.sessions.restrict("openai-codex", scanSessionId, [insideKey]);
+								return true;
+							},
+							waitForIdle: async () => {},
+							abort: async () => {},
+							dispose: async () => {
+								pooled.sessions.unrestrict("openai-codex", scanSessionId, own);
+								restrictedAfterDispose = pooled.sessions.isRestricted("openai-codex", scanSessionId);
+							},
+						};
+					},
+				},
+			);
+			// The scan id's state when the coordinator lifts its own claims at the very end of the scan.
+			const restrictedAtRelease: boolean[] = [];
+			const unrestrict = pooled.sessions.unrestrict.bind(pooled.sessions);
+			vi.spyOn(pooled.sessions, "unrestrict").mockImplementation((provider, sessionId, lease) => {
+				if (sessionId === scanSessionId && restrictedAfterDispose !== undefined) {
+					restrictedAtRelease.push(pooled.sessions.isRestricted(provider, sessionId));
+				}
+				unrestrict(provider, sessionId, lease);
+			});
+			const plan = await coordinator.preflight({ model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			expect((await coordinator.wait(started.operationId)).phase).toBe("partial");
+
+			expect(restrictedAtRelease[0]).toBe(true);
+			expect(pooled.sessions.isRestricted("openai-codex", scanSessionId)).toBe(false);
+			expect(pooled.sessions.isRestricted("openai-codex", "host-provider-session")).toBe(true);
+		} finally {
+			pooled.close();
+		}
+	});
+
 	test("scripted mock model publishes a canonical completed scan and restartable session", async () => {
 		const { coordinator, mock } = coordinatorWithMockSession([
 			{

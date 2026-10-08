@@ -89,9 +89,21 @@ function requireValue(value: string | undefined, label: string): string {
 	return value.trim();
 }
 
-/** The session id auth-store account restrictions are keyed on: the provider session id when known. */
+/**
+ * The provider session id auth-store account restrictions are keyed on. The tool-state
+ * id (`getSessionId`) is never a stand-in: an advisor's differs and is not restricted.
+ */
 function restrictionSessionId(session: ToolSession): string | undefined {
-	return session.getProviderSessionId?.() ?? session.getSessionId?.() ?? undefined;
+	return session.getProviderSessionId?.();
+}
+
+/** {@link restrictionSessionId}, required before any account is listed or selected. */
+function requireRestrictionSessionId(session: ToolSession): string {
+	const sessionId = restrictionSessionId(session);
+	if (sessionId === undefined) {
+		throw new ToolError("Security scans need the provider session id that the session's account pool is keyed on");
+	}
+	return sessionId;
 }
 
 function cloudClientForSession(session: ToolSession, credentialId?: number): CodexSecurityCloudClient {
@@ -100,7 +112,7 @@ function cloudClientForSession(session: ToolSession, credentialId?: number): Cod
 		session.authStorage,
 		"openai-codex",
 		credentialId,
-		restrictionSessionId(session),
+		requireRestrictionSessionId(session),
 	);
 	return new CodexSecurityCloudClient({
 		authStorage: session.authStorage,
@@ -139,6 +151,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			if (!this.session.modelRegistry || !this.session.authStorage) {
 				throw new ToolError("Security scan requires the session model and authentication registries");
 			}
+			requireRestrictionSessionId(this.session);
 			return getSecurityCoordinator({
 				cwd: this.session.cwd,
 				settings: this.session.settings,

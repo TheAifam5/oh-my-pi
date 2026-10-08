@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
+import type { SessionRestrictionLease } from "@oh-my-pi/pi-ai/auth-storage";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -85,7 +86,8 @@ export interface SecurityCoordinatorHost {
 	sessionId?: string;
 	/**
 	 * Provider session id the auth store's account restriction is keyed on, read at
-	 * each account check; `sessionId` when absent.
+	 * each account check. When given, it alone decides, so `undefined` means no
+	 * session; without it, `sessionId` is used.
 	 */
 	restrictionSessionId?: () => string | undefined;
 	agentId?: string;
@@ -95,7 +97,13 @@ export interface SecurityCoordinatorHost {
 /** Reads the session id whose account restriction scan accounts must satisfy. */
 function restrictionSessionIdOf(host: SecurityCoordinatorHost): () => string | undefined {
 	const { restrictionSessionId, sessionId } = host;
-	return () => restrictionSessionId?.() ?? sessionId;
+	// Never substitute another id for a missing restriction id: it may be one the restriction is not keyed on.
+	return restrictionSessionId ?? (() => sessionId);
+}
+
+/** Provider session id of the scan session, which carries the starting session's account restriction. */
+export function securityScanProviderSessionId(scanId: string): string {
+	return `security:${scanId}`;
 }
 
 export interface SecurityPreflightInput {
@@ -255,7 +263,7 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		...cfgTaskAgentPrewalk.get(scanSettings),
 		"security-reviewer": "off",
 	});
-	const providerSessionId = `security:${input.scanId}`;
+	const providerSessionId = securityScanProviderSessionId(input.scanId);
 	const { session } = await createAgentSession({
 		cwd: input.executionRoot,
 		authStorage: input.host.authStorage,
@@ -616,10 +624,23 @@ export class SecurityCoordinator {
 		reportProgress?: (text: string) => Promise<void>,
 	): Promise<void> {
 		const startedAt = toIsoTimestamp(this.#now);
+		const scanSessionId = securityScanProviderSessionId(record.snapshot.scanId);
 		let session: SecurityScanSession | undefined;
 		let publishedBundle: SecurityScanBundle | undefined;
 		let executionTarget: PreparedSecurityExecutionTarget | undefined;
+		// Every lookup under the scan's own id (provider-owned auth routes, title and other side
+		// requests) stays inside the account pool of the session that started the scan. #run owns
+		// that restriction from start to end: it is claimed again after the scan session starts and
+		// after it is disposed, so a restriction the session installs or lifts on the same id never
+		// leaves the id unrestricted before #run returns. Only the latest claim's leases still match.
+		const sessions = this.#host.authStorage.sessions;
+		const hostSessionId = restrictionSessionId();
+		const restrictionClaims: ReadonlyMap<string, SessionRestrictionLease>[] = [];
+		const claimScanRestriction = (): void => {
+			if (hostSessionId !== undefined) restrictionClaims.push(sessions.restrictLike(hostSessionId, scanSessionId));
+		};
 		try {
+			claimScanRestriction();
 			await store.putBundle(
 				initialBundle(store, plan, record.snapshot.scanId, record.snapshot.operationId, startedAt),
 			);
@@ -653,7 +674,7 @@ export class SecurityCoordinator {
 				// reads: for ref_diff scans that is the detached worktree, not the
 				// live repository root (#7118).
 				resolutionRoot: executionTarget.cwd,
-				sessionId: `security:${record.snapshot.scanId}`,
+				sessionId: scanSessionId,
 				operationId: record.snapshot.operationId,
 				onPublished: async bundle => {
 					publishedBundle = bundle;
@@ -673,6 +694,7 @@ export class SecurityCoordinator {
 				publicationTool: publicationTool as unknown as ToolDefinition,
 				sessionManager,
 			});
+			claimScanRestriction();
 			record.snapshot.sessionFile = session.sessionFile;
 			const abortSession = (): void => {
 				void session?.abort({ reason: "Security scan cancelled" });
@@ -752,9 +774,18 @@ export class SecurityCoordinator {
 			this.#update(record, cancelled ? "cancelled" : "failed", message);
 			await store.putBundle(terminal);
 		} finally {
-			await session?.dispose().catch(() => undefined);
-			await executionTarget?.cleanup().catch(() => undefined);
-			ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
+			try {
+				if (session) {
+					await session.dispose().catch(() => undefined);
+					claimScanRestriction();
+				}
+				await executionTarget?.cleanup().catch(() => undefined);
+				ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
+			} finally {
+				for (const claim of restrictionClaims) {
+					for (const [provider, lease] of claim) sessions.unrestrict(provider, scanSessionId, lease);
+				}
+			}
 		}
 	}
 }

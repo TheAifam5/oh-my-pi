@@ -137,6 +137,24 @@ describe("exact security OAuth resolver", () => {
 		}
 	});
 
+	test("the tool never lists or selects an account without the provider session id the pool is keyed on", async () => {
+		const listOAuthAccounts = vi.fn(() => []);
+		const authStorage = { oauth: { accounts: listOAuthAccounts } } as unknown as AuthStorage;
+		// An advisor's tool-state id differs from the restriction-keyed id and is never restricted.
+		const tool = new SecurityScanTool({
+			settings: Settings.isolated({ "security.enabled": true }),
+			authStorage,
+			modelRegistry: {},
+			getSessionId: () => "session-file-advisor",
+		} as unknown as ToolSession);
+		for (const action of ["cloud_scans", "preflight"] as const) {
+			await expect(tool.execute("call", { action })).rejects.toThrow(
+				"need the provider session id that the session's account pool is keyed on",
+			);
+		}
+		expect(listOAuthAccounts).not.toHaveBeenCalled();
+	});
+
 	test("plans provider-owned authentication for recognized Bedrock routes without OAuth", () => {
 		const authStorage = { oauth: { accounts: vi.fn(() => []) } } as unknown as AuthStorage;
 		for (const [provider, modelId, api] of [

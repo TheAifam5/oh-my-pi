@@ -4,17 +4,20 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { SESSION_PIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
 import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
-import { AccountUnavailableError } from "@oh-my-pi/pi-ai/error";
+import { AccountUnavailableError, MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isRecord, logger, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import { SessionAccountPoolScope } from "../src/config/account-pools";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import type { InteractiveModeContext } from "../src/modes/types";
+import * as accountAdmin from "../src/session/account-admin";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import { credentialPinHash, recordCredentialPin, seedCredentialPins } from "../src/session/credential-pin";
 import { SessionManager } from "../src/session/session-manager";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
@@ -424,6 +427,99 @@ describe("credential pins", () => {
 			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	test("a pin a restriction ignores while the session is built stays reported until unpinned", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const hashB = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		manager.appendCredentialPin("anthropic", hashB!, true);
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, manager.getSessionId());
+		const session = createSession(manager, scope);
+		try {
+			// Internal listeners (autolearn, memory backends) subscribe before any host renders notices.
+			session.subscribe(() => {});
+			const ignored = (warnings: readonly string[]) =>
+				warnings.filter(warning => warning.includes("outside the account pool this session is restricted to"));
+			// The header, RPC mode, and headless stderr report these once a host attaches.
+			expect(ignored(session.accountPinWarnings)).toHaveLength(1);
+			expect(ignored(session.configWarnings)).toHaveLength(1);
+
+			expect(session.unpinCurrentProviderAccount()).toBe("unpinned");
+			expect(ignored(session.accountPinWarnings)).toHaveLength(0);
+			expect(ignored(session.configWarnings)).toHaveLength(0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a restricted session lists, redeems, and drains only its pool's accounts", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, manager.getSessionId());
+		const session = createSession(manager, scope);
+		const saveDrain = vi.spyOn(accountAdmin, "setAccountDrain");
+		try {
+			const listed = await session.listCurrentProviderAccounts();
+			expect(listed?.accounts.map(account => account.email)).toEqual(["a@example.com"]);
+			const outcome = await session.redeemResetCredit({
+				provider: "anthropic",
+				credentialId: storedAccount("b").credentialId,
+			});
+			expect(outcome.code).toBe("no_account");
+
+			const output: string[] = [];
+			const runtime = {
+				ctx: {
+					editor: { setText: vi.fn() },
+					session,
+					showStatus: (message: string) => output.push(message),
+					statusLine: { invalidate: vi.fn() },
+					ui: { requestRender: vi.fn() },
+				} as unknown as InteractiveModeContext,
+			};
+			await executeBuiltinSlashCommand("/session drain b@example.com --save", runtime);
+			expect(saveDrain).not.toHaveBeenCalled();
+			expect(output.join("\n")).toContain("No stored anthropic OAuth account matches");
+
+			// Even a list holding every stored row never saves or drains an account outside the pool.
+			const drainCurrentProviderAccount = vi.fn(() => "drained");
+			runtime.ctx.session = {
+				sessionId: session.sessionId,
+				isStreaming: false,
+				settings: session.settings,
+				modelRegistry: session.modelRegistry,
+				listCurrentProviderAccounts: async () => ({
+					provider: "anthropic",
+					accounts: storage.sessions.accounts("anthropic"),
+				}),
+				drainCurrentProviderAccount,
+			} as unknown as AgentSession;
+			await executeBuiltinSlashCommand("/session drain b@example.com --save", runtime);
+			expect(saveDrain).not.toHaveBeenCalled();
+			expect(drainCurrentProviderAccount).not.toHaveBeenCalled();
+			expect(output.at(-1)).toContain("outside the anthropic account pool");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a released pool scope refuses later lookups without restricting new ids", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, "primary");
+		const registry = scope.registry(new ModelRegistry(storage));
+		storage.keys.setRuntime("anthropic", "runtime-key");
+		scope.release();
+
+		for (const sessionId of ["late-1", "late-2", undefined]) {
+			await expect(registry.getApiKey(model, sessionId)).rejects.toBeInstanceOf(MissingApiKeyError);
+			await expect(
+				Promise.resolve(registry.resolver(model, sessionId)({ lastChance: false, error: undefined })),
+			).rejects.toBeInstanceOf(MissingApiKeyError);
+		}
+		scope.restrict("late-3");
+		for (const sessionId of ["primary", "late-1", "late-2", "late-3"]) {
+			expect(storage.sessions.isRestricted("anthropic", sessionId)).toBe(false);
 		}
 	});
 

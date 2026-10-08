@@ -1,4 +1,5 @@
 import type { AuthApiKeyOptions, AuthStorage, SessionRestrictionLease } from "@oh-my-pi/pi-ai/auth-storage";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { Api, Model } from "@oh-my-pi/pi-ai/types";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
@@ -67,7 +68,13 @@ const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
  * The scope holds the lease of every id it restricted; {@link release} lifts
  * them once the session can no longer resolve keys. A lease lifts only the
  * restriction it installed, so a restriction another session has installed on
- * the same id since, such as a revived session's, stays.
+ * the same id since, such as a revived session's, stays. A released scope
+ * restricts nothing more and refuses every pooled key lookup through
+ * {@link registry}, so a late request neither grows the auth store's
+ * restrictions nor leaves the pool. A read that bypasses the registry and goes
+ * to the auth store directly under a released id is not restricted: release
+ * lifts the id, so a later owner that is not pooled, such as a resumed session,
+ * can use it.
  */
 export class SessionAccountPoolScope {
 	readonly #authStorage: Pick<AuthStorage, "sessions">;
@@ -75,6 +82,7 @@ export class SessionAccountPoolScope {
 	/** Provider id → restriction lease, by restricted provider session id. */
 	readonly #leases = new Map<string, Map<string, SessionRestrictionLease>>();
 	#primarySessionId: string;
+	#released = false;
 
 	constructor(authStorage: Pick<AuthStorage, "sessions">, pools: OAuthAccountPools, primarySessionId: string) {
 		this.#authStorage = authStorage;
@@ -83,9 +91,9 @@ export class SessionAccountPoolScope {
 		this.restrict(primarySessionId);
 	}
 
-	/** Restrict `sessionId` to the pools, once per id until {@link release}. */
+	/** Restrict `sessionId` to the pools, once per id; does nothing after {@link release}. */
 	restrict(sessionId: string): void {
-		if (this.#leases.has(sessionId)) return;
+		if (this.#released || this.#leases.has(sessionId)) return;
 		const leases = new Map<string, SessionRestrictionLease>();
 		for (const [provider, identityKeys] of Object.entries(this.#pools)) {
 			leases.set(provider, this.#authStorage.sessions.restrict(provider, sessionId, identityKeys));
@@ -99,8 +107,9 @@ export class SessionAccountPoolScope {
 		this.#primarySessionId = sessionId;
 	}
 
-	/** Lift every restriction this scope installed. */
+	/** Lift every restriction this scope installed; later pooled lookups through {@link registry} are refused. */
 	release(): void {
+		this.#released = true;
 		for (const [sessionId, leases] of this.#leases) {
 			for (const [provider, lease] of leases) {
 				this.#authStorage.sessions.unrestrict(provider, sessionId, lease);
@@ -109,9 +118,18 @@ export class SessionAccountPoolScope {
 		this.#leases.clear();
 	}
 
-	/** The session id a key lookup for `provider` resolves under, restricted first when pooled. */
+	/**
+	 * The session id a key lookup for `provider` resolves under, restricted first when pooled.
+	 * @throws AIError.MissingApiKeyError for a pooled provider once the scope is released.
+	 */
 	#sessionIdFor(provider: string, sessionId: string | undefined): string | undefined {
 		if (!Object.hasOwn(this.#pools, provider)) return sessionId;
+		if (this.#released) {
+			throw new AIError.MissingApiKeyError(
+				provider,
+				`No API key for provider: ${provider} (the session restricted to its OAuth account pool has ended)`,
+			);
+		}
 		const scopedSessionId = sessionId ?? this.#primarySessionId;
 		this.restrict(scopedSessionId);
 		return scopedSessionId;
@@ -127,14 +145,17 @@ export class SessionAccountPoolScope {
 	 */
 	registry(registry: ModelRegistry): ModelRegistry {
 		const target = scopedRegistryTargets.get(registry) ?? registry;
-		const getApiKey = (model: Model<Api>, sessionId?: string, options?: { signal?: AbortSignal }) =>
+		const getApiKey = async (model: Model<Api>, sessionId?: string, options?: { signal?: AbortSignal }) =>
 			target.getApiKey(model, this.#sessionIdFor(model.provider, sessionId), options);
-		const getApiKeyWithCredentialForProvider = (provider: string, sessionId?: string, options?: AuthApiKeyOptions) =>
-			target.getApiKeyWithCredentialForProvider(provider, this.#sessionIdFor(provider, sessionId), options);
+		const getApiKeyWithCredentialForProvider = async (
+			provider: string,
+			sessionId?: string,
+			options?: AuthApiKeyOptions,
+		) => target.getApiKeyWithCredentialForProvider(provider, this.#sessionIdFor(provider, sessionId), options);
 		const scoped: Partial<ModelRegistry> = {
 			getApiKey,
 			getApiKeyWithCredentialForProvider,
-			getApiKeyForProvider: (provider, sessionId, options) =>
+			getApiKeyForProvider: async (provider, sessionId, options) =>
 				target.getApiKeyForProvider(provider, this.#sessionIdFor(provider, sessionId), options),
 			getApiKeyAndHeaders: async model => {
 				try {
@@ -154,6 +175,13 @@ export class SessionAccountPoolScope {
 				const options =
 					typeof optionsOrSessionId === "string" ? { sessionId: optionsOrSessionId } : (optionsOrSessionId ?? {});
 				const provider = typeof resolverTarget === "string" ? resolverTarget : resolverTarget.provider;
+				let sessionId: string | undefined;
+				try {
+					sessionId = this.#sessionIdFor(provider, options.sessionId);
+				} catch (error) {
+					// The refusal surfaces when the request resolves its key, like a failed lookup.
+					return () => Promise.reject(error);
+				}
 				return createApiKeyResolver(
 					{ getApiKeyWithCredentialForProvider, authStorage: target.authStorage },
 					provider,
@@ -162,7 +190,7 @@ export class SessionAccountPoolScope {
 						...(typeof resolverTarget === "string"
 							? {}
 							: { baseUrl: resolverTarget.baseUrl, modelId: resolverTarget.id }),
-						sessionId: this.#sessionIdFor(provider, options.sessionId),
+						sessionId,
 					},
 				);
 			}) as ModelRegistry["resolver"],

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { formatModelStringWithRouting, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import {
 	disposeTerminalTitleState,
@@ -18,7 +20,7 @@ import {
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
-import { isWsl, logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { isWsl, logger, setTerminalHeadless, TempDir } from "@oh-my-pi/pi-utils";
 import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
@@ -528,6 +530,60 @@ describe("title generator", () => {
 		const userContent = sentMessages?.[0]?.content ?? "";
 		expect(userContent).not.toContain("Claude Code v2.1.158");
 		expect(userContent).toContain("pick provider then theme");
+	});
+
+	it("a title session releases its inherited pin copies and keeps the source session's own pin", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title>Pinned Title</title>" }],
+		} as never);
+		using tempDir = TempDir.createSync("@omp-title-pins-");
+		const dbPath = path.join(tempDir.path(), "agent.db");
+		const storage = new AuthStorage(await SqliteAuthCredentialStore.open(dbPath));
+		const peer = new AuthStorage(await SqliteAuthCredentialStore.open(dbPath));
+		try {
+			await storage.credentials.set("anthropic", {
+				type: "oauth",
+				access: "access-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 60 * 60_000,
+				accountId: "account-a",
+				email: "a@example.com",
+			});
+			await peer.credentials.reload();
+			const account = storage.sessions.accounts("anthropic")[0];
+			expect(storage.sessions.pin("anthropic", "parent", account?.credentialId ?? -1)).toBe(true);
+			const registry = {
+				getAvailable: () => [model],
+				getApiKey: async () => "test-key",
+				authStorage: storage,
+				resolver: () => async () => "test-key",
+			} as never;
+
+			const title = await generateSessionTitle(
+				"Investigate the resolver",
+				registry,
+				createSettings(model),
+				"title-session",
+				model,
+				undefined,
+				undefined,
+				undefined,
+				"parent",
+			);
+			expect(title).toBe("Pinned Title");
+
+			// Another process removes the title session's persisted copy: no in-memory copy shadows it.
+			expect(peer.sessions.unpin("anthropic", "title-session")).toBe(true);
+			const pinned = (sessionId: string) =>
+				storage.sessions.accounts("anthropic", sessionId).some(entry => entry.pinned);
+			expect(pinned("title-session")).toBe(false);
+			expect(pinned("parent")).toBe(true);
+		} finally {
+			peer.close();
+			storage.close();
+		}
 	});
 
 	it("accepts a plain sentence when the model omits the <title> markers", async () => {

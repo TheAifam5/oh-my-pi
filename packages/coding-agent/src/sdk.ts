@@ -2104,11 +2104,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// account wins) and cold-miss the child's whole prefix. An explicit parent pin is
 		// the user's choice and still reaches the child.
 		const ownPins = sessionManager.getCredentialPins();
-		modelRegistry.authStorage.sessions.inherit(
+		const sessions = modelRegistry.authStorage.sessions;
+		sessions.inherit(
 			options.credentialSourceSessionId,
 			providerSessionId,
 			(provider, explicit) => explicit || !ownPins.has(provider),
 		);
+		// A started session forgets these copies when it is disposed; a failed start forgets them here.
+		startupCleanup.defer(() => sessions.forgetInherited(providerSessionId));
 	}
 	// From here on the session resolves every key through its pools; see
 	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
@@ -3390,6 +3393,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					try {
 						usageHealth = await modelRegistry.authStorage.health.model(primary.model.provider, {
 							modelId: primary.model.id,
+							sessionId: providerSessionId,
 							baseUrl: primary.model.baseUrl,
 							reserveFraction: cfgRetryUsageReservePct.get(settings) / 100,
 						});
@@ -3452,7 +3456,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 				let authFallbackUsed = false;
 				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
+					const primaryKey = await modelRegistry.getApiKey(primary.model, providerSessionId);
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
 						const fallback = parseModelPattern(
 							options.modelPatternAuthFallback,
@@ -3460,7 +3464,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							matchPreferences,
 						);
 						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
+							const fallbackKey = await modelRegistry.getApiKey(fallback.model, providerSessionId);
 							if (isAuthenticated(fallbackKey)) {
 								selectedModel = fallback.model;
 								selectedThinkingLevel = fallback.thinkingLevel;
@@ -5099,6 +5103,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const id = sessionManager.getSessionId?.();
 				return id ? `${id}-advisor` : null;
 			},
+			// Advisors share the primary's account pool, which is keyed on the primary's provider session id.
+			getProviderSessionId: () => agent.sessionId,
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
