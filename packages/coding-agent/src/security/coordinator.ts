@@ -633,6 +633,7 @@ export class SecurityCoordinator {
 		// that restriction from start to end: it is claimed again after the scan session starts and
 		// after it is disposed, so a restriction the session installs or lifts on the same id never
 		// leaves the id unrestricted before #run returns. Only the latest claim's leases still match.
+		// When #run returns it retires that claim, so a deferred lookup under the scan id stays in the pool.
 		const sessions = this.#host.authStorage.sessions;
 		const hostSessionId = restrictionSessionId();
 		const restrictionClaims: ReadonlyMap<string, SessionRestrictionLease>[] = [];
@@ -783,7 +784,7 @@ export class SecurityCoordinator {
 				ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
 			} finally {
 				for (const claim of restrictionClaims) {
-					for (const [provider, lease] of claim) sessions.unrestrict(provider, scanSessionId, lease);
+					for (const [provider, lease] of claim) sessions.retire(provider, scanSessionId, lease);
 				}
 			}
 		}

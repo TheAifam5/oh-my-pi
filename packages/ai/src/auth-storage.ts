@@ -19,7 +19,7 @@
  * const apiKey = await auth.keys.get("anthropic", sessionId, { modelId });
  */
 import { logger } from "@oh-my-pi/pi-utils";
-import { SessionAffinity, type SessionRestrictions } from "./auth/affinity";
+import { createSessionRestrictions, SessionAffinity, type SessionRestrictions } from "./auth/affinity";
 import { BlockStoreHealth, CredentialBlocks } from "./auth/blocks";
 import { KeyCascade, KeyOverrides } from "./auth/cascade";
 import { CredentialHealth } from "./auth/health";
@@ -89,7 +89,7 @@ export class AuthStorage {
 	readonly #options: AuthStorageOptions;
 	readonly #overrides: KeyOverrides;
 	readonly #policies: AccountPolicies;
-	readonly #restrictions: SessionRestrictions = new Map();
+	readonly #restrictions: SessionRestrictions = createSessionRestrictions();
 	#modules: AuthStorageModules;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {

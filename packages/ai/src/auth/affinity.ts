@@ -62,15 +62,75 @@ export type SessionCredential = {
 	explicit?: true;
 };
 
-/** One installed restriction: the allowed OAuth identity keys and the lease that lifts it. */
-type SessionRestriction = { readonly allowed: ReadonlySet<string>; readonly lease: SessionRestrictionLease };
+/**
+ * Retired session restrictions ({@link SessionAffinity.retire}) kept at once,
+ * across providers. Past this many, the least recently used one is evicted
+ * and its session id is unrestricted again.
+ */
+export const SESSION_RESTRICTION_TOMBSTONES_MAX = 256;
 
 /**
- * Provider → session id → installed restriction. Owned by `AuthStorage` so
- * restrictions outlive store replacement, which rebuilds every store-bound
- * module (pins included) around the same identities.
+ * One installed restriction: {@link identityHash} digests of the allowed OAuth
+ * identity keys, so no email or account id is retained, and the lease that lifts it.
  */
-export type SessionRestrictions = Map<string, Map<string, SessionRestriction>>;
+type SessionRestriction = { readonly allowedHashes: ReadonlySet<string>; readonly lease: SessionRestrictionLease };
+
+/** A retired restriction: it keeps denying accounts outside its allowlist until replaced, lifted, or evicted. */
+type RestrictionTombstone = SessionRestriction & { readonly provider: string; readonly sessionId: string };
+
+/**
+ * Session account restrictions. Owned by `AuthStorage` so they outlive store
+ * replacement, which rebuilds every store-bound module (pins included) around
+ * the same identities.
+ */
+export type SessionRestrictions = {
+	/** Provider → session id → live restriction. Never evicted: that would widen a live session. */
+	readonly live: Map<string, Map<string, SessionRestriction>>;
+	/** {@link tombstoneKey} → retired restriction, bounded by {@link SESSION_RESTRICTION_TOMBSTONES_MAX}. */
+	readonly retired: LRUCache<string, RestrictionTombstone>;
+};
+
+/** Minimum time between two eviction warnings of one `AuthStorage`; evictions in between are counted. */
+export const SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS = 60_000;
+
+/**
+ * Empty restriction state for one `AuthStorage`. Evicting a retired
+ * restriction logs a warning with the provider, the cap, and the evictions
+ * since the previous warning, at most once per
+ * {@link SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS}; evictions after the
+ * last warning are reported with the next one.
+ */
+export function createSessionRestrictions(): SessionRestrictions {
+	let evictedSinceWarning = 0;
+	let lastWarningAtMs: number | undefined;
+	return {
+		live: new Map(),
+		retired: new LRUCache<string, RestrictionTombstone>({
+			max: SESSION_RESTRICTION_TOMBSTONES_MAX,
+			dispose: (tombstone, _key, reason) => {
+				if (reason !== "evict") return;
+				evictedSinceWarning += 1;
+				const nowMs = Date.now();
+				const elapsedMs = lastWarningAtMs === undefined ? undefined : nowMs - lastWarningAtMs;
+				// A wall clock stepped backwards counts as elapsed, so it cannot silence warnings.
+				if (elapsedMs !== undefined && elapsedMs >= 0 && elapsedMs < SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS) {
+					return;
+				}
+				logger.warn("Evicted retired session account restrictions; their session ids are unrestricted again", {
+					provider: tombstone.provider,
+					limit: SESSION_RESTRICTION_TOMBSTONES_MAX,
+					evicted: evictedSinceWarning,
+				});
+				evictedSinceWarning = 0;
+				lastWarningAtMs = nowMs;
+			},
+		}),
+	};
+}
+
+function tombstoneKey(provider: string, sessionId: string): string {
+	return `${provider}\0${sessionId}`;
+}
 
 /** An exclusive session pin of one session and provider. */
 type SessionPin = {
@@ -205,34 +265,80 @@ export class SessionAffinity implements SessionsApi {
 
 	restrict(provider: string, sessionId: string, identityKeys: readonly string[]): SessionRestrictionLease {
 		if (!provider || !sessionId) throw new Error("sessions.restrict requires a provider and a session id");
+		return this.#install(provider, sessionId, new Set(identityKeys.map(identityHash)));
+	}
+
+	/** Install a live restriction of `allowedHashes`, replacing a live or retired one; returns its new lease. */
+	#install(provider: string, sessionId: string, allowedHashes: ReadonlySet<string>): SessionRestrictionLease {
 		const lease = Symbol("sessions.restrict");
-		const sessions = this.#restrictions.get(provider) ?? new Map<string, SessionRestriction>();
-		sessions.set(sessionId, { allowed: new Set(identityKeys), lease });
-		this.#restrictions.set(provider, sessions);
+		const sessions = this.#restrictions.live.get(provider) ?? new Map<string, SessionRestriction>();
+		sessions.set(sessionId, { allowedHashes, lease });
+		this.#restrictions.live.set(provider, sessions);
+		this.#restrictions.retired.delete(tombstoneKey(provider, sessionId));
 		return lease;
 	}
 
-	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
-		const sessions = this.#restrictions.get(provider);
-		if (sessions?.get(sessionId)?.lease !== lease) return;
+	/** Remove the live restriction of `sessionId` when `lease` installed it; returns it, or `undefined`. */
+	#takeLive(provider: string, sessionId: string, lease: SessionRestrictionLease): SessionRestriction | undefined {
+		const sessions = this.#restrictions.live.get(provider);
+		const restriction = sessions?.get(sessionId);
+		if (!sessions || restriction?.lease !== lease) return undefined;
 		sessions.delete(sessionId);
-		if (sessions.size === 0) this.#restrictions.delete(provider);
+		if (sessions.size === 0) this.#restrictions.live.delete(provider);
+		return restriction;
+	}
+
+	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
+		if (this.#takeLive(provider, sessionId, lease)) return;
+		const key = tombstoneKey(provider, sessionId);
+		if (this.#restrictions.retired.peek(key)?.lease === lease) this.#restrictions.retired.delete(key);
+	}
+
+	retire(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
+		const restriction = this.#takeLive(provider, sessionId, lease);
+		if (!restriction) return;
+		this.#restrictions.retired.set(tombstoneKey(provider, sessionId), { ...restriction, provider, sessionId });
 	}
 
 	restrictLike(sourceSessionId: string, targetSessionId: string): ReadonlyMap<string, SessionRestrictionLease> {
 		if (!sourceSessionId || !targetSessionId) {
 			throw new Error("sessions.restrictLike requires a source and a target session id");
 		}
-		const copies: Array<[string, readonly string[]]> = [];
-		for (const [provider, sessions] of this.#restrictions) {
+		const copies = new Map<string, ReadonlySet<string>>();
+		for (const tombstone of this.#restrictions.retired.values()) {
+			if (tombstone.sessionId === sourceSessionId) copies.set(tombstone.provider, tombstone.allowedHashes);
+		}
+		for (const [provider, sessions] of this.#restrictions.live) {
 			const source = sessions.get(sourceSessionId);
-			if (source) copies.push([provider, [...source.allowed]]);
+			if (source) copies.set(provider, source.allowedHashes);
 		}
 		const leases = new Map<string, SessionRestrictionLease>();
-		for (const [provider, identityKeys] of copies) {
-			leases.set(provider, this.restrict(provider, targetSessionId, identityKeys));
+		for (const [provider, allowedHashes] of copies) {
+			leases.set(provider, this.#install(provider, targetSessionId, allowedHashes));
 		}
 		return leases;
+	}
+
+	/**
+	 * Digests of the identity keys `sessionId` may use for `provider`: its live
+	 * restriction, else its retired one (refreshing that one's recency), else
+	 * `undefined` for an unrestricted session.
+	 */
+	#allowedHashes(provider: string, sessionId: string | undefined): ReadonlySet<string> | undefined {
+		if (sessionId === undefined) return undefined;
+		return (
+			this.#restrictions.live.get(provider)?.get(sessionId)?.allowedHashes ??
+			this.#restrictions.retired.get(tombstoneKey(provider, sessionId))?.allowedHashes
+		);
+	}
+
+	/** True when `sessionId` is restricted for `provider` only by a retired restriction (see {@link retire}). */
+	restrictionRetired(provider: string, sessionId: string | undefined): boolean {
+		return (
+			sessionId !== undefined &&
+			this.#restrictions.live.get(provider)?.has(sessionId) !== true &&
+			this.#restrictions.retired.has(tombstoneKey(provider, sessionId))
+		);
 	}
 
 	/** Whether the store row `key` was read as absent within {@link SESSION_ROW_MISS_TTL_MS}. */
@@ -250,9 +356,9 @@ export class SessionAffinity implements SessionsApi {
 		this.#rowMisses.set(key, Date.now() + SESSION_ROW_MISS_TTL_MS);
 	}
 
-	/** True when {@link restrict} limits `sessionId` for `provider`. */
+	/** True when a live or retired restriction ({@link restrict}, {@link retire}) limits `sessionId` for `provider`. */
 	isRestricted(provider: string, sessionId: string | undefined): boolean {
-		return sessionId !== undefined && this.#restrictions.get(provider)?.has(sessionId) === true;
+		return this.#allowedHashes(provider, sessionId) !== undefined;
 	}
 
 	/**
@@ -260,11 +366,11 @@ export class SessionAffinity implements SessionsApi {
 	 * session, otherwise only an OAuth credential whose identity key is allowed.
 	 */
 	allows(provider: string, sessionId: string | undefined, credential: AuthCredential): boolean {
-		const allowed = sessionId === undefined ? undefined : this.#restrictions.get(provider)?.get(sessionId)?.allowed;
-		if (allowed === undefined) return true;
+		const allowedHashes = this.#allowedHashes(provider, sessionId);
+		if (allowedHashes === undefined) return true;
 		if (credential.type !== "oauth") return false;
 		const identityKey = resolveCredentialIdentityKey(provider, credential);
-		return identityKey !== null && allowed.has(identityKey);
+		return identityKey !== null && allowedHashes.has(identityHash(identityKey));
 	}
 
 	/** Whether the stored row at `index` may serve `sessionId` (see {@link allows}). */
@@ -287,10 +393,7 @@ export class SessionAffinity implements SessionsApi {
 
 	/** Whether an identity key in the allowlist of the restricted `sessionId` has the digest `hash`. */
 	#allowsIdentity(provider: string, sessionId: string, hash: string | undefined): boolean {
-		const allowed = this.#restrictions.get(provider)?.get(sessionId)?.allowed;
-		if (hash === undefined || allowed === undefined) return false;
-		for (const identityKey of allowed) if (identityHash(identityKey) === hash) return true;
-		return false;
+		return hash !== undefined && this.#allowedHashes(provider, sessionId)?.has(hash) === true;
 	}
 
 	/** Bounded per-provider session map, created on first use. */
@@ -369,9 +472,10 @@ export class SessionAffinity implements SessionsApi {
 		for (const sessions of this.#sessionLastCredential.values()) {
 			for (const sessionId of sessions.keys()) sessionIds.add(sessionId);
 		}
-		for (const sessions of this.#restrictions.values()) {
+		for (const sessions of this.#restrictions.live.values()) {
 			for (const sessionId of sessions.keys()) sessionIds.add(sessionId);
 		}
+		for (const tombstone of this.#restrictions.retired.values()) sessionIds.add(tombstone.sessionId);
 		return sessionIds;
 	}
 

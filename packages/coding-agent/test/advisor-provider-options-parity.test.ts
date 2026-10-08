@@ -351,7 +351,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(metadataSessionId(capturedStreamOptions[0])).not.toBe(previousAdvisorSessionId);
 	});
 
-	it("keeps the advisor inside the primary session's OAuth account pool until dispose", async () => {
+	it("keeps the advisor inside the primary session's OAuth account pool, also after dispose", async () => {
 		const pooledStorage = createInMemoryAuthStorage();
 		try {
 			await pooledStorage.credentials.set(
@@ -397,10 +397,11 @@ describe("AgentSession advisor provider-options parity", () => {
 			expect(await pooledStorage.keys.get("anthropic", advisorProviderSessionId)).toBe("access-c");
 			expect(await pooledStorage.keys.get("anthropic", mainProviderSessionId)).toBe("access-c");
 
-			// Dispose lifts the pool from every provider session id the session restricted.
+			// Dispose retires the pool on every provider session id the session restricted, so late
+			// lookups straight to the auth store under those ids stay inside it.
 			await session.dispose();
-			expect(await pooledStorage.keys.get("anthropic", advisorProviderSessionId)).toBe("runtime-key");
-			expect(await pooledStorage.keys.get("anthropic", mainProviderSessionId)).toBe("runtime-key");
+			expect(await pooledStorage.keys.get("anthropic", advisorProviderSessionId)).toBe("access-c");
+			expect(await pooledStorage.keys.get("anthropic", mainProviderSessionId)).toBe("access-c");
 		} finally {
 			await session.dispose();
 			pooledStorage.close();

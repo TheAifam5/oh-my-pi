@@ -1374,7 +1374,7 @@ export interface SessionsApi {
 	 * in memory.
 	 */
 	forgetInherited(sessionId: string): void;
-	/** Whether {@link restrict} limits `sessionId` for `provider`. */
+	/** Whether a live {@link restrict} or a {@link retire}d restriction limits `sessionId` for `provider`. */
 	isRestricted(provider: string, sessionId: string | undefined): boolean;
 	/**
 	 * Whether the stored row `credentialId` may serve `sessionId` under its
@@ -1391,16 +1391,19 @@ export interface SessionsApi {
 	 * environment, and stored API keys are not used for that session; when no
 	 * listed account can serve, key resolution fails instead of borrowing
 	 * another account. An empty list allows no account. Replaces any earlier
-	 * restriction for the same provider and session; {@link inherit} does not
-	 * copy restrictions. Restrictions are never evicted, because that would
-	 * widen a live session; the owner passes the returned lease to
-	 * {@link unrestrict} when the session ends.
+	 * restriction for the same provider and session, live or retired;
+	 * {@link inherit} does not copy restrictions. Live restrictions are never
+	 * evicted, because that would widen a live session; when the session ends,
+	 * the owner passes the returned lease to {@link retire} to keep later
+	 * lookups under the id inside the allowlist, or to {@link unrestrict} to
+	 * lift the restriction.
 	 */
 	restrict(provider: string, sessionId: string, identityKeys: readonly string[]): SessionRestrictionLease;
 	/**
-	 * Lift the restriction that `lease` installed. Once a later {@link restrict}
-	 * call has replaced it for the same provider and session, this does nothing,
-	 * so a stale owner never lifts the restriction a newer owner relies on.
+	 * Lift the restriction that `lease` installed, live or retired, so the
+	 * session id is unrestricted again. Once a later {@link restrict} call has
+	 * replaced it for the same provider and session, this does nothing, so a
+	 * stale owner never lifts the restriction a newer owner relies on.
 	 */
 	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void;
 	/**
@@ -1410,12 +1413,25 @@ export interface SessionsApi {
 	 */
 	permits(provider: string, sessionId: string, credentialId: number): boolean;
 	/**
-	 * Restrict `targetSessionId` exactly as `sourceSessionId` is restricted now:
-	 * one {@link restrict} call per provider the source is restricted for, with
-	 * the same allowlist. Returns the lease of each copy by provider; the caller
-	 * passes each to {@link unrestrict} when the target session ends. A source
-	 * restricted for no provider copies nothing. Later changes to the source's
-	 * restriction are not followed.
+	 * End the live restriction that `lease` installed while keeping its
+	 * allowlist: a lookup made under the id afterwards, by any caller, is still
+	 * restricted as {@link restrict} describes. The retired restriction stays
+	 * until a later {@link restrict} replaces it, {@link unrestrict} lifts it
+	 * with the same lease, or it is evicted as the least recently used of more
+	 * than `SESSION_RESTRICTION_TOMBSTONES_MAX` retired restrictions, which
+	 * leaves the id unrestricted. Retired restrictions live in this process's
+	 * memory only. Does nothing when `lease` no longer holds the live
+	 * restriction (replaced, lifted, or already retired).
+	 */
+	retire(provider: string, sessionId: string, lease: SessionRestrictionLease): void;
+	/**
+	 * Restrict `targetSessionId` exactly as `sourceSessionId` is restricted now,
+	 * by a live or a retired restriction: one {@link restrict} call per provider
+	 * the source is restricted for, with the same allowlist. Returns the lease of
+	 * each copy by provider; the caller passes each to {@link unrestrict} or
+	 * {@link retire} when the target session ends. A source restricted for no
+	 * provider copies nothing. Later changes to the source's restriction are not
+	 * followed.
 	 */
 	restrictLike(sourceSessionId: string, targetSessionId: string): ReadonlyMap<string, SessionRestrictionLease>;
 	/**

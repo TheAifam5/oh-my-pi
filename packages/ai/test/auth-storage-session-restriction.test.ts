@@ -2,11 +2,17 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { identityHash, SESSION_PIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
+import {
+	identityHash,
+	SESSION_PIN_CACHE_PREFIX,
+	SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS,
+	SESSION_RESTRICTION_TOMBSTONES_MAX,
+} from "@oh-my-pi/pi-ai/auth/affinity";
 import { SESSION_DRAIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/drain-state";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { logger } from "@oh-my-pi/pi-utils";
 
 const PROVIDER = "unit-oauth-restrict";
 
@@ -140,6 +146,11 @@ describe("AuthStorage session account restrictions", () => {
 		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
 		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
 		expect(storage.sessions.permits(PROVIDER, "unrestricted", accountB.credentialId)).toBe(true);
+
+		// A retired restriction keeps the same allowlist.
+		storage.sessions.retire(PROVIDER, "session", lease);
+		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
+		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
 
 		storage.sessions.unrestrict(PROVIDER, "session", lease);
 		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(true);
@@ -327,6 +338,138 @@ describe("AuthStorage session account restrictions", () => {
 		expect(storage.sessions.restrictLike("unrestricted", "other").size).toBe(0);
 	});
 
+	test("a retired restriction keeps denying accounts outside its allowlist until its owner lifts it", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const [accountA] = storage.oauth.accounts(PROVIDER);
+		if (!accountA) throw new Error("expected stored accounts");
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		const lease = storage.sessions.restrict(PROVIDER, "released", ["account:acc-b"]);
+
+		storage.sessions.retire(PROVIDER, "released", lease);
+		// A late lookup straight to the store under the released id: the allowed account serves,
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("access-b");
+		expect(storage.oauth.accounts(PROVIDER, "released").map(account => account.accountId)).toEqual(["acc-b"]);
+		// and neither another account nor the runtime key does.
+		expect(storage.sessions.admits(PROVIDER, "released", accountA.credentialId)).toBe(false);
+		expect(storage.sessions.pin(PROVIDER, "released", accountA.credentialId)).toBe(false);
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("access-b");
+
+		// A second release is a no-op; the owner's lease still lifts the retired restriction.
+		storage.sessions.retire(PROVIDER, "released", lease);
+		expect(storage.sessions.isRestricted(PROVIDER, "released")).toBe(true);
+		storage.sessions.unrestrict(PROVIDER, "released", lease);
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("runtime-key");
+	});
+
+	test("a new restriction replaces a retired one, and a stale lease neither retires nor lifts the newer one", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		const ended = storage.sessions.restrict(PROVIDER, "session", ["account:acc-b"]);
+		storage.sessions.retire(PROVIDER, "session", ended);
+
+		// A revived owner restricts the same id to its own pool; lifting it leaves nothing of the replaced one.
+		const revived = storage.sessions.restrict(PROVIDER, "session", ["account:acc-a"]);
+		expect(await storage.keys.get(PROVIDER, "session")).toBe("access-a");
+		storage.sessions.unrestrict(PROVIDER, "session", revived);
+		expect(await storage.keys.get(PROVIDER, "session")).toBe("runtime-key");
+
+		// With no account of the pool stored, the refusal tells a live restriction from a retired one.
+		const live = `(session other is restricted to its OAuth account pool and none of those accounts is available)`;
+		const retired =
+			"(session other is restricted to its OAuth account pool past the end of the session that installed it and";
+		const stale = storage.sessions.restrict(PROVIDER, "other", ["account:acc-z"]);
+		const current = storage.sessions.restrict(PROVIDER, "other", ["account:acc-z"]);
+		storage.sessions.retire(PROVIDER, "other", stale);
+		await expect(storage.keys.get(PROVIDER, "other")).rejects.toThrow(live);
+		storage.sessions.retire(PROVIDER, "other", current);
+		await expect(storage.keys.get(PROVIDER, "other")).rejects.toThrow(retired);
+		storage.sessions.unrestrict(PROVIDER, "other", stale);
+		await expect(storage.keys.get(PROVIDER, "other")).rejects.toThrow(retired);
+		storage.sessions.unrestrict(PROVIDER, "other", current);
+		expect(await storage.keys.get(PROVIDER, "other")).toBe("runtime-key");
+	});
+
+	test("a later owner without a restriction reusing a retired id resolves only the pool and names the ended restriction", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		storage.sessions.retire(PROVIDER, "served", storage.sessions.restrict(PROVIDER, "served", ["account:acc-b"]));
+		storage.sessions.retire(PROVIDER, "refused", storage.sessions.restrict(PROVIDER, "refused", ["account:acc-z"]));
+
+		expect(await storage.keys.get(PROVIDER, "served")).toBe("access-b");
+		await expect(storage.keys.get(PROVIDER, "refused")).rejects.toThrow(
+			`No API key for provider: ${PROVIDER} (session refused is restricted to its OAuth account pool past the end of the session that installed it and none of those accounts is available)`,
+		);
+		storage.keys.setConfig(PROVIDER, "config-key");
+		await expect(storage.keys.get(PROVIDER, "served")).rejects.toThrow(
+			"restricted to its OAuth account pool past the end of the session that installed it, but models.yml configures an apiKey",
+		);
+	});
+
+	test("restrictLike copies a retired restriction", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		storage.sessions.retire(PROVIDER, "host", storage.sessions.restrict(PROVIDER, "host", ["account:acc-b"]));
+
+		const leases = storage.sessions.restrictLike("host", "scan");
+		expect([...leases.keys()]).toEqual([PROVIDER]);
+		expect(await storage.keys.get(PROVIDER, "scan")).toBe("access-b");
+		for (const [provider, lease] of leases) storage.sessions.unrestrict(provider, "scan", lease);
+		expect(await storage.keys.get(PROVIDER, "scan")).toBe("runtime-key");
+	});
+
+	test("retired restrictions past the cap evict the least recently used one, which is unrestricted again", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		for (let index = 0; index <= SESSION_RESTRICTION_TOMBSTONES_MAX; index += 1) {
+			const sessionId = `released-${index}`;
+			storage.sessions.retire(
+				PROVIDER,
+				sessionId,
+				storage.sessions.restrict(PROVIDER, sessionId, ["account:acc-b"]),
+			);
+		}
+
+		expect(await storage.keys.get(PROVIDER, "released-0")).toBe("runtime-key");
+		for (const sessionId of ["released-1", `released-${SESSION_RESTRICTION_TOMBSTONES_MAX}`]) {
+			expect(await storage.keys.get(PROVIDER, sessionId)).toBe("access-b");
+		}
+	});
+
+	test("evictions warn at most once per interval, with the count since the previous warning and no session id", () => {
+		const startMs = Date.parse("2026-10-08T10:00:00Z");
+		setSystemTime(new Date(startMs));
+		try {
+			const warn = vi.spyOn(logger, "warn");
+			const evictionWarnings = () =>
+				warn.mock.calls.filter(([message]) => String(message).startsWith("Evicted retired session account"));
+			const retireSessions = (from: number, count: number) => {
+				for (let index = from; index < from + count; index += 1) {
+					const sessionId = `released-${index}`;
+					storage.sessions.retire(
+						PROVIDER,
+						sessionId,
+						storage.sessions.restrict(PROVIDER, sessionId, ["account:acc-b"]),
+					);
+				}
+			};
+			// Three evictions inside one interval: the first warns, the other two are counted.
+			retireSessions(0, SESSION_RESTRICTION_TOMBSTONES_MAX + 3);
+			expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
+				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 1 },
+			]);
+
+			setSystemTime(new Date(startMs + SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS));
+			retireSessions(SESSION_RESTRICTION_TOMBSTONES_MAX + 3, 1);
+			expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
+				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 1 },
+				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 3 },
+			]);
+			expect(JSON.stringify(evictionWarnings())).not.toContain("released-");
+		} finally {
+			setSystemTime();
+		}
+	});
+
 	test("an unpinned session reads its pin and drain rows at most once per miss window", async () => {
 		setSystemTime(new Date("2026-10-07T10:00:00Z"));
 		try {
@@ -421,6 +564,7 @@ describe("AuthStorage session account restrictions", () => {
 
 	test("keeps restrictions across a credential store replacement", async () => {
 		storage.sessions.restrict(PROVIDER, "session", ["account:acc-b"]);
+		storage.sessions.retire(PROVIDER, "retired", storage.sessions.restrict(PROVIDER, "retired", ["account:acc-b"]));
 		const replacement = await SqliteAuthCredentialStore.open(path.join(tempDir, "replacement.db"));
 		stores.push(replacement);
 		await storage.replaceStore(replacement);
@@ -428,7 +572,9 @@ describe("AuthStorage session account restrictions", () => {
 		const [accountA] = storage.oauth.accounts(PROVIDER);
 		if (!accountA) throw new Error("expected stored accounts");
 
-		expect(storage.sessions.pin(PROVIDER, "session", accountA.credentialId)).toBe(false);
-		expect(await storage.keys.get(PROVIDER, "session")).toBe("access-b");
+		for (const sessionId of ["session", "retired"]) {
+			expect(storage.sessions.pin(PROVIDER, sessionId, accountA.credentialId)).toBe(false);
+			expect(await storage.keys.get(PROVIDER, sessionId)).toBe("access-b");
+		}
 	});
 });

@@ -131,16 +131,17 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		return { session, released: released.promise };
 	}
 
-	it("lifts the pool once a run that outlived the deadline settles", async () => {
+	it("releases the pool once a run that outlived the deadline settles, keeping late lookups inside it", async () => {
 		const release = Promise.withResolvers<void>();
 		const { session, released } = await createPooledSession(release.promise);
 		await session.dispose({ drainTimeoutMs: 20 });
-		// The unsettled run may still resolve keys, so the pool stays for now.
+		// The unsettled run may still resolve keys, so the pool stays live.
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 
 		release.resolve();
 		await released;
-		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
+		// A late lookup straight to the auth store under the released id stays in the pool, not the runtime key.
+		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 	});
 
 	it("keeps the pool a revival installed on the same provider session id", async () => {
@@ -155,6 +156,6 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 
 		await revived.dispose();
-		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
+		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 	});
 });

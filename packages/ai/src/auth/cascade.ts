@@ -374,6 +374,13 @@ export class KeyCascade implements KeysApi {
 		}
 	}
 
+	/** Names the restriction of `sessionId` in a refusal, noting one kept after its session ended. */
+	#restrictionText(provider: string, sessionId: string | undefined): string {
+		return this.#deps.affinity.restrictionRetired(provider, sessionId)
+			? `session ${sessionId} is restricted to its OAuth account pool past the end of the session that installed it`
+			: `session ${sessionId} is restricted to its OAuth account pool`;
+	}
+
 	async #resolve(
 		provider: string,
 		sessionId?: string,
@@ -396,7 +403,7 @@ export class KeyCascade implements KeysApi {
 		if (restricted && this.#deps.overrides.configKey(provider) !== undefined) {
 			throw new AIError.MissingApiKeyError(
 				provider,
-				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool, but models.yml configures an apiKey for this provider, and pooled OAuth tokens are never sent past it)`,
+				`No API key for provider: ${provider} (${this.#restrictionText(provider, sessionId)}, but models.yml configures an apiKey for this provider, and pooled OAuth tokens are never sent past it)`,
 			);
 		}
 		const configKey = restricted ? undefined : this.#deps.overrides.configKey(provider);
@@ -477,7 +484,7 @@ export class KeyCascade implements KeysApi {
 			if (oauthRefreshFailure) throw oauthRefreshFailure;
 			throw new AIError.MissingApiKeyError(
 				provider,
-				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool and none of those accounts is available)`,
+				`No API key for provider: ${provider} (${this.#restrictionText(provider, sessionId)} and none of those accounts is available)`,
 			);
 		}
 		const loginApiKeySelection = await this.#deps.selector.selectApiKey(

@@ -65,16 +65,22 @@ const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
  * site opting in. A lookup without a session id resolves under the primary id
  * instead of falling back to the provider's unrestricted credentials.
  *
- * The scope holds the lease of every id it restricted; {@link release} lifts
- * them once the session can no longer resolve keys. A lease lifts only the
- * restriction it installed, so a restriction another session has installed on
- * the same id since, such as a revived session's, stays. A released scope
- * restricts nothing more and refuses every pooled key lookup through
- * {@link registry}, so a late request neither grows the auth store's
- * restrictions nor leaves the pool. A read that bypasses the registry and goes
- * to the auth store directly under a released id is not restricted: release
- * lifts the id, so a later owner that is not pooled, such as a resumed session,
- * can use it.
+ * The scope holds the lease of every id it restricted; {@link release} retires
+ * them (`AuthStorage.sessions.retire`) once the session can no longer resolve
+ * keys. A lease retires only the restriction it installed, so a restriction
+ * another session has installed on the same id since, such as a revived
+ * session's, stays. A released scope restricts nothing more and refuses every
+ * pooled key lookup through {@link registry}, so a late request neither grows
+ * the auth store's restrictions nor leaves the pool. A read that bypasses the
+ * registry and goes to the auth store directly under a released id (a scan
+ * job, a deferred side request, a tool holding the id) stays inside the pool:
+ * the retired restriction keeps denying every other account and every API key
+ * until a later owner restricts the id again, as a revived or resumed pooled
+ * session does. A later owner without pools reusing the id resolves only the pool's
+ * accounts and otherwise fails with an error naming the ended restriction. The
+ * auth store keeps a bounded number of retired restrictions in memory, in
+ * this process only; once one is evicted as the least recently used, its id is
+ * unrestricted again.
  */
 export class SessionAccountPoolScope {
 	readonly #authStorage: Pick<AuthStorage, "sessions">;
@@ -107,12 +113,16 @@ export class SessionAccountPoolScope {
 		this.#primarySessionId = sessionId;
 	}
 
-	/** Lift every restriction this scope installed; later pooled lookups through {@link registry} are refused. */
+	/**
+	 * Retire every restriction this scope installed, so later direct auth store
+	 * lookups under its ids stay inside the pools; later pooled lookups through
+	 * {@link registry} are refused.
+	 */
 	release(): void {
 		this.#released = true;
 		for (const [sessionId, leases] of this.#leases) {
 			for (const [provider, lease] of leases) {
-				this.#authStorage.sessions.unrestrict(provider, sessionId, lease);
+				this.#authStorage.sessions.retire(provider, sessionId, lease);
 			}
 		}
 		this.#leases.clear();

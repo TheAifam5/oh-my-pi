@@ -518,9 +518,11 @@ describe("credential pins", () => {
 			).rejects.toBeInstanceOf(MissingApiKeyError);
 		}
 		scope.restrict("late-3");
-		for (const sessionId of ["primary", "late-1", "late-2", "late-3"]) {
+		for (const sessionId of ["late-1", "late-2", "late-3"]) {
 			expect(storage.sessions.isRestricted("anthropic", sessionId)).toBe(false);
 		}
+		// The id the scope restricted before release keeps its pool for direct auth store lookups.
+		expect(storage.sessions.isRestricted("anthropic", "primary")).toBe(true);
 	});
 
 	test("recording never appends an automatic entry over the user's pin", () => {
