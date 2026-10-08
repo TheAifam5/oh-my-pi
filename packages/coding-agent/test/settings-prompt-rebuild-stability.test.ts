@@ -8,9 +8,17 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgTtsrEnabled } from "@oh-my-pi/pi-coding-agent/export/ttsr-settings";
-import { cfgDisabledExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
+import {
+	cfgCommandsEnableClaudeUser,
+	cfgDisabledExtensions,
+	cfgSkillsEnablePiProject,
+} from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import { createAgentSession, type CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { HindsightApi, MentalModelListResponse } from "@oh-my-pi/pi-coding-agent/hindsight/client";
+import { loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { cfgSecretsEnabled } from "@oh-my-pi/pi-coding-agent/secrets/settings";
+import { cfgWorkspaceAdditionalDirectories } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgPersonality } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -92,6 +100,66 @@ describe("system prompt stability across rebuilds", () => {
 		return requests;
 	}
 
+	/**
+	 * Records each provider request's system prompt. The first request runs `duringFirst`
+	 * while it is still open, then answers with a failing `read` call, so the loop sends a
+	 * continuation request within the same prompt; later requests answer "ok".
+	 */
+	function recordRequestsAcrossToolCall(session: AgentSession, duringFirst: () => Promise<void>): string[][] {
+		const requests: string[][] = [];
+		const mock = createMockModel({
+			handler: async context => {
+				requests.push([...(context.systemPrompt ?? [])]);
+				if (requests.length > 1) return { content: ["ok"] };
+				await duringFirst();
+				return {
+					content: [{ type: "toolCall", name: "read", arguments: { path: path.join(registryDir, "absent.txt") } }],
+				};
+			},
+		});
+		session.agent.streamFn = mock.stream;
+		return requests;
+	}
+
+	/**
+	 * The workspace listener applies the roots before it queues the rebuild; a macrotask
+	 * drains that in-memory chain, then the registry lock waits for the queued rebuild.
+	 */
+	async function settleWorkspaceRoots(session: AgentSession): Promise<void> {
+		await Bun.sleep(0);
+		await session.runToolRegistryMutation(async () => {});
+	}
+
+	/** Project-only skill discovery, so the listing holds exactly the skills a test writes. */
+	const projectSkillSettings = {
+		"skills.enabled": true,
+		"skills.enableCodexUser": false,
+		"skills.enableClaudeUser": false,
+		"skills.enableClaudeProject": false,
+		"skills.enablePiUser": false,
+		"skills.enablePiProject": true,
+	};
+
+	/** Writes `.omp/skills/<name>/SKILL.md` for each name into a fresh project directory. */
+	function writeProjectSkills(names: string[]): string {
+		const projectDir = path.join(registryDir, `skills-${Snowflake.next()}`);
+		for (const name of names) {
+			const skillDir = path.join(projectDir, ".omp", "skills", name);
+			fs.mkdirSync(skillDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(skillDir, "SKILL.md"),
+				`---\nname: ${name}\ndescription: Skill ${name} for the deferral test.\n---\nbody\n`,
+			);
+		}
+		return projectDir;
+	}
+
+	function userEntryIds(session: AgentSession): string[] {
+		return session.sessionManager
+			.getEntries()
+			.flatMap(entry => (entry.type === "message" && entry.message.role === "user" ? [entry.id] : []));
+	}
+
 	function collectNotices(session: AgentSession): string[] {
 		const notices: string[] = [];
 		session.subscribe(event => {
@@ -155,6 +223,193 @@ describe("system prompt stability across rebuilds", () => {
 		expect(session.systemPrompt).toEqual(startupPrompt);
 	});
 
+	describe("memory auto-recall on a prefix-bound session", () => {
+		function recallSettings(dbPath: string, autoRecall = true): Settings {
+			return Settings.isolated({
+				"memory.backend": "mnemopi",
+				"mnemopi.dbPath": dbPath,
+				"mnemopi.scoping": "global",
+				"mnemopi.noEmbeddings": true,
+				"mnemopi.llmMode": "none",
+				"mnemopi.autoRetain": false,
+				"mnemopi.autoRecall": autoRecall,
+			});
+		}
+
+		/** Records each request's system prompt and serialized messages, answering "ok". */
+		function recordPromptAndMessages(session: AgentSession): { systemPrompt: string[]; messages: string }[] {
+			const requests: { systemPrompt: string[]; messages: string }[] = [];
+			session.agent.streamFn = createMockModel({
+				handler: context => {
+					requests.push({
+						systemPrompt: [...(context.systemPrompt ?? [])],
+						messages: JSON.stringify(context.messages),
+					});
+					return { content: ["ok"] };
+				},
+			}).stream;
+			return requests;
+		}
+
+		async function rememberFact(session: AgentSession, fact: string): Promise<void> {
+			for (let attempt = 0; !session.getMnemopiSessionState() && attempt < 100; attempt++) await Bun.sleep(10);
+			const state = session.getMnemopiSessionState();
+			if (!state) throw new Error("Expected a mnemopi session state");
+			state.rememberInScope(fact);
+		}
+
+		it("keeps the prompt carrying a first-turn recall byte-stable on the next turn", async () => {
+			const settings = recallSettings(path.join(registryDir, `recall-${Snowflake.next()}.db`));
+			const session = await startPrefixBoundSession(settings);
+			await rememberFact(session, "Zebra herds cross the Mara river every July.");
+			const requests = recordPromptAndMessages(session);
+
+			await session.prompt("When do zebra herds cross the Mara river?");
+			await session.prompt("And the zebra herds afterwards?");
+			expect(requests[0].systemPrompt.join("\n")).toContain("Mara river every July");
+			expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+		});
+
+		it("queues a background recall found during the first request for the next turn", async () => {
+			const session = await startPrefixBoundSession(Settings.isolated({}));
+			const requests: { systemPrompt: string[]; messages: string }[] = [];
+			session.agent.streamFn = createMockModel({
+				handler: async context => {
+					requests.push({
+						systemPrompt: [...(context.systemPrompt ?? [])],
+						messages: JSON.stringify(context.messages),
+					});
+					if (requests.length > 1) return { content: ["ok"] };
+					await session.publishBackgroundMemoryRecall("Background recall marker.");
+					return {
+						content: [
+							{ type: "toolCall", name: "read", arguments: { path: path.join(registryDir, "absent.txt") } },
+						],
+					};
+				},
+			}).stream;
+
+			await session.prompt("first");
+			await session.prompt("second");
+			expect(requests).toHaveLength(3);
+			expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(requests[2].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(requests[1].messages).not.toContain("Background recall marker.");
+			expect(requests[2].messages).toContain("Background recall marker.");
+		});
+
+		it("delivers a background recall synchronously once its generation check passes", async () => {
+			const session = await startPrefixBoundSession(Settings.isolated({}));
+			recordPromptAndMessages(session);
+			await session.prompt("first");
+			const hasRecall = (text: string) =>
+				session.agent.state.messages.some(
+					message =>
+						message.role === "custom" && message.customType === "memory-recall" && message.content === text,
+				);
+
+			const delivered = session.publishBackgroundMemoryRecall("Current recall.", () => true);
+			// No await separates the check from the append, so a later generation bump cannot interleave.
+			expect(hasRecall("Current recall.")).toBe(true);
+			await delivered;
+
+			await session.publishBackgroundMemoryRecall("Superseded recall.", () => false);
+			expect(hasRecall("Superseded recall.")).toBe(false);
+		});
+
+		describe("Hindsight mental models after the prompt was sent", () => {
+			async function startHindsightState(responses: Promise<MentalModelListResponse>[]) {
+				const session = await startPrefixBoundSession(Settings.isolated({}));
+				const requests = recordPromptAndMessages(session);
+				await session.prompt("first");
+				let request = 0;
+				const client = {
+					listMentalModels: () => responses[request++] ?? Promise.resolve({ items: [] }),
+				} as unknown as HindsightApi;
+				const state = new HindsightSessionState({
+					sessionId: "hindsight-session",
+					client,
+					bankId: "b",
+					config: { ...loadHindsightConfig(Settings.isolated({})), mentalModelsEnabled: true },
+					session,
+					banksSet: new Set(["b"]),
+					lastRetainedTurn: 0,
+					hasRecalledForFirstTurn: true,
+				});
+				return { session, requests, state };
+			}
+
+			function mentalModels(content: string): MentalModelListResponse {
+				return { items: [{ id: "u", bank_id: "b", name: "User Preferences", content }] };
+			}
+
+			it("rides the next turn as a hidden message, keeping the prompt, and drops a superseded load", async () => {
+				const stale = Promise.withResolvers<MentalModelListResponse>();
+				const { session, requests, state } = await startHindsightState([
+					stale.promise,
+					Promise.resolve(mentalModels("current preference")),
+				]);
+				const committed = session.systemPrompt;
+
+				const superseded = state.runMentalModelLoad({ bankId: "b" });
+				await Promise.resolve();
+				state.beginMentalModelsTranscriptReload();
+				await state.mentalModelsLoadPromise;
+				stale.resolve(mentalModels("stale preference"));
+				await superseded;
+
+				expect(session.systemPrompt).toBe(committed);
+				await session.prompt("second");
+				expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+				expect(requests[1].messages).toContain("current preference");
+				expect(requests[1].messages).not.toContain("stale preference");
+			});
+
+			it("neither rebuilds nor delivers an empty mental-model block", async () => {
+				const { session, requests, state } = await startHindsightState([Promise.resolve({ items: [] })]);
+				state.mentalModelsSnippet = "<mental_models>old</mental_models>";
+				const committed = session.systemPrompt;
+
+				await state.runMentalModelLoad({ bankId: "b" });
+				expect(state.mentalModelsSnippet).toBeUndefined();
+				expect(session.systemPrompt).toBe(committed);
+				await session.prompt("second");
+				expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+				expect(
+					session.agent.state.messages.some(
+						message => message.role === "custom" && message.customType === "memory-recall",
+					),
+				).toBe(false);
+			});
+		});
+
+		it("delivers a recall on a resumed transcript as a hidden message, keeping the cached prompt", async () => {
+			const dbPath = path.join(registryDir, `recall-${Snowflake.next()}.db`);
+			const sessionDir = path.join(registryDir, `sessions-${Snowflake.next()}`);
+			// Without a first-turn recall in the transcript, the resumed turn recalls afresh.
+			const first = await startPrefixBoundSession(recallSettings(dbPath, false), {
+				sessionManager: SessionManager.create(registryDir, sessionDir),
+			});
+			const firstRequests = recordPromptAndMessages(first);
+			await first.prompt("Which river do zebra herds cross?");
+			await rememberFact(first, "Zebra herds cross the Mara river every July.");
+			await first.sessionManager.flush();
+			const sessionFile = first.sessionFile;
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await first.dispose();
+
+			const resumed = await startPrefixBoundSession(recallSettings(dbPath), {
+				sessionManager: await SessionManager.open(sessionFile, sessionDir),
+			});
+			expect(resumed.agent.state.messages.some(message => message.role === "assistant")).toBe(true);
+			const requests = recordPromptAndMessages(resumed);
+			await resumed.prompt("When do zebra herds cross the Mara river?");
+
+			expect(requests[0].systemPrompt).toEqual(firstRequests[0].systemPrompt);
+			expect(requests[0].messages).toContain("Mara river every July");
+		});
+	});
+
 	describe("on a prefix-bound session after a turn", () => {
 		it("defers a prompt-only settings change to the next forced rebuild with one notice", async () => {
 			const { session, requests } = await startWithDeferredPersonality(Settings.isolated({}));
@@ -194,6 +449,49 @@ describe("system prompt stability across rebuilds", () => {
 
 			await session.setModel(getBundledModel("anthropic", "claude-opus-5-5"));
 			expect(session.systemPrompt).toBe(committed);
+		});
+
+		it("lands a pending deferral when tree navigation leaves no sent turn, not again at the model switch", async () => {
+			const { session, requests } = await startWithDeferredPersonality(
+				Settings.isolated({ includeModelInPrompt: false }),
+			);
+			const firstUser = userEntryIds(session)[0];
+
+			await session.navigateTree(firstUser);
+			expect(session.agent.state.messages).toEqual([]);
+			expect(session.systemPrompt[0]).not.toBe(requests[0].systemPrompt[0]);
+
+			const committed = session.systemPrompt;
+			await session.setModel(getBundledModel("anthropic", "claude-opus-5-5"));
+			expect(session.systemPrompt).toBe(committed);
+		});
+
+		it("keeps a pending deferral when tree navigation keeps a sent turn", async () => {
+			const { session, requests } = await startWithDeferredPersonality(
+				Settings.isolated({ includeModelInPrompt: false }),
+			);
+			const secondUser = userEntryIds(session)[1];
+
+			await session.navigateTree(secondUser);
+			expect(session.agent.state.messages.some(message => message.role === "assistant")).toBe(true);
+			expect(session.systemPrompt).toEqual(requests[0].systemPrompt);
+
+			await session.setModel(getBundledModel("anthropic", "claude-opus-5-5"));
+			expect(session.systemPrompt[0]).not.toBe(requests[0].systemPrompt[0]);
+		});
+
+		it("adds a workspace root at once and defers its prompt listing", async () => {
+			const settings = Settings.isolated({});
+			const { session, requests, notices } = await startWithDeferredPersonality(settings);
+			const extraRoot = fs.mkdtempSync(path.join(registryDir, "extra-root-"));
+
+			cfgWorkspaceAdditionalDirectories.set(settings, [extraRoot]);
+			await settleWorkspaceRoots(session);
+			expect(session.sessionManager.getAdditionalDirectories()).toEqual([extraRoot]);
+
+			await session.prompt("third");
+			expect(requests[2].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(notices).toHaveLength(1);
 		});
 
 		it("rebuilds immediately when a TTSR setting changes", async () => {
@@ -295,6 +593,67 @@ describe("system prompt stability across rebuilds", () => {
 			expect(notices).toEqual([]);
 		});
 
+		it("skips the rebuild and adds no notice when a commands discovery setting changes no rendered skill", async () => {
+			const settings = Settings.isolated({});
+			const { session, requests } = await startWithDeferredPersonality(settings);
+			const notices = collectNotices(session);
+
+			const refreshed = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribeCommandMetadataChanged(() => refreshed.resolve());
+			cfgCommandsEnableClaudeUser.set(settings, !cfgCommandsEnableClaudeUser.get(settings));
+			await refreshed.promise;
+			unsubscribe();
+
+			await session.prompt("third");
+			expect(requests[2].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(notices).toEqual([]);
+		});
+
+		it("defers a skills discovery setting change that hides skills, noticing once", async () => {
+			const projectDir = writeProjectSkills(["alpha-skill"]);
+			const settings = Settings.isolated(projectSkillSettings);
+			const session = await startPrefixBoundSession(settings, {
+				cwd: projectDir,
+				agentDir: projectDir,
+				skills: undefined,
+			});
+			expect(session.skills.map(skill => skill.name)).toContain("alpha-skill");
+			const requests = recordRequests(session);
+			const notices = collectNotices(session);
+			await session.prompt("first");
+
+			const refreshed = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribeCommandMetadataChanged(() => refreshed.resolve());
+			cfgSkillsEnablePiProject.override(settings, false);
+			await refreshed.promise;
+			unsubscribe();
+			expect(session.skills.map(skill => skill.name)).not.toContain("alpha-skill");
+
+			await session.prompt("second");
+			expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(notices).toHaveLength(1);
+		});
+
+		it("lands a mid-session skillful toggle at the next model switch", async () => {
+			const projectDir = writeProjectSkills(["alpha-skill"]);
+			const session = await startPrefixBoundSession(
+				Settings.isolated({ ...projectSkillSettings, includeModelInPrompt: false }),
+				{ cwd: projectDir, agentDir: projectDir, skills: undefined },
+			);
+			const requests = recordRequests(session);
+			const notices = collectNotices(session);
+			await session.prompt("first");
+			expect(requests[0].systemPrompt.join("\n")).toContain("alpha-skill");
+
+			await session.setSkillful(false);
+			await session.prompt("second");
+			expect(requests[1].systemPrompt).toEqual(requests[0].systemPrompt);
+			expect(notices).toHaveLength(1);
+
+			await session.setModel(getBundledModel("anthropic", "claude-opus-5-5"));
+			expect(session.systemPrompt.join("\n")).not.toContain("alpha-skill");
+		});
+
 		it("defers a disabledExtensions change that hides skills, noticing once", async () => {
 			const projectDir = path.join(registryDir, `skills-${Snowflake.next()}`);
 			for (const name of ["alpha-skill", "beta-skill"]) {
@@ -338,6 +697,42 @@ describe("system prompt stability across rebuilds", () => {
 		});
 	});
 
+	describe("while the first request of a prefix-bound session is in flight", () => {
+		it("defers a prompt-only settings change past the continuation request", async () => {
+			const settings = Settings.isolated({});
+			const session = await startPrefixBoundSession(settings);
+			const notices = collectNotices(session);
+			const requests = recordRequestsAcrossToolCall(session, async () => {
+				cfgPersonality.set(settings, "pragmatic");
+				await settle(session);
+			});
+
+			await session.prompt("first");
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toEqual(requests[0]);
+			expect(notices).toHaveLength(1);
+
+			await session.prompt("second");
+			expect(requests[2]).toEqual(requests[0]);
+		});
+
+		it("rebuilds before the continuation request on a model without prefix binding", async () => {
+			const settings = Settings.isolated({});
+			authStorage.keys.setRuntime("openai", "test-key");
+			const session = await startSession(settings);
+			const notices = collectNotices(session);
+			const requests = recordRequestsAcrossToolCall(session, async () => {
+				cfgPersonality.set(settings, "pragmatic");
+				await settle(session);
+			});
+
+			await session.prompt("first");
+			expect(requests).toHaveLength(2);
+			expect(requests[1][0]).not.toBe(requests[0][0]);
+			expect(notices).toEqual([]);
+		});
+	});
+
 	describe("rebuilds immediately", () => {
 		it("on a prefix-bound session before its first turn", async () => {
 			const settings = Settings.isolated({});
@@ -349,6 +744,21 @@ describe("system prompt stability across rebuilds", () => {
 			await settle(session);
 			expect(session.systemPrompt[0]).not.toBe(before[0]);
 			expect(notices).toEqual([]);
+		});
+
+		it("with a workspace root change on a model without prefix binding after a turn", async () => {
+			const settings = Settings.isolated({});
+			authStorage.keys.setRuntime("openai", "test-key");
+			const session = await startSession(settings);
+			const requests = recordRequests(session);
+			await session.prompt("first");
+			const extraRoot = fs.mkdtempSync(path.join(registryDir, "extra-root-"));
+
+			cfgWorkspaceAdditionalDirectories.set(settings, [extraRoot]);
+			await settleWorkspaceRoots(session);
+			await session.prompt("second");
+			expect(requests[0].systemPrompt.join("\n")).not.toContain(extraRoot);
+			expect(requests[1].systemPrompt.join("\n")).toContain(extraRoot);
 		});
 
 		it("on a model without prefix binding after a turn", async () => {

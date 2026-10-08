@@ -52,6 +52,7 @@ import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
+import type { AdvertisedToolSettings } from "./advertised-settings";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
@@ -390,6 +391,12 @@ export interface ToolSession {
 	 * results fall back to {@link isToolActive}.
 	 */
 	isToolAdvertised?: (name: string) => boolean | undefined;
+	/**
+	 * Tool-gate settings frozen at the last system-prompt rebuild, like
+	 * {@link isToolAdvertised}; read through `resolveAdvertisedToolSettings`, which
+	 * falls back to live settings when this returns undefined.
+	 */
+	getAdvertisedToolSettings?: () => AdvertisedToolSettings | undefined;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Canonical map containing every registered tool exactly once. */

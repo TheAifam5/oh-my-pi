@@ -41,7 +41,7 @@ import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-intera
 import { checkBashInterception } from "./bash-interceptor";
 import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
-import { resolveEvalBackends } from "./eval-backends";
+import { resolveAdvertisedToolSettings } from "./advertised-settings";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import { serviceLogs, startService, type ServiceReady } from "../launch/services";
 import { isFindEnabled } from "./jfind";
@@ -604,7 +604,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly label = "Bash";
 	readonly loadMode = "essential";
 	get description(): string {
-		const evalBackends = resolveEvalBackends(this.session);
+		const evalBackends = resolveAdvertisedToolSettings(this.session).evalBackends;
 		const isToolActive = (name: string, fallback: boolean): boolean =>
 			this.session.isToolAdvertised?.(name) ?? this.session.isToolActive?.(name) ?? fallback;
 		return prompt.render(bashDescription, {
@@ -628,16 +628,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasSkills:
 				(this.session.skillHintVisible ??
 					(cfgSkillful.get(this.session.settings) && (this.session.skills?.length ?? 0) > 0)) === true,
-			hasLaunch: this.#launchEnabled,
+			hasLaunch: this.#launchAdvertised,
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
 			isWindows: process.platform === "win32",
 		});
 	}
-	/** Schema variant for the live `async.enabled` and `launch.enabled` settings. */
+	/** Schema variant for the live `async.enabled` and the advertised `launch.enabled` settings. */
 	get parameters(): BashToolSchema {
 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);
-		if (this.#launchEnabled) return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
+		if (this.#launchAdvertised) return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
 		return asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
 	// Non-pty calls run alongside each other (the executor isolates overlapping
@@ -671,6 +671,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	/** Service launch mode: live `launch.enabled` while `bash` itself is an active tool. */
 	get #launchEnabled(): boolean {
 		return cfgLaunchEnabled.get(this.session.settings) === true && (this.session.isToolActive?.("bash") ?? true);
+	}
+
+	/**
+	 * Service launch mode as the definition advertises it: the frozen `launch.enabled`
+	 * and `bash` roster (see `resolveAdvertisedToolSettings`); execution checks
+	 * {@link #launchEnabled}.
+	 */
+	get #launchAdvertised(): boolean {
+		return (
+			resolveAdvertisedToolSettings(this.session).launchEnabled &&
+			(this.session.isToolAdvertised?.("bash") ?? this.session.isToolActive?.("bash") ?? true)
+		);
 	}
 
 	#formatResultOutput(result: BashResult | BashInteractiveResult): string {

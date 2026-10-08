@@ -595,6 +595,7 @@ export class HindsightSessionState {
 		const published = await this.#refreshBaseSystemPromptAfter(
 			reason,
 			() => generation === this.#mentalModelsLoadGeneration,
+			result.block,
 		);
 		if (generation !== this.#mentalModelsLoadGeneration) return;
 		if (!published) this.mentalModelsSnippet = previousSnippet;
@@ -638,12 +639,24 @@ export class HindsightSessionState {
 		this.retainQueue.dispose();
 	}
 
+	/**
+	 * Publishes a loaded mental-model block. A background load (`MM load`, `MM transcript
+	 * reload`) goes through {@link AgentSession.publishBackgroundMemoryRecall}, so a
+	 * prefix-bound session that already sent its prompt gets the block as a hidden
+	 * next-turn message and an empty block waits for the next rebuild; the explicit
+	 * `MM reload` always rebuilds the prompt.
+	 */
 	async #refreshBaseSystemPromptAfter(
 		reason: "MM load" | "MM reload" | "MM transcript reload",
 		commitIf?: () => boolean,
+		block?: string,
 	): Promise<boolean> {
 		try {
-			await this.session.refreshBaseSystemPrompt(commitIf);
+			if (reason !== "MM reload") {
+				await this.session.publishBackgroundMemoryRecall(block, commitIf);
+			} else {
+				await this.session.refreshBaseSystemPrompt(commitIf);
+			}
 			return !commitIf || commitIf();
 		} catch (err) {
 			logger.debug(`Hindsight: refreshBaseSystemPrompt after ${reason} failed`, { error: String(err) });

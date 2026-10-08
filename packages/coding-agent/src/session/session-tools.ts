@@ -34,6 +34,7 @@ import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" w
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
+import { type AdvertisedToolSettings, liveAdvertisedToolSettings } from "../tools/advertised-settings";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 import { getApprovalGrants } from "../tools/approval-cache";
@@ -181,6 +182,8 @@ interface SystemPromptPreparation {
 	systemPrompt: string[];
 	/** Memory backend note to deliver with the turn ({@link MemoryPromptPreparation.notice}). */
 	memoryNotice?: MemoryPromptPreparation["notice"];
+	/** Hidden context delivered with the turn after its user message instead of in the system prompt. */
+	messages?: CustomMessage<undefined>[];
 	/** Publish staged state at validated delivery; false declines the prepared turn without mutation. */
 	commit?(): boolean;
 }
@@ -269,6 +272,8 @@ const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 const SESSION_AGENT_NOTICE_MESSAGE_TYPE = "session-agent-notice";
+/** Hidden message carrying memory recall that stays out of an already-cached system prompt. */
+export const MEMORY_RECALL_MESSAGE_TYPE = "memory-recall";
 const SETTINGS_PROMPT_REBUILD_DEFERRED_NOTICE = "Prompt settings change takes effect at /new or the next model switch.";
 
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
@@ -331,6 +336,8 @@ interface PromptSurface {
 	sessionAgents: readonly AgentDefinition[];
 	/** Active tool names sibling descriptions may reference (`bash`/`grep`/`glob` hints for `find`, ...). */
 	advertisedToolNames: ReadonlySet<string>;
+	/** Tool-gate settings rendered by definitions of tools that stay active (`read`, `bash`, `eval`). */
+	toolSettings: AdvertisedToolSettings;
 }
 
 interface PendingNoticePreview<T> {
@@ -379,6 +386,12 @@ export class SessionTools {
 	 * {@link #implicitRebuildBinding}.
 	 */
 	#restoredTranscript: { reply: AgentMessage; promptDigest: string } | undefined;
+	/**
+	 * Newest assistant reply restored with the transcript this session was created
+	 * with, recorded digest or not, until this session's first primary model call.
+	 * While it is the newest reply, this process has not sent its startup prompt.
+	 */
+	#restoredReply: AgentMessage | undefined;
 	/** Base-prompt digest of the last primary model call, until its reply ends. */
 	#capturedPromptDigest: string | undefined;
 	/** Base-prompt digest each primary reply with provider output was produced under. */
@@ -422,6 +435,13 @@ export class SessionTools {
 	 * prompt carries no catalog (no mounts, or a custom prompt that omits the section).
 	 */
 	#basePromptXdevNames: ReadonlySet<string> = new Set();
+	/**
+	 * Mounted MCP tools whose route line in the current base system prompt carries
+	 * their catalog summary, captured when that prompt is built or committed. A frozen
+	 * prefix-bound prompt keeps the routes it was built with, so live routes may list
+	 * tools the outgoing prompt does not.
+	 */
+	#basePromptRoutedXdevNames: ReadonlySet<string> = new Set();
 	#toolRegistryMutationScope = new AsyncLocalStorage<boolean>();
 	/**
 	 * Render-scoped candidate prompt surface. Rebuild frames run inside
@@ -523,6 +543,7 @@ export class SessionTools {
 		this.#setActiveToolNames = options.setActiveToolNames;
 		this.#baseSystemPrompt = options.baseSystemPrompt;
 		const restoredReply = this.#latestReply();
+		this.#restoredReply = restoredReply;
 		const restoredPromptDigest = restoredReply && this.recordedPromptDigest();
 		this.#restoredTranscript =
 			restoredReply && restoredPromptDigest
@@ -543,6 +564,8 @@ export class SessionTools {
 		for (const tool of host.agent.state.tools) this.#enabledToolNames.add(tool.name);
 		for (const name of this.#xdev?.mountedNames ?? []) this.#enabledToolNames.add(name);
 		this.#promptModelKey = this.#currentPromptModelKey();
+		// The startup prompt rendered its route guidance from this construction state.
+		this.#basePromptRoutedXdevNames = this.#routedSummaryXdevNames();
 	}
 
 	/** Mutable registry shared with controller hosts that inspect available tools. */
@@ -647,6 +670,22 @@ export class SessionTools {
 	}
 
 	/**
+	 * Tool-gate settings tool definitions render: the candidate inside a rebuild frame,
+	 * the committed snapshot while a prefix-bound turn was sent or a deferral is pending
+	 * (see {@link #promptSurface}), and live settings otherwise, so sessions without a
+	 * cached prefix to protect (other models, restricted sessions before their first
+	 * request) follow every change.
+	 */
+	get advertisedToolSettings(): AdvertisedToolSettings {
+		const candidate = this.#promptSurfaceScope.getStore();
+		if (candidate) return candidate.toolSettings;
+		if (this.#settingsRebuildDeferredForModel === undefined && !this.#prefixBoundTurnSent()) {
+			return liveAdvertisedToolSettings(this.#host.settings);
+		}
+		return this.#promptSurface.toolSettings;
+	}
+
+	/**
 	 * Derives the candidate surface from live state without publishing it.
 	 * `toolNames` is the `isToolActive` predicate set the candidate renders with.
 	 */
@@ -656,18 +695,26 @@ export class SessionTools {
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
 			advertisedToolNames: new Set(toolNames),
+			toolSettings: liveAdvertisedToolSettings(this.#host.settings),
 		};
 	}
 
 	/**
-	 * A prefix-binding model already answered on the current prompt, so a
-	 * rebuilt system prompt or tool prefix would void its cached prefix.
+	 * A prefix-binding model already received the current prompt, so a rebuilt
+	 * system prompt or tool prefix would void its cached prefix: an assistant
+	 * message exists, or the agent loop is running a request (the first one of a
+	 * fresh session included, whose continuation after tool calls reuses the
+	 * prefix). Prompt setup before the loop starts does not count.
 	 */
 	#prefixBoundTurnSent(): boolean {
-		return (
-			this.#host.model()?.thinking?.prefixBinding === true &&
-			this.#host.agent.state.messages.some(message => message.role === "assistant")
-		);
+		if (this.#host.model()?.thinking?.prefixBinding !== true) return false;
+		const state = this.#host.agent.state;
+		return state.isStreaming || state.messages.some(message => message.role === "assistant");
+	}
+
+	/** Whether a prefix-binding model already received the current prompt (see {@link #prefixBoundTurnSent}). */
+	get prefixBoundPromptSent(): boolean {
+		return this.#prefixBoundTurnSent();
 	}
 
 	/**
@@ -682,6 +729,26 @@ export class SessionTools {
 			return;
 		}
 		await this.refreshBaseSystemPrompt();
+	}
+
+	/**
+	 * Lands a pending settings deferral when the current branch no longer holds a
+	 * sent prefix-bound turn (tree navigation or a branch back before the first
+	 * answer), as a settings change on such a session would rebuild at once. A
+	 * branch that still holds one keeps the deferral pending.
+	 */
+	async landDeferredSettingsRebuildIfUnsent(): Promise<void> {
+		if (this.#settingsRebuildDeferredForModel === undefined || this.#prefixBoundTurnSent()) return;
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/**
+	 * Records a prompt-rendered change the caller kept out of the committed prompt as a
+	 * pending deferral (see {@link refreshBaseSystemPromptForSettingsChange}) when a
+	 * prefix-bound turn was sent; otherwise does nothing.
+	 */
+	deferPromptChangeIfSent(): void {
+		if (this.#prefixBoundTurnSent()) this.#deferSettingsPromptRebuild();
 	}
 
 	/** Marks the rebuild pending; only the first deferral after a committed rebuild notifies. */
@@ -894,6 +961,7 @@ export class SessionTools {
 	/** Installs and activates the ephemeral vibe tool set. */
 	activateVibeTools(baseToolNames: string[]): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			this.#seedFreezeBaseline();
 			const createVibeTools = this.#createVibeTools;
 			if (!createVibeTools) {
 				throw new Error("Vibe tools are unavailable in this session.");
@@ -919,6 +987,7 @@ export class SessionTools {
 	/** Uninstalls vibe tools and activates the replacement set. */
 	deactivateVibeTools(nextToolNames: string[]): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			this.#seedFreezeBaseline();
 			this.#uninstallVibeTools();
 			await this.#applyActiveToolsByName(nextToolNames);
 		});
@@ -927,6 +996,7 @@ export class SessionTools {
 	/** Removes vibe tools without restoring a source-session snapshot. */
 	removeVibeToolsPreservingActive(): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			this.#seedFreezeBaseline();
 			const removed = new Set(this.#installedVibeToolNames);
 			this.#uninstallVibeTools();
 			const nextEnabled = this.getEnabledToolNames().filter(name => !removed.has(name));
@@ -1268,6 +1338,19 @@ export class SessionTools {
 		prefixBoundTurnSent?: boolean,
 	): Promise<void> {
 		signal?.throwIfAborted();
+		// The startup prompt is built outside this class and leaves no signature, so the
+		// freeze below would never engage; compare against the surface the provider
+		// already has. Callers that mutate the registry seed it earlier ({@link #seedFreezeBaseline}).
+		// A resumed process has not sent its startup prompt while the restored reply is
+		// the newest one; {@link #implicitRebuildBinding} decides what its rebuilds keep.
+		if (
+			this.#lastAppliedToolSignature === undefined &&
+			!forcePromptRefresh &&
+			(prefixBoundTurnSent ?? this.#prefixBoundTurnSent()) &&
+			(this.#restoredReply === undefined || this.#latestReply() !== this.#restoredReply)
+		) {
+			this.#lastAppliedToolSignature = this.#committedToolSignature();
+		}
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		const fullWriteSelected =
@@ -1514,6 +1597,26 @@ export class SessionTools {
 
 	#setBasePromptXdevNames(names: readonly string[] | undefined): void {
 		this.#basePromptXdevNames = new Set(names);
+		this.#basePromptRoutedXdevNames = this.#routedSummaryXdevNames();
+	}
+
+	/**
+	 * Mounted MCP tools whose route line in the global route guidance, rendered from the
+	 * live `xd://` state, carries their catalog summary. Tools the bounded route projection
+	 * omits and tools whose docs the prompt inlines have no such line.
+	 */
+	#routedSummaryXdevNames(): ReadonlySet<string> {
+		if (!this.#xdev) return new Set();
+		const docsPlan = planXdevPromptDocs(
+			this.#xdev,
+			cfgToolsXdevDocs.get(this.#host.settings),
+			cfgToolsXdevInlineDevices.get(this.#host.settings),
+		);
+		return new Set(
+			projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(listXdevTools(this.#xdev)))
+				.mappings.filter(mapping => docsPlan.catalog.has(mapping.name))
+				.map(mapping => mapping.name),
+		);
 	}
 
 	#latestReply(): AgentMessage | undefined {
@@ -1555,6 +1658,7 @@ export class SessionTools {
 	 */
 	recordPrimaryModelCall(prompt: string[]): void {
 		this.#restoredTranscript = undefined;
+		this.#restoredReply = undefined;
 		this.#capturedPromptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
 	}
 
@@ -1592,6 +1696,7 @@ export class SessionTools {
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
+		this.#restoredReply = undefined;
 		this.#recordedDigestScan = undefined;
 	}
 
@@ -1972,22 +2077,12 @@ export class SessionTools {
 			// keep their notice lines: ones the bounded route projection omits
 			// (no shipped route line to lean on), and ones whose docs the prompt
 			// inlines (their route line has no summary; the notice is what
-			// delivers their docs).
-			let routedSummaryNames: Set<string> | undefined;
-			if (this.#xdev) {
-				const docsPlan = planXdevPromptDocs(
-					this.#xdev,
-					cfgToolsXdevDocs.get(this.#host.settings),
-					cfgToolsXdevInlineDevices.get(this.#host.settings),
-				);
-				routedSummaryNames = new Set(
-					projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(listXdevTools(this.#xdev)))
-						.mappings.filter(mapping => docsPlan.catalog.has(mapping.name))
-						.map(mapping => mapping.name),
-				);
-			}
+			// delivers their docs). Only routes the base prompt was built with
+			// count: a frozen prefix-bound prompt lacks routes mounted since.
 			for (const name of pending.added) {
-				if (this.#basePromptXdevNames.has(name) || routedSummaryNames?.has(name)) announcedMounts.add(name);
+				if (this.#basePromptXdevNames.has(name) || this.#basePromptRoutedXdevNames.has(name)) {
+					announcedMounts.add(name);
+				}
 			}
 		}
 		// Only announce a net change relative to what the model already knows (from
@@ -2160,6 +2255,7 @@ export class SessionTools {
 	/** Replaces memory-backend tools while preserving unrelated selections. */
 	replaceMemoryTools(tools: AgentTool[]): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			this.#seedFreezeBaseline();
 			const removed = new Set<string>(MEMORY_BACKEND_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)));
 			const nextActive = this.getEnabledToolNames().filter(name => !removed.has(name));
 			for (const name of removed) {
@@ -2195,6 +2291,7 @@ export class SessionTools {
 
 	#setThinkToolActive(enabled: boolean): Promise<boolean> {
 		return this.runToolRegistryMutation(async () => {
+			this.#seedFreezeBaseline();
 			const active = this.getEnabledToolNames();
 			if (!enabled) {
 				if (active.includes("think")) {
@@ -2260,7 +2357,27 @@ export class SessionTools {
 			const freezePrompt = !xdevChanged && this.#prefixBoundTurnSent();
 			if (freezePrompt) this.#lastAppliedToolSignature ??= baselineSignature;
 			await this.#applyActiveToolsByName([...enabled], !freezePrompt, undefined, freezePrompt);
+			// No notice tells the model about a changed definition of a tool that stays
+			// active, so that change waits for the next rebuild like a deferred setting.
+			if (
+				freezePrompt &&
+				!Bun.deepEquals(liveAdvertisedToolSettings(this.#host.settings), this.#promptSurface.toolSettings)
+			) {
+				this.#deferSettingsPromptRebuild();
+			}
 		});
+	}
+
+	/**
+	 * Seeds the freeze comparison of {@link #applyActiveToolsByName} from the committed
+	 * surface on a sent prefix-bound session the startup prompt left without a signature.
+	 * Callers that replace, add, or drop registry entries call it before that mutation,
+	 * so a dropped or redescribed active tool still differs from the baseline.
+	 */
+	#seedFreezeBaseline(): void {
+		if (this.#lastAppliedToolSignature === undefined && this.#prefixBoundTurnSent()) {
+			this.#lastAppliedToolSignature = this.#committedToolSignature();
+		}
 	}
 
 	/** Signature of the active tool surface as the committed prompt surface renders it. */
@@ -2355,12 +2472,30 @@ export class SessionTools {
 		};
 	}
 
-	/** Stages memory prompt injection; the owning turn commits it together with extension policy. */
+	/**
+	 * Before the first request of a prefix-bound session, publishes the live tool-gate
+	 * values as the frozen ones that request sends (see {@link advertisedToolSettings}).
+	 * A session that reconciles its gates already holds them; a restricted session has no
+	 * gate listener, so its construction-time snapshot may be stale.
+	 */
+	#pinToolSettingsForFirstRequest(): void {
+		if (this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (this.#settingsRebuildDeferredForModel !== undefined) return;
+		if (this.#host.agent.state.messages.some(message => message.role === "assistant")) return;
+		this.#promptSurface = { ...this.#promptSurface, toolSettings: liveAdvertisedToolSettings(this.#host.settings) };
+	}
+
+	/**
+	 * Stages memory prompt injection; the owning turn commits it together with extension
+	 * policy. The recall joins the system prompt, or rides the turn as a hidden message
+	 * when a prefix-bound model already received the prompt.
+	 */
 	async buildSystemPromptForAgentStart(
 		promptText: string,
 		isCurrent: () => boolean,
 		signal?: AbortSignal,
 	): Promise<SystemPromptPreparation> {
+		this.#pinToolSettingsForFirstRequest();
 		const backend = await resolveMemoryBackend(this.#host.settings);
 		if (!isCurrent() || !backend.beforeAgentStartPrompt) return { systemPrompt: this.#baseSystemPrompt };
 
@@ -2372,6 +2507,26 @@ export class SessionTools {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
+					commit: () => isCurrent() && memory.commit(),
+				};
+			}
+			// A prefix-bound model already cached this prompt (a resumed or branched
+			// transcript): the recall rides the turn as a hidden message, and the next
+			// real rebuild renders the committed snippet in the memory section.
+			if (this.#prefixBoundTurnSent()) {
+				return {
+					systemPrompt: this.#baseSystemPrompt,
+					memoryNotice: memory.notice,
+					messages: [
+						{
+							role: "custom",
+							customType: MEMORY_RECALL_MESSAGE_TYPE,
+							content: injected,
+							attribution: "agent",
+							display: false,
+							timestamp: Date.now(),
+						},
+					],
 					commit: () => isCurrent() && memory.commit(),
 				};
 			}
@@ -2522,6 +2677,7 @@ export class SessionTools {
 	}
 
 	async #applyMCPToolRefresh(mcpTools: CustomTool[]): Promise<void> {
+		this.#seedFreezeBaseline();
 		const previousMcpTools = new Map<string, AgentTool>();
 		for (const [name, tool] of this.#toolRegistry) {
 			if (isMCPToolName(name)) previousMcpTools.set(name, tool);
@@ -2589,6 +2745,7 @@ export class SessionTools {
 	}
 
 	async #applyRpcHostToolRefresh(rpcTools: AgentTool[]): Promise<void> {
+		this.#seedFreezeBaseline();
 		const nextToolNames = rpcTools.map(tool => tool.name);
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {

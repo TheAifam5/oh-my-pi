@@ -2,21 +2,26 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { type CreateAgentSessionOptions, type CustomTool, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
+import { cfgEvalPy } from "@oh-my-pi/pi-coding-agent/eval/settings";
 import { cfgBashEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import {
 	cfgFindEnabled,
 	cfgGithubEnabled,
 	cfgGrepEnabled,
+	cfgLaunchEnabled,
 	cfgToolsXdev,
 } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
@@ -48,6 +53,7 @@ describe("settings-gated tools in a live session", () => {
 		settings: Settings,
 		toolNames?: string[],
 		model = getBundledModel("openai", "gpt-4o-mini"),
+		overrides: Partial<CreateAgentSessionOptions> = {},
 	): Promise<AgentSession> {
 		const { session } = await createAgentSession({
 			cwd: registryDir,
@@ -66,6 +72,7 @@ describe("settings-gated tools in a live session", () => {
 			rules: [],
 			workspaceTree: { rootPath: registryDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
 			toolNames,
+			...overrides,
 		});
 		sessions.push(session);
 		return session;
@@ -103,6 +110,8 @@ describe("settings-gated tools in a live session", () => {
 			systemPrompt: string[];
 			toolNames: string[];
 			descriptions: Map<string, string>;
+			/** Each tool's provider-visible definition (description plus JSON schema). */
+			definitions: Map<string, string>;
 		}
 
 		afterEach(() => {
@@ -112,9 +121,19 @@ describe("settings-gated tools in a live session", () => {
 		/** Starts a prefix-binding session whose provider requests are recorded, and runs one turn. */
 		async function startPrefixBoundSession(
 			settings: Settings,
+			options: {
+				toolNames?: string[];
+				overrides?: Partial<CreateAgentSessionOptions>;
+				beforeFirstPrompt?: (session: AgentSession) => Promise<void>;
+			} = {},
 		): Promise<{ session: AgentSession; requests: RecordedRequest[] }> {
 			authStorage.keys.setRuntime("anthropic", "test-key");
-			const session = await startSession(settings, undefined, getBundledModel("anthropic", "claude-sonnet-5-5"));
+			const session = await startSession(
+				settings,
+				options.toolNames,
+				getBundledModel("anthropic", "claude-sonnet-5-5"),
+				options.overrides,
+			);
 			expect(session.model?.thinking?.prefixBinding).toBe(true);
 			const requests: RecordedRequest[] = [];
 			const mock = createMockModel({
@@ -124,11 +143,18 @@ describe("settings-gated tools in a live session", () => {
 						systemPrompt: [...(context.systemPrompt ?? [])],
 						toolNames: tools.map(tool => tool.name),
 						descriptions: new Map(tools.map(tool => [tool.name, tool.description])),
+						definitions: new Map(
+							tools.map(tool => [
+								tool.name,
+								JSON.stringify({ description: tool.description, parameters: toolWireSchema(tool) }),
+							]),
+						),
 					});
 					return { content: ["ok"] };
 				},
 			});
 			session.agent.streamFn = mock.stream;
+			await options.beforeFirstPrompt?.(session);
 			await session.prompt("first");
 			return { session, requests };
 		}
@@ -199,6 +225,124 @@ describe("settings-gated tools in a live session", () => {
 			expect(rosterNotices(session)).toHaveLength(0);
 		});
 
+		it("keeps the request prefix byte-stable when an MCP refresh adds a tool", async () => {
+			const settings = Settings.isolated({});
+			const { session, requests } = await startPrefixBoundSession(settings);
+
+			// The `browser.enabled` toggle re-filters MCP tools through this refresh.
+			await session.refreshMCPTools([
+				{
+					name: "mcp__browser_navigate",
+					label: "browser/navigate",
+					description: "Navigates the browser.",
+					parameters: type({}),
+					mcpServerName: "browser",
+					mcpToolName: "navigate",
+					async execute() {
+						return { content: [{ type: "text", text: "ok" }] };
+					},
+				} satisfies CustomTool,
+			]);
+			expect(session.getEnabledToolNames()).toContain("mcp__browser_navigate");
+			await session.prompt("second");
+
+			const [before, after] = requests;
+			expectSiblingDescriptionsUnchanged(before, after);
+			// The model learns of the tool from a hidden notice instead of the rebuilt prompt.
+			const notices = session.agent.state.messages.filter(
+				message =>
+					message.role === "custom" &&
+					(message.customType === "tool-roster-notice" || message.customType === "xdev-mount-notice"),
+			);
+			expect(JSON.stringify(notices)).toContain("mcp__browser_navigate");
+		});
+
+		it("keeps active tool definitions byte-stable when a gate changes what they advertise", async () => {
+			// Without async jobs or subagents, `launch.enabled` also brings in `wait`, which `eval` describes.
+			const settings = Settings.isolated({
+				"async.enabled": false,
+				"task.maxRecursionDepth": 0,
+				"launch.enabled": false,
+				"eval.py": true,
+				"eval.js": true,
+				includeModelInPrompt: false,
+			});
+			const { session, requests } = await startPrefixBoundSession(settings);
+			expect(session.getActiveToolNames()).not.toContain("wait");
+			const notices: string[] = [];
+			session.subscribe(event => {
+				if (event.type === "notice" && event.source === "settings") notices.push(event.message);
+			});
+
+			cfgLaunchEnabled.override(settings, true);
+			cfgEvalPy.override(settings, false);
+			await settle(session);
+			await session.prompt("second");
+
+			const [before, after] = requests;
+			expect(after.toolNames).toContain("wait");
+			expect(after.systemPrompt).toEqual(before.systemPrompt);
+			for (const name of ["bash", "eval"]) {
+				expect(after.definitions.get(name)).toBe(before.definitions.get(name));
+			}
+			expect(notices).toHaveLength(1);
+
+			// Like any deferred prompt setting, the change lands at the next model switch.
+			await session.setModel(getBundledModel("anthropic", "claude-opus-5-5"));
+			await session.prompt("third");
+			for (const name of ["bash", "eval"]) {
+				expect(requests[2].definitions.get(name)).not.toBe(before.definitions.get(name));
+			}
+		});
+
+		it("keeps the request prefix byte-stable when vibe tools are installed", async () => {
+			const { session, requests } = await startPrefixBoundSession(Settings.isolated({}));
+
+			await session.activateVibeTools(session.getEnabledToolNames());
+			expect(session.getEnabledToolNames()).toEqual(expect.arrayContaining([...VIBE_TOOL_NAMES]));
+			await session.prompt("second");
+
+			const [before, after] = requests;
+			expectSiblingDescriptionsUnchanged(before, after);
+			const notices = session.agent.state.messages.filter(
+				message =>
+					message.role === "custom" &&
+					(message.customType === "tool-roster-notice" || message.customType === "xdev-mount-notice"),
+			);
+			expect(JSON.stringify(notices)).toContain("vibe_spawn");
+		});
+
+		it("sends a restricted session's tool-gate values as of its first request", async () => {
+			const settings = Settings.isolated({ "launch.enabled": false, "eval.py": true, "eval.js": true });
+			let expected: Map<string, string> | undefined;
+			// The loop adds an intent field to each sent schema, so descriptions are compared verbatim
+			// and schemas by the field the gate controls.
+			const { session, requests } = await startPrefixBoundSession(settings, {
+				toolNames: ["bash", "eval"],
+				overrides: { restrictToolNames: true },
+				beforeFirstPrompt: async session => {
+					// Restricted sessions have no gate listener; the flip lands before anything is sent.
+					cfgLaunchEnabled.override(settings, true);
+					cfgEvalPy.override(settings, false);
+					await settle(session);
+					expected = new Map(
+						["bash", "eval"].map(name => {
+							const tool = session.getToolByName(name);
+							if (!tool) throw new Error(`Expected the ${name} tool`);
+							return [name, tool.description];
+						}),
+					);
+				},
+			});
+			await session.prompt("second");
+
+			for (const name of ["bash", "eval"]) {
+				expect(requests[0].descriptions.get(name)).toBe(expected?.get(name));
+				expect(requests[1].definitions.get(name)).toBe(requests[0].definitions.get(name));
+			}
+			expect(requests[0].definitions.get("eval")).not.toContain('"py"');
+		});
+
 		it("rebuilds the prompt when tools.xdev changes how tools are mounted", async () => {
 			const settings = Settings.isolated({});
 			const { session, requests } = await startPrefixBoundSession(settings);
@@ -211,6 +355,43 @@ describe("settings-gated tools in a live session", () => {
 			expect(after.systemPrompt).not.toEqual(before.systemPrompt);
 			expect(rosterNotices(session)).toHaveLength(0);
 		});
+	});
+
+	it("follows a gate change in active tool definitions on a model without prefix binding", async () => {
+		const settings = Settings.isolated({ "launch.enabled": false, "eval.py": true, "eval.js": true });
+		const session = await startSession(settings);
+		const definition = (name: string) => {
+			const tool = session.getToolByName(name);
+			if (!tool) throw new Error(`Expected the ${name} tool`);
+			return JSON.stringify({ description: tool.description, parameters: toolWireSchema(tool) });
+		};
+		const bash = definition("bash");
+		const evalTool = definition("eval");
+
+		cfgLaunchEnabled.override(settings, true);
+		cfgEvalPy.override(settings, false);
+		await settle(session);
+		expect(definition("bash")).not.toBe(bash);
+		expect(definition("eval")).not.toBe(evalTool);
+	});
+
+	it("follows a gate change in tool definitions of a restricted session", async () => {
+		const settings = Settings.isolated({ "launch.enabled": false, "eval.py": true, "eval.js": true });
+		// Restricted sessions keep their exact tool list and never reconcile gates.
+		const session = await startSession(settings, ["bash", "eval"], undefined, { restrictToolNames: true });
+		const definition = (name: string) => {
+			const tool = session.getToolByName(name);
+			if (!tool) throw new Error(`Expected the ${name} tool`);
+			return JSON.stringify({ description: tool.description, parameters: toolWireSchema(tool) });
+		};
+		const bash = definition("bash");
+		const evalTool = definition("eval");
+
+		cfgLaunchEnabled.override(settings, true);
+		cfgEvalPy.override(settings, false);
+		await settle(session);
+		expect(definition("bash")).not.toBe(bash);
+		expect(definition("eval")).not.toBe(evalTool);
 	});
 
 	it("never widens an explicit tool list", async () => {

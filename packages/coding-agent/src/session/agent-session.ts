@@ -236,6 +236,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import type { AdvertisedToolSettings } from "../tools/advertised-settings";
 import { resolveApproval, resolveToolReplayClass } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { type AskToolInput, recoverAskQuestions } from "../tools/ask";
@@ -479,7 +480,7 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { SessionTools, type SessionToolsHost } from "./session-tools";
+import { MEMORY_RECALL_MESSAGE_TYPE, SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveOpenAIWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -587,7 +588,14 @@ const cfgAdvisorRuntimeInputs = combine({
 	maxNotesPerUpdate: cfgAdvisorMaxNotesPerUpdate,
 	tier: cfgTierAdvisor,
 });
-/** Settings behind the session's extra workspace roots and the auto-QA prompt note. */
+/**
+ * Settings behind the session's extra workspace roots and the auto-QA prompt note. Both are
+ * deferrable prompt inputs (see `SYSTEM_PROMPT_INPUT_REBUILD` in system-prompt.ts): the
+ * listener applies the roots to the session manager before any rebuild, and subagent
+ * spawns read them from there live, while auto-QA recording and the `xd://report_issue`
+ * device check the setting per call. A rebuild only rewrites the rendered root list and
+ * the auto-QA note.
+ */
 const cfgWorkspacePromptInputs = combine({
 	additionalDirectories: cfgWorkspaceAdditionalDirectories,
 	autoqa: cfgDevAutoqa,
@@ -2947,7 +2955,8 @@ export class AgentSession implements SettingsScope {
 			const autoQaEnabled = isAutoQaEnabled(this.settings);
 			const autoQaChanged = autoQaEnabled !== this.#autoQaEnabled;
 			this.#autoQaEnabled = autoQaEnabled;
-			if ((rootsChanged || autoQaChanged) && !this.#isDisposed) await this.refreshBaseSystemPrompt();
+			if ((rootsChanged || autoQaChanged) && !this.#isDisposed)
+				await this.refreshBaseSystemPromptForSettingsChange();
 		});
 	}
 
@@ -3123,6 +3132,20 @@ export class AgentSession implements SettingsScope {
 				sessionFile: this.sessionFile,
 				error: String(error),
 			});
+		}
+	}
+
+	/**
+	 * After the branch's messages change, lands a deferred prompt settings change the
+	 * new branch no longer needs to hold back (see
+	 * {@link SessionTools.landDeferredSettingsRebuildIfUnsent}). A failed rebuild keeps the
+	 * deferral pending and does not fail the navigation.
+	 */
+	async #landDeferredSettingsRebuildAfterBranchChange(): Promise<void> {
+		try {
+			await this.#tools.landDeferredSettingsRebuildIfUnsent();
+		} catch (error) {
+			logger.warn("Pending prompt settings rebuild after a branch change failed", { error: String(error) });
 		}
 	}
 
@@ -7652,6 +7675,31 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.refreshBaseSystemPrompt(commitIf);
 	}
 
+	/**
+	 * Publishes memory context found after its turn started: rebuilds the system prompt,
+	 * whose memory section renders the committed snippet, unless a prefix-binding model
+	 * already received the prompt; then the context rides the next turn as a hidden
+	 * message. `commitIf` discards a superseded publication on either path.
+	 */
+	async publishBackgroundMemoryRecall(context: string | undefined, commitIf?: () => boolean): Promise<void> {
+		if (!this.#tools.prefixBoundPromptSent) {
+			await this.refreshBaseSystemPrompt(commitIf);
+			return;
+		}
+		// An empty context (a cleared snapshot) has nothing to deliver; it lands at the next rebuild.
+		if (!context || this.#isDisposed) return;
+		// Checked in the same synchronous step as the delivery, so no newer generation can slip in.
+		if (commitIf && !commitIf()) return;
+		this.#deliverHiddenNextTurnMessage({
+			role: "custom",
+			customType: MEMORY_RECALL_MESSAGE_TYPE,
+			content: context,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+	}
+
 	/** Settings-change prompt rebuild (see {@link SessionTools.refreshBaseSystemPromptForSettingsChange}). */
 	refreshBaseSystemPromptForSettingsChange(): Promise<void> {
 		return this.#tools.refreshBaseSystemPromptForSettingsChange();
@@ -9117,6 +9165,7 @@ export class AgentSession implements SettingsScope {
 					timestamp: Date.now(),
 				});
 			}
+			messages.push(...(basePreparation.messages ?? []));
 			const attribution = "attribution" in message ? message.attribution : undefined;
 			for (const payload of result?.messages ?? []) {
 				const normalized = normalizeCustomMessagePayload(payload);
@@ -10223,6 +10272,31 @@ export class AgentSession implements SettingsScope {
 		return delivered;
 	}
 
+	/**
+	 * Delivers a hidden text message with the next turn synchronously, as
+	 * `sendCustomMessage(..., { deliverAs: "nextTurn" })` does without a turn trigger:
+	 * queued while a turn runs, appended to the transcript when idle.
+	 */
+	#deliverHiddenNextTurnMessage(message: CustomMessage): void {
+		if (this.isStreaming) {
+			this.#queueHiddenNextTurnMessage(message, false);
+			return;
+		}
+		this.#appendHiddenMessageNow(message);
+	}
+
+	/** Appends a custom message to the agent transcript and the session file. */
+	#appendHiddenMessageNow(message: CustomMessage): void {
+		this.agent.appendMessage(message);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution,
+		);
+	}
+
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
@@ -10550,14 +10624,7 @@ export class AgentSession implements SettingsScope {
 				});
 				return outcome.sessionClaimed;
 			}
-			this.agent.appendMessage(normalizedAppMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				normalizedAppMessage.customType,
-				normalizedAppMessage.content,
-				normalizedAppMessage.display,
-				normalizedAppMessage.details,
-				normalizedAppMessage.attribution,
-			);
+			this.#appendHiddenMessageNow(normalizedAppMessage);
 			return false;
 		}
 
@@ -10951,6 +11018,11 @@ export class AgentSession implements SettingsScope {
 	/** Frozen advertised-tool snapshot (see {@link SessionTools.isToolAdvertised}). */
 	isToolAdvertised(name: string): boolean {
 		return this.#tools.isToolAdvertised(name);
+	}
+
+	/** Frozen tool-gate settings snapshot (see {@link SessionTools.advertisedToolSettings}). */
+	get advertisedToolSettings(): AdvertisedToolSettings {
+		return this.#tools.advertisedToolSettings;
 	}
 
 	/** Skill loading warnings captured by SDK */
@@ -12123,9 +12195,11 @@ export class AgentSession implements SettingsScope {
 	 *
 	 * With an empty transcript the rebuilt system prompt simply carries or
 	 * drops the `<skills>` listing. Mid-session the provider-visible prompt
-	 * stays byte-stable: disabling is a no-op until the next session, and
+	 * stays byte-stable: disabling is a no-op until the next prompt rebuild, and
 	 * enabling appends a single hidden notice carrying the listing so the
-	 * model learns the skills without a prompt-prefix rewrite.
+	 * model learns the skills without a prompt-prefix rewrite. A prefix-bound
+	 * session that sent its prompt also lands the listing change at the next
+	 * model switch or /new, with the deferred-settings notice.
 	 */
 	async setSkillful(enabled: boolean): Promise<boolean> {
 		if (enabled === cfgSkillful.get(this.settings)) return enabled;
@@ -12143,7 +12217,11 @@ export class AgentSession implements SettingsScope {
 		this.#skillfulApplied = enabled;
 		if (this.agent.state.messages.length === 0) {
 			await this.refreshBaseSystemPrompt();
-		} else if (enabled) {
+			return;
+		}
+		// A sent prefix-bound turn holds the listing change until the next model switch or /new.
+		this.#tools.deferPromptChangeIfSent();
+		if (enabled) {
 			// Enabled covers top-level and xd://-mounted tools: every path through
 			// which the model can still reach a reader.
 			const hasSkillReader = this.getEnabledToolNames().some(name => toolReadsSkillUris(this.getToolByName(name)));
@@ -13757,6 +13835,7 @@ export class AgentSession implements SettingsScope {
 				this.agent.replaceMessages(sessionContext.messages);
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
+				await this.#landDeferredSettingsRebuildAfterBranchChange();
 			}
 
 			this.#advisors.reattachRecorderFeeds();
@@ -14220,6 +14299,7 @@ export class AgentSession implements SettingsScope {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
+		await this.#landDeferredSettingsRebuildAfterBranchChange();
 
 		this.#branchSummaryAbortController = undefined;
 

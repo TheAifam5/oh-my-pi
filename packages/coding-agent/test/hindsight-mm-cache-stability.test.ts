@@ -103,15 +103,64 @@ describe("HindsightSessionState mental-model freeze", () => {
 	});
 });
 
+describe("HindsightSessionState mental-model publication", () => {
+	function makePublishingState() {
+		const client = {
+			listMentalModels: async () => ({
+				items: [{ id: "u", bank_id: "b", name: "User Preferences", content: "published preference" }],
+			}),
+		} as unknown as HindsightApi;
+		const session = {
+			refreshBaseSystemPrompt: vi.fn(async (_commitIf?: () => boolean) => {}),
+			publishBackgroundMemoryRecall: vi.fn(async (_context: string, _commitIf?: () => boolean) => {}),
+			sessionManager: { getEntries: () => [] },
+		};
+		const state = new HindsightSessionState({
+			sessionId: "s",
+			client,
+			bankId: "b",
+			config: makeConfig(),
+			session: session as never,
+			banksSet: new Set(["b"]),
+			lastRetainedTurn: 0,
+			hasRecalledForFirstTurn: false,
+		});
+		return { session, state };
+	}
+
+	// A prefix-bound session that already sent its prompt turns the publication into a
+	// hidden next-turn message instead of a rebuild (see AgentSession.publishBackgroundMemoryRecall).
+	it("publishes a background load through the session's memory publisher", async () => {
+		const { session, state } = makePublishingState();
+		await state.runMentalModelLoad({ bankId: "b" });
+
+		expect(session.publishBackgroundMemoryRecall).toHaveBeenCalledTimes(1);
+		expect(session.publishBackgroundMemoryRecall.mock.calls[0][0]).toContain("published preference");
+		expect(session.refreshBaseSystemPrompt).not.toHaveBeenCalled();
+		expect(state.mentalModelsSnippet).toContain("published preference");
+	});
+
+	it("rebuilds the prompt for an explicit reload", async () => {
+		const { session, state } = makePublishingState();
+		await state.reloadMentalModels();
+
+		expect(session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
+		expect(session.publishBackgroundMemoryRecall).not.toHaveBeenCalled();
+	});
+});
+
 describe("SessionMemory mental-model boundary reload", () => {
 	function makeBoundaryHarness(response: Promise<MentalModelListResponse>, publicationGate?: Promise<void>) {
 		const published: Array<string | undefined> = [];
 		const client = { listMentalModels: () => response } as unknown as HindsightApi;
 		const stateSession: {
 			refreshBaseSystemPrompt: (commitIf?: () => boolean) => Promise<void>;
+			publishBackgroundMemoryRecall: (context: string, commitIf?: () => boolean) => Promise<void>;
 			sessionManager: { getEntries: () => never[] };
 		} = {
 			refreshBaseSystemPrompt: async () => {},
+			// A session that has not sent a prefix-bound prompt publishes by rebuilding.
+			publishBackgroundMemoryRecall: (_context, commitIf) => stateSession.refreshBaseSystemPrompt(commitIf),
 			sessionManager: { getEntries: () => [] },
 		};
 		const state = new HindsightSessionState({
@@ -246,11 +295,13 @@ describe("SessionMemory mental-model boundary reload", () => {
 		const published: Array<string | undefined> = [];
 		const stateSession: {
 			refreshBaseSystemPrompt: (commitIf?: () => boolean) => Promise<void>;
+			publishBackgroundMemoryRecall: (context: string, commitIf?: () => boolean) => Promise<void>;
 			sessionManager: { getEntries: () => never[] };
 		} = {
 			refreshBaseSystemPrompt: async commitIf => {
 				if (!commitIf || commitIf()) published.push(state.mentalModelsSnippet);
 			},
+			publishBackgroundMemoryRecall: (_context, commitIf) => stateSession.refreshBaseSystemPrompt(commitIf),
 			sessionManager: { getEntries: () => [] },
 		};
 		const state = new HindsightSessionState({

@@ -2596,6 +2596,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			isToolActive: name => activeToolNames.has(name),
 			isToolAdvertised: name => session?.isToolAdvertised(name),
+			getAdvertisedToolSettings: () => session?.advertisedToolSettings,
 			setActiveToolNames,
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
@@ -4318,8 +4319,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				: undefined;
 			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
-			// tool-availability caveat lives in the wrapper template.
-			advisorMemoryPrompt = formatAdvisorMemoryPrompt(memoryInstructions);
+			// tool-availability caveat lives in the wrapper template. Advisors have no
+			// `xd://` devices, so a block naming mounted memory tools is rendered again
+			// with bare names, which match the advisor's own tool list.
+			const mountedNames = toolSession.xdev?.mountedNames;
+			const advisorMemoryInstructions =
+				memoryBackend && MEMORY_BACKEND_TOOL_NAMES.some(name => mountedNames?.has(name))
+					? await memoryBackend.buildDeveloperInstructions(
+							agentDir,
+							sessionManager.getCwd(),
+							settings,
+							session,
+							new Set(),
+						)
+					: memoryInstructions;
+			advisorMemoryPrompt = formatAdvisorMemoryPrompt(advisorMemoryInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
 			const inlineToolDescriptors = resolveInlineToolDescriptors();
 			// Unset only during the initial build; the agent is constructed with it.
@@ -5130,6 +5144,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isToolActive: name => toolSession.isToolActive?.(name) === true,
 			// Descriptions follow the primary's frozen roster, like `isToolActive` above.
 			isToolAdvertised: name => toolSession.isToolAdvertised?.(name),
+			getAdvertisedToolSettings: () => toolSession.getAdvertisedToolSettings?.(),
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {
@@ -5601,8 +5616,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if (agentKind === "main") {
 			// Live skills/commands discovery settings: rediscover skills and file slash
 			// commands, rebuild the prompt, and notify command pickers (TUI/RPC/ACP).
-			// `enabledProviders`/`disabledProviders` gate foreign provider sources.
-			cfgSkillsAndCommandsDiscovery.listen(session, () => session.refreshSkillsAndCommands());
+			// `enabledProviders`/`disabledProviders` gate foreign provider sources. Like
+			// the extension sources below, a prefix-bound session that already sent its
+			// prompt skips an unchanged skill listing and defers a changed one.
+			cfgSkillsAndCommandsDiscovery.listen(session, () =>
+				session.refreshSkillsAndCommands({ settingsChange: true }),
+			);
 			// Live `extensions` / `disabledExtensions`: a settings-governed extension whose
 			// source leaves the rediscovered set is suspended (handlers, commands, tools,
 			// renderers, shortcuts, file fallbacks) and a returning source resumes. Modules

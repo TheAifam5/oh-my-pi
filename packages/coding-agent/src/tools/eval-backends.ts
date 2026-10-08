@@ -8,7 +8,7 @@ export interface EvalBackendsAllowance {
 }
 
 /** Active eval backend allowance (`eval.py` / `eval.js`; `PI_PY` / `PI_JS` override). */
-export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {
+export function resolveEvalBackends(session: Pick<ToolSession, "settings">): EvalBackendsAllowance {
 	return {
 		python: cfgEvalPy.get(session.settings),
 		js: cfgEvalJs.get(session.settings),

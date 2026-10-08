@@ -123,6 +123,23 @@ describe("advisor memory context", () => {
 		expect(names).not.toContain("edit");
 	});
 
+	it("names memory tools without xd:// in the advisor's memory block while the main prompt mounts them", async () => {
+		tempDir = TempDir.createSync("@pi-advisor-memory-");
+		session = await createAdvisedSession("mnemopi", SessionManager.inMemory(tempDir.path()));
+		expect(session.getMountedXdevToolNames()).toContain("recall");
+		expect(session.agent.state.systemPrompt.join("\n")).toContain("`xd://recall`");
+
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to exist");
+		const advisorPrompt = advisor.state.systemPrompt.join("\n");
+		const memoryBlock = advisorPrompt.slice(
+			advisorPrompt.indexOf("<memory-context>"),
+			advisorPrompt.indexOf("</memory-context>"),
+		);
+		expect(memoryBlock).toContain("`recall`");
+		expect(memoryBlock).not.toContain("xd://");
+	});
+
 	it.each(["hindsight", "mnemopi"])("keeps in-memory advisor URL tools bound to the %s session", async backend => {
 		tempDir = TempDir.createSync("@pi-advisor-memory-urls-");
 		const previousAgentDir = getAgentDir();

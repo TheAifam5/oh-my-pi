@@ -37,6 +37,7 @@ import {
 	isIdaDatabasePath,
 } from "../ida";
 import { normalizeToLF } from "../edit/normalize";
+import { resolveAdvertisedToolSettings } from "./advertised-settings";
 import { getEditStore, recordFullySeenRows } from "../edit/store";
 import {
 	extractUriScheme,
@@ -1035,11 +1036,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	};
 	readonly label = "Read";
 	readonly loadMode = "essential";
-	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
+	/**
+	 * Rendered per access so the hashline guidance follows a live `edit.mode` change;
+	 * binary views follow the advertised `ida.*` snapshot.
+	 */
 	get description(): string {
 		return prompt.render(readDescription, {
 			IS_HL_MODE: resolveFileDisplayMode(this.session).hashLines,
-			BINARY_VIEWS: cfgIdaAvailable.get(this.session.settings),
+			BINARY_VIEWS: resolveAdvertisedToolSettings(this.session).binaryViews,
 		});
 	}
 	readonly parameters = readSchema;

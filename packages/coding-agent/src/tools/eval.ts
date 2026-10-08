@@ -40,6 +40,7 @@ import { webpExclusionForModel } from "@oh-my-pi/pi-tui/chat/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
+import { resolveAdvertisedToolSettings } from "./advertised-settings";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
 import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -56,7 +57,6 @@ import {
 	cfgEvalAutoProvision,
 	cfgEvalToolsEnabled,
 } from "../eval/settings";
-import { cfgTaskMaxRecursionDepth } from "../task/settings";
 import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./settings";
 
 /** Language tokens the eval tool accepts, in stable display order. */
@@ -121,10 +121,11 @@ export type EvalCellInput = EvalToolParams;
 
 /**
  * Build a session-scoped copy of the eval schema whose `language` enum and field
- * descriptions advertise only the runtimes enabled for this session. Disabled
- * backends never reach the model: the wire schema, BM25 discovery corpus, and
- * tool description stay in lockstep with {@link resolveEvalBackends}. The static
- * {@link evalSchema} (full union) remains the type-level source of truth.
+ * descriptions advertise only the runtimes this session advertises: the wire
+ * schema, BM25 discovery corpus, and tool description follow the snapshot from
+ * `resolveAdvertisedToolSettings`, while execution rejects any backend
+ * {@link resolveEvalBackends} has disabled since. The static {@link evalSchema}
+ * (full union) remains the type-level source of truth.
  */
 function buildEvalSchema(langs: readonly EvalLanguageToken[]): typeof evalSchema {
 	const schema = type({
@@ -335,11 +336,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	#descriptionOptions(): EvalToolDescriptionOptions {
 		const session = this.session;
 		if (!session) return {};
-		const backends = resolveEvalBackends(session);
-		const depthAllowsSpawning = canSpawnAtDepth(
-			cfgTaskMaxRecursionDepth.get(session.settings),
-			session.taskDepth ?? 0,
-		);
+		const advertised = resolveAdvertisedToolSettings(session);
+		const backends = advertised.evalBackends;
+		const depthAllowsSpawning = canSpawnAtDepth(advertised.taskMaxRecursionDepth, session.taskDepth ?? 0);
 		return {
 			py: backends.python,
 			js: backends.js,
@@ -347,9 +346,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
-			waitTool: hasWaitTool(session),
+			waitTool: session.isToolAdvertised?.("wait") ?? hasWaitTool(session),
 			preludes: this.#advertisedPreludes(session),
-			inlineTopics: session.isToolActive?.("read") === false,
+			inlineTopics: (session.isToolAdvertised?.("read") ?? session.isToolActive?.("read")) === false,
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 		};
 	}
@@ -421,11 +420,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly #environmentModes: Partial<Record<EvalLanguage, "managed" | "project">> = {};
 
 	/**
-	 * Languages enabled for this session, in display order. Detached tools (no
-	 * session) fall back to the shipped defaults (py/js; rb/jl are opt-in).
+	 * Languages the definition advertises, in display order: the session's frozen
+	 * snapshot (execution checks live settings). Detached tools (no session) fall
+	 * back to the shipped defaults (py/js; rb/jl are opt-in).
 	 */
 	#enabledLanguages(): EvalLanguageToken[] {
-		return this.session ? enabledEvalLanguages(resolveEvalBackends(this.session)) : ["py", "js"];
+		return this.session
+			? enabledEvalLanguages(resolveAdvertisedToolSettings(this.session).evalBackends)
+			: ["py", "js"];
 	}
 
 	constructor(
