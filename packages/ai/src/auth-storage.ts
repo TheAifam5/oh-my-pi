@@ -31,7 +31,7 @@ import { ResetCredits } from "./auth/resets";
 import { RateLimits } from "./auth/rotation";
 import { CredentialSelector } from "./auth/select";
 import { SqliteAuthCredentialStore } from "./auth/sqlite-credential-store";
-import type { AuthCredentialStore } from "./auth/store";
+import type { AuthCredentialStore, CacheApi } from "./auth/store";
 import type {
 	AuthAccountPolicies,
 	AuthApiKeyOptions,
@@ -75,6 +75,7 @@ interface AuthStorageModules {
 	limits: RateLimits;
 	resets: ResetCredits;
 	blocks: CredentialBlocks;
+	cache: CacheApi;
 }
 
 /**
@@ -135,6 +136,10 @@ export class AuthStorage {
 	/** Persisted rate-limit blocks (auth-broker server seam). */
 	get blocks(): BlocksApi {
 		return this.#modules.blocks;
+	}
+	/** Credential cache rows shared with broker clients (auth-broker server seam). */
+	get cache(): CacheApi {
+		return this.#modules.cache;
 	}
 
 	/**
@@ -263,6 +268,16 @@ export class AuthStorage {
 			limits,
 			resets: new ResetCredits({ store, pool, oauth, usage, usageCache, blocks }),
 			blocks,
+			cache: {
+				list: (prefix, limit) => store.listCacheRows?.(prefix, limit),
+				count: prefix => store.countCacheRows?.(prefix),
+				get: key => store.getCache(key),
+				set: (key, value, expiresAtSec) => store.setCache(key, value, expiresAtSec),
+				delete: key => (store.deleteCache ? store.deleteCache(key) : store.setCache(key, "", 0)),
+				deletePrefix: prefix => store.deleteCachePrefix?.(prefix),
+				cleanExpired: () => store.cleanExpiredCache(),
+				cleanExpiredPrefix: prefix => store.deleteExpiredCacheRows?.(prefix),
+			},
 		};
 	}
 

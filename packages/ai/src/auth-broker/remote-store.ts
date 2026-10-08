@@ -3,9 +3,17 @@
  * snapshot. Refresh tokens never leave the broker; mutating methods (`replace*`,
  * `upsert*`, `delete*ForProvider`) throw because login flows are server-side.
  *
- * Cache (`getCache`/`setCache`/`cleanExpiredCache`) is in-memory and ephemeral.
- * The bounded hot set preserves recently used session pins without keeping
- * every gateway client's 30-day sticky row resident.
+ * Cache (`getCache`/`setCache`/`cleanExpiredCache`) is in-memory. The bounded
+ * hot set preserves recently used session pins without keeping every gateway
+ * client's 30-day sticky row resident. Rows under the shared prefixes (drain
+ * state, session drain overrides) are written through to the broker's
+ * `/v1/cache` and re-seeded from it, so every client of one broker sees them;
+ * every other row (usage reports, session pins and stickies) stays
+ * process-local and ephemeral. A shared row the broker has not yet
+ * acknowledged is exempt from eviction until it is delivered, removed, or
+ * expires; evicting any other shared row (one the broker holds, or one it
+ * refused) loses only the local copy, and the next seed restores what the
+ * broker holds.
  */
 import * as os from "node:os";
 import { getAppName, getInstallId, logger, postmortem } from "@oh-my-pi/pi-utils";
@@ -28,9 +36,18 @@ import type { ClientUsageIdentity, ObservedUsageEntry, UsageReport } from "../us
 import { raceSignal } from "../auth/abort";
 import { type AuthBrokerClient, AuthBrokerError, AuthBrokerStreamUnsupportedError } from "./client";
 import { compareCredentialBlockSnapshots } from "./protocol";
+import {
+	isSharedCacheKey,
+	isSharedCacheValue,
+	SHARED_CACHE_MAX_ROWS_PER_PREFIX,
+	SHARED_CACHE_MAX_TTL_SEC,
+	SHARED_CACHE_PREFIXES,
+	sharedCachePrefixOf,
+} from "./shared-cache";
 import type {
 	CredentialBlockSnapshot,
 	RefresherSchedule,
+	SharedCacheRow,
 	SnapshotEntry,
 	SnapshotResponse,
 	SnapshotStreamEvent,
@@ -116,6 +133,22 @@ const BACKGROUND_BACKOFF_MAX_MS = 30_000;
 const BACKGROUND_IDLE_MS = 20_000;
 /** Longest a process exit waits for the final observed-usage report to reach the broker. */
 const OBSERVED_USAGE_EXIT_FLUSH_MS = 2_000;
+/** Least interval between shared cache seeds that cache reads and snapshot refreshes trigger. */
+const SHARED_CACHE_SEED_INTERVAL_MS = 15_000;
+/** Longest interval between triggered seeds after repeated seed failures, which double the interval. */
+const SHARED_CACHE_SEED_MAX_INTERVAL_MS = 10 * 60_000;
+/** Most queued shared cache writes; queuing past it drops the oldest write. */
+const SHARED_CACHE_QUEUE_MAX = 256;
+/** Attempts one shared cache write gets against transient broker failures. */
+const SHARED_CACHE_MAX_ATTEMPTS = 5;
+/** Age at which a queued shared cache write is dropped unsent. */
+const SHARED_CACHE_RETRY_DEADLINE_MS = 2 * 60_000;
+const SHARED_CACHE_BACKOFF_INITIAL_MS = 500;
+const SHARED_CACHE_BACKOFF_MAX_MS = 30_000;
+/** How long writes under a shared prefix the broker reported full (507) stay local before they are tried again. */
+const SHARED_CACHE_FULL_COOLDOWN_MS = 5 * 60_000;
+/** How long a broker feature that answered 404 or 501 stays off before it is probed again. */
+const FEATURE_REPROBE_MS = 10 * 60_000;
 
 function toCredentialBlockSnapshot(block: StoredCredentialBlock): CredentialBlockSnapshot {
 	return {
@@ -197,6 +230,32 @@ function emptySnapshot(): SnapshotResponse {
 interface CacheEntry {
 	value: string;
 	expiresAtSec: number;
+}
+
+/** One shared cache mutation queued for the broker. */
+type SharedCacheWrite = (
+	| { op: "put"; key: string; value: string; expiresAtSec: number }
+	| { op: "delete-prefix"; prefix: string }
+) & {
+	attempts: number;
+	firstQueuedAtMs: number;
+};
+
+function sharedCacheWriteId(write: SharedCacheWrite): string {
+	return write.op === "put" ? `put:${write.key}` : `prefix:${write.prefix}`;
+}
+
+/**
+ * Whether a broker failure is worth retrying: no HTTP status (connection,
+ * timeout), 408, 429, or a 5xx other than 501 (not implemented) and 507 (a
+ * full shared prefix, which a retry cannot fix).
+ */
+function isTransientBrokerFailure(error: unknown): boolean {
+	if (!(error instanceof AuthBrokerError)) return true;
+	const { status } = error;
+	return (
+		status === undefined || status === 408 || status === 429 || (status >= 500 && status !== 501 && status !== 507)
+	);
 }
 
 interface UsageCacheEntry {
@@ -300,6 +359,19 @@ export interface RemoteAuthCredentialStoreOptions {
 	 * the next use. Default 20s.
 	 */
 	backgroundIdleMs?: number;
+	/**
+	 * Shared cache write retry timing. Internal-only — tests shorten it.
+	 * Defaults: 500ms initial backoff, 30s backoff cap, 2-minute per-write deadline.
+	 */
+	sharedCacheRetry?: { initialBackoffMs?: number; maxBackoffMs?: number; deadlineMs?: number };
+	/**
+	 * How long a broker feature (the shared cache) that answered 404 or 501
+	 * stays off before it is probed again. Internal-only —
+	 * tests shorten it. Default 10 minutes.
+	 */
+	featureReprobeMs?: number;
+	/** Least interval between triggered shared cache seeds. Internal-only — tests shorten it. Default 15s. */
+	sharedCacheSeedIntervalMs?: number;
 }
 
 export class RemoteAuthCredentialStore implements AuthCredentialStore {
@@ -371,17 +443,49 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#observedUsageFlush: Promise<void> = Promise.resolve();
 	/** Cancels the exit flush registered with the first buffered usage. */
 	#cancelObservedUsageExitFlush: (() => void) | undefined;
+	/** Until this time shared rows stay local: set when the broker answered 404 or 501 on `/v1/cache`. */
+	#sharedCacheDisabledUntilMs = 0;
+	/** Shared prefixes the broker reported full (507), until the time their writes are tried again. */
+	#sharedCacheFullUntil = new Map<string, number>();
+	readonly #featureReprobeMs: number;
+	readonly #sharedCacheSeedIntervalMs: number;
+	/** Consecutive failed seeds; each doubles the interval before the next triggered seed. */
+	#sharedCacheSeedFailures = 0;
+	#sharedCacheSeed: Promise<void> | undefined;
+	/** Start of the last shared cache seed; throttles seeds triggered by reads. */
+	#sharedCacheSeededAtMs = Number.NEGATIVE_INFINITY;
+	/** Counter stamped on every local shared cache mutation, so a seed never reverts one made after it started. */
+	#sharedCacheWriteSeq = 0;
+	/** Last {@link #sharedCacheWriteSeq} of each local mutation, by {@link sharedCacheWriteId}; pruned by each seed. */
+	#sharedCacheLocalWrites = new Map<string, number>();
+	/** Writes not yet acknowledged, in send order, by {@link sharedCacheWriteId}. */
+	#sharedCacheQueue = new Map<string, SharedCacheWrite>();
+	/** Keys whose write was dropped unsent; the next seed rewrites them if the broker lacks them. */
+	#sharedCacheUnsynced = new Set<string>();
+	#sharedCacheTimer: Timer | undefined;
+	#sharedCacheFlushing = false;
+	/** Consecutive transient failures; drives the queue's backoff. */
+	#sharedCacheFailures = 0;
+	readonly #sharedCacheBackoffMs: number;
+	readonly #sharedCacheMaxBackoffMs: number;
+	readonly #sharedCacheDeadlineMs: number;
 
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
 		this.#observedUsageFlushMs = opts.observedUsageFlushMs ?? 10_000;
 		this.#backgroundIdleMs = opts.backgroundIdleMs ?? BACKGROUND_IDLE_MS;
+		this.#sharedCacheBackoffMs = opts.sharedCacheRetry?.initialBackoffMs ?? SHARED_CACHE_BACKOFF_INITIAL_MS;
+		this.#sharedCacheMaxBackoffMs = opts.sharedCacheRetry?.maxBackoffMs ?? SHARED_CACHE_BACKOFF_MAX_MS;
+		this.#featureReprobeMs = opts.featureReprobeMs ?? FEATURE_REPROBE_MS;
+		this.#sharedCacheSeedIntervalMs = opts.sharedCacheSeedIntervalMs ?? SHARED_CACHE_SEED_INTERVAL_MS;
+		this.#sharedCacheDeadlineMs = opts.sharedCacheRetry?.deadlineMs ?? SHARED_CACHE_RETRY_DEADLINE_MS;
 		this.#accountPool = opts.accountPool ? resolveAccountPool(opts.accountPool) : undefined;
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0);
 		this.#acknowledgedRevision = this.#credentialRevision;
 		this.#onSnapshot = opts.onSnapshot;
 		void this.#runBackground();
+		this.#maybeSeedSharedCache(true);
 	}
 
 	get client(): AuthBrokerClient {
@@ -636,6 +740,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				// relative to this new baseline below.
 				const { kind: _kind, ...snapshot } = event;
 				this.#applySnapshot(snapshot, snapshot.generation);
+				this.#maybeSeedSharedCache(false);
 				return;
 			}
 			case "entry": {
@@ -706,6 +811,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	/** Re-hydrate the in-memory snapshot from the broker. */
 	async refreshSnapshot(): Promise<SnapshotResponse> {
 		this.#noteActivity();
+		this.#maybeSeedSharedCache(false);
 		const result = await this.#client.fetchSnapshot();
 		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
 		return this.#snapshot;
@@ -1219,6 +1325,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	getCache(key: string): string | null {
 		this.#noteActivity();
+		if (sharedCachePrefixOf(key) !== undefined) this.#maybeSeedSharedCache(false);
 		const entry = this.#cache.get(key);
 		if (!entry) return null;
 		if (entry.expiresAtSec * 1000 <= Date.now()) {
@@ -1232,19 +1339,68 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	setCache(key: string, value: string, expiresAtSec: number): void {
 		this.#noteActivity();
-		this.#deleteCache(key);
-		const size = key.length + value.length;
-		if (size > REMOTE_CACHE_MAX_CHARACTERS) return;
-		this.#cache.set(key, { value, expiresAtSec });
-		this.#cacheCharacters += size;
-		while (this.#cache.size > REMOTE_CACHE_MAX_ENTRIES || this.#cacheCharacters > REMOTE_CACHE_MAX_CHARACTERS) {
-			const oldest = this.#cache.keys().next().value;
-			if (oldest === undefined) break;
-			this.#deleteCache(oldest);
+		const shareable = sharedCachePrefixOf(key) !== undefined && isSharedCacheKey(key) && isSharedCacheValue(value);
+		if (!this.#insertCache(key, value, expiresAtSec, shareable)) return;
+		if (sharedCachePrefixOf(key) === undefined) return;
+		if (!shareable) {
+			logger.debug("auth-broker shared cache row exceeds broker limits; kept local", {
+				prefix: sharedCachePrefixOf(key),
+			});
+			return;
 		}
+		if (this.#sharedCacheDisabled()) {
+			// Sent by the first seed after the broker answers again.
+			this.#sharedCacheUnsynced.add(key);
+			return;
+		}
+		this.#sharedCacheUnsynced.delete(key);
+		this.#queueSharedCacheWrite({ op: "put", key, value, expiresAtSec, attempts: 0, firstQueuedAtMs: Date.now() });
 	}
 
+	#sharedCacheDisabled(): boolean {
+		return Date.now() < this.#sharedCacheDisabledUntilMs;
+	}
+
+	/** Drop this process's copy of `key` without a broker write; the next seed may bring the broker's row back. */
+	forgetCache(key: string): void {
+		this.#deleteCache(key);
+	}
+
+	/**
+	 * Store `key` as the newest row of the hot set, then evict the oldest rows
+	 * until both bounds hold. Returns false, keeping no copy, when the row alone
+	 * exceeds {@link REMOTE_CACHE_MAX_CHARACTERS}. Shared rows the broker has
+	 * not acknowledged (queued puts and `#sharedCacheUnsynced` keys) are skipped
+	 * by eviction: a dropped or refused write falls back to the local row for
+	 * redelivery, so its value must stay here. They stay bounded by the write
+	 * queue and this process's own shared writes and their TTL, and may hold the
+	 * hot set over its bounds until delivered, removed, or expired. `retain`
+	 * exempts the inserted row itself, for a shared write about to be queued.
+	 */
+	#insertCache(key: string, value: string, expiresAtSec: number, retain = false): boolean {
+		this.#deleteCache(key);
+		const size = key.length + value.length;
+		if (size > REMOTE_CACHE_MAX_CHARACTERS) return false;
+		this.#cache.set(key, { value, expiresAtSec });
+		this.#cacheCharacters += size;
+		for (const candidate of this.#cache.keys()) {
+			if (this.#cache.size <= REMOTE_CACHE_MAX_ENTRIES && this.#cacheCharacters <= REMOTE_CACHE_MAX_CHARACTERS)
+				break;
+			if (retain && candidate === key) continue;
+			if (this.#sharedCacheUnsynced.has(candidate) || this.#sharedCacheQueue.has(`put:${candidate}`)) continue;
+			this.#deleteCache(candidate);
+		}
+		return true;
+	}
+
+	/** Leave a dropped put's key for the next seed to resend, unless its local row was removed meanwhile. */
+	#markSharedCacheUnsynced(key: string): void {
+		if (this.#cache.has(key)) this.#sharedCacheUnsynced.add(key);
+	}
+
+	/** Remove `key` from the hot set; a removed row no longer needs delivery to the broker. */
 	#deleteCache(key: string): void {
+		this.#sharedCacheUnsynced.delete(key);
 		const entry = this.#cache.get(key);
 		if (!entry) return;
 		this.#cacheCharacters -= key.length + entry.value.length;
@@ -1256,6 +1412,281 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		for (const key of this.#cache.keys()) {
 			if (key.startsWith(prefix)) this.#deleteCache(key);
 		}
+		for (const key of this.#sharedCacheUnsynced) {
+			if (key.startsWith(prefix)) this.#sharedCacheUnsynced.delete(key);
+		}
+		// Mirror to the broker only within the shared prefixes: a narrower prefix as is, a broader one as each shared prefix it covers.
+		const sharedRoot = sharedCachePrefixOf(prefix);
+		const mirrored =
+			sharedRoot !== undefined ? [prefix] : SHARED_CACHE_PREFIXES.filter(root => root.startsWith(prefix));
+		for (const target of mirrored) {
+			if (!isSharedCacheKey(target)) continue;
+			this.#queueSharedCacheWrite({ op: "delete-prefix", prefix: target, attempts: 0, firstQueuedAtMs: Date.now() });
+		}
+	}
+
+	/**
+	 * Re-seed the shared cache rows from the broker now, after any seed already
+	 * running. Rows other clients wrote become visible to {@link getCache};
+	 * rows they deleted disappear unless this process changed them since the
+	 * seed started. Resolves without throwing; failures leave the local copy.
+	 */
+	async syncSharedCache(): Promise<void> {
+		await this.#sharedCacheSeed;
+		this.#maybeSeedSharedCache(true);
+		await this.#sharedCacheSeed;
+	}
+
+	#maybeSeedSharedCache(force: boolean): void {
+		if (this.#closed || this.#sharedCacheDisabled() || this.#sharedCacheSeed) return;
+		const nowMs = Date.now();
+		const intervalMs = Math.min(
+			SHARED_CACHE_SEED_MAX_INTERVAL_MS,
+			this.#sharedCacheSeedIntervalMs * 2 ** this.#sharedCacheSeedFailures,
+		);
+		if (!force && nowMs - this.#sharedCacheSeededAtMs < intervalMs) return;
+		this.#sharedCacheSeededAtMs = nowMs;
+		const seed = this.#seedSharedCache().finally(() => {
+			if (this.#sharedCacheSeed === seed) this.#sharedCacheSeed = undefined;
+		});
+		this.#sharedCacheSeed = seed;
+	}
+
+	async #seedSharedCache(): Promise<void> {
+		const startSeq = this.#sharedCacheWriteSeq;
+		const signal = this.#backgroundAbort.signal;
+		const responses: Array<{ root: string; rows: SharedCacheRow[]; truncated: boolean }> = [];
+		try {
+			for (const root of SHARED_CACHE_PREFIXES) {
+				const response = await this.#client.listSharedCache(root, signal);
+				responses.push({ root, rows: response.rows, truncated: response.truncated });
+			}
+		} catch (error) {
+			if (this.#closed) return;
+			this.#sharedCacheSeedFailures = Math.min(this.#sharedCacheSeedFailures + 1, 16);
+			this.#noteSharedCacheFailure(error, "seed");
+			return;
+		}
+		this.#sharedCacheSeedFailures = 0;
+		if (this.#closed || this.#sharedCacheDisabled()) return;
+		for (const { root, rows, truncated } of responses) this.#applySharedCacheRows(root, rows, truncated, startSeq);
+		for (const [id, seq] of this.#sharedCacheLocalWrites) {
+			if (seq <= startSeq) this.#sharedCacheLocalWrites.delete(id);
+		}
+	}
+
+	/**
+	 * Replace the local rows under `root` with the broker's, except rows this
+	 * process changed after the seed started or has not yet delivered. A local
+	 * row the broker lacks was deleted or expired there, and is dropped; when
+	 * the response was truncated, absence proves nothing and local rows stay.
+	 */
+	#applySharedCacheRows(
+		root: string,
+		rows: readonly SharedCacheRow[],
+		reportedTruncated: boolean,
+		startSeq: number,
+	): void {
+		// Absence proves nothing in a response past the broker's row cap, or for a full prefix whose rows stay local.
+		const truncated =
+			reportedTruncated ||
+			rows.length > SHARED_CACHE_MAX_ROWS_PER_PREFIX ||
+			(this.#sharedCacheFullUntil.get(root) ?? 0) > Date.now();
+		const nowSec = Math.floor(Date.now() / 1000);
+		const remote = new Map<string, SharedCacheRow>();
+		for (const row of rows.slice(0, SHARED_CACHE_MAX_ROWS_PER_PREFIX)) {
+			if (
+				!row.key.startsWith(root) ||
+				!isSharedCacheKey(row.key) ||
+				!isSharedCacheValue(row.value) ||
+				!Number.isFinite(row.expiresAtSec) ||
+				row.expiresAtSec <= nowSec
+			) {
+				continue;
+			}
+			remote.set(row.key, { ...row, expiresAtSec: Math.min(row.expiresAtSec, nowSec + SHARED_CACHE_MAX_TTL_SEC) });
+		}
+		for (const key of this.#cache.keys()) {
+			if (!key.startsWith(root) || remote.has(key) || this.#sharedCacheChangedLocally(key, startSeq)) continue;
+			if (this.#sharedCacheUnsynced.has(key)) {
+				// Past the queue's free room the key waits for a later seed instead of evicting queued writes.
+				if (this.#sharedCacheQueue.size >= SHARED_CACHE_QUEUE_MAX) continue;
+				const entry = this.#cache.get(key)!;
+				this.#sharedCacheUnsynced.delete(key);
+				if (entry.expiresAtSec * 1000 > Date.now()) {
+					this.#queueSharedCacheWrite({
+						op: "put",
+						key,
+						value: entry.value,
+						expiresAtSec: entry.expiresAtSec,
+						attempts: 0,
+						firstQueuedAtMs: Date.now(),
+					});
+				}
+				continue;
+			}
+			if (!truncated) this.#deleteCache(key);
+		}
+		for (const [key, row] of remote) {
+			if (this.#sharedCacheChangedLocally(key, startSeq)) continue;
+			this.#sharedCacheUnsynced.delete(key);
+			const local = this.#cache.get(key);
+			// An unchanged row keeps its place, so each seed does not promote every shared row over hot session pins.
+			if (local?.value === row.value && local.expiresAtSec === row.expiresAtSec) continue;
+			this.#insertCache(key, row.value, row.expiresAtSec);
+		}
+	}
+
+	/** Whether `key` has a local mutation newer than `startSeq` or still queued for the broker. */
+	#sharedCacheChangedLocally(key: string, startSeq: number): boolean {
+		if (this.#sharedCacheQueue.has(`put:${key}`)) return true;
+		if ((this.#sharedCacheLocalWrites.get(`put:${key}`) ?? 0) > startSeq) return true;
+		for (const [id, seq] of this.#sharedCacheLocalWrites) {
+			if (id.startsWith("prefix:") && seq > startSeq && key.startsWith(id.slice("prefix:".length))) return true;
+		}
+		for (const write of this.#sharedCacheQueue.values()) {
+			if (write.op === "delete-prefix" && key.startsWith(write.prefix)) return true;
+		}
+		return false;
+	}
+
+	#queueSharedCacheWrite(write: SharedCacheWrite): void {
+		if (this.#closed || this.#sharedCacheDisabled()) return;
+		if (write.op === "put") {
+			const root = sharedCachePrefixOf(write.key);
+			const fullUntil = root === undefined ? undefined : this.#sharedCacheFullUntil.get(root);
+			if (root !== undefined && fullUntil !== undefined) {
+				// A full prefix keeps new writes local; they are neither queued nor resent by seeds.
+				if (Date.now() < fullUntil) return;
+				this.#sharedCacheFullUntil.delete(root);
+			}
+		}
+		const id = sharedCacheWriteId(write);
+		this.#sharedCacheWriteSeq += 1;
+		this.#sharedCacheLocalWrites.set(id, this.#sharedCacheWriteSeq);
+		// Re-inserted at the tail: the newest write of a key is sent after every older write.
+		this.#sharedCacheQueue.delete(id);
+		this.#sharedCacheQueue.set(id, write);
+		while (this.#sharedCacheQueue.size > SHARED_CACHE_QUEUE_MAX) {
+			const [oldestId, oldest] = this.#sharedCacheQueue.entries().next().value!;
+			this.#sharedCacheQueue.delete(oldestId);
+			this.#dropSharedCacheWrite(oldest, "queue full");
+		}
+		this.#scheduleSharedCacheFlush(0);
+	}
+
+	#dropSharedCacheWrite(write: SharedCacheWrite, reason: string): void {
+		if (write.op === "put") this.#markSharedCacheUnsynced(write.key);
+		logger.debug("auth-broker shared cache write dropped", {
+			op: write.op,
+			prefix: sharedCachePrefixOf(write.op === "put" ? write.key : write.prefix),
+			attempts: write.attempts,
+			reason,
+		});
+	}
+
+	#scheduleSharedCacheFlush(delayMs: number): void {
+		if (this.#closed || this.#sharedCacheFlushing) return;
+		if (this.#sharedCacheTimer !== undefined) {
+			// A pending backoff stands: new writes wait for it instead of hammering a failing broker.
+			if (this.#sharedCacheFailures > 0) return;
+			clearTimeout(this.#sharedCacheTimer);
+		}
+		this.#sharedCacheTimer = setTimeout(() => {
+			this.#sharedCacheTimer = undefined;
+			void this.#flushSharedCache();
+		}, delayMs);
+		this.#sharedCacheTimer.unref?.();
+	}
+
+	/**
+	 * Send queued shared cache writes in queue order, one at a time. A
+	 * transient failure stops the pass and backs the whole queue off; a write
+	 * past {@link SHARED_CACHE_MAX_ATTEMPTS} attempts or its deadline is dropped
+	 * and its key left for the next seed to reconcile. A rejection drops the
+	 * write; 404 or 501 disables sharing for the life of the store.
+	 */
+	async #flushSharedCache(): Promise<void> {
+		if (this.#sharedCacheFlushing) return;
+		this.#sharedCacheFlushing = true;
+		let retryInMs: number | undefined;
+		try {
+			const signal = this.#backgroundAbort.signal;
+			while (!this.#closed && !this.#sharedCacheDisabled()) {
+				const nowMs = Date.now();
+				for (const [id, write] of this.#sharedCacheQueue) {
+					if (nowMs - write.firstQueuedAtMs < this.#sharedCacheDeadlineMs) continue;
+					this.#sharedCacheQueue.delete(id);
+					this.#dropSharedCacheWrite(write, "deadline");
+				}
+				const head = this.#sharedCacheQueue.entries().next().value;
+				if (!head) break;
+				const [id, write] = head;
+				try {
+					if (write.op === "put") {
+						await this.#client.putSharedCache(
+							write.key,
+							{ value: write.value, expiresAtSec: write.expiresAtSec },
+							signal,
+						);
+					} else {
+						await this.#client.deleteSharedCachePrefix(write.prefix, signal);
+					}
+					this.#sharedCacheFailures = 0;
+					if (this.#sharedCacheQueue.get(id) === write) this.#sharedCacheQueue.delete(id);
+					// Stamped at the acknowledgement too: a seed whose listing predates this write must not drop it.
+					this.#sharedCacheWriteSeq += 1;
+					this.#sharedCacheLocalWrites.set(id, this.#sharedCacheWriteSeq);
+				} catch (error) {
+					if (this.#closed) return;
+					if (!isTransientBrokerFailure(error)) {
+						if (this.#sharedCacheQueue.get(id) === write) this.#sharedCacheQueue.delete(id);
+						this.#noteSharedCacheFailure(error, write.op, write);
+						continue;
+					}
+					write.attempts += 1;
+					this.#sharedCacheFailures += 1;
+					if (write.attempts >= SHARED_CACHE_MAX_ATTEMPTS && this.#sharedCacheQueue.get(id) === write) {
+						this.#sharedCacheQueue.delete(id);
+						this.#dropSharedCacheWrite(write, "attempts exhausted");
+					}
+					retryInMs = Math.min(
+						this.#sharedCacheMaxBackoffMs,
+						this.#sharedCacheBackoffMs * 2 ** (this.#sharedCacheFailures - 1),
+					);
+					break;
+				}
+			}
+		} finally {
+			this.#sharedCacheFlushing = false;
+		}
+		if (this.#sharedCacheQueue.size > 0) this.#scheduleSharedCacheFlush(retryInMs ?? 0);
+	}
+
+	/**
+	 * Log a failed shared cache request. 404 or 501 turns sharing off for
+	 * {@link FEATURE_REPROBE_MS}, keeping queued rows for the seed that follows;
+	 * 507 keeps that prefix's writes local for {@link SHARED_CACHE_FULL_COOLDOWN_MS}.
+	 */
+	#noteSharedCacheFailure(error: unknown, op: string, write?: SharedCacheWrite): void {
+		const status = error instanceof AuthBrokerError ? error.status : undefined;
+		if (status === 404 || status === 501) {
+			this.#sharedCacheDisabledUntilMs = Date.now() + this.#featureReprobeMs;
+			for (const queued of this.#sharedCacheQueue.values()) {
+				if (queued.op === "put") this.#markSharedCacheUnsynced(queued.key);
+			}
+			this.#sharedCacheQueue.clear();
+			this.#sharedCacheLocalWrites.clear();
+			logger.debug("auth-broker does not share cache rows; drain state stays local until re-probed", { status });
+			return;
+		}
+		if (status === 507 && write?.op === "put") {
+			const root = sharedCachePrefixOf(write.key);
+			if (root !== undefined) this.#sharedCacheFullUntil.set(root, Date.now() + SHARED_CACHE_FULL_COOLDOWN_MS);
+			logger.warn("auth-broker shared cache prefix is full; its rows stay local for a while", { prefix: root });
+			return;
+		}
+		logger.debug("auth-broker shared cache request failed", { op, status, error: String(error) });
 	}
 
 	cleanExpiredCache(): void {
@@ -1638,6 +2069,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// Final flush. The exit registration outlives close() until it settles, so a
 		// process exiting right after close() still sends it; failures are dropped.
 		void this.#flushObservedUsage().finally(() => this.#cancelObservedUsageExitFlush?.());
+		if (this.#sharedCacheTimer !== undefined) {
+			clearTimeout(this.#sharedCacheTimer);
+			this.#sharedCacheTimer = undefined;
+		}
+		// Unsent shared cache writes are abandoned; the in-flight one is aborted with the background signal.
+		this.#sharedCacheQueue.clear();
+		this.#sharedCacheUnsynced.clear();
+		this.#sharedCacheLocalWrites.clear();
 		this.#cache.clear();
 		this.#cacheCharacters = 0;
 		this.#usageOverlays.clear();

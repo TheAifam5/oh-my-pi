@@ -114,6 +114,36 @@ export interface UsageStaleResponse {
 	ok: boolean;
 }
 
+/** One live shared cache row. */
+export interface SharedCacheRow {
+	key: string;
+	value: string;
+	/** Expiry in epoch seconds. */
+	expiresAtSec: number;
+}
+
+/** GET /v1/cache?prefix= response body. */
+export interface SharedCacheListResponse {
+	generatedAt: number;
+	rows: SharedCacheRow[];
+	/** True when more live rows exist under the prefix than the response carries. */
+	truncated: boolean;
+}
+
+/**
+ * PUT /v1/cache/:key request body. An `expiresAtSec` at or before the
+ * broker's clock, or an empty `value`, deletes the row.
+ */
+export interface SharedCachePutRequest {
+	value: string;
+	expiresAtSec: number;
+}
+
+/** PUT /v1/cache/:key or DELETE /v1/cache?prefix= response body. */
+export interface SharedCacheWriteResponse {
+	ok: boolean;
+}
+
 /**
  * POST /v1/credential request body. The OAuth `refresh` must be the *real*
  * refresh token (not the sentinel) — the broker is the canonical writer.
@@ -173,6 +203,12 @@ export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
 
 /** Client understands independent Codex `chat` and `spark` credential-block scopes. */
 export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
+
+/**
+ * Client speaks the shared cache routes (`/v1/cache`). Advisory: brokers
+ * without the routes answer 404, which clients treat as local-only caching.
+ */
+export const AUTH_BROKER_CAPABILITY_SHARED_CACHE = "shared-cache";
 
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";

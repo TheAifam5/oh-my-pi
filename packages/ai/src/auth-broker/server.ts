@@ -27,6 +27,8 @@ import type {
 	DisabledCredentialsResponse,
 	HealthzResponse,
 	RefresherSchedule,
+	SharedCacheListResponse,
+	SharedCacheWriteResponse,
 	SnapshotEntry,
 	SnapshotResponse,
 	SnapshotStreamEntryEvent,
@@ -44,11 +46,20 @@ import {
 } from "./types";
 import { compareCredentialBlockSnapshots, parseGenerationTag } from "./protocol";
 import {
+	isSharedCacheKey,
+	isSharedCacheValue,
+	SHARED_CACHE_MAX_BODY_BYTES,
+	SHARED_CACHE_MAX_ROWS_PER_PREFIX,
+	SHARED_CACHE_MAX_TTL_SEC,
+	sharedCachePrefixOf,
+} from "./shared-cache";
+import {
 	clientUsageReportRequestSchema,
 	credentialBlockDeleteRequestSchema,
 	credentialBlockRequestSchema,
 	credentialDisableRequestSchema,
 	credentialUploadRequestSchema,
+	sharedCachePutRequestSchema,
 } from "./wire-schemas";
 
 const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
@@ -124,6 +135,34 @@ function supportsCodexMeterBlockScopes(req: Request): boolean {
 }
 
 /**
+ * The request body as text, read in chunks and abandoned once it passes
+ * `maxBytes` (undefined then), so a body without Content-Length is never
+ * buffered past the limit.
+ */
+async function readBoundedText(req: Request, maxBytes: number): Promise<string | undefined> {
+	if (!req.body) return "";
+	const reader = req.body.getReader();
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	let text = "";
+	let bytes = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > maxBytes) {
+				await reader.cancel().catch(() => {});
+				return undefined;
+			}
+			text += decoder.decode(value, { stream: true });
+		}
+		return text + decoder.decode();
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+/**
  * Parse + validate a JSON request body against an ArkType schema. Returns a
  * `Response` (400) on parse/validation failure so handlers can early-return.
  * When `allowEmpty` is set, an empty request body is validated against `{}`.
@@ -131,11 +170,17 @@ function supportsCodexMeterBlockScopes(req: Request): boolean {
 async function parseBody<t>(
 	req: Request,
 	schema: Type<t>,
-	options: { allowEmpty?: boolean } = {},
+	options: { allowEmpty?: boolean; maxBytes?: number } = {},
 ): Promise<{ ok: true; data: typeof schema.infer } | { ok: false; response: Response }> {
+	const { maxBytes } = options;
+	if (maxBytes !== undefined && Number(req.headers.get("content-length") ?? 0) > maxBytes) {
+		return { ok: false, response: json(413, { error: "Request body too large" }) };
+	}
 	let raw: string;
 	try {
-		raw = await req.text();
+		const bounded = maxBytes === undefined ? await req.text() : await readBoundedText(req, maxBytes);
+		if (bounded === undefined) return { ok: false, response: json(413, { error: "Request body too large" }) };
+		raw = bounded;
 	} catch (error) {
 		return { ok: false, response: json(400, { error: `Invalid request body: ${String(error)}` }) };
 	}
@@ -177,6 +222,11 @@ function loggablePath(pathname: string): string {
 	const dynamic = [REFRESH_ROUTE, DISABLE_ROUTE, BLOCK_ROUTE, BLOCKS_ROUTE].some(route => route.test(pathname));
 	return dynamic ? pathname : "<unrouted>";
 }
+
+const SHARED_CACHE_ROUTE = "/v1/cache";
+/** Interval between sweeps of expired cache rows on the broker's store. */
+const CACHE_CLEANUP_INTERVAL_MS = 10 * 60_000;
+const SHARED_CACHE_KEY_ROUTE = /^\/v1\/cache\/(.+)$/;
 
 const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
@@ -805,6 +855,98 @@ function serveSnapshotStream(
 	});
 }
 
+/**
+ * A shared cache key or prefix from the request, or the rejection: 400 when
+ * missing or malformed, 403 when it is outside every shared prefix.
+ */
+function sharedCacheTarget(raw: string | null): { ok: true; value: string } | { ok: false; response: Response } {
+	if (raw === null || raw.length === 0) {
+		return { ok: false, response: json(400, { error: "Shared cache key or prefix required" }) };
+	}
+	if (sharedCachePrefixOf(raw) === undefined) {
+		return { ok: false, response: json(403, { error: "Not a shared cache key" }) };
+	}
+	if (!isSharedCacheKey(raw)) {
+		return { ok: false, response: json(400, { error: "Malformed shared cache key" }) };
+	}
+	return { ok: true, value: raw };
+}
+
+const NO_SHARED_CACHE = (): Response => json(501, { error: "broker store does not share cache rows" });
+
+/**
+ * Serve the shared cache routes: `GET /v1/cache?prefix=`, `DELETE
+ * /v1/cache?prefix=`, and `PUT /v1/cache/:key`. Only keys under
+ * the shared prefixes are reachable; every other cache row is
+ * refused with 403. Returns undefined for any other request.
+ */
+async function serveSharedCache(
+	req: Request,
+	url: URL,
+	storage: AuthStorage,
+	peer: string,
+): Promise<Response | undefined> {
+	const { pathname } = url;
+	if (pathname === SHARED_CACHE_ROUTE && (req.method === "GET" || req.method === "DELETE")) {
+		const target = sharedCacheTarget(url.searchParams.get("prefix"));
+		if (!target.ok) return target.response;
+		const prefix = target.value;
+		if (req.method === "DELETE") {
+			if (storage.cache.count(prefix) === undefined) return NO_SHARED_CACHE();
+			storage.cache.deletePrefix(prefix);
+			logger.debug("auth-broker shared cache prefix deleted", { peer, prefix: sharedCachePrefixOf(prefix) });
+			const response: SharedCacheWriteResponse = { ok: true };
+			return json(200, response);
+		}
+		const listed = storage.cache.list(prefix, SHARED_CACHE_MAX_ROWS_PER_PREFIX + 1);
+		if (listed === undefined) return NO_SHARED_CACHE();
+		// Rows written to the store directly (not through PUT) are held to the same bounds, so a listing fits clients' read limit.
+		const rows = listed.filter(row => isSharedCacheKey(row.key) && isSharedCacheValue(row.value));
+		const body: SharedCacheListResponse = {
+			generatedAt: Date.now(),
+			rows: rows.slice(0, SHARED_CACHE_MAX_ROWS_PER_PREFIX),
+			truncated: listed.length > SHARED_CACHE_MAX_ROWS_PER_PREFIX,
+		};
+		return json(200, body, { "Cache-Control": "no-store" });
+	}
+	const keyMatch = req.method === "PUT" ? pathname.match(SHARED_CACHE_KEY_ROUTE) : null;
+	if (!keyMatch) return undefined;
+	let rawKey: string;
+	try {
+		rawKey = decodeURIComponent(keyMatch[1]);
+	} catch {
+		return json(400, { error: "Malformed shared cache key" });
+	}
+	const target = sharedCacheTarget(rawKey);
+	if (!target.ok) return target.response;
+	const key = target.value;
+	const parsed = await parseBody(req, sharedCachePutRequestSchema, { maxBytes: SHARED_CACHE_MAX_BODY_BYTES });
+	if (!parsed.ok) return parsed.response;
+	const { value, expiresAtSec } = parsed.data;
+	if (!Number.isFinite(expiresAtSec)) return json(400, { error: "expiresAtSec must be a finite number" });
+	if (!isSharedCacheValue(value)) return json(413, { error: "Shared cache value too large" });
+	const root = sharedCachePrefixOf(key)!;
+	const liveRows = storage.cache.count(root);
+	if (liveRows === undefined) return NO_SHARED_CACHE();
+	const nowSec = Math.floor(Date.now() / 1000);
+	if (value.length === 0 || expiresAtSec <= nowSec) {
+		// The clients' delete idiom; a real delete, so absent keys leave no expired rows behind.
+		storage.cache.delete(key);
+	} else {
+		if (storage.cache.get(key) === null) {
+			// The cap counts live rows; expired ones under the prefix go first so short-lived rows cannot pile up past it.
+			storage.cache.cleanExpiredPrefix(root);
+			if (liveRows >= SHARED_CACHE_MAX_ROWS_PER_PREFIX) {
+				logger.warn("auth-broker shared cache prefix full", { peer, prefix: root, rows: liveRows });
+				return json(507, { error: `Shared cache prefix ${root} holds ${liveRows} rows` });
+			}
+		}
+		storage.cache.set(key, value, Math.min(Math.floor(expiresAtSec), nowSec + SHARED_CACHE_MAX_TTL_SEC));
+	}
+	const response: SharedCacheWriteResponse = { ok: true };
+	return json(200, response);
+}
+
 /** Boot the broker. Caller owns lifecycle; `handle.close()` to stop. */
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
@@ -822,6 +964,17 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 			});
 	refresher?.start();
 	const snapshotSource = new SnapshotSource(opts.storage, refresher);
+	// Expired cache rows (shared or local) are otherwise pruned only when a usage cache is built.
+	const cleanCache = (): void => {
+		try {
+			opts.storage.cache.cleanExpired();
+		} catch (error) {
+			logger.debug("auth-broker expired cache cleanup failed", { error: String(error) });
+		}
+	};
+	cleanCache();
+	const cacheCleanupTimer = setInterval(cleanCache, CACHE_CLEANUP_INTERVAL_MS);
+	cacheCleanupTimer.unref?.();
 	const generationGate = new GenerationGate(opts.storage, externalChangePollMs);
 	const streamHub = new SnapshotStreamHub(opts.storage, snapshotSource);
 
@@ -923,6 +1076,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						return json(500, { error: message });
 					}
 				}
+				const sharedCache = await serveSharedCache(req, url, opts.storage, peer);
+				if (sharedCache) return sharedCache;
 				if (req.method === "GET" && pathname === "/v1/credentials/disabled") {
 					const provider = url.searchParams.get("provider") ?? undefined;
 					const disabled = await opts.storage.credentials.listDisabled(provider, req.signal);
@@ -1088,6 +1243,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 		hostname: boundHost,
 		close: async () => {
 			refresher?.stop();
+			clearInterval(cacheCleanupTimer);
 			generationGate.close();
 			streamHub.close();
 			server.stop(true);

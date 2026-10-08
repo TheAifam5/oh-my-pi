@@ -128,6 +128,9 @@ const schemaNames = [
 	"usageStaleResponseSchema",
 	"credentialUploadRequestSchema",
 	"credentialUploadResponseSchema",
+	"sharedCacheListResponseSchema",
+	"sharedCachePutRequestSchema",
+	"sharedCacheWriteResponseSchema",
 ] as const;
 
 type SchemaName = (typeof schemaNames)[number];
@@ -200,6 +203,13 @@ const validSamples: Record<SchemaName, unknown> = {
 	usageStaleResponseSchema: { ok: true },
 	credentialUploadRequestSchema: { provider: "anthropic", credential: REAL_OAUTH },
 	credentialUploadResponseSchema: { entries: [CREDENTIAL_ENTRY] },
+	sharedCacheListResponseSchema: {
+		generatedAt: 2_000,
+		rows: [{ key: "drain:state:anthropic:7::/reset", value: '{"since":1}', expiresAtSec: 9_000 }],
+		truncated: false,
+	},
+	sharedCachePutRequestSchema: { value: '{"since":1}', expiresAtSec: 9_000 },
+	sharedCacheWriteResponseSchema: { ok: true },
 };
 
 function run(schema: unknown, input: unknown): unknown {
@@ -218,7 +228,7 @@ function reject(schema: unknown, input: unknown): void {
 }
 
 describe("auth-broker public wire schemas", () => {
-	test("exports all 32 real callable ArkType values with canonical behavior", () => {
+	test("exports all 35 real callable ArkType values with canonical behavior", () => {
 		expect(Object.keys(wireSchemas).sort()).toEqual([...schemaNames].sort());
 		for (const name of schemaNames) {
 			const schema = wireSchemas[name];

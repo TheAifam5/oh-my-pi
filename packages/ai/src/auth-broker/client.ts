@@ -24,14 +24,22 @@ import type {
 	CredentialUploadResponse,
 	DisabledCredentialsResponse,
 	HealthzResponse,
+	SharedCacheListResponse,
+	SharedCachePutRequest,
+	SharedCacheWriteResponse,
 	SnapshotResponse,
 	SnapshotStreamEvent,
 	UsageHistoryResponse,
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
-import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES } from "./types";
+import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_SHARED_CACHE,
+} from "./types";
 import { parseGenerationTag } from "./protocol";
+import { SHARED_CACHE_MAX_LISTING_BYTES } from "./shared-cache";
 import {
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
@@ -42,6 +50,8 @@ import {
 	credentialUploadResponseSchema,
 	disabledCredentialsResponseSchema,
 	healthzResponseSchema,
+	sharedCacheListResponseSchema,
+	sharedCacheWriteResponseSchema,
 	snapshotResponseSchema,
 	snapshotStreamEventSchema,
 	usageHistoryResponseSchema,
@@ -60,6 +70,8 @@ const RESPONSE_SCHEMAS = {
 	credentialUploadResponseSchema,
 	disabledCredentialsResponseSchema,
 	healthzResponseSchema,
+	sharedCacheListResponseSchema,
+	sharedCacheWriteResponseSchema,
 	usageHistoryResponseSchema,
 	usageResponseSchema,
 	usageStaleResponseSchema,
@@ -115,6 +127,44 @@ export type FetchSnapshotResult =
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RETRIES = 1;
+/** Largest broker response body read by default, in bytes. */
+const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+/** Largest `GET /v1/cache` response read: the broker's worst-case listing with a quarter's margin. */
+const SHARED_CACHE_MAX_RESPONSE_BYTES = Math.ceil(SHARED_CACHE_MAX_LISTING_BYTES * 1.25);
+
+/**
+ * `response`'s body as text, read in chunks and abandoned once it passes
+ * `maxBytes`, so a hostile or broken broker cannot make the client buffer
+ * an unbounded body.
+ *
+ * @throws AuthBrokerError when the body exceeds `maxBytes`.
+ */
+async function readBoundedResponse(response: Response, maxBytes: number): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	let bytes = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > maxBytes) {
+				await reader.cancel().catch(() => {});
+				throw new AuthBrokerError(`Auth broker response exceeded ${maxBytes} bytes`, { status: response.status });
+			}
+			text += decoder.decode(value, { stream: true });
+		}
+		return text + decoder.decode();
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+const SHARED_CACHE_HEADERS: Record<string, string> = {
+	[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_SHARED_CACHE,
+};
 
 export class AuthBrokerClient {
 	readonly #baseUrl: string;
@@ -319,6 +369,37 @@ export class AuthBrokerClient {
 		});
 	}
 
+	/** Live shared cache rows under `prefix` (`GET /v1/cache`); 404 from brokers without shared cache. */
+	listSharedCache(prefix: string, signal?: AbortSignal): Promise<SharedCacheListResponse> {
+		const params = new URLSearchParams({ prefix });
+		return this.#request<SharedCacheListResponse>("GET", `/v1/cache?${params.toString()}`, {
+			schema: "sharedCacheListResponseSchema",
+			headers: SHARED_CACHE_HEADERS,
+			signal,
+			maxResponseBytes: SHARED_CACHE_MAX_RESPONSE_BYTES,
+		});
+	}
+
+	/** Write one shared cache row (`PUT /v1/cache/:key`); a past expiry or empty value deletes it. */
+	putSharedCache(key: string, body: SharedCachePutRequest, signal?: AbortSignal): Promise<SharedCacheWriteResponse> {
+		return this.#request<SharedCacheWriteResponse>("PUT", `/v1/cache/${encodeURIComponent(key)}`, {
+			body,
+			schema: "sharedCacheWriteResponseSchema",
+			headers: SHARED_CACHE_HEADERS,
+			signal,
+		});
+	}
+
+	/** Delete every shared cache row under `prefix` (`DELETE /v1/cache`). */
+	deleteSharedCachePrefix(prefix: string, signal?: AbortSignal): Promise<SharedCacheWriteResponse> {
+		const params = new URLSearchParams({ prefix });
+		return this.#request<SharedCacheWriteResponse>("DELETE", `/v1/cache?${params.toString()}`, {
+			schema: "sharedCacheWriteResponseSchema",
+			headers: SHARED_CACHE_HEADERS,
+			signal,
+		});
+	}
+
 	async refreshCredential(
 		id: number,
 		signal?: AbortSignal,
@@ -407,18 +488,21 @@ export class AuthBrokerClient {
 	}
 
 	async #request<t>(
-		method: "GET" | "POST" | "DELETE",
+		method: "GET" | "POST" | "PUT" | "DELETE",
 		path: string,
 		opts: {
 			schema: AuthBrokerResponseSchemaName;
 			auth?: boolean;
 			body?: unknown;
+			headers?: Record<string, string>;
 			signal?: AbortSignal;
 			timeoutMs?: number;
+			/** Largest response body read, in bytes; a larger one fails the request. */
+			maxResponseBytes?: number;
 		},
 	): Promise<t> {
 		const response = await this.#fetchRaw(method, path, opts);
-		const text = await response.text();
+		const text = await readBoundedResponse(response, opts.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
 		const raw = this.#parseJson(text, response.status);
 		const validated = RESPONSE_SCHEMAS[opts.schema](raw);
 		if (validated instanceof type.errors) {
@@ -443,7 +527,7 @@ export class AuthBrokerClient {
 	}
 
 	async #fetchRaw(
-		method: "GET" | "POST" | "DELETE",
+		method: "GET" | "POST" | "PUT" | "DELETE",
 		path: string,
 		opts: {
 			auth?: boolean;

@@ -2,7 +2,8 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { BillingMode, BillingSnapshot, BillingSource } from "../usage/billing";
 import type { DrainSpendClass } from "./types";
 
-const DRAIN_STATE_CACHE_PREFIX = "drain:state:";
+/** Prefix for persisted drain state rows. */
+export const DRAIN_STATE_CACHE_PREFIX = "drain:state:";
 /** Prefix for persisted session drain overrides. */
 export const SESSION_DRAIN_CACHE_PREFIX = "session:drain:";
 /** Shortest lifetime of a persisted drain state row past its last write. */

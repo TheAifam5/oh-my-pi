@@ -18,7 +18,7 @@ import {
 	logger,
 	openSqliteDatabase,
 } from "@oh-my-pi/pi-utils";
-import type { AuthCredentialStore, CredentialRefreshLeaseFence } from "./store";
+import type { AuthCredentialStore, CredentialRefreshLeaseFence, StoredCacheRow } from "./store";
 import type {
 	AuthCredential,
 	DisabledCredentialSummary,
@@ -56,6 +56,31 @@ const USAGE_HISTORY_BUCKET_MS = 60 * 60_000;
  * instead of one row per 10s flush.
  */
 const CLIENT_USAGE_BUCKET_MS = 5 * 60_000;
+
+/**
+ * The smallest string greater than every string that starts with `prefix`, in
+ * code point order (SQLite's binary collation of UTF-8): `prefix` with its last
+ * code point incremented, skipping surrogates and dropping maximal code points.
+ * Undefined when no such string exists (empty or all-maximal prefix).
+ */
+function prefixUpperBound(prefix: string): string | undefined {
+	const codePoints = Array.from(prefix, character => character.codePointAt(0)!);
+	while (codePoints.length > 0) {
+		const last = codePoints.pop()!;
+		if (last === 0x10ffff) continue;
+		codePoints.push(last === 0xd7ff ? 0xe000 : last + 1);
+		return String.fromCodePoint(...codePoints);
+	}
+	return undefined;
+}
+
+/** A `key` range condition matching exactly the keys that start with `prefix`, with its parameters. */
+function keyPrefixRange(prefix: string): { condition: string; params: string[] } {
+	const upper = prefixUpperBound(prefix);
+	return upper === undefined
+		? { condition: "key >= ?", params: [prefix] }
+		: { condition: "key >= ? AND key < ?", params: [prefix, upper] };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SqliteAuthCredentialStore
@@ -414,7 +439,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#getCacheStmt: Statement;
 	#getCacheIncludingExpiredStmt: Statement;
 	#upsertCacheStmt: Statement;
-	#deleteCachePrefixStmt: Statement;
 	#deleteExpiredCacheStmt: Statement;
 	#updateIfMatchesWithLeaseStmt: Statement;
 	#deleteIfMatchesWithLeaseStmt: Statement;
@@ -506,7 +530,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCacheStmt = this.#db.prepare(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
-		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
 		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
 		this.#getCredentialBlockStmt = this.#db.prepare(
 			"SELECT blocked_until_ms, updated_at FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ? AND blocked_until_ms > ?",
@@ -1612,10 +1635,45 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	/** Drop all cache rows whose keys start with the supplied prefix. */
 	deleteCachePrefix(prefix: string): void {
 		try {
-			this.#deleteCachePrefixStmt.run(prefix.length, prefix);
+			const range = keyPrefixRange(prefix);
+			this.#db.query(`DELETE FROM cache WHERE ${range.condition}`).run(...range.params);
 		} catch {
 			// Ignore cache delete failures
 		}
+	}
+
+	listCacheRows(prefix: string, limit: number): StoredCacheRow[] {
+		const range = keyPrefixRange(prefix);
+		const rows = this.#db
+			.query(
+				`SELECT key, value, expires_at FROM cache
+				 WHERE ${range.condition} AND expires_at > ${SQLITE_NOW_EPOCH} ORDER BY key LIMIT ?`,
+			)
+			.all(...range.params, Math.max(0, Math.trunc(limit))) as Array<{
+			key: string;
+			value: string;
+			expires_at: number;
+		}>;
+		return rows.map(row => ({ key: row.key, value: row.value, expiresAtSec: row.expires_at }));
+	}
+
+	deleteExpiredCacheRows(prefix: string): void {
+		const range = keyPrefixRange(prefix);
+		this.#db
+			.query(`DELETE FROM cache WHERE ${range.condition} AND expires_at <= ${SQLITE_NOW_EPOCH}`)
+			.run(...range.params);
+	}
+
+	deleteCache(key: string): void {
+		this.#db.query("DELETE FROM cache WHERE key = ?").run(key);
+	}
+
+	countCacheRows(prefix: string): number {
+		const range = keyPrefixRange(prefix);
+		const row = this.#db
+			.query(`SELECT COUNT(*) AS count FROM cache WHERE ${range.condition} AND expires_at > ${SQLITE_NOW_EPOCH}`)
+			.get(...range.params) as { count: number } | null;
+		return row?.count ?? 0;
 	}
 
 	cleanExpiredCache(): void {
@@ -2132,7 +2190,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#updateIfMatchesStmt.finalize();
 		this.#updateIfMatchesWithLeaseStmt.finalize();
 		this.#deleteIfMatchesWithLeaseStmt.finalize();
-		this.#deleteCachePrefixStmt.finalize();
 		this.#acquireCredentialRefreshLeaseStmt.finalize();
 		this.#getCredentialRefreshLeaseStmt.finalize();
 		this.#renewCredentialRefreshLeaseStmt.finalize();

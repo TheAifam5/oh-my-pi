@@ -561,6 +561,27 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
+	 * Stop following the session's drain override in this process because its
+	 * account is not among the accounts this process sees, without clearing
+	 * the persisted row for other processes that share it through a broker.
+	 * Against a local store the row is cleared, as for {@link drain}.
+	 */
+	forgetDrainOverride(provider: string, sessionId: string): void {
+		const cacheKey = sessionDrainKey(provider, sessionId);
+		if (!this.#store.forgetCache) {
+			this.#writeDrainOverride(provider, sessionId, undefined);
+			return;
+		}
+		try {
+			this.#store.forgetCache(cacheKey);
+		} catch (err) {
+			logger.debug("Failed to drop session drain override from the store cache", { err });
+		}
+		nestedSet(this.#drainOverrides, sessionId, provider, undefined);
+		this.#noteMiss(cacheKey);
+	}
+
+	/**
 	 * The session's drain override: a row id, `null` for no drain target,
 	 * `undefined` to follow account policy. A miss is cached like
 	 * {@link #sessionPin}'s, so an override another process writes applies at most

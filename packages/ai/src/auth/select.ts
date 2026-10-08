@@ -830,7 +830,7 @@ export class CredentialSelector {
 			policy = this.#deps.policies.forCredential(provider, overridden);
 		} else {
 			// An override whose account is gone falls back to the pool's drain target, then the account policy.
-			if (override !== undefined && sessionId) this.#deps.affinity.drain(provider, sessionId, undefined);
+			if (override !== undefined && sessionId) this.#deps.affinity.forgetDrainOverride(provider, sessionId);
 			const named =
 				routing?.drain === undefined ? undefined : this.#deps.affinity.namedAccount(provider, routing.drain);
 			if (named?.credential.type === "oauth") {

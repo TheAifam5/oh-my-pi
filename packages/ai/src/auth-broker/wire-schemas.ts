@@ -39,6 +39,10 @@ import type {
 	DisabledCredentialsResponse,
 	HealthzResponse,
 	RefresherSchedule,
+	SharedCacheListResponse,
+	SharedCachePutRequest,
+	SharedCacheRow,
+	SharedCacheWriteResponse,
 	SnapshotEntry,
 	SnapshotResponse,
 	SnapshotStreamEntryEvent,
@@ -412,6 +416,35 @@ export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDe
 });
 
 export const usageStaleResponseSchema: FluentType<UsageStaleResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+// ─── Shared cache ────────────────────────────────────────────────────────────
+
+const sharedCacheRowSchema: FluentType<SharedCacheRow> = type({
+	"+": "reject",
+	key: "string",
+	value: "string",
+	expiresAtSec: "number",
+});
+
+/** Broker `GET /v1/cache?prefix=` response — live shared rows under one prefix. */
+export const sharedCacheListResponseSchema: FluentType<SharedCacheListResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	rows: sharedCacheRowSchema.array(),
+	truncated: "boolean",
+});
+
+/** Broker `PUT /v1/cache/:key` request. */
+export const sharedCachePutRequestSchema: FluentType<SharedCachePutRequest> = type({
+	"+": "reject",
+	value: "string",
+	expiresAtSec: "number",
+});
+
+export const sharedCacheWriteResponseSchema: FluentType<SharedCacheWriteResponse> = type({
 	"+": "reject",
 	ok: "boolean",
 });

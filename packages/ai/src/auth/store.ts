@@ -85,6 +85,14 @@ export interface CredentialRowStore {
 	deleteAuthCredentials(provider: string, disabledCause: string): Promise<void>;
 }
 
+/** One live row of the credential cache. */
+export interface StoredCacheRow {
+	key: string;
+	value: string;
+	/** Expiry in epoch seconds; the row is live while this is in the future. */
+	expiresAtSec: number;
+}
+
 /** Persistent key/value cache shared by credential services. */
 export interface CredentialCacheStore {
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
@@ -92,6 +100,45 @@ export interface CredentialCacheStore {
 	/** Drop all cache rows whose keys start with the supplied prefix. */
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
+	/**
+	 * Live rows whose keys start with `prefix`, in key order, at most `limit`.
+	 * Optional: the auth-broker server needs it to serve shared cache rows;
+	 * stores without it make those routes answer 501.
+	 */
+	listCacheRows?(prefix: string, limit: number): StoredCacheRow[];
+	/** Number of live rows whose keys start with `prefix`; present together with {@link listCacheRows}. */
+	countCacheRows?(prefix: string): number;
+	/** Remove the row under `key`, live or expired, if present. */
+	deleteCache?(key: string): void;
+	/** Remove the expired rows whose keys start with `prefix`. */
+	deleteExpiredCacheRows?(prefix: string): void;
+	/**
+	 * Drop this process's copy of the row under `key` without telling any
+	 * other process. Optional: stores whose copy is shared with other clients
+	 * (the broker remote store) implement it; elsewhere callers clear the row
+	 * with an expired {@link setCache}.
+	 */
+	forgetCache?(key: string): void;
+}
+
+/** Credential cache rows the auth-broker server shares with its clients (server seam over the store). */
+export interface CacheApi {
+	/** Live rows whose keys start with `prefix`, in key order, at most `limit`; undefined when the store cannot list. */
+	list(prefix: string, limit: number): StoredCacheRow[] | undefined;
+	/** Number of live rows whose keys start with `prefix`; undefined when the store cannot count. */
+	count(prefix: string): number | undefined;
+	/** The live value under `key`, or null. */
+	get(key: string): string | null;
+	/** Write one row; an `expiresAtSec` in the past removes it from every live read. */
+	set(key: string, value: string, expiresAtSec: number): void;
+	/** Remove the row under `key` without leaving an expired row behind; falls back to an expired write. */
+	delete(key: string): void;
+	/** Drop every row whose key starts with `prefix`. */
+	deletePrefix(prefix: string): void;
+	/** Remove every expired row. */
+	cleanExpired(): void;
+	/** Remove the expired rows whose keys start with `prefix`. */
+	cleanExpiredPrefix(prefix: string): void;
 }
 
 /** Durable rate-limit blocks, present together when supported by the store. */
