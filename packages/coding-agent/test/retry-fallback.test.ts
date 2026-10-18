@@ -9,8 +9,10 @@ import {
 	orderRetryFallbackCandidates,
 	recordRetryFallbackUse,
 	resetRetryFallbackRoundRobinPositions,
+	type RetryFallbackOrderOptions,
 	type RetryFallbackQuotaEvidence,
 	type RetryFallbackResolutionContext,
+	type RetryFallbackStrategy,
 	resolveRetryFallbackChainKey,
 	retryFallbackQuotaEvidence,
 	validateRetryFallbackChains,
@@ -507,5 +509,145 @@ describe("retry fallback strategies", () => {
 				NOW,
 			),
 		).toEqual({ state: "healthy", remainingFraction: 0.7, observedAt: 30 });
+	});
+});
+
+describe("retry fallback strategy lists", () => {
+	const NOW = 1_000_000;
+	const fresh = (state: RetryFallbackQuotaEvidence["state"], remainingFraction?: number) => ({
+		state,
+		remainingFraction,
+		observedAt: NOW,
+	});
+	const order = (
+		candidates: string[],
+		strategies: readonly RetryFallbackStrategy[],
+		evidence: Record<string, RetryFallbackQuotaEvidence>,
+		ranks: Partial<Record<RetryFallbackStrategy, Record<string, number>>>,
+		extra: Partial<RetryFallbackOrderOptions<string>> = {},
+	) =>
+		orderRetryFallbackCandidates(candidates, strategies, {
+			evidence: candidate => evidence[candidate],
+			nowMs: NOW,
+			maxAgeMs: 60_000,
+			rank: (candidate, strategy) => ranks[strategy]?.[candidate],
+			...extra,
+		});
+
+	it("ties quota fractions within the tolerance and breaks the tie by the next key", () => {
+		const evidence = { a: fresh("healthy", 0.82), b: fresh("healthy", 0.88), c: fresh("healthy", 0.65) };
+		const ranks = { cheapest: { a: 1, b: 5, c: 0 } };
+		// a and b share the 0.8 bucket, so the cheaper a goes first; c's lower bucket keeps it last despite its price.
+		expect(order(["b", "c", "a"], ["quota", "cheapest"], evidence, ranks, { quotaTolerance: 0.1 })).toEqual([
+			"a",
+			"b",
+			"c",
+		]);
+		// Without a tolerance the exact fractions decide.
+		expect(order(["b", "c", "a"], ["quota", "cheapest"], evidence, ranks)).toEqual(["b", "a", "c"]);
+		// A fraction that is a whole multiple of the tolerance opens its own bucket despite float error.
+		const edge = { low: fresh("healthy", 0.29), high: fresh("healthy", 0.3) };
+		expect(
+			order(
+				["low", "high"],
+				["quota", "cheapest"],
+				edge,
+				{ cheapest: { low: 0, high: 1 } },
+				{ quotaTolerance: 0.1 },
+			),
+		).toEqual(["high", "low"]);
+	});
+
+	it("applies three keys in list order and keeps unknown and depleted members last", () => {
+		const evidence = {
+			a: fresh("healthy", 0.9),
+			b: fresh("healthy", 0.8),
+			c: fresh("healthy", 0.76),
+			d: fresh("depleted"),
+		};
+		const ranks = {
+			cheapest: { a: 2, b: 2, c: 1, d: 0, e: 0 },
+			"least-loaded": { a: 5, b: 1, c: 9, d: 0, e: 0 },
+		};
+		const strategies = ["quota", "cheapest", "least-loaded"] as const;
+		expect(order(["a", "b", "c", "d", "e"], strategies, evidence, ranks, { quotaTolerance: 0.25 })).toEqual([
+			"c",
+			"b",
+			"a",
+			"e",
+			"d",
+		]);
+		expect(
+			order(["a", "b", "c", "d", "e"], strategies, evidence, ranks, { quotaTolerance: 0.25, excludeUnknown: true }),
+		).toEqual(["c", "b", "a", "d"]);
+	});
+
+	it("breaks the remaining ties by a last random entry, drawing once per candidate", () => {
+		const draws = [0.1, 0.9, 0.5, 0.7];
+		let drawn = 0;
+		const random = () => {
+			drawn++;
+			return draws.shift() ?? 0;
+		};
+		// The draws rank b, d, c, a; c is cheapest, and the tied rest follow the draw.
+		expect(
+			order(["a", "b", "c", "d"], ["cheapest", "random"], {}, { cheapest: { a: 1, b: 1, c: 0, d: 1 } }, { random }),
+		).toEqual(["c", "b", "d", "a"]);
+		expect(drawn).toBe(4);
+	});
+
+	it("breaks the remaining ties by a last round-robin entry, starting after the last applied member", () => {
+		const chain = ["p", "a", "b", "c"];
+		expect(
+			order(
+				["p", "a", "b", "c"],
+				["least-loaded", "round-robin"],
+				{},
+				{ "least-loaded": { p: 1, a: 0, b: 0, c: 0 } },
+				{ chainPosition: candidate => chain.indexOf(candidate), chainLength: chain.length, lastAppliedPosition: 1 },
+			),
+		).toEqual(["b", "c", "a", "p"]);
+	});
+
+	it("orders by one strategy name exactly as before and as a one-entry list", () => {
+		const candidates = ["a", "b", "c", "d", "e"];
+		const evidence: Record<string, RetryFallbackQuotaEvidence> = {
+			a: fresh("reserve", 0.2),
+			b: fresh("healthy", 0.5),
+			c: fresh("healthy"),
+			d: fresh("unknown"),
+			e: fresh("healthy", 0.9),
+		};
+		const rank: Record<string, number> = { a: 3, b: 1, d: 1, e: 0 };
+		const options = (): RetryFallbackOrderOptions<string> => {
+			const draws = [0.3, 0.8, 0.1, 0.6, 0.4];
+			return {
+				evidence: candidate => evidence[candidate],
+				nowMs: NOW,
+				maxAgeMs: 60_000,
+				random: () => draws.shift() ?? 0,
+				weight: candidate => (candidate === "c" ? 4 : undefined),
+				rank: candidate => rank[candidate],
+				bagPosition: candidate => ({ c: 0, a: 1, e: 2 })[candidate],
+				chainPosition: candidate => candidates.indexOf(candidate),
+				chainLength: candidates.length,
+				lastAppliedPosition: 2,
+			};
+		};
+		// `least-used` and `least-loaded` take the same rank path as `cheapest`.
+		const expected: Partial<Record<RetryFallbackStrategy, string[]>> = {
+			priority: ["a", "b", "c", "d", "e"],
+			"round-robin": ["d", "e", "a", "b", "c"],
+			"weighted-random": ["b", "d", "c", "e", "a"],
+			random: ["b", "d", "e", "a", "c"],
+			quota: ["e", "b", "c", "a", "d"],
+			cheapest: ["e", "b", "d", "a", "c"],
+			p2c: ["e", "a", "b", "c", "d"],
+			"shuffle-bag": ["c", "a", "e", "b", "d"],
+		};
+		for (const [strategy, ordered] of Object.entries(expected) as [RetryFallbackStrategy, string[]][]) {
+			expect(orderRetryFallbackCandidates(candidates, strategy, options())).toEqual(ordered);
+			expect(orderRetryFallbackCandidates(candidates, [strategy], options())).toEqual(ordered);
+		}
 	});
 });

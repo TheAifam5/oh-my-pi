@@ -1500,6 +1500,57 @@ describe("ModelHub", () => {
 			]);
 		});
 
+		test("g leaves a strategy list as configured, which the pool row shows in order", () => {
+			for (const strategy of [["cheapest", "random"], ["cheapest"]]) {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy,
+					models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				});
+				const { hub } = createHub({
+					models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+					scoped: true,
+					settings,
+				});
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(normalize(hub.render(220))).toContain(strategy.join(" → "));
+				hub.handleInput("g");
+				expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy });
+				expect(normalize(hub.render(220))).toContain("change it in config");
+			}
+		});
+
+		test("member edits keep the order of a strategy list that ends in priority", () => {
+			const settings = Settings.isolated();
+			settings.setModelRoleSpec("smol", {
+				strategy: ["cheapest", "priority"],
+				strategyOptions: { order: ["a", "b"] },
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+			});
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b"), makeModel("test", "model-c")],
+				scoped: true,
+				settings,
+			});
+			const smol = () => settings.getModelRoleEntries().smol as Record<string, unknown>;
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput("\n"); // add a member
+			for (const ch of "model-c") hub.handleInput(ch);
+			hub.handleInput("\n");
+			expect(smol()).toMatchObject({
+				strategy: ["cheapest", "priority"],
+				strategyOptions: { order: ["a", "b", "model-c"] },
+			});
+			hub.handleInput("x"); // the cursor landed on the new member
+			expect(smol()).toMatchObject({ strategy: ["cheapest", "priority"], strategyOptions: { order: ["a", "b"] } });
+			hub.handleInput(UP);
+			hub.handleInput(UP); // member a
+			hub.handleInput("]");
+			expect(smol()).toMatchObject({ strategy: ["cheapest", "priority"], strategyOptions: { order: ["b", "a"] } });
+		});
+
 		test("g drops a least-used window when cycling past it", () => {
 			const settings = Settings.isolated();
 			settings.setModelRoleSpec("smol", {

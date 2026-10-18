@@ -2194,7 +2194,8 @@ export class TurnRecovery {
 	 * {@link findRetryFallbackCandidates}, ordered by the chain's strategy ({@link PoolSelection.order})
 	 * and filtered by its group's funding policy ({@link PoolSelection.filterFunding}).
 	 *
-	 * A strategy other than `priority` and `quota` orders only candidates that are not cooling down and that no
+	 * Unless the strategies order every candidate (a first `priority` or `quota` entry and a last `priority` or
+	 * key-based entry), they order only candidates that are not cooling down and that no
 	 * local `skip` limit refuses; the others follow in given order. `round-robin` starts a new walk (`walkActive` false) after the entry this
 	 * process last applied from the same chain; a walk under way continues
 	 * around the chain from its current entry, and cooldown suppression keeps
@@ -2274,10 +2275,10 @@ export class TurnRecovery {
 		options: { walkActive: boolean; signal?: AbortSignal; lookups?: RetryFallbackHealthLookups },
 	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
 		const resolveCandidate = (selector: RetryFallbackSelector) => this.resolveRetryFallbackCandidate(role, selector);
-		const strategy = this.#poolSelection.strategy(policy);
+		const strategies = this.#poolSelection.strategies(policy);
 		const nowMs = Date.now();
 		const limited = hasLocalLimits(this.#host.settings);
-		const ordered = await this.#poolSelection.order(label, candidates, strategy, policy, {
+		const ordered = await this.#poolSelection.order(label, candidates, strategies, policy, {
 			purpose: "retry-fallback",
 			resolveCandidate,
 			chain,
@@ -2315,14 +2316,17 @@ export class TurnRecovery {
 	): void {
 		const rolePool = this.#rolePoolMembers(role);
 		if (rolePool?.members.some(member => member.raw === selector.raw)) {
-			recordRetryFallbackUse(this.#poolSelection.strategy(rolePool.policy), rolePool.members, selector);
+			recordRetryFallbackUse(this.#poolSelection.strategies(rolePool.policy), rolePool.members, selector);
 			return;
 		}
-		const policy = rolePool ? resolveChainGroupPolicy(this.#host.settings, role) : undefined;
-		const strategy = rolePool ? this.#poolSelection.strategy(policy) : this.#retryFallbackStrategy(role);
-		if (strategy !== "round-robin" && strategy !== "shuffle-bag") return;
+		const policy = rolePool
+			? resolveChainGroupPolicy(this.#host.settings, role)
+			: resolveRetryFallbackGroupPolicy(this.#host.settings, role);
+		// Only the last strategy of a list can keep round-robin or shuffle-bag state.
+		const stateful = this.#poolSelection.strategies(policy).at(-1);
+		if (stateful !== "round-robin" && stateful !== "shuffle-bag") return;
 		recordRetryFallbackUse(
-			strategy,
+			stateful,
 			getRetryFallbackChain(this.#getRetryFallbackResolutionContext(), role, currentSelector, currentModel),
 			selector,
 		);

@@ -8,7 +8,14 @@ import {
 import type { ModelHubPool, ModelHubPoolTarget, ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import { isModelGroupForm, type ModelGroup, ModelGroupConfigError, roleAcceptsGroups } from "../config/model-groups";
+import {
+	formatGroupStrategies,
+	groupConfiguredOrder,
+	isModelGroupForm,
+	type ModelGroup,
+	ModelGroupConfigError,
+	roleAcceptsGroups,
+} from "../config/model-groups";
 import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
 import { resolveModelRoleValue, rolePriorityDefaults } from "../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../config/model-roles";
@@ -290,11 +297,7 @@ function poolWriteBlocker(settings: Settings, target: ModelHubPoolTarget): strin
 
 /** Members in scheduling order with the efforts `profile` selects, plus routing as display text. */
 function describeGroup(group: ModelGroup, profile: string | undefined): Omit<ModelHubPool, "source"> {
-	const strategy = group.strategy;
-	const order =
-		strategy.name === "priority" || strategy.name === "round-robin"
-			? strategy.order
-			: group.models.map(member => member.alias);
+	const order = groupConfiguredOrder(group);
 	const byAlias = new Map(group.models.map(member => [member.alias, member]));
 	const overrides = profile === undefined ? undefined : group.profiles.get(profile)?.models;
 	const members: ModelHubPool["members"][number][] = [];
@@ -311,7 +314,7 @@ function describeGroup(group: ModelGroup, profile: string | undefined): Omit<Mod
 	}
 	const routing = group.routing;
 	return {
-		strategy: strategy.name,
+		strategy: formatGroupStrategies(group),
 		members,
 		funding: routing?.funding ?? [],
 		...(routing?.spending ? { spending: routing.spending.policy } : {}),

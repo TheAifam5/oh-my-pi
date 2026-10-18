@@ -135,8 +135,9 @@ export interface ModelHubPoolMember {
 export interface ModelHubPool {
 	/** `inline`: the group is written at the entry; `ref`: the entry names `modelGroups.<group>`. */
 	source: { kind: "inline" } | { kind: "ref"; group: string; profile?: string };
+	/** Strategy name; a strategy list as its names joined by ` → `. */
 	strategy: string;
-	/** Members in scheduling order: the strategy's `order` for priority and round-robin, else alias order. */
+	/** Members in scheduling order: the `order` of a priority or round-robin strategy, else alias order. */
 	members: readonly ModelHubPoolMember[];
 	/** Authorized billing classes in funding order; empty when the pool configures none. */
 	funding: readonly string[];
@@ -509,12 +510,27 @@ function draftRecord(parent: Record<string, unknown>, key: string): Record<strin
 	return created;
 }
 
-/** The mutable `strategyOptions.order` of a priority or round-robin pool draft; undefined for other strategies. */
+/**
+ * The mutable `strategyOptions.order` of a pool draft whose strategy, or the last entry of whose
+ * strategy list, is priority or round-robin; undefined for other strategies.
+ */
 function draftOrder(draft: Record<string, unknown>): string[] | undefined {
-	if (draft.strategy !== "priority" && draft.strategy !== "round-robin") return undefined;
+	const ordering = Array.isArray(draft.strategy) ? draft.strategy.at(-1) : draft.strategy;
+	if (ordering !== "priority" && ordering !== "round-robin") return undefined;
 	const options = draftRecord(draft, "strategyOptions");
 	if (!Array.isArray(options.order)) options.order = [];
 	return options.order as string[];
+}
+
+/**
+ * The strategy that orders the ties of `pool`: its strategy, or the last entry of the strategy list
+ * an editable pool configures. Only that entry consumes `order` or member weights.
+ */
+function poolTailStrategy(pool: ModelHubPool | undefined): string | undefined {
+	const configured = pool?.raw?.strategy;
+	if (!Array.isArray(configured)) return pool?.strategy;
+	const last = configured.at(-1);
+	return typeof last === "string" ? last : undefined;
 }
 
 function memberModel(member: unknown): unknown {
@@ -2299,16 +2315,21 @@ export class ModelHubComponent implements Component {
 
 	/** Whether the pool at `target` schedules members in an explicit order that `[`/`]` can change. */
 	#poolOrdered(target: ModelHubPoolTarget): boolean {
-		const strategy = this.#pool(target)?.strategy;
+		const strategy = poolTailStrategy(this.#pool(target));
 		return strategy === "priority" || strategy === "round-robin";
 	}
 
 	/**
 	 * `g`: step through {@link POOL_STRATEGY_CYCLE}; leaving weighted-random drops member weights it
-	 * alone accepts. A strategy outside the cycle (`quota`) is left for config, so `g` declines to change it.
+	 * alone accepts. A strategy outside the cycle (`quota`) or a strategy list is left for config, so
+	 * `g` declines to change it.
 	 */
 	#cyclePoolStrategy(target: ModelHubPoolTarget): void {
 		const pool = this.#pool(target);
+		if (pool && Array.isArray(pool.raw?.strategy)) {
+			this.#poolNotice(`strategy list ${pool.strategy} is not in the hub's strategy cycle; change it in config`);
+			return;
+		}
 		if (pool && !POOL_STRATEGY_CYCLE.some(name => name === pool.strategy)) {
 			this.#poolNotice(`${pool.strategy} is not in the hub's strategy cycle; change the strategy in config`);
 			return;
@@ -2352,7 +2373,7 @@ export class ModelHubComponent implements Component {
 
 	/** `w`: step a weighted-random member's weight through {@link POOL_WEIGHT_CYCLE}. */
 	#cyclePoolWeight(target: ModelHubPoolTarget, alias: string): void {
-		if (this.#pool(target)?.strategy !== "weighted-random") return;
+		if (poolTailStrategy(this.#pool(target)) !== "weighted-random") return;
 		this.#editPool(target, draft => {
 			const member = draftRecord(draft, "models")[alias];
 			if (!isRecord(member)) return false;
@@ -3322,7 +3343,7 @@ export class ModelHubComponent implements Component {
 				target.kind === "role" && this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
 				editable && { label: "remove", keys: ["x"] },
 				this.#poolMemberEffortItem(row) !== undefined && { label: "effort", keys: ["t"] },
-				editable && pool?.strategy === "weighted-random" && { label: "weight", keys: ["w"] },
+				editable && poolTailStrategy(pool) === "weighted-random" && { label: "weight", keys: ["w"] },
 				editable && this.#poolOrdered(target) && { label: "reorder", keys: ["[", "]"] },
 				...(routing || []),
 			);

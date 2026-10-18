@@ -1,7 +1,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { type AssistantMessage, type BillingSource, knownBilling, type Model, type Usage } from "@oh-my-pi/pi-ai";
+import {
+	type AssistantMessage,
+	type BillingSource,
+	knownBilling,
+	type Model,
+	type ModelUsageHealth,
+	type Usage,
+} from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
@@ -15,6 +22,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	notePoolPickApplied,
+	ordersEveryCandidate,
 	PoolSelection,
 	type RolePoolDeps,
 	type RolePoolPick,
@@ -24,8 +32,14 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/pool-selection";
 import { trackInFlightRequest } from "@oh-my-pi/pi-coding-agent/session/in-flight-requests";
 import { LEDGER_HIT_RATE_TTL_MS, PromptCacheAffinity } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-affinity";
-import { resetRetryFallbackRoundRobinPositions } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
-import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
+import {
+	resetRetryFallbackRoundRobinPositions,
+	type RetryFallbackStrategy,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import {
+	resolveRolePoolGroup,
+	retryFallbackBillingRegistry,
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -655,6 +669,303 @@ describe("model role pools", () => {
 				});
 			expect((await ordered(true)).candidates).toEqual(chain);
 			expect((await ordered(false)).candidates).not.toEqual(chain);
+		});
+	});
+
+	describe("strategy lists", () => {
+		/** An inline pool of OPENAI, GOOGLE, and ANTHROPIC (aliases m1, m2, m3) with a strategy list. */
+		function listPool(
+			strategy: string[],
+			strategyOptions: Record<string, unknown> = {},
+			routing?: Record<string, unknown>,
+		): Record<string, unknown> {
+			const listed = pool("random", [OPENAI, GOOGLE, ANTHROPIC], routing);
+			return { ...listed, strategy, strategyOptions };
+		}
+
+		/** Healthy usage with `fractions` remaining per provider; a provider not listed reports unknown usage. */
+		function stubQuota(fractions: Record<string, number>): void {
+			vi.spyOn(modelRegistry.authStorage.health, "model").mockImplementation(async provider =>
+				fractions[provider] === undefined ? { state: "unknown", accounts: [] } : healthy(fractions[provider]),
+			);
+		}
+
+		function healthy(remainingFraction: number): ModelUsageHealth {
+			return {
+				state: "healthy",
+				accounts: [
+					{
+						credentialId: 1,
+						credentialType: "oauth",
+						state: "healthy",
+						remainingFraction,
+						fetchedAt: Date.now(),
+					},
+				],
+			};
+		}
+
+		async function order(settings: Settings, extra: Partial<RolePoolDeps> = {}): Promise<string[]> {
+			const resolution = await resolveRolePool("engineer", deps(settings, extra));
+			if (resolution?.kind !== "picked") throw new Error("expected a pick");
+			return [resolution.pick.selector, ...resolution.pick.rest].map(selector => selector.raw);
+		}
+
+		/** `models` as {@link PoolSelection.order} orders them under the engineer pool of `settings`. */
+		async function selectionOrder(
+			settings: Settings,
+			models: Model[],
+			options: { admits?: (model: Model) => boolean; signal?: AbortSignal; random?: () => number } = {},
+		): Promise<{ selectors: string[]; health: number }> {
+			const policy = resolveRolePoolGroup(settings, "engineer");
+			const selection = new PoolSelection(deps(settings, options.random ? { random: options.random } : {}));
+			const byRaw = new Map(models.map(model => [selectorOf(model), model]));
+			const candidates = models.map(model => ({
+				raw: selectorOf(model),
+				provider: model.provider,
+				id: model.id,
+				thinkingLevel: undefined,
+			}));
+			const admits = options.admits;
+			const ordered = await selection.order("engineer", candidates, selection.strategies(policy), policy, {
+				purpose: "model-role",
+				resolveCandidate: candidate => byRaw.get(candidate.raw),
+				chain: () => candidates,
+				walkActive: false,
+				...(admits ? { admits: (candidate: { raw: string }) => admits(byRaw.get(candidate.raw)!) } : {}),
+				...(options.signal ? { signal: options.signal } : {}),
+			});
+			return { selectors: ordered.candidates.map(candidate => candidate.raw), health: ordered.health.size };
+		}
+
+		it("breaks quota ties within the tolerance by price inside funding stages, after a warm member", async () => {
+			// GOOGLE has more quota left, but within 0.25 of OPENAI, which is cheaper; ANTHROPIC is far behind.
+			stubQuota({ openai: 0.8, google: 0.9, anthropic: 0.3 });
+			// ANTHROPIC reports no usage, so it is unverified and follows the funded stage.
+			stubBilling({
+				openai: { mode: "subscription-included", state: "available" },
+				google: { mode: "subscription-included", state: "available" },
+			});
+			const routing = { funding: { order: ["included"] }, cache: { affinity: true } };
+			const listed = Settings.isolated({
+				modelRoles: { engineer: listPool(["quota", "cheapest"], { tolerance: 0.25 }, routing) },
+			});
+			expect(await order(listed)).toEqual([OPENAI, GOOGLE, ANTHROPIC].map(selectorOf));
+			const quotaOnly = Settings.isolated({ modelRoles: { engineer: listPool(["quota"], {}, routing) } });
+			expect(await order(quotaOnly)).toEqual([GOOGLE, OPENAI, ANTHROPIC].map(selectorOf));
+			// A warm member goes first; the rest keep the list's order.
+			expect(await order(listed, { promptCacheWarm: model => model.provider === "google" })).toEqual(
+				[GOOGLE, OPENAI, ANTHROPIC].map(selectorOf),
+			);
+		});
+
+		it("orders by the next key when the quota lookups do not answer in time, and by none under exclude", async () => {
+			vi.spyOn(modelRegistry.authStorage.health, "model").mockImplementation(
+				() => Promise.withResolvers<never>().promise,
+			);
+			const settings = Settings.isolated({ modelRoles: { engineer: listPool(["quota", "cheapest"]) } });
+			expect(await selectionOrder(settings, [ANTHROPIC, GOOGLE, OPENAI], { signal: AbortSignal.abort() })).toEqual({
+				selectors: [OPENAI, GOOGLE, ANTHROPIC].map(selectorOf),
+				health: 0,
+			});
+			const excluding = Settings.isolated({
+				modelRoles: { engineer: listPool(["quota", "cheapest"], {}, { quota: { unknown: "exclude" } }) },
+			});
+			expect(
+				(await selectionOrder(excluding, [ANTHROPIC, GOOGLE, OPENAI], { signal: AbortSignal.abort() })).selectors,
+			).toEqual([]);
+		});
+
+		it("drops a member without quota usage under exclude when quota follows another key", async () => {
+			stubQuota({ openai: 0.5, google: 0.5 });
+			const settings = Settings.isolated({
+				modelRoles: { engineer: listPool(["cheapest", "quota"], {}, { quota: { unknown: "exclude" } }) },
+			});
+			expect((await selectionOrder(settings, [ANTHROPIC, GOOGLE, OPENAI])).selectors).toEqual(
+				[OPENAI, GOOGLE].map(selectorOf),
+			);
+		});
+
+		it("counts least-used requests over its own window before breaking ties by price", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "least-used-list.db"));
+			try {
+				const settings = Settings.isolated(
+					{
+						modelRoles: {
+							engineer: listPool(["least-used", "cheapest"], {
+								window: { type: "rolling", durationMs: 3_600_000 },
+							}),
+						},
+					},
+					{ storage },
+				);
+				const call = (model: Model, atMs: number) =>
+					storage.usageLedger.record({
+						atMs,
+						provider: model.provider,
+						model: model.id,
+						costNanos: 0,
+						inputTokens: 1,
+						outputTokens: 1,
+					});
+				call(OPENAI, Date.now());
+				// Outside the one-hour window, so GOOGLE ties ANTHROPIC and its lower price puts it first.
+				call(GOOGLE, Date.now() - 2 * 3_600_000);
+				expect(await order(settings)).toEqual([GOOGLE, ANTHROPIC, OPENAI].map(selectorOf));
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
+		it("keeps a cooling member out of the shuffle bag of a quota-first list, refilling it with usable members", async () => {
+			stubQuota({ openai: 0.9, google: 0.9, anthropic: 0.9 });
+			const settings = Settings.isolated({ modelRoles: { engineer: listPool(["quota", "shuffle-bag"]) } });
+			// The refill shuffle with 0.5 draws is OPENAI, ANTHROPIC, GOOGLE.
+			const random = () => 0.5;
+			const applied = async () => {
+				const resolution = await resolveRolePool("engineer", deps(settings, { random }));
+				if (resolution?.kind !== "picked") throw new Error("expected a pick");
+				notePoolPickApplied(resolution.pick);
+				return resolution.pick.selector.raw;
+			};
+			expect([await applied(), await applied()]).toEqual([OPENAI, ANTHROPIC].map(selectorOf));
+			// Only GOOGLE is left in the bag, and it starts cooling down.
+			modelRegistry.suppressSelector(selectorOf(GOOGLE), Date.now() + 60_000);
+			expect([await applied(), await applied()]).toEqual([OPENAI, ANTHROPIC].map(selectorOf));
+		});
+
+		it("never draws a cooling member under a quota-first list ending in random", async () => {
+			stubQuota({ openai: 0.9, google: 0.9, anthropic: 0.9 });
+			const settings = Settings.isolated({ modelRoles: { engineer: listPool(["quota", "random"]) } });
+			modelRegistry.suppressSelector(selectorOf(OPENAI), Date.now() + 60_000);
+			// Drawn over every member, OPENAI's 0.9 would put it first.
+			const draws = [0.9, 0.1, 0.2];
+			expect(
+				(await selectionOrder(settings, [OPENAI, GOOGLE, ANTHROPIC], { random: () => draws.shift() ?? 0 }))
+					.selectors,
+			).toEqual([GOOGLE, ANTHROPIC, OPENAI].map(selectorOf));
+		});
+
+		it("keeps ordering every member, cooling ones included, under a quota-first list ending in a key", async () => {
+			stubQuota({ openai: 0.9, google: 0.9, anthropic: 0.9 });
+			const settings = Settings.isolated({ modelRoles: { engineer: listPool(["quota", "cheapest"]) } });
+			expect(
+				(await selectionOrder(settings, [ANTHROPIC, GOOGLE, OPENAI], { admits: model => model !== OPENAI }))
+					.selectors,
+			).toEqual([OPENAI, GOOGLE, ANTHROPIC].map(selectorOf));
+		});
+
+		it.each<[RetryFallbackStrategy[], boolean]>([
+			[["priority"], true],
+			[["quota"], true],
+			[["quota", "cheapest"], true],
+			[["quota", "priority"], true],
+			[["cheapest"], false],
+			[["quota", "round-robin"], false],
+			[["quota", "cheapest", "shuffle-bag"], false],
+			[["cheapest", "priority"], false],
+		])("orders a limit-refused member in place only when %j orders every member", async (strategies, every) => {
+			expect(ordersEveryCandidate(strategies)).toBe(every);
+			stubQuota({ openai: 0.9, google: 0.9, anthropic: 0.9 });
+			const options =
+				strategies.includes("priority") || strategies.includes("round-robin") ? { order: ["m1", "m2", "m3"] } : {};
+			const settings = Settings.isolated({ modelRoles: { engineer: listPool(strategies, options) } });
+			// OPENAI is cheapest and first in order, so it leads unless it is held back.
+			const ordered = await selectionOrder(settings, [OPENAI, GOOGLE, ANTHROPIC], {
+				admits: model => model !== OPENAI,
+				random: () => 0.5,
+			});
+			expect(ordered.selectors[0] === selectorOf(OPENAI)).toBe(every);
+		});
+
+		it("reports a limit-refused member of a quota-first shuffle-bag list as limited, with or without exclude", async () => {
+			const storage = await AgentStorage.open(path.join(tempDir.path(), "list-limits.db"));
+			try {
+				storage.usageLedger.record({
+					atMs: Date.now(),
+					provider: ANTHROPIC.provider,
+					model: ANTHROPIC.id,
+					costNanos: 0,
+					inputTokens: 1,
+					outputTokens: 1,
+				});
+				const limits = {
+					[selectorOf(ANTHROPIC)]: [{ metric: "requests", max: 1, window: { type: "calendar", period: "day" } }],
+				};
+				// ANTHROPIC reports no usage, so `unknown: exclude` drops it before the limit check.
+				stubQuota({ openai: 0.9, google: 0.9 });
+				for (const routing of [undefined, { quota: { unknown: "exclude" } }]) {
+					const settings = Settings.isolated(
+						{ modelRoles: { engineer: listPool(["quota", "shuffle-bag"], {}, routing) }, limits },
+						{ storage },
+					);
+					const resolution = await resolveRolePool("engineer", deps(settings, { random: () => 0.5 }));
+					if (resolution?.kind !== "picked") throw new Error("expected a pick");
+					expect(resolution.pick.selector.raw).not.toBe(selectorOf(ANTHROPIC));
+				}
+				for (const routing of [undefined, { quota: { unknown: "exclude" } }]) {
+					const settings = Settings.isolated(
+						{ modelRoles: { engineer: listPool(["quota", "shuffle-bag"], {}, routing) }, limits },
+						{ storage },
+					);
+					const none = await resolveRolePool(
+						"engineer",
+						deps(settings, { hasUsableAuth: model => model === ANTHROPIC }),
+					);
+					if (none?.kind !== "none") throw new Error("expected no pick");
+					expect(
+						none.skipped
+							.filter(entry => entry.selector === selectorOf(ANTHROPIC))
+							.map(entry => entry.reason.kind),
+					).toEqual(["limit-reached"]);
+				}
+			} finally {
+				AgentStorage.close();
+			}
+		});
+
+		it("returns no member, held ones included, when quota lookups stall under exclude", async () => {
+			vi.spyOn(modelRegistry.authStorage.health, "model").mockImplementation(
+				() => Promise.withResolvers<never>().promise,
+			);
+			const settings = Settings.isolated({
+				modelRoles: { engineer: listPool(["quota", "shuffle-bag"], {}, { quota: { unknown: "exclude" } }) },
+			});
+			const ordered = await selectionOrder(settings, [OPENAI, GOOGLE, ANTHROPIC], {
+				admits: model => model !== OPENAI,
+				signal: AbortSignal.abort(),
+			});
+			expect(ordered.selectors).toEqual([]);
+		});
+
+		it("drops held members without quota usage under exclude, keeping the known ones after the ordered", async () => {
+			stubQuota({ openai: 0.9, google: 0.9 });
+			const settings = Settings.isolated({
+				modelRoles: { engineer: listPool(["quota", "shuffle-bag"], {}, { quota: { unknown: "exclude" } }) },
+			});
+			expect(
+				(
+					await selectionOrder(settings, [OPENAI, GOOGLE, ANTHROPIC], {
+						admits: model => model === GOOGLE,
+						random: () => 0.5,
+					})
+				).selectors,
+			).toEqual([GOOGLE, OPENAI].map(selectorOf));
+		});
+
+		it("advances a last round-robin entry on recorded use while the keys before it tie", async () => {
+			const settings = Settings.isolated({
+				modelRoles: {
+					engineer: listPool(["least-loaded", "round-robin"], { order: ["m1", "m2", "m3"] }),
+				},
+			});
+			const first = await order(settings);
+			expect(first[0]).toBe(selectorOf(OPENAI));
+			const resolution = await resolveRolePool("engineer", deps(settings));
+			if (resolution?.kind !== "picked") throw new Error("expected a pick");
+			expect(resolution.pick.strategy).toBe("least-loaded");
+			notePoolPickApplied(resolution.pick);
+			expect((await order(settings))[0]).toBe(selectorOf(GOOGLE));
 		});
 	});
 

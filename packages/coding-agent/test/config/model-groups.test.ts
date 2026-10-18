@@ -371,6 +371,144 @@ describe("modelRoles values (strict)", () => {
 	});
 });
 
+describe("strategy lists", () => {
+	it("parses each listed strategy with the options it consumes, the first one reported as the strategy", () => {
+		const group = roleGroup(
+			"engineer",
+			pool({
+				strategy: ["quota", "least-used", "weighted-random"],
+				strategyOptions: { tolerance: 0.1, window: { type: "rolling", durationMs: 3_600_000 } },
+				models: { opus: { model: OPUS, weight: 3 }, astra: { model: ASTRA } },
+			}),
+		);
+		expect(group.strategies).toEqual([
+			{ name: "quota", tolerance: 0.1 },
+			{ name: "least-used", windowMs: 3_600_000 },
+			{ name: "weighted-random" },
+		]);
+		expect(group.strategy).toEqual({ name: "quota", tolerance: 0.1 });
+		expect(group.models.find(member => member.alias === "opus")?.weight).toBe(3);
+		const ordered = roleGroup(
+			"engineer",
+			pool({ strategy: ["cheapest", "priority"], strategyOptions: { order: ["opus", "astra"] } }),
+		);
+		expect(ordered.strategies).toEqual([{ name: "cheapest" }, { name: "priority", order: ["opus", "astra"] }]);
+	});
+
+	it("parses a single name exactly as a one-entry list", () => {
+		const single = roleGroup("engineer", pool({ strategy: "quota" }));
+		expect(single.strategies).toEqual([{ name: "quota" }]);
+		expect(roleGroup("engineer", pool({ strategy: ["quota"] }))).toEqual(single);
+	});
+
+	it.each<[string, unknown, ModelGroupIssue[]]>([
+		[
+			"a strategy that is not key-based before the last entry",
+			pool({ strategy: ["random", "cheapest"] }),
+			[
+				{
+					path: "modelRoles.engineer.strategy[0]",
+					message:
+						"random may only be the last strategy; entries before it must be quota, cheapest, least-used, least-loaded",
+				},
+			],
+		],
+		[
+			"p2c as the last entry of a list",
+			pool({ strategy: ["least-loaded", "p2c"] }),
+			[{ path: "modelRoles.engineer.strategy[1]", message: "p2c cannot be combined with other strategies" }],
+		],
+		[
+			"p2c before another entry",
+			pool({ strategy: ["p2c", "cheapest"] }),
+			[{ path: "modelRoles.engineer.strategy[0]", message: "p2c cannot be combined with other strategies" }],
+		],
+		[
+			"a strategy listed twice",
+			pool({ strategy: ["cheapest", "cheapest"] }),
+			[{ path: "modelRoles.engineer.strategy[1]", message: "lists cheapest twice" }],
+		],
+		[
+			"more than four strategies",
+			pool({ strategy: ["quota", "cheapest", "least-used", "least-loaded", "random"] }),
+			[
+				{
+					path: "modelRoles.engineer.strategy",
+					message: "must be a strategy name or a list of 1 to 4 strategy names",
+				},
+			],
+		],
+		[
+			"an empty strategy list",
+			pool({ strategy: [] }),
+			[
+				{
+					path: "modelRoles.engineer.strategy",
+					message: "must be a strategy name or a list of 1 to 4 strategy names",
+				},
+			],
+		],
+		[
+			"an unknown name in a list",
+			pool({ strategy: ["quota", "fastest"] }),
+			[
+				{
+					path: "modelRoles.engineer.strategy[1]",
+					message:
+						'"fastest" is not one of: priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, shuffle-bag',
+				},
+			],
+		],
+		[
+			"a tolerance without quota",
+			pool({ strategy: ["cheapest", "random"], strategyOptions: { tolerance: 0.1 } }),
+			[
+				{
+					path: "modelRoles.engineer.strategyOptions.tolerance",
+					message: "applies only when the strategy includes quota",
+				},
+			],
+		],
+		[
+			"a tolerance of zero",
+			pool({ strategy: ["quota", "cheapest"], strategyOptions: { tolerance: 0 } }),
+			[{ path: "modelRoles.engineer.strategyOptions.tolerance", message: "must be a number in (0, 0.5]" }],
+		],
+		[
+			"a tolerance above one half",
+			pool({ strategy: "quota", strategyOptions: { tolerance: 0.6 } }),
+			[{ path: "modelRoles.engineer.strategyOptions.tolerance", message: "must be a number in (0, 0.5]" }],
+		],
+		[
+			"an option no listed strategy consumes",
+			pool({ strategy: ["quota", "cheapest"], strategyOptions: { order: ["opus", "astra"] } }),
+			[
+				{
+					path: "modelRoles.engineer.strategyOptions.order",
+					message: "unsupported field; supported: objective, capacityMetric, tolerance",
+				},
+			],
+		],
+		[
+			"a priority last entry without order",
+			pool({ strategy: ["quota", "priority"] }),
+			[
+				{
+					path: "modelRoles.engineer.strategyOptions",
+					message: "priority requires order listing every member alias exactly once",
+				},
+			],
+		],
+		[
+			"a member weight without weighted-random in the list",
+			pool({ strategy: ["cheapest", "random"], models: { opus: { model: OPUS, weight: 2 } } }),
+			[{ path: "modelRoles.engineer.models.opus.weight", message: "applies only to strategy weighted-random" }],
+		],
+	])("rejects %s", (_label, value, issues) => {
+		expect(roleIssues("engineer", value)).toEqual(issues);
+	});
+});
+
 describe("tolerant loading", () => {
 	it("skips only the bad member and drops it from order and profiles", () => {
 		const result = parseModelRoleValue(

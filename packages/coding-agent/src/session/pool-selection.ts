@@ -1,6 +1,6 @@
 import type { Model, ModelUsageHealth, UsageReport } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
-import { type BillingClass, DEFAULT_LEAST_USED_WINDOW_MS } from "../config/model-groups";
+import { type BillingClass, DEFAULT_LEAST_USED_WINDOW_MS, isKeyGroupStrategy } from "../config/model-groups";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelStringWithRouting,
@@ -43,6 +43,28 @@ import { evaluateLimits, hasLocalLimits, limitTargets } from "./local-limits";
  * longest a funding filter waits for usage reports before treating billing as unavailable.
  */
 export const QUOTA_ORDERING_DEADLINE_MS = 1_500;
+
+/** `strategyOptions.tolerance` of `policy`'s `quota` strategy, if set. */
+function quotaTolerance(policy: GroupFallbackChain | undefined): number | undefined {
+	for (const strategy of policy?.group.strategies ?? []) {
+		if (strategy.name === "quota") return strategy.tolerance;
+	}
+	return undefined;
+}
+
+/**
+ * Whether `strategies` order every candidate rather than only the usable ones: a lone `priority`, or
+ * a list starting with `quota` and ending in `priority` or a key strategy. Their order is fixed per
+ * candidate, so a member passed over later leaves the others' order unchanged; a last entry that
+ * draws or keeps state (`round-robin`, `shuffle-bag`, `random`, `weighted-random`) would instead pick
+ * or record a member that cannot be used.
+ */
+export function ordersEveryCandidate(strategies: readonly RetryFallbackStrategy[]): boolean {
+	const [first] = strategies;
+	const last = strategies.at(-1);
+	if (first !== "priority" && first !== "quota") return false;
+	return last === "priority" || (last !== undefined && isKeyGroupStrategy(last));
+}
 
 /** Which consumer a selection serves; it names the consumer in logs and notices. */
 export type PoolSelectionPurpose = "retry-fallback" | "model-role";
@@ -130,18 +152,27 @@ export class PoolSelection {
 		return this.#host.now?.() ?? Date.now();
 	}
 
-	/** Ordering of a walk governed by `policy`: its group strategy, `priority` without a group. */
+	/**
+	 * Strategy a walk governed by `policy` is reported by: its group's first strategy, `priority`
+	 * without a group.
+	 */
 	strategy(policy: GroupFallbackChain | undefined): RetryFallbackStrategy {
 		return policy ? policy.group.strategy.name : "priority";
 	}
 
+	/** Ordering of a walk governed by `policy`: its group's strategies in order, `priority` without a group. */
+	strategies(policy: GroupFallbackChain | undefined): readonly RetryFallbackStrategy[] {
+		return policy ? policy.group.strategies.map(strategy => strategy.name) : ["priority"];
+	}
+
 	/**
-	 * `candidates` ordered by `strategy`.
+	 * `candidates` ordered by `strategy`, one strategy or a list ({@link orderRetryFallbackCandidates}).
 	 *
-	 * Except under `priority` and `quota`, which order every candidate, the strategy orders only the
+	 * Unless the strategies order every candidate ({@link ordersEveryCandidate}), they order only the
 	 * candidates that are not cooling down and that `options.admits` accepts; the others follow them
-	 * in given order. A strategy therefore never picks, and its state never names, a member that
-	 * cannot be used now.
+	 * in given order, and under `routing.quota.unknown: exclude` with `quota` listed, only those of
+	 * them with known fresh quota evidence remain. A strategy therefore never picks, and its state
+	 * never names, a member that cannot be used now.
 	 *
 	 * `round-robin` starts a new walk (`walkActive` false) after the entry last recorded for
 	 * `options.chain()`; a walk under way keeps the given order. `random` and `weighted-random` draw a
@@ -155,11 +186,13 @@ export class PoolSelection {
 	 * that holds none of the ordered members with a fresh shuffle; a walk under way keeps the given
 	 * order. `quota` reads usage health
 	 * for each unsuppressed candidate with configured auth, concurrently, sharing one lookup per
-	 * routed model through `lookups`, and ages evidence by the group's
-	 * `routing.quota.maxObservationAgeMs`. When the lookups outlast {@link QUOTA_ORDERING_DEADLINE_MS}
-	 * or `signal` aborts, the candidates keep given order (none remain under
-	 * `routing.quota.unknown: exclude`) and `health` is empty. Otherwise `health` holds the answered
-	 * lookups keyed by selector; a failed lookup leaves no entry.
+	 * routed model through `lookups`, ages evidence by the group's
+	 * `routing.quota.maxObservationAgeMs`, and ties fractions within `strategyOptions.tolerance`.
+	 * When the lookups outlast {@link QUOTA_ORDERING_DEADLINE_MS} or `signal` aborts, `quota` is left
+	 * out and the remaining strategies order the candidates (given order when none remain; no
+	 * candidate remains under `routing.quota.unknown: exclude`), and `health` is empty. Otherwise
+	 * `health` holds the answered lookups keyed by selector; a failed lookup leaves no entry. A
+	 * `least-used` whose ledger cannot be read is likewise left out.
 	 *
 	 * Under `routing.cache.affinity`, the ordered members not cooling down that `options.admits`
 	 * accepts and whose prompt cache is warm ({@link PoolSelectionHost.promptCacheWarm}) then move
@@ -168,10 +201,11 @@ export class PoolSelection {
 	async order(
 		label: string,
 		candidates: RetryFallbackSelector[],
-		strategy: RetryFallbackStrategy,
+		strategy: RetryFallbackStrategy | readonly RetryFallbackStrategy[],
 		policy: GroupFallbackChain | undefined,
 		options: PoolOrderOptions,
 	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
+		const strategies: readonly RetryFallbackStrategy[] = typeof strategy === "string" ? [strategy] : strategy;
 		const admitted = new Map<RetryFallbackSelector, boolean>();
 		const admits = (candidate: RetryFallbackSelector) => {
 			let result = admitted.get(candidate);
@@ -182,13 +216,10 @@ export class PoolSelection {
 			}
 			return result;
 		};
-		// Their order is fixed per candidate, so a member passed over later leaves the others' order
-		// unchanged, and `quota` keeps dropping members without evidence under `unknown: exclude`.
-		const keepsAll = strategy === "priority" || strategy === "quota";
-		const held = keepsAll ? [] : candidates.filter(candidate => !admits(candidate));
+		const held = ordersEveryCandidate(strategies) ? [] : candidates.filter(candidate => !admits(candidate));
 		const eligible = held.length > 0 ? candidates.filter(candidate => !held.includes(candidate)) : candidates;
-		const ordered = await this.#orderByStrategy(label, eligible, strategy, policy, options);
-		const result = { candidates: [...ordered.candidates, ...held], health: ordered.health };
+		const ordered = await this.#orderByStrategy(label, eligible, held, strategies, policy, options);
+		const result = { candidates: [...ordered.candidates, ...ordered.held], health: ordered.health };
 		const warm = this.#host.promptCacheWarm;
 		if (!policy?.group.routing?.cache?.affinity || !warm || result.candidates.length <= 1) return result;
 		const nowMs = this.#now();
@@ -205,82 +236,114 @@ export class PoolSelection {
 		};
 	}
 
+	/**
+	 * `candidates` ordered by `strategies`, and `held` (the candidates held back from ordering) kept
+	 * in given order, reduced under `routing.quota.unknown: exclude` with `quota` listed to those with
+	 * known fresh quota evidence.
+	 */
 	async #orderByStrategy(
 		label: string,
 		candidates: RetryFallbackSelector[],
-		strategy: RetryFallbackStrategy,
+		held: RetryFallbackSelector[],
+		strategies: readonly RetryFallbackStrategy[],
 		policy: GroupFallbackChain | undefined,
 		options: PoolOrderOptions,
-	): Promise<{ candidates: RetryFallbackSelector[]; health: Map<string, ModelUsageHealth> }> {
+	): Promise<{
+		candidates: RetryFallbackSelector[];
+		held: RetryFallbackSelector[];
+		health: Map<string, ModelUsageHealth>;
+	}> {
 		const quotaPolicy = policy?.group.routing?.quota;
-		const excludeUnknown = strategy === "quota" && quotaPolicy?.unknown === "exclude";
-		if (strategy === "priority" || (candidates.length <= 1 && !excludeUnknown)) {
-			return { candidates, health: new Map() };
+		const excludeUnknown = strategies.includes("quota") && quotaPolicy?.unknown === "exclude";
+		if (strategies.every(name => name === "priority") || (candidates.length <= 1 && !excludeUnknown)) {
+			return { candidates, held, health: new Map() };
 		}
+		// Read before the quota lookups, so their wait does not age the evidence they return.
 		const nowMs = this.#now();
 		const maxAgeMs = quotaPolicy?.maxObservationAgeMs ?? DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS;
+		let applied = strategies;
+		let health = new Map<string, ModelUsageHealth>();
+		let keptHeld = held;
+		if (strategies.includes("quota")) {
+			// Held members are probed too, so `unknown: exclude` can drop the unknown ones among them.
+			const probed = excludeUnknown ? [...candidates, ...held] : candidates;
+			const answered = await this.#quotaHealth(label, probed, policy, options);
+			if (answered) health = answered;
+			else if (excludeUnknown) return { candidates: [], held: [], health };
+			else applied = applied.filter(name => name !== "quota");
+			if (excludeUnknown && held.length > 0) {
+				const known = new Set(
+					orderRetryFallbackCandidates(held, "quota", {
+						evidence: candidate => retryFallbackQuotaEvidence(health.get(candidate.raw), nowMs),
+						nowMs,
+						maxAgeMs,
+						excludeUnknown,
+					}),
+				);
+				keptHeld = held.filter(candidate => known.has(candidate));
+			}
+		}
 		const host = this.#host;
 		const random = host.random ? () => host.random?.() ?? Math.random() : undefined;
-		if (strategy === "random" || strategy === "weighted-random") {
-			const members = new Map(policy?.members.map(entry => [entry.selector.trim(), entry.member]));
-			return {
-				candidates: orderRetryFallbackCandidates(candidates, strategy, {
-					nowMs,
-					maxAgeMs,
-					random,
-					weight: candidate => {
-						const member = members.get(candidate.raw);
-						return member?.kind === "model" ? member.weight : undefined;
-					},
-				}),
-				health: new Map(),
-			};
+		const ranks = new Map<RetryFallbackStrategy, Map<string, number>>();
+		for (const name of applied) {
+			const ranked = this.#rank(candidates, name, policy, options, nowMs);
+			if (ranked) ranks.set(name, ranked);
+			// An unreadable usage ledger leaves `least-used` out, so its members keep the next order.
+			else if (name === "least-used") applied = applied.filter(entry => entry !== name);
 		}
-		const ranked = this.#rank(candidates, strategy, policy, options, nowMs);
-		if (ranked) {
-			return {
-				candidates: orderRetryFallbackCandidates(candidates, strategy, {
-					nowMs,
-					maxAgeMs,
+		// A walk under way keeps the given order instead of advancing a shuffle bag.
+		if (options.walkActive) applied = applied.filter(name => name !== "shuffle-bag");
+		const members = applied.includes("weighted-random")
+			? new Map(policy?.members.map(entry => [entry.selector.trim(), entry.member]))
+			: undefined;
+		const bag = applied.includes("shuffle-bag")
+			? getRetryFallbackShuffleBag(
+					options.chain(),
+					candidates.map(candidate => candidate.raw),
 					random,
-					rank: candidate => ranked.get(candidate.raw),
-				}),
-				health: new Map(),
-			};
-		}
-		if (strategy === "shuffle-bag") {
-			if (options.walkActive) return { candidates, health: new Map() };
-			const bag = getRetryFallbackShuffleBag(
-				options.chain(),
-				candidates.map(candidate => candidate.raw),
+				)
+			: undefined;
+		const chain = applied.includes("round-robin") ? options.chain() : undefined;
+		const positions = chain ? new Map(chain.map((selector, index) => [selector.raw, index])) : undefined;
+		return {
+			candidates: orderRetryFallbackCandidates(candidates, applied, {
+				evidence: candidate => retryFallbackQuotaEvidence(health.get(candidate.raw), nowMs),
+				nowMs,
+				maxAgeMs,
+				excludeUnknown,
+				quotaTolerance: quotaTolerance(policy),
 				random,
-			);
-			return {
-				candidates: orderRetryFallbackCandidates(candidates, strategy, {
-					nowMs,
-					maxAgeMs,
-					bagPosition: candidate => {
-						const position = bag.indexOf(candidate.raw);
-						return position >= 0 ? position : undefined;
-					},
-				}),
-				health: new Map(),
-			};
-		}
-		if (strategy === "round-robin") {
-			const chain = options.chain();
-			const positions = new Map(chain.map((selector, index) => [selector.raw, index]));
-			return {
-				candidates: orderRetryFallbackCandidates(candidates, strategy, {
-					nowMs,
-					maxAgeMs,
-					chainPosition: candidate => positions.get(candidate.raw),
-					chainLength: chain.length,
-					lastAppliedPosition: options.walkActive ? undefined : getRetryFallbackRoundRobinPosition(chain),
-				}),
-				health: new Map(),
-			};
-		}
+				weight: candidate => {
+					const member = members?.get(candidate.raw);
+					return member?.kind === "model" ? member.weight : undefined;
+				},
+				rank: (candidate, name) => ranks.get(name)?.get(candidate.raw),
+				bagPosition: candidate => {
+					const position = bag?.indexOf(candidate.raw) ?? -1;
+					return position >= 0 ? position : undefined;
+				},
+				chainPosition: candidate => positions?.get(candidate.raw),
+				chainLength: chain?.length,
+				lastAppliedPosition: chain && !options.walkActive ? getRetryFallbackRoundRobinPosition(chain) : undefined,
+			}),
+			held: keptHeld,
+			health,
+		};
+	}
+
+	/**
+	 * Usage health of each unsuppressed candidate with configured auth, keyed by selector; a failed
+	 * lookup leaves no entry. `undefined` when the lookups outlast {@link QUOTA_ORDERING_DEADLINE_MS}
+	 * or `options.signal` aborts.
+	 */
+	async #quotaHealth(
+		label: string,
+		candidates: readonly RetryFallbackSelector[],
+		policy: GroupFallbackChain | undefined,
+		options: PoolOrderOptions,
+	): Promise<Map<string, ModelUsageHealth> | undefined> {
+		const quotaPolicy = policy?.group.routing?.quota;
 		const subject = QUOTA_ORDERING_SUBJECT[options.purpose];
 		const deadline = AbortSignal.timeout(QUOTA_ORDERING_DEADLINE_MS);
 		const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
@@ -330,17 +393,9 @@ export class PoolSelection {
 				reason: options.signal?.aborted ? "aborted" : "deadline",
 				deadlineMs: QUOTA_ORDERING_DEADLINE_MS,
 			});
-			return { candidates: excludeUnknown ? [] : candidates, health: new Map() };
+			return undefined;
 		}
-		return {
-			candidates: orderRetryFallbackCandidates(candidates, strategy, {
-				evidence: candidate => retryFallbackQuotaEvidence(health.get(candidate.raw), nowMs),
-				nowMs,
-				maxAgeMs,
-				excludeUnknown,
-			}),
-			health,
-		};
+		return health;
 	}
 
 	/**
@@ -382,10 +437,10 @@ export class PoolSelection {
 				}
 				return ranks;
 			case "least-used": {
-				const windowMs =
-					policy?.group.strategy.name === "least-used"
-						? policy.group.strategy.windowMs
-						: DEFAULT_LEAST_USED_WINDOW_MS;
+				let windowMs = DEFAULT_LEAST_USED_WINDOW_MS;
+				for (const entry of policy?.group.strategies ?? []) {
+					if (entry.name === "least-used") windowMs = entry.windowMs;
+				}
 				const ledger = this.#host.settings.getStorage()?.usageLedger;
 				if (!ledger) return undefined;
 				try {
@@ -567,7 +622,10 @@ export interface RolePoolPick {
 	explicitThinkingLevel: boolean;
 	/** Eligible members after the pick, in strategy and funding order. */
 	rest: RetryFallbackSelector[];
+	/** The pool's first strategy, which the pick is reported by. */
 	strategy: RetryFallbackStrategy;
+	/** The pool's strategies in order; the last one keeps round-robin or shuffle-bag state. */
+	strategies: readonly RetryFallbackStrategy[];
 	/** Every parsed member in configured order; the list round-robin positions refer to. */
 	members: RetryFallbackSelector[];
 }
@@ -654,8 +712,9 @@ export class RolePoolUnavailableError extends Error {
  * Members are ordered by the pool's strategy ({@link PoolSelection.order}; `round-robin` starts
  * after the member last recorded by {@link notePoolPickApplied} or retry fallback for the same
  * members). Members that resolve to no model exactly in `deps.availableModels()` or lack usable
- * credentials are passed over first; the rest are ordered (a strategy other than `priority` and
- * `quota` choosing among the members that are not cooling down and that no local limit refuses,
+ * credentials are passed over first; the rest are ordered (unless the strategies order every member
+ * ({@link ordersEveryCandidate}), choosing among the members that are not cooling down and that no
+ * local limit refuses,
  * the others following), filtered by the pool's `routing.funding`
  * ({@link PoolSelection.filterFunding}, limited and cooled-down members included), and the first
  * eligible member that is neither limited nor cooling down is picked with its effort. A member that does not parse as a `provider/model` selector is not a
@@ -736,8 +795,8 @@ export async function resolveRolePool(
 			limitSkips.set(member.raw, { kind, limit: refusal.target.label });
 		}
 	}
-	const strategy = selection.strategy(policy);
-	const ordered = await selection.order(role, callable, strategy, policy, {
+	const strategies = selection.strategies(policy);
+	const ordered = await selection.order(role, callable, strategies, policy, {
 		purpose: "model-role",
 		resolveCandidate: selector => resolve(selector).model,
 		chain: () => members,
@@ -753,8 +812,10 @@ export async function resolveRolePool(
 	const droppedCooledDown: RetryFallbackSelector[] = [];
 	for (const member of callable) {
 		if (kept.has(member.raw)) continue;
-		if (!isSuppressed(member)) skipped.push({ selector: member.raw, reason: { kind: "quota-unknown" } });
-		else if (funding) droppedCooledDown.push(member);
+		// A member a local limit refuses is reported as limited, even when quota exclusion dropped it.
+		if (!isSuppressed(member)) {
+			skipped.push({ selector: member.raw, reason: limitSkips.get(member.raw) ?? { kind: "quota-unknown" } });
+		} else if (funding) droppedCooledDown.push(member);
 		else skipped.push({ selector: member.raw, reason: { kind: "cooldown" } });
 	}
 	let eligible = [...ordered.candidates, ...droppedCooledDown];
@@ -790,7 +851,8 @@ export async function resolveRolePool(
 			model: match.model,
 			explicitThinkingLevel: match.explicitThinkingLevel,
 			rest,
-			strategy,
+			strategy: selection.strategy(policy),
+			strategies,
 			members,
 		};
 		if (match.thinkingLevel !== undefined) pick.thinkingLevel = match.thinkingLevel;
@@ -809,7 +871,7 @@ export async function resolveRolePool(
  * same members reads and moves the same state.
  */
 export function notePoolPickApplied(pick: RolePoolPick): void {
-	recordRetryFallbackUse(pick.strategy, pick.members, pick.selector);
+	recordRetryFallbackUse(pick.strategies, pick.members, pick.selector);
 }
 
 /** The pool role a selection resolves through, and the effort a role-alias suffix asks for. */
@@ -861,7 +923,8 @@ export function warnRolePoolProjection(settings: Settings, role: string): void {
 	const policy = target ? resolveRolePoolGroup(settings, target.role) : undefined;
 	if (!policy) return;
 	const funding = policy.group.routing?.funding !== undefined;
-	const quota = policy.group.strategy.name === "quota" || policy.group.routing?.quota !== undefined;
+	const quota =
+		policy.group.strategies.some(strategy => strategy.name === "quota") || policy.group.routing?.quota !== undefined;
 	if (!funding && !quota) return;
 	projectionWarnings.add(role);
 	logger.warn("Model role pool resolved in configured order without its funding or quota policy", {

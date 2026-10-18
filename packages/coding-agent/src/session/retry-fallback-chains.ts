@@ -20,6 +20,7 @@ import { getRoleInfo, isKindRole } from "../config/model-roles";
 import {
 	assertModelRoleName,
 	type GroupStrategyName,
+	isKeyGroupStrategy,
 	isModelGroupForm,
 	parseFallbackChainValue,
 } from "../config/model-groups";
@@ -71,11 +72,16 @@ export interface RetryFallbackOrderOptions<T> {
 	 */
 	lastAppliedPosition?: number;
 	/**
-	 * A candidate's rank, lower first; `undefined` ranks after every ranked candidate. Read by
-	 * `cheapest` (price), `least-used` (recorded requests), and `least-loaded` and `p2c` (requests in
-	 * flight).
+	 * A candidate's rank under `strategy`, lower first; `undefined` ranks after every ranked
+	 * candidate. Read by `cheapest` (price), `least-used` (recorded requests), and `least-loaded` and
+	 * `p2c` (requests in flight), each with its own name.
 	 */
-	rank?: (candidate: T) => number | undefined;
+	rank?: (candidate: T, strategy: RetryFallbackStrategy) => number | undefined;
+	/**
+	 * Width of the remaining-fraction buckets `quota` compares, in (0, 0.5]; fractions in the same
+	 * bucket tie. `undefined` compares exact fractions. Read only by `quota`.
+	 */
+	quotaTolerance?: number;
 	/** A candidate's position in the current shuffle bag; `undefined` (already used) goes after. Read only by `shuffle-bag`. */
 	bagPosition?: (candidate: T) => number | undefined;
 }
@@ -814,8 +820,24 @@ export function findRetryFallbackCandidates(
 /** Rank of a quota state; lower is tried first. Depleted is known non-viable, so it follows unknown. */
 const QUOTA_STATE_RANK: Record<ModelUsageHealthState, number> = { healthy: 0, reserve: 1, unknown: 2, depleted: 3 };
 
+// Keeps a fraction that is a whole multiple of the tolerance (0.3 / 0.1) in its own bucket despite float error.
+const QUOTA_BUCKET_EPSILON = 1e-9;
+
+/** A candidate being ordered: its given index and the keys of the key-based strategies, compared in order. */
+interface OrderEntry<T> {
+	candidate: T;
+	index: number;
+	keys: number[];
+}
+
 /**
  * Orders fallback candidates by `strategy`, returning a new array.
+ *
+ * `strategy` is one strategy or a list of them. Every entry but the last of a list is key-based
+ * (`quota`, `cheapest`, `least-used`, `least-loaded`): candidates sort by the first entry's key,
+ * ties by the next entry's key, and so on. A last entry that is not key-based then breaks the
+ * remaining ties by its own order of the candidates; otherwise ties keep the given order. One
+ * strategy orders exactly as a one-entry list.
  *
  * - `priority` keeps the given order.
  * - `round-robin` orders by chain position, starting after
@@ -824,11 +846,10 @@ const QUOTA_STATE_RANK: Record<ModelUsageHealthState, number> = { healthy: 0, re
  *   replacement with probability proportional to each remaining weight.
  * - `quota` sorts healthy before reserve before unknown before depleted, and
  *   by larger remaining fraction within a state, with a fraction-less entry
- *   after those reporting one. Missing evidence, and evidence older than
- *   `maxAgeMs`, counts as unknown; `excludeUnknown` drops those candidates.
- *   Ties keep the given order.
- * - `cheapest`, `least-used`, and `least-loaded` sort by `rank`, unranked last,
- *   ties in given order.
+ *   after those reporting one. With `quotaTolerance`, fractions with the same
+ *   `floor(fraction / quotaTolerance)` tie. Missing evidence, and evidence older
+ *   than `maxAgeMs`, counts as unknown; `excludeUnknown` drops those candidates.
+ * - `cheapest`, `least-used`, and `least-loaded` sort by `rank`, unranked last.
  * - `p2c` draws two distinct candidates with `random` and puts the lower-ranked
  *   first (the first drawn on a tie), then the rest in given order.
  * - `shuffle-bag` puts candidates still in the bag first, in bag order, then the
@@ -836,9 +857,73 @@ const QUOTA_STATE_RANK: Record<ModelUsageHealthState, number> = { healthy: 0, re
  */
 export function orderRetryFallbackCandidates<T>(
 	candidates: readonly T[],
-	strategy: RetryFallbackStrategy,
+	strategy: RetryFallbackStrategy | readonly RetryFallbackStrategy[],
 	options: RetryFallbackOrderOptions<T>,
 ): T[] {
+	const strategies: readonly RetryFallbackStrategy[] = typeof strategy === "string" ? [strategy] : strategy;
+	const last = strategies.at(-1);
+	const tail = last !== undefined && !isKeyGroupStrategy(last) ? last : undefined;
+	let entries: OrderEntry<T>[] = candidates.map((candidate, index) => ({ candidate, index, keys: [] }));
+	for (const name of strategies) {
+		if (!isKeyGroupStrategy(name)) continue;
+		if (name === "quota") {
+			const kept: OrderEntry<T>[] = [];
+			for (const entry of entries) {
+				const [state, share] = quotaKey(entry.candidate, options);
+				if (options.excludeUnknown && state === QUOTA_STATE_RANK.unknown) continue;
+				entry.keys.push(state, share);
+				kept.push(entry);
+			}
+			entries = kept;
+		} else {
+			for (const entry of entries)
+				entry.keys.push(options.rank?.(entry.candidate, name) ?? Number.POSITIVE_INFINITY);
+		}
+	}
+	const position =
+		tail === undefined ? undefined : new Map(tailOrder(entries, tail, options).map((entry, at) => [entry, at]));
+	return entries
+		.sort(
+			(a, b) => compareKeys(a.keys, b.keys) || (position ? position.get(a)! - position.get(b)! : a.index - b.index),
+		)
+		.map(entry => entry.candidate);
+}
+
+/** `quota`'s key of `candidate`: its state rank, then its negated remaining fraction or bucket, missing last. */
+function quotaKey<T>(candidate: T, options: RetryFallbackOrderOptions<T>): [number, number] {
+	const evidence = options.evidence?.(candidate);
+	const fresh =
+		evidence?.observedAt !== undefined && options.nowMs - evidence.observedAt <= options.maxAgeMs
+			? evidence
+			: undefined;
+	const remaining = fresh?.state === "unknown" ? undefined : fresh?.remainingFraction;
+	const tolerance = options.quotaTolerance;
+	const share =
+		remaining === undefined
+			? undefined
+			: tolerance === undefined
+				? remaining
+				: Math.floor(remaining / tolerance + QUOTA_BUCKET_EPSILON);
+	return [QUOTA_STATE_RANK[fresh?.state ?? "unknown"], share === undefined ? Number.POSITIVE_INFINITY : -share];
+}
+
+/** Lexicographic comparison of two equally long key lists, each key ascending. */
+function compareKeys(a: readonly number[], b: readonly number[]): number {
+	for (let i = 0; i < a.length; i++) {
+		const x = a[i]!;
+		const y = b[i]!;
+		if (x < y) return -1;
+		if (x > y) return 1;
+	}
+	return 0;
+}
+
+/** `entries` in the order the non-key strategy `strategy` gives them; draws happen once per call. */
+function tailOrder<T>(
+	entries: readonly OrderEntry<T>[],
+	strategy: RetryFallbackStrategy,
+	options: RetryFallbackOrderOptions<T>,
+): OrderEntry<T>[] {
 	if (strategy === "random" || strategy === "weighted-random") {
 		const random = options.random ?? Math.random;
 		const weight = (candidate: T): number => {
@@ -847,70 +932,40 @@ export function orderRetryFallbackCandidates<T>(
 			return value !== undefined && Number.isFinite(value) && value > 0 ? value : 1;
 		};
 		// Efraimidis-Spirakis: sorting by u^(1/w) descending samples without replacement by weight.
-		return candidates
-			.map((candidate, index) => ({ candidate, index, key: random() ** (1 / weight(candidate)) }))
-			.sort((a, b) => b.key - a.key || a.index - b.index)
-			.map(entry => entry.candidate);
+		return entries
+			.map((entry, at) => ({ entry, at, key: random() ** (1 / weight(entry.candidate)) }))
+			.sort((a, b) => b.key - a.key || a.at - b.at)
+			.map(drawn => drawn.entry);
 	}
-	if (strategy === "priority" || (candidates.length <= 1 && strategy !== "quota")) return [...candidates];
-	if (strategy === "cheapest" || strategy === "least-used" || strategy === "least-loaded") {
-		return sortByKey(candidates, options.rank);
-	}
+	if (strategy === "priority" || entries.length <= 1) return [...entries];
 	if (strategy === "p2c") {
 		const random = options.random ?? Math.random;
-		const first = Math.min(candidates.length - 1, Math.floor(random() * candidates.length));
+		const first = Math.min(entries.length - 1, Math.floor(random() * entries.length));
 		// The second draw skips the first index, so the two are always distinct.
-		let second = Math.min(candidates.length - 2, Math.floor(random() * (candidates.length - 1)));
+		let second = Math.min(entries.length - 2, Math.floor(random() * (entries.length - 1)));
 		if (second >= first) second++;
-		const rank = (index: number) => options.rank?.(candidates[index]!) ?? Number.POSITIVE_INFINITY;
+		const rank = (at: number) => options.rank?.(entries[at]!.candidate, "p2c") ?? Number.POSITIVE_INFINITY;
 		const chosen = rank(second) < rank(first) ? second : first;
-		return [candidates[chosen]!, ...candidates.filter((_candidate, index) => index !== chosen)];
+		return [entries[chosen]!, ...entries.filter((_entry, at) => at !== chosen)];
 	}
-	if (strategy === "shuffle-bag") return sortByKey(candidates, options.bagPosition);
+	if (strategy === "shuffle-bag") return sortByKey(entries, entry => options.bagPosition?.(entry.candidate));
 	if (strategy === "round-robin") {
 		const { chainPosition, chainLength, lastAppliedPosition } = options;
-		if (lastAppliedPosition === undefined || !chainPosition || !chainLength) return [...candidates];
-		const distance = (candidate: T): number => {
-			const position = chainPosition(candidate);
+		if (lastAppliedPosition === undefined || !chainPosition || !chainLength) return [...entries];
+		return sortByKey(entries, entry => {
+			const position = chainPosition(entry.candidate);
 			return position === undefined ? chainLength : (position - lastAppliedPosition - 1 + chainLength) % chainLength;
-		};
-		return candidates
-			.map((candidate, index) => ({ candidate, index, distance: distance(candidate) }))
-			.sort((a, b) => a.distance - b.distance || a.index - b.index)
-			.map(entry => entry.candidate);
+		});
 	}
-	const ranked = candidates.map((candidate, index) => {
-		const evidence = options.evidence?.(candidate);
-		const fresh =
-			evidence?.observedAt !== undefined && options.nowMs - evidence.observedAt <= options.maxAgeMs
-				? evidence
-				: undefined;
-		return {
-			candidate,
-			index,
-			rank: QUOTA_STATE_RANK[fresh?.state ?? "unknown"],
-			remaining: fresh?.state === "unknown" ? undefined : fresh?.remainingFraction,
-		};
-	});
-	const considered = options.excludeUnknown ? ranked.filter(entry => entry.rank !== QUOTA_STATE_RANK.unknown) : ranked;
-	considered.sort((a, b) => {
-		if (a.rank !== b.rank) return a.rank - b.rank;
-		if (a.remaining !== b.remaining) {
-			if (a.remaining === undefined) return 1;
-			if (b.remaining === undefined) return -1;
-			return b.remaining - a.remaining;
-		}
-		return a.index - b.index;
-	});
-	return considered.map(entry => entry.candidate);
+	return [...entries];
 }
 
-/** `candidates` sorted by `key` ascending, keyless last, ties in given order. */
-function sortByKey<T>(candidates: readonly T[], key: ((candidate: T) => number | undefined) | undefined): T[] {
-	return candidates
-		.map((candidate, index) => ({ candidate, index, key: key?.(candidate) ?? Number.POSITIVE_INFINITY }))
+/** `items` sorted by `key` ascending, keyless last, ties in given order. */
+function sortByKey<T>(items: readonly T[], key: (item: T) => number | undefined): T[] {
+	return items
+		.map((item, index) => ({ item, index, key: key(item) ?? Number.POSITIVE_INFINITY }))
 		.sort((a, b) => a.key - b.key || a.index - b.index)
-		.map(entry => entry.candidate);
+		.map(entry => entry.item);
 }
 
 /**
@@ -994,15 +1049,17 @@ export function getRetryFallbackShuffleBag(
 
 /**
  * Records that `selector` was applied from `chain` under `strategy`: `round-robin` moves its
- * position, `shuffle-bag` takes it out of the current bag; other strategies keep no state.
+ * position, `shuffle-bag` takes it out of the current bag; other strategies keep no state. Of a
+ * strategy list only the last entry, the only one that can keep state, is recorded.
  */
 export function recordRetryFallbackUse(
-	strategy: RetryFallbackStrategy,
+	strategy: RetryFallbackStrategy | readonly RetryFallbackStrategy[],
 	chain: readonly RetryFallbackSelector[],
 	selector: RetryFallbackSelector,
 ): void {
-	if (strategy === "round-robin") recordRetryFallbackRoundRobinPosition(chain, selector);
-	else if (strategy === "shuffle-bag") {
+	const stateful = typeof strategy === "string" ? strategy : strategy.at(-1);
+	if (stateful === "round-robin") recordRetryFallbackRoundRobinPosition(chain, selector);
+	else if (stateful === "shuffle-bag") {
 		const bag = shuffleBags.get(roundRobinChainId(chain));
 		const index = bag?.indexOf(selector.raw) ?? -1;
 		if (index >= 0) bag?.splice(index, 1);

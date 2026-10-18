@@ -126,6 +126,24 @@ export const GROUP_STRATEGIES = [
 ] as const;
 export type GroupStrategyName = (typeof GROUP_STRATEGIES)[number];
 
+/**
+ * Strategies that rank each member by a key of its own, so a later strategy in a list can break
+ * their ties. Only these may precede another entry of a strategy list.
+ */
+export const KEY_GROUP_STRATEGIES = ["quota", "cheapest", "least-used", "least-loaded"] as const;
+export type KeyGroupStrategyName = (typeof KEY_GROUP_STRATEGIES)[number];
+
+/** Whether `name` ranks members by a key ({@link KEY_GROUP_STRATEGIES}). */
+export function isKeyGroupStrategy(name: GroupStrategyName): name is KeyGroupStrategyName {
+	return (KEY_GROUP_STRATEGIES as readonly string[]).includes(name);
+}
+
+/** Most entries one strategy list may hold. */
+export const MAX_GROUP_STRATEGIES = 4;
+
+/** Largest `strategyOptions.tolerance`, a share of quota. */
+export const MAX_QUOTA_TOLERANCE = 0.5;
+
 /** Billing classes in the only order funding may list them; `metered` is always last. */
 export const BILLING_CLASSES = ["included", "free", "metered"] as const;
 export type BillingClass = (typeof BILLING_CLASSES)[number];
@@ -144,7 +162,8 @@ export const DEFAULT_LEAST_USED_WINDOW_MS = 24 * 60 * 60 * 1000;
 export type GroupStrategy =
 	| { name: "random" }
 	| { name: "weighted-random" }
-	| { name: "quota" }
+	/** `tolerance`, in (0, 0.5]: remaining fractions in the same `floor(fraction / tolerance)` bucket tie. */
+	| { name: "quota"; tolerance?: number }
 	| { name: "cheapest" }
 	| { name: "least-loaded" }
 	| { name: "p2c" }
@@ -213,7 +232,15 @@ export interface GroupProfile {
 }
 
 export interface ModelGroup {
+	/** First entry of `strategies`; the strategy a group is shown and reported by. */
 	strategy: GroupStrategy;
+	/**
+	 * Configured strategies in order, 1 to {@link MAX_GROUP_STRATEGIES} distinct entries. Every
+	 * entry but the last is key-based ({@link KEY_GROUP_STRATEGIES}): members are ordered by each
+	 * entry's key in turn, and the last entry breaks the remaining ties. `p2c` is never in a list of
+	 * more than one entry.
+	 */
+	strategies: readonly GroupStrategy[];
 	routing?: GroupRouting;
 	/** Sorted by alias in code-point order; scheduling order comes only from the strategy. */
 	models: readonly GroupMember[];
@@ -445,7 +472,7 @@ function parseMember(
 	path: string,
 	alias: string,
 	raw: unknown,
-	strategy: GroupStrategyName | undefined,
+	strategies: readonly GroupStrategyName[] | undefined,
 ): ModelMember | undefined {
 	const before = c.issues.length;
 	readName(c, path, "member alias", alias, alias);
@@ -465,7 +492,7 @@ function parseMember(
 		: undefined;
 	let weight: number | undefined;
 	if (present(raw, "weight")) {
-		if (strategy !== undefined && strategy !== "weighted-random") {
+		if (strategies !== undefined && !strategies.includes("weighted-random")) {
 			c.add(`${path}.weight`, "applies only to strategy weighted-random", alias);
 		} else {
 			weight = readPositive(c, `${path}.weight`, raw.weight, false, alias);
@@ -525,19 +552,89 @@ function parseOrder(c: Collector, path: string, value: unknown, aliases: readonl
 	return valid ? order : undefined;
 }
 
-function parseStrategy(
+/** `strategyOptions` fields each strategy consumes. */
+const STRATEGY_OPTION_FIELDS: Readonly<Record<GroupStrategyName, readonly string[]>> = {
+	priority: ["order"],
+	"round-robin": ["order"],
+	"weighted-random": [],
+	random: [],
+	quota: ["objective", "capacityMetric", "tolerance"],
+	cheapest: [],
+	"least-used": ["window"],
+	"least-loaded": [],
+	p2c: [],
+	"shuffle-bag": [],
+};
+
+/**
+ * Names of a `strategy` value: one strategy name, or a list of 1 to {@link MAX_GROUP_STRATEGIES}
+ * distinct names whose entries before the last are key-based ({@link KEY_GROUP_STRATEGIES}) and
+ * which hold `p2c` only alone.
+ */
+function readStrategyNames(c: Collector, path: string, value: unknown): GroupStrategyName[] | undefined {
+	if (!Array.isArray(value)) {
+		const name = readOneOf(c, path, GROUP_STRATEGIES, value);
+		return name === undefined ? undefined : [name];
+	}
+	if (value.length === 0 || value.length > MAX_GROUP_STRATEGIES) {
+		c.add(path, `must be a strategy name or a list of 1 to ${MAX_GROUP_STRATEGIES} strategy names`);
+		return undefined;
+	}
+	const before = c.issues.length;
+	const names: GroupStrategyName[] = [];
+	for (const [index, item] of value.entries()) {
+		const at = `${path}[${index}]`;
+		const name = readOneOf(c, at, GROUP_STRATEGIES, item);
+		if (name === undefined) continue;
+		if (name === "p2c" && value.length > 1) {
+			// p2c only picks which member goes first, so it neither ranks the rest nor breaks ties usefully.
+			c.add(at, "p2c cannot be combined with other strategies");
+		} else if (names.includes(name)) {
+			c.add(at, `lists ${name} twice`);
+		} else if (index < value.length - 1 && !isKeyGroupStrategy(name)) {
+			c.add(
+				at,
+				`${name} may only be the last strategy; entries before it must be ${KEY_GROUP_STRATEGIES.join(", ")}`,
+			);
+		}
+		names.push(name);
+	}
+	return c.issues.length > before ? undefined : names;
+}
+
+/** The strategies `names` with their options from `strategyOptions`, which may hold only fields one of them consumes. */
+function parseStrategies(
 	c: Collector,
 	path: string,
-	strategy: GroupStrategyName,
+	names: readonly GroupStrategyName[],
 	rawOptions: unknown,
 	aliases: readonly string[],
-): GroupStrategy | undefined {
+): GroupStrategy[] | undefined {
 	const at = `${path}.strategyOptions`;
 	const before = c.issues.length;
-	const options = (allowed: readonly string[]): Record<string, unknown> | undefined => {
-		const value = rawOptions ?? {};
-		return checkFields(c, at, value, allowed) ? value : undefined;
-	};
+	const value = rawOptions ?? {};
+	const allowed = [...new Set(names.flatMap(name => STRATEGY_OPTION_FIELDS[name]))];
+	// Named on its own so the message says why, rather than listing it as an unknown field.
+	const strayTolerance = !names.includes("quota") && isRecord(value) && Object.hasOwn(value, "tolerance");
+	if (strayTolerance) c.add(`${at}.tolerance`, "applies only when the strategy includes quota");
+	if (!checkFields(c, at, value, strayTolerance ? [...allowed, "tolerance"] : allowed)) return undefined;
+	const strategies: GroupStrategy[] = [];
+	for (const name of names) {
+		const strategy = parseStrategy(c, at, name, value, aliases);
+		if (strategy) strategies.push(strategy);
+	}
+	return c.issues.length > before ? undefined : strategies;
+}
+
+/** One strategy with the options it consumes from the already field-checked `o` at `at`. */
+function parseStrategy(
+	c: Collector,
+	at: string,
+	strategy: GroupStrategyName,
+	o: Record<string, unknown>,
+	aliases: readonly string[],
+): GroupStrategy | undefined {
+	const before = c.issues.length;
 	const failed = () => c.issues.length > before;
 	switch (strategy) {
 		case "random":
@@ -546,11 +643,8 @@ function parseStrategy(
 		case "least-loaded":
 		case "p2c":
 		case "shuffle-bag":
-			options([]);
-			return failed() ? undefined : { name: strategy };
+			return { name: strategy };
 		case "least-used": {
-			const o = options(["window"]);
-			if (!o) return undefined;
 			let windowMs = DEFAULT_LEAST_USED_WINDOW_MS;
 			const windowPath = `${at}.window`;
 			if (present(o, "window") && checkFields(c, windowPath, o.window, ["type", "durationMs"])) {
@@ -568,8 +662,6 @@ function parseStrategy(
 		}
 		case "round-robin":
 		case "priority": {
-			const o = options(["order"]);
-			if (!o) return undefined;
 			if (!present(o, "order")) {
 				c.add(at, `${strategy} requires order listing every member alias exactly once`);
 				return undefined;
@@ -579,13 +671,21 @@ function parseStrategy(
 		}
 		case "quota": {
 			// Quota balances remaining fraction; these options may only restate that.
-			const o = options(["objective", "capacityMetric"]);
-			if (!o) return undefined;
 			if (present(o, "objective")) readOneOf(c, `${at}.objective`, ["balance"] as const, o.objective);
 			if (present(o, "capacityMetric")) {
 				readOneOf(c, `${at}.capacityMetric`, ["fraction"] as const, o.capacityMetric);
 			}
-			return failed() ? undefined : { name: strategy };
+			let tolerance: number | undefined;
+			if (present(o, "tolerance")) {
+				const value = o.tolerance;
+				if (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_QUOTA_TOLERANCE) {
+					tolerance = value;
+				} else {
+					c.add(`${at}.tolerance`, `must be a number in (0, ${MAX_QUOTA_TOLERANCE}]`);
+				}
+			}
+			if (failed()) return undefined;
+			return tolerance === undefined ? { name: strategy } : { name: strategy, tolerance };
 		}
 	}
 }
@@ -864,9 +964,9 @@ function parseGroupBody(
 	const before = c.issues.length;
 	checkFields(c, path, raw, inline ? INLINE_GROUP_FIELDS : GROUP_FIELDS);
 
-	let strategyName: GroupStrategyName | undefined;
+	let strategyNames: GroupStrategyName[] | undefined;
 	if (raw.strategy === undefined) c.add(path, `strategy is required: ${GROUP_STRATEGIES.join(", ")}`);
-	else if (raw.strategy !== null) strategyName = readOneOf(c, `${path}.strategy`, GROUP_STRATEGIES, raw.strategy);
+	else if (raw.strategy !== null) strategyNames = readStrategyNames(c, `${path}.strategy`, raw.strategy);
 
 	const modelsPath = `${path}.models`;
 	const models: ModelMember[] = [];
@@ -893,7 +993,7 @@ function parseGroupBody(
 				`${modelsPath}.${modelGroupPathKey(alias)}`,
 				alias,
 				raw.models[alias],
-				strategyName,
+				strategyNames,
 			);
 			if (member) models.push(member);
 		}
@@ -901,8 +1001,8 @@ function parseGroupBody(
 	const aliases = declared.filter(alias => !c.skip.has(alias));
 	if (declared.length > 0 && aliases.length === 0) c.add(modelsPath, "no valid model remains");
 
-	const strategy =
-		strategyName === undefined ? undefined : parseStrategy(c, path, strategyName, raw.strategyOptions, aliases);
+	const strategies =
+		strategyNames === undefined ? undefined : parseStrategies(c, path, strategyNames, raw.strategyOptions, aliases);
 	const routing = present(raw, "routing") ? parseRouting(c, `${path}.routing`, raw.routing) : undefined;
 	const profiles = parseProfiles(c, `${path}.profiles`, present(raw, "profiles") ? raw.profiles : undefined, aliases);
 
@@ -923,9 +1023,11 @@ function parseGroupBody(
 		}
 	}
 
-	if (c.issues.length > before || !strategy || !profiles) return undefined;
+	const strategy = strategies?.[0];
+	if (c.issues.length > before || !strategies || !strategy || !profiles) return undefined;
 	return {
 		strategy,
+		strategies,
 		...(routing !== undefined ? { routing } : {}),
 		models,
 		profiles,
@@ -1209,20 +1311,31 @@ export interface GroupMemberSelector {
 }
 
 /**
- * The members of `group` as selectors, in configured order: the strategy's
- * `order` for `priority` and `round-robin`, else alias order. Each model takes
- * the effort of `profile` (default: the group's selected profile), else its
+ * Member aliases of `group` in configured order: the `order` of its `priority` or `round-robin`
+ * strategy entry, else alias order.
+ */
+export function groupConfiguredOrder(group: ModelGroup): readonly string[] {
+	for (const strategy of group.strategies) {
+		if (strategy.name === "priority" || strategy.name === "round-robin") return strategy.order;
+	}
+	return group.models.map(member => member.alias);
+}
+
+/** Display text of a group's strategy: its strategy names in order, joined by ` → `. */
+export function formatGroupStrategies(group: ModelGroup): string {
+	return group.strategies.map(strategy => strategy.name).join(" → ");
+}
+
+/**
+ * The members of `group` as selectors, in configured order ({@link groupConfiguredOrder}).
+ * Each model takes the effort of `profile` (default: the group's selected profile), else its
  * `defaultEffort`.
  */
 export function groupMemberSelectors(
 	group: ModelGroup,
 	profile: string | undefined = group.profile,
 ): GroupMemberSelector[] {
-	const strategy = group.strategy;
-	const order =
-		strategy.name === "priority" || strategy.name === "round-robin"
-			? strategy.order
-			: group.models.map(member => member.alias);
+	const order = groupConfiguredOrder(group);
 	const members = new Map(group.models.map(member => [member.alias, member]));
 	const overrides = profile === undefined ? undefined : group.profiles.get(profile)?.models;
 	const selectors: GroupMemberSelector[] = [];
