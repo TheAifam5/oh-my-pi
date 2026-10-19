@@ -112,6 +112,18 @@ export interface InterruptedToolResultDetails {
 	replay?: ToolReplayClass;
 }
 
+/**
+ * `execution` of a tool result's `details` written for an interrupted call
+ * (`__interrupted: true`): by resume repair ({@link InterruptedToolResultDetails})
+ * or by the agent loop for a call an interrupt cut off after it started.
+ * `undefined` for any other result or a malformed value.
+ */
+export function interruptedToolExecution(details: unknown): InterruptedToolResultDetails["execution"] | undefined {
+	if (!isObject(details) || details.__interrupted !== true) return undefined;
+	const { execution } = details;
+	return execution === "started" || execution === "not_started" || execution === "unknown" ? execution : undefined;
+}
+
 /** Records a resume must append to close an interrupted turn, in append order. */
 export interface InterruptedTurnRepair {
 	/** One result per call of the interrupted assistant turn that has no result yet. */

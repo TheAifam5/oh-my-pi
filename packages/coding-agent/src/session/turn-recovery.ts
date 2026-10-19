@@ -15,6 +15,7 @@ import type {
 	ModelUsageHealth,
 	TextContent,
 	ToolChoice,
+	ToolResultMessage,
 	AnthropicFallbackCreditHandle,
 	BillingResult,
 	UsageReport,
@@ -33,6 +34,7 @@ import {
 	logger,
 	prompt,
 	sleepLong,
+	truncate,
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import type { GroupBudget } from "../config/model-groups";
@@ -130,6 +132,8 @@ import {
 	USAGE_PREFLIGHT_BLOCKED_PREFIX,
 } from "./local-limits";
 import { sanitizeNoticeLine } from "../utils/notice-text";
+import { resolveToolReplayClass } from "../tools/approval";
+import { interruptedToolExecution } from "./exit-diagnostics";
 
 import {
 	cfgFeaturesUnexpectedStopDetection,
@@ -271,6 +275,18 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 		if (result.isError !== true || !callIds.has(result.toolCallId)) return undefined;
 	}
 	return start;
+}
+
+/** Calls named in the notice for a refused tool replay; the rest are counted. */
+const REFUSED_REPLAY_NOTICE_MAX_CALLS = 5;
+
+/** Longest tool name, in UTF-16 code units with its ellipsis, the refused replay notice shows; the model chooses the name. */
+const REFUSED_REPLAY_NOTICE_MAX_TOOL_NAME_LENGTH = 64;
+
+/** One call of a failed batch that a tool replay does not re-run, labelled by why. */
+interface RefusedReplayCall {
+	toolName: string;
+	reason: "tool unavailable" | "started" | "may have started" | "already ran";
 }
 
 /** Result shape shared with automatic maintenance recovery. */
@@ -4131,6 +4147,16 @@ export class TurnRecovery {
 	 * the same tool calls directly rather than paying a model call to re-issue
 	 * them.
 	 *
+	 * Tool replay is all or nothing. The batch is re-run only when every call
+	 * of the anchor turn qualifies: its result is a synthetic never-executed
+	 * placeholder, its interrupted result records `execution: "not_started"`,
+	 * or the live tool resolved by name declares the call replay-safe for its
+	 * arguments ({@link resolveToolReplayClass}). One call that does not
+	 * qualify, including one whose tool is no longer registered, refuses the
+	 * whole batch: nothing is re-run, the failed results stay in context, and
+	 * the continuation is a model call that sees them (only an aborted boundary
+	 * after them is dropped). One warning notice names the refused calls.
+	 *
 	 * @returns true if retry was initiated, false if no failed turn to retry or agent is busy
 	 */
 	async retry(): Promise<boolean> {
@@ -4138,14 +4164,17 @@ export class TurnRecovery {
 
 		const messages = this.#host.agent.state.messages;
 		const activeTurnEnd = retryableAssistantTurnEnd(messages);
+		let refused: RefusedReplayCall[] = [];
 		if (activeTurnEnd !== undefined) {
 			const replayStart = toolReplayStart(messages);
-			if (replayStart !== undefined) {
+			if (replayStart !== undefined) refused = this.#refusedReplayCalls(messages, replayStart);
+			if (replayStart !== undefined && refused.length === 0) {
 				await this.#stripForToolReplay(messages, replayStart);
 			} else {
 				// Remove the failed/aborted assistant message plus its synthetic tool
 				// results (same as auto-retry does before re-attempting), keeping the
-				// trailing eval snapshot the continuation is sent with.
+				// trailing eval snapshot the continuation is sent with. After a refused
+				// tool replay that is only the aborted boundary after the failed results.
 				this.#host.agent.replaceMessages([
 					...messages.slice(0, activeTurnEnd - 1),
 					...messages.slice(conversationEnd(messages)),
@@ -4160,8 +4189,10 @@ export class TurnRecovery {
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
 			const replayStart = toolReplayStart(messages);
-			if (replayStart !== undefined) await this.#stripForToolReplay(messages, replayStart);
+			if (replayStart !== undefined) refused = this.#refusedReplayCalls(messages, replayStart);
+			if (replayStart !== undefined && refused.length === 0) await this.#stripForToolReplay(messages, replayStart);
 		}
+		if (refused.length > 0) await this.#noticeRefusedReplay(refused);
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
@@ -4170,6 +4201,62 @@ export class TurnRecovery {
 		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });
 
 		return true;
+	}
+	/**
+	 * Calls of the failed batch starting at `replayStart` that a tool replay
+	 * must not re-run (see {@link retry}), in the anchor turn's order; empty
+	 * when every call may run again. The replay class comes from the live tool
+	 * and the call's arguments, never from the class recorded in the transcript.
+	 */
+	#refusedReplayCalls(messages: readonly AgentMessage[], replayStart: number): RefusedReplayCall[] {
+		const anchor = messages[replayStart - 1] as AssistantMessage;
+		const results = new Map<string, ToolResultMessage>();
+		for (let i = replayStart; i < messages.length; i++) {
+			const message = messages[i];
+			if (message.role === "toolResult") results.set(message.toolCallId, message);
+		}
+		const tools = this.#host.agent.state.tools ?? [];
+		const refused: RefusedReplayCall[] = [];
+		for (const block of anchor.content) {
+			if (block.type !== "toolCall") continue;
+			const result = results.get(block.id);
+			if (isSyntheticToolResultMessage(result)) continue;
+			const execution = interruptedToolExecution(result?.details);
+			if (execution === "not_started") continue;
+			// The agent loop's name lookup without its side-transport fallback, so xd:// device tools stay unsafe.
+			const tool =
+				tools.find(candidate => candidate.name === block.name) ??
+				tools.find(candidate => candidate.customWireName !== undefined && candidate.customWireName === block.name);
+			if (!tool) {
+				refused.push({ toolName: block.name, reason: "tool unavailable" });
+				continue;
+			}
+			if (resolveToolReplayClass(tool, block.arguments) === "safe") continue;
+			refused.push({
+				toolName: block.name,
+				reason: execution === "started" ? "started" : execution === "unknown" ? "may have started" : "already ran",
+			});
+		}
+		return refused;
+	}
+	/** Emit the one warning that names the calls a refused tool replay did not re-run. */
+	async #noticeRefusedReplay(refused: readonly RefusedReplayCall[]): Promise<void> {
+		const labels = [
+			...new Set(
+				refused.map(
+					call => `${truncate(call.toolName, REFUSED_REPLAY_NOTICE_MAX_TOOL_NAME_LENGTH)} (${call.reason})`,
+				),
+			),
+		];
+		const named = labels.slice(0, REFUSED_REPLAY_NOTICE_MAX_CALLS).join(", ");
+		const more = labels.length - REFUSED_REPLAY_NOTICE_MAX_CALLS;
+		const list = more > 0 ? `${named}, and ${more} more` : named;
+		const message = sanitizeNoticeLine(
+			`Retry did not re-run ${list}: running a call again may repeat its side effects. The model continues from the failed results.`,
+		);
+		await this.#host
+			.emitSessionEvent({ type: "notice", level: "warning", message, source: "tool-replay" })
+			.catch(error => logger.debug("Refused tool replay notice failed", { error: String(error) }));
 	}
 	/**
 	 * Strip the failed tool batch (and any aborted boundary) for a tool replay:

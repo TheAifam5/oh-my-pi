@@ -119,6 +119,10 @@
 
 - Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
 
+### Fixed
+
+- Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool, type ToolReplay } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -13,9 +13,11 @@ import {
 	CRASHED_TURN_ERROR,
 	planInterruptedTurnRepair,
 	repairInterruptedTurn,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { localReadReplay } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const zeroUsage = {
@@ -43,19 +45,50 @@ function assistant(model: Model, fields: Partial<AssistantMessage>): AssistantMe
 
 const probeSchema = type({ value: "string" });
 
-/** A `probe` tool recording each run's `value` in `executed`. */
-function probeTool(executed: string[]): AgentTool {
+/** A tool (`probe` by default) recording each run's `value` in `executed`, with the given replay declaration. */
+function probeTool(executed: string[], replay: ToolReplay | undefined, name = "probe"): AgentTool {
 	const tool: AgentTool<typeof probeSchema, { value: string }> = {
-		name: "probe",
+		name,
 		label: "Probe",
 		description: "Probe tool",
 		parameters: probeSchema,
+		replay,
 		async execute(_toolCallId, params) {
 			executed.push(params.value);
 			return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
 		},
 	};
 	return tool as AgentTool;
+}
+
+/**
+ * A session holding `user` and then `turn`, with a start marker after the turn for each
+ * call in `started`, as the write-before-execute hook leaves them when the process dies.
+ */
+function crashedMidTurn(user: string, turn: AssistantMessage, started: readonly string[]): SessionManager {
+	const manager = SessionManager.inMemory();
+	manager.appendMessage({ role: "user", content: user, timestamp: Date.now() });
+	const assistantEntryId = manager.appendMessage(turn);
+	for (const block of turn.content) {
+		if (block.type !== "toolCall" || !started.includes(block.id)) continue;
+		manager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+			toolCallId: block.id,
+			toolName: block.name,
+			startedAt: "2026-10-01T10:00:00.000Z",
+			replay: "unsafe",
+			assistantEntryId,
+		});
+	}
+	return manager;
+}
+
+/** Warning notices `session` emits from now on. */
+function collectNotices(session: AgentSession): string[] {
+	const notices: string[] = [];
+	session.subscribe(event => {
+		if (event.type === "notice") notices.push(event.message);
+	});
+	return notices;
 }
 
 /** `persisted` with the records resume-time exit recovery (sdk.ts) closes its cut-off turn with. */
@@ -93,13 +126,17 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 	/** A session reopened from `persisted` as `--resume` builds it, its model answering from `responses`. */
 	function reopen(
 		model: Model,
-		persisted: Message[],
+		persisted: Message[] | SessionManager,
 		tools: AgentTool[],
 		responses: MockResponse[],
 		evalToolSession?: ToolSession,
 	) {
-		const sessionManager = SessionManager.inMemory();
-		for (const message of persisted) sessionManager.appendMessage(message);
+		let sessionManager: SessionManager;
+		if (persisted instanceof SessionManager) sessionManager = persisted;
+		else {
+			sessionManager = SessionManager.inMemory();
+			for (const message of persisted) sessionManager.appendMessage(message);
+		}
 		const mock = createMockModel({ responses });
 		const agent = new Agent({
 			getApiKey: model => `${model.provider}-test-key`,
@@ -122,7 +159,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		return { session, mock };
 	}
 
-	it("goes on with a turn a crash cut off mid tool call, running the cut-off call again", async () => {
+	it("goes on with a turn a crash cut off mid tool call, running the cut-off replay-safe call again", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 		const executed: string[] = [];
@@ -136,7 +173,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					stopReason: "toolUse",
 				}),
 			],
-			[probeTool(executed)],
+			[probeTool(executed, "safe")],
 			[{ content: ["done after restore"], stopReason: "stop" }],
 		);
 
@@ -162,7 +199,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					stopReason: "toolUse",
 				}),
 			],
-			[probeTool(executed)],
+			[probeTool(executed, "safe")],
 			[{ content: ["done after restore"], stopReason: "stop" }],
 		);
 		// A resume without --restore (or a revived subagent) closes the crash tail at startup.
@@ -224,7 +261,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					stopReason: "toolUse",
 				}),
 			]),
-			[probeTool(executed)],
+			[probeTool(executed, "safe")],
 			[{ content: ["done after restore"], stopReason: "stop" }],
 			evalToolSession,
 		);
@@ -277,7 +314,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					stopReason: "toolUse",
 				}),
 			],
-			[probeTool(executed)],
+			[probeTool(executed, "safe")],
 			[{ content: ["done after restore"], stopReason: "stop" }],
 			evalToolSession,
 		);
@@ -337,7 +374,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					timestamp: Date.now(),
 				},
 			],
-			[probeTool(executed)],
+			[probeTool(executed, "safe")],
 			[{ content: ["answered from the transcript"], stopReason: "stop" }],
 			evalToolSession,
 		);
@@ -350,6 +387,192 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		// Re-running the batch would repeat the completed call; the model answers instead.
 		expect(executed).toEqual([]);
 		expect(mock.calls.length).toBe(1);
+	});
+
+	it("does not re-run an unsafe call that started before the crash: the model sees its interrupted result and a notice names it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const { session, mock } = reopen(
+			model,
+			crashedMidTurn(
+				"deploy",
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { value: "kubectl apply" } }],
+					stopReason: "toolUse",
+				}),
+				["call_1"],
+			),
+			[probeTool(executed, "unsafe", "bash")],
+			[{ content: ["answered after restore"], stopReason: "stop" }],
+		);
+		const notices = collectNotices(session);
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const sent = mock.calls[0]!.context.messages.at(-1);
+		if (sent?.role !== "toolResult") throw new Error("Expected the interrupted result to end the request");
+		expect(sent.toolCallId).toBe("call_1");
+		expect(sent.content).toContainEqual({ type: "text", text: expect.stringContaining("It was not re-run") });
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("bash (started)");
+	});
+
+	it("re-runs a crash-cut batch of local reads that started before the crash", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const { session, mock } = reopen(
+			model,
+			crashedMidTurn(
+				"read the notes",
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { value: "notes.md" } }],
+					stopReason: "toolUse",
+				}),
+				["call_1"],
+			),
+			[probeTool(executed, localReadReplay, "read")],
+			[{ content: ["done after restore"], stopReason: "stop" }],
+		);
+		const notices = collectNotices(session);
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual(["notes.md"]);
+		expect(mock.calls.length).toBe(1);
+		expect(notices).toEqual([]);
+	});
+
+	it("re-runs an unsafe call the journal proves never started", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		// The read's marker names the turn, so the unmarked bash call reads as not started.
+		const { session, mock } = reopen(
+			model,
+			crashedMidTurn(
+				"read, then deploy",
+				assistant(model, {
+					content: [
+						{ type: "toolCall", id: "call_read", name: "read", arguments: { value: "notes.md" } },
+						{ type: "toolCall", id: "call_bash", name: "bash", arguments: { value: "kubectl apply" } },
+					],
+					stopReason: "toolUse",
+				}),
+				["call_read"],
+			),
+			[probeTool(executed, localReadReplay, "read"), probeTool(executed, "unsafe", "bash")],
+			[{ content: ["done after restore"], stopReason: "stop" }],
+		);
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect([...executed].sort()).toEqual(["kubectl apply", "notes.md"]);
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("re-runs none of a batch on /retry when one of its calls is unsafe and started", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const { session, mock } = reopen(
+			model,
+			crashedMidTurn(
+				"read, then deploy",
+				assistant(model, {
+					content: [
+						{ type: "toolCall", id: "call_read", name: "read", arguments: { value: "notes.md" } },
+						{ type: "toolCall", id: "call_bash", name: "bash", arguments: { value: "kubectl apply" } },
+					],
+					stopReason: "toolUse",
+				}),
+				["call_read", "call_bash"],
+			),
+			[probeTool(executed, localReadReplay, "read"), probeTool(executed, "unsafe", "bash")],
+			[{ content: ["answered after retry"], stopReason: "stop" }],
+		);
+		// A plain resume closes the crash tail at startup; the user then runs /retry.
+		repairInterruptedTurn(session.sessionManager);
+		session.agent.replaceMessages(session.sessionManager.buildSessionContext().messages);
+		const notices = collectNotices(session);
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const sentResults = mock.calls[0]!.context.messages.flatMap(message =>
+			message.role === "toolResult" ? [message.toolCallId] : [],
+		);
+		expect(sentResults).toEqual(["call_read", "call_bash"]);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("bash (started)");
+		expect(notices[0]).not.toContain("read");
+	});
+
+	it("does not re-run a crash-cut call whose tool is no longer registered", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const executed: string[] = [];
+		const { session, mock } = reopen(
+			model,
+			crashedMidTurn(
+				"run the removed tool",
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "gone", arguments: { value: "x" } }],
+					stopReason: "toolUse",
+				}),
+				[],
+			),
+			[probeTool(executed, "safe")],
+			[{ content: ["answered after restore"], stopReason: "stop" }],
+		);
+		const notices = collectNotices(session);
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(mock.calls.length).toBe(1);
+		const sent = mock.calls[0]!.context.messages.at(-1);
+		if (sent?.role !== "toolResult") throw new Error("Expected the interrupted result to end the request");
+		expect(sent.content).toContainEqual({ type: "text", text: expect.stringContaining("It was not re-run") });
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("gone (tool unavailable)");
+	});
+
+	it("shortens an oversized model-chosen tool name in the refusal notice to one bounded line", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const toolName = `${"x".repeat(10)}\n${"y".repeat(5_000)}`;
+		const { session } = reopen(
+			model,
+			crashedMidTurn(
+				"run the removed tool",
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: toolName, arguments: { value: "x" } }],
+					stopReason: "toolUse",
+				}),
+				[],
+			),
+			[probeTool([], "safe")],
+			[{ content: ["answered after restore"], stopReason: "stop" }],
+		);
+		const notices = collectNotices(session);
+
+		await expect(session.restoreInterruptedTurn()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain(`${"x".repeat(10)} ${"y".repeat(52)}… (tool unavailable)`);
+		expect(notices[0]).not.toContain("y".repeat(53));
+		expect(notices[0]!.length).toBeLessThan(256);
+		expect(notices[0]).not.toMatch(/[\r\n]/);
 	});
 
 	it("leaves a turn the user interrupted, and one that finished, as they are", async () => {

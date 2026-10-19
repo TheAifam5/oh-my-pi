@@ -259,7 +259,7 @@ describe("AgentSession manual retry", () => {
 		expect(session.hasAbortedToolCallTail).toBe(false);
 	});
 
-	it("re-executes the aborted tool call instead of re-issuing it via the model", async () => {
+	it("re-executes the aborted replay-safe tool call instead of re-issuing it via the model", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
@@ -272,6 +272,7 @@ describe("AgentSession manual retry", () => {
 			label: "Probe",
 			description: "Probe tool",
 			parameters: toolSchema,
+			replay: "safe",
 			async execute(_toolCallId, params) {
 				executed.push(params.value);
 				return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
@@ -352,6 +353,194 @@ describe("AgentSession manual retry", () => {
 		expect(replayResult.isError).not.toBe(true);
 		expect(replayResult.content).toContainEqual({ type: "text", text: "ok:again" });
 		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after replay" });
+	});
+
+	it("keeps an interrupted unsafe call's result for the model instead of re-executing it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const bashTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "bash",
+			label: "Bash",
+			description: "Bash stand-in",
+			parameters: toolSchema,
+			replay: "unsafe",
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ran:${params.value}` }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["saw the interrupted push"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// Esc landed while `git push` ran: the loop's result records that the call started.
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [bashTool],
+				messages: [
+					{ role: "user", content: "push it", timestamp: Date.now() },
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { value: "git push" } }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "bash",
+						content: [{ type: "text", text: "Execution interrupted" }],
+						details: { __interrupted: true, source: "interrupt_skipped", execution: "started" },
+						isError: true,
+						timestamp: Date.now(),
+					},
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "aborted",
+						errorMessage: "Interrupted by user",
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const sent = mock.calls[0]!.context.messages.at(-1);
+		if (sent?.role !== "toolResult") throw new Error("Expected the interrupted result to end the request");
+		expect(sent.content).toContainEqual({ type: "text", text: "Execution interrupted" });
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("bash (started)");
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "saw the interrupted push" });
+	});
+
+	it("does not re-execute an unsafe call that failed after running when the next model call errored", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const bashTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "bash",
+			label: "Bash",
+			description: "Bash stand-in",
+			parameters: toolSchema,
+			replay: "unsafe",
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ran:${params.value}` }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["saw the failed publish"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// `npm publish` ran and exited non-zero; the model call after its result then failed.
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [bashTool],
+				messages: [
+					{ role: "user", content: "publish it", timestamp: Date.now() },
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { value: "npm publish" } }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "bash",
+						content: [{ type: "text", text: "Command exited with code 1" }],
+						isError: true,
+						timestamp: Date.now(),
+					},
+					{
+						role: "assistant",
+						content: [],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "error",
+						errorMessage: "Request timed out",
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const sent = mock.calls[0]!.context.messages.at(-1);
+		if (sent?.role !== "toolResult") throw new Error("Expected the failed result to end the request");
+		expect(sent.content).toContainEqual({ type: "text", text: "Command exited with code 1" });
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("bash (already ran)");
 	});
 
 	it("retries a persisted failed turn after rebuilding provider context", async () => {
@@ -460,6 +649,7 @@ describe("AgentSession manual retry", () => {
 			label: "Probe",
 			description: "Probe tool",
 			parameters: toolSchema,
+			replay: "safe",
 			async execute(_toolCallId, _params, signal) {
 				probeRuns++;
 				if (probeRuns === 1) {

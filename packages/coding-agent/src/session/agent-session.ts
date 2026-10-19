@@ -12804,8 +12804,9 @@ export class AgentSession implements SettingsScope {
 	 * by {@link repairInterruptedTurn} with the exit assumed: its unfinished tool
 	 * calls get interrupted results and an interrupted-turn abort ends it. A turn
 	 * whose abort is the branch tail ({@link hasRestorableTurn}) is then retried as
-	 * `/retry` does: a batch whose every call was cut off runs again, otherwise the
-	 * model answers from where the transcript stops. A turn that finished, failed,
+	 * `/retry` does: a batch whose every call was cut off runs again when each call
+	 * is safe to repeat (see `TurnRecovery.retry`), otherwise the model answers from
+	 * where the transcript stops. A turn that finished, failed,
 	 * or the user interrupted stays as it is, and so does a turn left unrepaired
 	 * because another session holds it or a separated copy's turn that continues
 	 * in the live session.
