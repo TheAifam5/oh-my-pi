@@ -78,9 +78,10 @@ const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
  * until a later owner restricts the id again, as a revived or resumed pooled
  * session does. A later owner without pools reusing the id resolves only the pool's
  * accounts and otherwise fails with an error naming the ended restriction. The
- * auth store keeps a bounded number of retired restrictions in memory, in
- * this process only; once one is evicted as the least recently used, its id is
- * unrestricted again.
+ * auth store keeps retired restrictions in memory, in this process only, for
+ * 24 hours after they are retired (`SESSION_RESTRICTION_TOMBSTONE_TTL_MS`);
+ * once one expires, or a memory safety cap evicts it, its id is unrestricted
+ * again.
  */
 export class SessionAccountPoolScope {
 	readonly #authStorage: Pick<AuthStorage, "sessions">;

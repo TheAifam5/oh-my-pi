@@ -40,6 +40,10 @@
 - Fixed native remote compaction for supported Bedrock Claude models without changing ordinary Converse turns; a custom non-AWS `baseUrl` needs `remoteCompaction.enabled: true` ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 - Fixed Anthropic compaction blocks dropping their signed `tool_changes`, which made the replayed block fail its signature ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 
+### Fixed
+
+- Fixed a retired session account pool lifting once more than 256 other pools were retired, so a deferred lookup under its session id could use any account or API key; a retired pool now holds for 24 hours
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

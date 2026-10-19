@@ -63,11 +63,32 @@ export type SessionCredential = {
 };
 
 /**
- * Retired session restrictions ({@link SessionAffinity.retire}) kept at once,
- * across providers. Past this many, the least recently used one is evicted
- * and its session id is unrestricted again.
+ * How long a retired session restriction ({@link SessionAffinity.retire}) keeps
+ * denying accounts outside its allowlist, measured on a monotonic clock from the
+ * moment it was retired. It must exceed the longest deferred lookup (scan job,
+ * side request) an ended session leaves behind, because a lookup after expiry
+ * runs unrestricted. Reads do not extend it.
  */
-export const SESSION_RESTRICTION_TOMBSTONES_MAX = 256;
+export const SESSION_RESTRICTION_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Memory guard on the retired restrictions kept at once, across providers.
+ * Past it the earliest retired ones are evicted first, and their session ids
+ * are unrestricted again before their TTL ends.
+ */
+export const SESSION_RESTRICTION_TOMBSTONES_HARD_CAP = 65_536;
+
+/** Minimum time between two full sweeps of expired retired restrictions. */
+const SESSION_RESTRICTION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * A monotonic clock in milliseconds: it never moves backwards and wall-clock
+ * changes (NTP steps, manual changes) do not move it. Only differences between
+ * two readings are meaningful.
+ */
+export type MonotonicClock = () => number;
+
+const monotonicNow: MonotonicClock = () => performance.now();
 
 /**
  * One installed restriction: {@link identityHash} digests of the allowed OAuth
@@ -75,8 +96,150 @@ export const SESSION_RESTRICTION_TOMBSTONES_MAX = 256;
  */
 type SessionRestriction = { readonly allowedHashes: ReadonlySet<string>; readonly lease: SessionRestrictionLease };
 
-/** A retired restriction: it keeps denying accounts outside its allowlist until replaced, lifted, or evicted. */
-type RestrictionTombstone = SessionRestriction & { readonly provider: string; readonly sessionId: string };
+/**
+ * A retired restriction: it keeps denying accounts outside its allowlist until
+ * replaced, lifted, expired ({@link SESSION_RESTRICTION_TOMBSTONE_TTL_MS} after
+ * `retiredAtMs`), or evicted by the safety cap.
+ */
+type RestrictionTombstone = SessionRestriction & {
+	readonly provider: string;
+	readonly sessionId: string;
+	/** {@link MonotonicClock} reading when it was retired. */
+	readonly retiredAtMs: number;
+};
+
+/** Minimum time between two eviction warnings of one `AuthStorage`; evictions in between are counted. */
+export const SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS = 60_000;
+
+/** Minimum time between two expiry debug records of one `AuthStorage`; expiries in between are counted. */
+export const SESSION_RESTRICTION_EXPIRY_LOG_INTERVAL_MS = 60_000;
+
+/**
+ * Retired session restrictions of one `AuthStorage`, keyed by {@link tombstoneKey}.
+ *
+ * Expiry is evaluated on every read, so an expired entry is never returned,
+ * and a full sweep runs at most once per {@link SESSION_RESTRICTION_SWEEP_INTERVAL_MS}
+ * when an entry is added or a restriction installed, so memory stays bounded
+ * by the TTL times the retire rate. Ages, intervals, and rate limits are read
+ * from the {@link MonotonicClock} given at construction, so a wall-clock step
+ * neither expires an entry early nor keeps it longer. A clock reading earlier
+ * than an entry's `retiredAtMs`, which a monotonic clock does not produce,
+ * reads as not expired: the restriction stays rather than lifting early.
+ *
+ * Every expired entry dropped is counted, and a debug record with the provider
+ * and the expiries since the previous record is logged at most once per
+ * {@link SESSION_RESTRICTION_EXPIRY_LOG_INTERVAL_MS}; expiries after the last
+ * record are reported with the next one. No session id is logged.
+ *
+ * Past {@link SESSION_RESTRICTION_TOMBSTONES_HARD_CAP} entries the earliest
+ * retired is evicted. An eviction logs a warning with the provider, the cap,
+ * and the evictions since the previous warning, at most once per
+ * {@link SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS}; evictions after the
+ * last warning are reported with the next one. No session id is logged.
+ */
+export class RetiredRestrictions {
+	/** Insertion order is retirement order: an entry is deleted before it is set again. */
+	readonly #entries = new Map<string, RestrictionTombstone>();
+	readonly #now: MonotonicClock;
+	#lastSweepAtMs: number | undefined;
+	#evictedSinceWarning = 0;
+	#lastWarningAtMs: number | undefined;
+	#expiredSinceRecord = 0;
+	#lastExpiryRecordAtMs: number | undefined;
+
+	/** `now` ages the entries; it defaults to `performance.now()`. */
+	constructor(now: MonotonicClock = monotonicNow) {
+		this.#now = now;
+	}
+
+	/** The unexpired retired restriction under `key`; an expired one is dropped. */
+	get(key: string): RestrictionTombstone | undefined {
+		const tombstone = this.#entries.get(key);
+		if (tombstone === undefined) return undefined;
+		const nowMs = this.#now();
+		if (!RetiredRestrictions.#expired(tombstone, nowMs)) return tombstone;
+		this.#dropExpired(key, tombstone, nowMs);
+		return undefined;
+	}
+
+	/** Every unexpired retired restriction, earliest retired first; expired ones are dropped. */
+	values(): RestrictionTombstone[] {
+		const nowMs = this.#now();
+		const values: RestrictionTombstone[] = [];
+		for (const [key, tombstone] of this.#entries) {
+			if (RetiredRestrictions.#expired(tombstone, nowMs)) this.#dropExpired(key, tombstone, nowMs);
+			else values.push(tombstone);
+		}
+		return values;
+	}
+
+	delete(key: string): void {
+		this.#entries.delete(key);
+	}
+
+	/** Retire `restriction` for `provider`/`sessionId` now, replacing any entry under its key. */
+	add(provider: string, sessionId: string, restriction: SessionRestriction): void {
+		const nowMs = this.#now();
+		this.sweep(nowMs);
+		const key = tombstoneKey(provider, sessionId);
+		this.#entries.delete(key);
+		this.#entries.set(key, { ...restriction, provider, sessionId, retiredAtMs: nowMs });
+		while (this.#entries.size > SESSION_RESTRICTION_TOMBSTONES_HARD_CAP) {
+			const earliest = this.#entries.entries().next().value;
+			if (earliest === undefined) break;
+			this.#entries.delete(earliest[0]);
+			this.#noteEviction(earliest[1].provider, nowMs);
+		}
+	}
+
+	/** Drop every expired entry, unless a sweep ran within {@link SESSION_RESTRICTION_SWEEP_INTERVAL_MS}. */
+	sweep(nowMs = this.#now()): void {
+		const elapsedMs = this.#lastSweepAtMs === undefined ? undefined : nowMs - this.#lastSweepAtMs;
+		// A clock reading that went backwards counts as elapsed, so it cannot postpone sweeps.
+		if (elapsedMs !== undefined && elapsedMs >= 0 && elapsedMs < SESSION_RESTRICTION_SWEEP_INTERVAL_MS) return;
+		this.#lastSweepAtMs = nowMs;
+		for (const [key, tombstone] of this.#entries) {
+			if (RetiredRestrictions.#expired(tombstone, nowMs)) this.#dropExpired(key, tombstone, nowMs);
+		}
+	}
+
+	static #expired(tombstone: RestrictionTombstone, nowMs: number): boolean {
+		const ageMs = nowMs - tombstone.retiredAtMs;
+		// A negative age (a clock reading below the retirement stamp) fails closed: the restriction stays.
+		return ageMs >= SESSION_RESTRICTION_TOMBSTONE_TTL_MS;
+	}
+
+	#dropExpired(key: string, tombstone: RestrictionTombstone, nowMs: number): void {
+		this.#entries.delete(key);
+		this.#expiredSinceRecord += 1;
+		const elapsedMs = this.#lastExpiryRecordAtMs === undefined ? undefined : nowMs - this.#lastExpiryRecordAtMs;
+		// A clock reading that went backwards counts as elapsed, so it cannot silence records.
+		if (elapsedMs !== undefined && elapsedMs >= 0 && elapsedMs < SESSION_RESTRICTION_EXPIRY_LOG_INTERVAL_MS) return;
+		logger.debug("Retired session account restrictions expired; their session ids are unrestricted again", {
+			provider: tombstone.provider,
+			expired: this.#expiredSinceRecord,
+		});
+		this.#expiredSinceRecord = 0;
+		this.#lastExpiryRecordAtMs = nowMs;
+	}
+
+	#noteEviction(provider: string, nowMs: number): void {
+		this.#evictedSinceWarning += 1;
+		const elapsedMs = this.#lastWarningAtMs === undefined ? undefined : nowMs - this.#lastWarningAtMs;
+		// A clock reading that went backwards counts as elapsed, so it cannot silence warnings.
+		if (elapsedMs !== undefined && elapsedMs >= 0 && elapsedMs < SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS) return;
+		logger.warn(
+			"Evicted retired session account restrictions past the safety cap; their session ids are unrestricted again",
+			{
+				provider,
+				limit: SESSION_RESTRICTION_TOMBSTONES_HARD_CAP,
+				evicted: this.#evictedSinceWarning,
+			},
+		);
+		this.#evictedSinceWarning = 0;
+		this.#lastWarningAtMs = nowMs;
+	}
+}
 
 /**
  * Session account restrictions. Owned by `AuthStorage` so they outlive store
@@ -86,46 +249,13 @@ type RestrictionTombstone = SessionRestriction & { readonly provider: string; re
 export type SessionRestrictions = {
 	/** Provider → session id → live restriction. Never evicted: that would widen a live session. */
 	readonly live: Map<string, Map<string, SessionRestriction>>;
-	/** {@link tombstoneKey} → retired restriction, bounded by {@link SESSION_RESTRICTION_TOMBSTONES_MAX}. */
-	readonly retired: LRUCache<string, RestrictionTombstone>;
+	/** Retired restrictions, kept until their TTL ends ({@link RetiredRestrictions}). */
+	readonly retired: RetiredRestrictions;
 };
 
-/** Minimum time between two eviction warnings of one `AuthStorage`; evictions in between are counted. */
-export const SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS = 60_000;
-
-/**
- * Empty restriction state for one `AuthStorage`. Evicting a retired
- * restriction logs a warning with the provider, the cap, and the evictions
- * since the previous warning, at most once per
- * {@link SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS}; evictions after the
- * last warning are reported with the next one.
- */
-export function createSessionRestrictions(): SessionRestrictions {
-	let evictedSinceWarning = 0;
-	let lastWarningAtMs: number | undefined;
-	return {
-		live: new Map(),
-		retired: new LRUCache<string, RestrictionTombstone>({
-			max: SESSION_RESTRICTION_TOMBSTONES_MAX,
-			dispose: (tombstone, _key, reason) => {
-				if (reason !== "evict") return;
-				evictedSinceWarning += 1;
-				const nowMs = Date.now();
-				const elapsedMs = lastWarningAtMs === undefined ? undefined : nowMs - lastWarningAtMs;
-				// A wall clock stepped backwards counts as elapsed, so it cannot silence warnings.
-				if (elapsedMs !== undefined && elapsedMs >= 0 && elapsedMs < SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS) {
-					return;
-				}
-				logger.warn("Evicted retired session account restrictions; their session ids are unrestricted again", {
-					provider: tombstone.provider,
-					limit: SESSION_RESTRICTION_TOMBSTONES_MAX,
-					evicted: evictedSinceWarning,
-				});
-				evictedSinceWarning = 0;
-				lastWarningAtMs = nowMs;
-			},
-		}),
-	};
+/** Empty restriction state for one `AuthStorage`; `now` ages retired restrictions ({@link RetiredRestrictions}). */
+export function createSessionRestrictions(now?: MonotonicClock): SessionRestrictions {
+	return { live: new Map(), retired: new RetiredRestrictions(now) };
 }
 
 function tombstoneKey(provider: string, sessionId: string): string {
@@ -275,6 +405,7 @@ export class SessionAffinity implements SessionsApi {
 		sessions.set(sessionId, { allowedHashes, lease });
 		this.#restrictions.live.set(provider, sessions);
 		this.#restrictions.retired.delete(tombstoneKey(provider, sessionId));
+		this.#restrictions.retired.sweep();
 		return lease;
 	}
 
@@ -291,13 +422,13 @@ export class SessionAffinity implements SessionsApi {
 	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
 		if (this.#takeLive(provider, sessionId, lease)) return;
 		const key = tombstoneKey(provider, sessionId);
-		if (this.#restrictions.retired.peek(key)?.lease === lease) this.#restrictions.retired.delete(key);
+		if (this.#restrictions.retired.get(key)?.lease === lease) this.#restrictions.retired.delete(key);
 	}
 
 	retire(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
 		const restriction = this.#takeLive(provider, sessionId, lease);
 		if (!restriction) return;
-		this.#restrictions.retired.set(tombstoneKey(provider, sessionId), { ...restriction, provider, sessionId });
+		this.#restrictions.retired.add(provider, sessionId, restriction);
 	}
 
 	restrictLike(sourceSessionId: string, targetSessionId: string): ReadonlyMap<string, SessionRestrictionLease> {
@@ -321,8 +452,8 @@ export class SessionAffinity implements SessionsApi {
 
 	/**
 	 * Digests of the identity keys `sessionId` may use for `provider`: its live
-	 * restriction, else its retired one (refreshing that one's recency), else
-	 * `undefined` for an unrestricted session.
+	 * restriction, else its unexpired retired one, else `undefined` for an
+	 * unrestricted session.
 	 */
 	#allowedHashes(provider: string, sessionId: string | undefined): ReadonlySet<string> | undefined {
 		if (sessionId === undefined) return undefined;
@@ -337,7 +468,7 @@ export class SessionAffinity implements SessionsApi {
 		return (
 			sessionId !== undefined &&
 			this.#restrictions.live.get(provider)?.has(sessionId) !== true &&
-			this.#restrictions.retired.has(tombstoneKey(provider, sessionId))
+			this.#restrictions.retired.get(tombstoneKey(provider, sessionId)) !== undefined
 		);
 	}
 
@@ -387,8 +518,7 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	admits(provider: string, sessionId: string | undefined, credentialId: number): boolean {
-		const credential = this.#pool.entries(provider).find(entry => entry.id === credentialId)?.credential;
-		return credential !== undefined && this.allows(provider, sessionId, credential);
+		return sessionId === undefined || this.permits(provider, sessionId, credentialId);
 	}
 
 	/** Whether an identity key in the allowlist of the restricted `sessionId` has the digest `hash`. */

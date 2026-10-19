@@ -90,11 +90,12 @@ export class AuthStorage {
 	readonly #options: AuthStorageOptions;
 	readonly #overrides: KeyOverrides;
 	readonly #policies: AccountPolicies;
-	readonly #restrictions: SessionRestrictions = createSessionRestrictions();
+	readonly #restrictions: SessionRestrictions;
 	#modules: AuthStorageModules;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#options = options;
+		this.#restrictions = createSessionRestrictions(options.sessionRestrictionClock);
 		this.#overrides = new KeyOverrides(options.configValueResolver);
 		this.#policies = new AccountPolicies(options.accountPolicies ?? [], options.defaultReservePct);
 		this.#modules = this.#compose(store, options.sourceLabel);

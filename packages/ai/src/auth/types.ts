@@ -479,6 +479,12 @@ export type AuthStorageOptions = {
 	 * - `"broker http://omp.internal:8765"`
 	 */
 	sourceLabel?: string;
+	/**
+	 * Monotonic clock in milliseconds that ages retired session restrictions
+	 * ({@link SessionsApi.retire}): it must never move backwards and must not
+	 * follow wall-clock changes. Defaults to `performance.now()`.
+	 */
+	sessionRestrictionClock?: () => number;
 };
 
 /**
@@ -1381,9 +1387,11 @@ export interface SessionsApi {
 	/** Whether a live {@link restrict} or a {@link retire}d restriction limits `sessionId` for `provider`. */
 	isRestricted(provider: string, sessionId: string | undefined): boolean;
 	/**
-	 * Whether the stored row `credentialId` may serve `sessionId` under its
-	 * restriction: every stored row of an unrestricted session, only an allowed
-	 * OAuth account of a restricted one. False for a row that is not stored.
+	 * Whether the row `credentialId` may serve `sessionId` under its
+	 * restriction; the same answer as {@link permits}, and true without a
+	 * session id. A restricted session admits only a stored, allowed OAuth
+	 * account, so a row that is not stored is refused; an unrestricted session
+	 * admits any row id, and a caller that needs the row stored checks that.
 	 */
 	admits(provider: string, sessionId: string | undefined, credentialId: number): boolean;
 	/**
@@ -1411,9 +1419,9 @@ export interface SessionsApi {
 	 */
 	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void;
 	/**
-	 * Whether stored credential `credentialId` may serve `sessionId`: always for
-	 * an unrestricted session, otherwise only an OAuth account its
-	 * {@link restrict} list names.
+	 * Whether credential `credentialId` may serve `sessionId`: always for an
+	 * unrestricted session, whether or not the row is stored, otherwise only a
+	 * stored OAuth account its {@link restrict} list names.
 	 */
 	permits(provider: string, sessionId: string, credentialId: number): boolean;
 	/**
@@ -1421,11 +1429,19 @@ export interface SessionsApi {
 	 * allowlist: a lookup made under the id afterwards, by any caller, is still
 	 * restricted as {@link restrict} describes. The retired restriction stays
 	 * until a later {@link restrict} replaces it, {@link unrestrict} lifts it
-	 * with the same lease, or it is evicted as the least recently used of more
-	 * than `SESSION_RESTRICTION_TOMBSTONES_MAX` retired restrictions, which
-	 * leaves the id unrestricted. Retired restrictions live in this process's
-	 * memory only. Does nothing when `lease` no longer holds the live
-	 * restriction (replaced, lifted, or already retired).
+	 * with the same lease, or it expires `SESSION_RESTRICTION_TOMBSTONE_TTL_MS`
+	 * (24 hours) after this call, measured on a monotonic clock
+	 * ({@link AuthStorageOptions.sessionRestrictionClock}), so a wall-clock
+	 * step neither expires it early nor keeps it longer; reads do not extend
+	 * it. Expiry leaves the id unrestricted and logs a rate-limited debug
+	 * record with the provider and no session id, so the TTL must exceed the
+	 * longest lookup a caller defers under the id after this call. A
+	 * memory safety cap (`SESSION_RESTRICTION_TOMBSTONES_HARD_CAP` retired
+	 * restrictions across providers) evicts the earliest retired ones first
+	 * when exceeded, which also leaves their ids unrestricted and logs a
+	 * warning. Retired restrictions live in this process's memory only. Does
+	 * nothing when `lease` no longer holds the live restriction (replaced,
+	 * lifted, or already retired).
 	 */
 	retire(provider: string, sessionId: string, lease: SessionRestrictionLease): void;
 	/**

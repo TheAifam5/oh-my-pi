@@ -6,7 +6,9 @@ import {
 	identityHash,
 	SESSION_PIN_CACHE_PREFIX,
 	SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS,
-	SESSION_RESTRICTION_TOMBSTONES_MAX,
+	SESSION_RESTRICTION_EXPIRY_LOG_INTERVAL_MS,
+	SESSION_RESTRICTION_TOMBSTONE_TTL_MS,
+	SESSION_RESTRICTION_TOMBSTONES_HARD_CAP,
 } from "@oh-my-pi/pi-ai/auth/affinity";
 import { SESSION_DRAIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/drain-state";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
@@ -33,12 +35,15 @@ describe("AuthStorage session account restrictions", () => {
 	let storage: AuthStorage;
 	/** Access tokens the OAuth exchange was asked to serve, in order. */
 	let exchanged: string[] = [];
+	/** Reading of the monotonic clock that ages `storage`'s retired restrictions. */
+	let monotonicMs = 0;
 
 	beforeEach(async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-session-restrict-"));
 		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		stores = [store];
-		storage = new AuthStorage(store);
+		monotonicMs = 1_000_000;
+		storage = new AuthStorage(store, { sessionRestrictionClock: () => monotonicMs });
 		exchanged = [];
 		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
 			const credential = credentials[provider];
@@ -143,14 +148,28 @@ describe("AuthStorage session account restrictions", () => {
 		if (!accountA || !accountB) throw new Error("expected stored accounts");
 		const lease = storage.sessions.restrict(PROVIDER, "session", ["account:acc-a"]);
 
-		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
-		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
-		expect(storage.sessions.permits(PROVIDER, "unrestricted", accountB.credentialId)).toBe(true);
+		const unstoredId = Math.max(accountA.credentialId, accountB.credentialId) + 1;
+		// permits and admits give one answer: a stored allowed account only, any row id when unrestricted.
+		const answers = (sessionId: string) =>
+			[accountA.credentialId, accountB.credentialId, unstoredId].map(id => [
+				storage.sessions.permits(PROVIDER, sessionId, id),
+				storage.sessions.admits(PROVIDER, sessionId, id),
+			]);
+		const restricted = [
+			[true, true],
+			[false, false],
+			[false, false],
+		];
+		expect(answers("session")).toEqual(restricted);
+		expect(answers("unrestricted")).toEqual([
+			[true, true],
+			[true, true],
+			[true, true],
+		]);
 
 		// A retired restriction keeps the same allowlist.
 		storage.sessions.retire(PROVIDER, "session", lease);
-		expect(storage.sessions.permits(PROVIDER, "session", accountA.credentialId)).toBe(true);
-		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(false);
+		expect(answers("session")).toEqual(restricted);
 
 		storage.sessions.unrestrict(PROVIDER, "session", lease);
 		expect(storage.sessions.permits(PROVIDER, "session", accountB.credentialId)).toBe(true);
@@ -417,10 +436,12 @@ describe("AuthStorage session account restrictions", () => {
 		expect(await storage.keys.get(PROVIDER, "scan")).toBe("runtime-key");
 	});
 
-	test("retired restrictions past the cap evict the least recently used one, which is unrestricted again", async () => {
+	test("a retired restriction keeps denying other accounts and API keys after more than 256 other retirements", async () => {
 		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const [accountA] = storage.oauth.accounts(PROVIDER);
+		if (!accountA) throw new Error("expected stored accounts");
 		storage.keys.setRuntime(PROVIDER, "runtime-key");
-		for (let index = 0; index <= SESSION_RESTRICTION_TOMBSTONES_MAX; index += 1) {
+		for (let index = 0; index <= 300; index += 1) {
 			const sessionId = `released-${index}`;
 			storage.sessions.retire(
 				PROVIDER,
@@ -429,45 +450,109 @@ describe("AuthStorage session account restrictions", () => {
 			);
 		}
 
-		expect(await storage.keys.get(PROVIDER, "released-0")).toBe("runtime-key");
-		for (const sessionId of ["released-1", `released-${SESSION_RESTRICTION_TOMBSTONES_MAX}`]) {
-			expect(await storage.keys.get(PROVIDER, sessionId)).toBe("access-b");
-		}
+		expect(await storage.keys.get(PROVIDER, "released-0")).toBe("access-b");
+		expect(storage.sessions.admits(PROVIDER, "released-0", accountA.credentialId)).toBe(false);
 	});
 
-	test("evictions warn at most once per interval, with the count since the previous warning and no session id", () => {
-		const startMs = Date.parse("2026-10-08T10:00:00Z");
-		setSystemTime(new Date(startMs));
-		try {
-			const warn = vi.spyOn(logger, "warn");
-			const evictionWarnings = () =>
-				warn.mock.calls.filter(([message]) => String(message).startsWith("Evicted retired session account"));
-			const retireSessions = (from: number, count: number) => {
-				for (let index = from; index < from + count; index += 1) {
-					const sessionId = `released-${index}`;
-					storage.sessions.retire(
-						PROVIDER,
-						sessionId,
-						storage.sessions.restrict(PROVIDER, sessionId, ["account:acc-b"]),
-					);
-				}
-			};
-			// Three evictions inside one interval: the first warns, the other two are counted.
-			retireSessions(0, SESSION_RESTRICTION_TOMBSTONES_MAX + 3);
-			expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
-				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 1 },
-			]);
+	/** Two accounts whose tokens outlive a wall-clock jump past the TTL, so only the restriction decides, and a runtime key. */
+	async function seedFreshAccounts(): Promise<void> {
+		const expires = Date.now() + 3 * SESSION_RESTRICTION_TOMBSTONE_TTL_MS;
+		await storage.credentials.set(PROVIDER, [
+			{ ...oauthCredential("a"), expires },
+			{ ...oauthCredential("b"), expires },
+		]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+	}
 
-			setSystemTime(new Date(startMs + SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS));
-			retireSessions(SESSION_RESTRICTION_TOMBSTONES_MAX + 3, 1);
-			expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
-				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 1 },
-				{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_MAX, evicted: 3 },
-			]);
-			expect(JSON.stringify(evictionWarnings())).not.toContain("released-");
+	function retireRestricted(sessionId: string): void {
+		storage.sessions.retire(PROVIDER, sessionId, storage.sessions.restrict(PROVIDER, sessionId, ["account:acc-b"]));
+	}
+
+	test("a retired restriction expires once its TTL has passed on the monotonic clock, and not before", async () => {
+		await seedFreshAccounts();
+		const retiredAtMs = monotonicMs;
+		retireRestricted("released");
+
+		monotonicMs = retiredAtMs + SESSION_RESTRICTION_TOMBSTONE_TTL_MS - 1;
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("access-b");
+
+		monotonicMs = retiredAtMs + SESSION_RESTRICTION_TOMBSTONE_TTL_MS;
+		expect(storage.sessions.isRestricted(PROVIDER, "released")).toBe(false);
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("runtime-key");
+	});
+
+	test("a wall clock jumped forward past the TTL keeps a retired restriction the monotonic clock has not aged", async () => {
+		await seedFreshAccounts();
+		retireRestricted("released");
+		setSystemTime(new Date(Date.now() + SESSION_RESTRICTION_TOMBSTONE_TTL_MS + 60 * 60_000));
+		try {
+			// Retiring another id sweeps; the wall-clock jump must not count as expiry either way.
+			retireRestricted("other");
+			expect(storage.sessions.isRestricted(PROVIDER, "released")).toBe(true);
+			expect(await storage.keys.get(PROVIDER, "released")).toBe("access-b");
 		} finally {
 			setSystemTime();
 		}
+	});
+
+	test("a clock reading below the retirement stamp keeps the restriction", async () => {
+		await seedFreshAccounts();
+		retireRestricted("released");
+
+		monotonicMs -= 2 * SESSION_RESTRICTION_TOMBSTONE_TTL_MS;
+		// Retiring another id sweeps; the negative age must not count as expiry either way.
+		retireRestricted("other");
+		expect(await storage.keys.get(PROVIDER, "released")).toBe("access-b");
+	});
+
+	test("expired retired restrictions log a rate-limited debug record with the provider, the count, and no session id", async () => {
+		await seedFreshAccounts();
+		const debug = vi.spyOn(logger, "debug");
+		const expiryRecords = () =>
+			debug.mock.calls.filter(([message]) =>
+				String(message).startsWith("Retired session account restrictions expired"),
+			);
+		for (const sessionId of ["released-0", "released-1", "released-2"]) retireRestricted(sessionId);
+
+		// Two expiries inside one interval: the first logs, the second is counted.
+		monotonicMs += SESSION_RESTRICTION_TOMBSTONE_TTL_MS;
+		expect(await storage.keys.get(PROVIDER, "released-0")).toBe("runtime-key");
+		expect(await storage.keys.get(PROVIDER, "released-1")).toBe("runtime-key");
+		expect(expiryRecords().map(([, fields]) => fields)).toEqual([{ provider: PROVIDER, expired: 1 }]);
+
+		monotonicMs += SESSION_RESTRICTION_EXPIRY_LOG_INTERVAL_MS;
+		expect(await storage.keys.get(PROVIDER, "released-2")).toBe("runtime-key");
+		expect(expiryRecords().map(([, fields]) => fields)).toEqual([
+			{ provider: PROVIDER, expired: 1 },
+			{ provider: PROVIDER, expired: 2 },
+		]);
+		expect(JSON.stringify(expiryRecords())).not.toContain("released-");
+	});
+
+	test("past the safety cap the earliest retired restrictions are evicted, with a rate-limited warning and no session id", async () => {
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		const warn = vi.spyOn(logger, "warn");
+		const evictionWarnings = () =>
+			warn.mock.calls.filter(([message]) => String(message).startsWith("Evicted retired session account"));
+		const retireSessions = (from: number, count: number) => {
+			for (let index = from; index < from + count; index += 1) retireRestricted(`released-${index}`);
+		};
+		// Three evictions inside one interval: the first warns, the other two are counted.
+		retireSessions(0, SESSION_RESTRICTION_TOMBSTONES_HARD_CAP + 3);
+		expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
+			{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_HARD_CAP, evicted: 1 },
+		]);
+		expect(await storage.keys.get(PROVIDER, "released-2")).toBe("runtime-key");
+		expect(await storage.keys.get(PROVIDER, "released-3")).toBe("access-b");
+
+		monotonicMs += SESSION_RESTRICTION_EVICTION_LOG_INTERVAL_MS;
+		retireSessions(SESSION_RESTRICTION_TOMBSTONES_HARD_CAP + 3, 1);
+		expect(evictionWarnings().map(([, fields]) => fields)).toEqual([
+			{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_HARD_CAP, evicted: 1 },
+			{ provider: PROVIDER, limit: SESSION_RESTRICTION_TOMBSTONES_HARD_CAP, evicted: 3 },
+		]);
+		expect(JSON.stringify(evictionWarnings())).not.toContain("released-");
 	});
 
 	test("an unpinned session reads its pin and drain rows at most once per miss window", async () => {
