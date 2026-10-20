@@ -35,6 +35,10 @@
 - Fixed Amazon Bedrock Kimi K3 (`global.`/`us.moonshotai.kimi-k3`) offering Anthropic-style thinking budgets it ignores; it now offers `low`, `high` and `max` effort, defaulting to `max` ([#13697](https://github.com/can1357/oh-my-pi/pull/13697) by [@alblez](https://github.com/alblez))
 - Marked supported Bedrock Claude models as eligible for native compaction ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 
+### Added
+
+- Added the "Anthropic (Console API key)" login (`omp login anthropic-api-key`), which refuses OAuth and Admin keys and checks the key against Anthropic before saving it as an `anthropic` account
+
 ## [18.12.3] - 2026-10-19
 
 ### Changed

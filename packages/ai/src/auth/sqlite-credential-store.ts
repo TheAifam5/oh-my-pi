@@ -1488,9 +1488,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				identityKey: resolveRowCredentialIdentityKey(providerName, row),
 			}));
 
+			// An OAuth login retires legacy API-key rows (a key stored without a
+			// login, such as a pre-OAuth or broker-migrated copy) so they cannot
+			// serve in its place. A key the user stored through `/login` is a
+			// separate account and survives: stored OAuth already outranks it in
+			// resolution, so keeping it shadows nothing.
 			if (item.type === "oauth") {
 				for (const row of existing) {
-					if (row.credential && row.credential.type === "api_key") {
+					if (row.credential?.type === "api_key" && row.credential.source !== "login") {
 						this.#deleteStmt.run("replaced by oauth login", row.id);
 					}
 				}

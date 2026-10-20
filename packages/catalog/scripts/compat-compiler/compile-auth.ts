@@ -15,6 +15,8 @@ import type {
 	CompiledCredentialField,
 	CompiledCredentialMap,
 	CompiledDeviceCodeLogin,
+	CompiledKeyPrefix,
+	CompiledKeyPrefixRejection,
 	CompiledLogin,
 	CompiledOAuthCodeLogin,
 	CompiledOAuthRequest,
@@ -329,16 +331,38 @@ function validation(node: KdlNodeView): CompiledAuthValidation {
 			leaf(node, ["base-url", "model", "label", "optional", "trust-forbidden"]);
 			return { kind, ...common, baseUrl: requiredProp(node, "base-url"), model: requiredProp(node, "model") };
 		case "models-endpoint": {
-			leaf(node, ["url", "base-url-env", "headers-hook", "label", "optional", "trust-forbidden"]);
+			leaf(node, ["url", "base-url-env", "headers-hook", "auth-header", "label", "optional", "trust-forbidden"]);
 			const result: CompiledAuthValidation = { kind, ...common, url: requiredProp(node, "url") };
 			const baseUrlEnv = propString(node, "base-url-env");
 			if (baseUrlEnv !== undefined) result.baseUrlEnv = baseUrlEnv;
 			if (propString(node, "headers-hook") !== undefined) result.headersHook = hookName(node, "headers-hook");
+			const authHeader = propString(node, "auth-header");
+			if (authHeader !== undefined) {
+				if (authHeader !== "x-api-key") malformed(node, "validate auth-header");
+				result.authHeader = authHeader;
+			}
 			return result;
 		}
 		default:
 			return malformed(node);
 	}
+}
+
+/** Reads `key-prefix "accept"… { reject "prefix" message="…" }`; reject children may repeat. */
+function keyPrefix(node: KdlNodeView): CompiledKeyPrefix {
+	validateProps(node, []);
+	const accept = positionalStrings(node);
+	if (accept.length === 0 || accept.some(value => !value)) malformed(node);
+	const reject: CompiledKeyPrefixRejection[] = [];
+	for (const child of node.children ?? []) {
+		if (child.name !== "reject") unexpected(child, "key-prefix");
+		leaf(child, ["message"]);
+		const prefix = singleString(child);
+		const message = requiredProp(child, "message");
+		if (!message) malformed(child);
+		reject.push({ prefix, message });
+	}
+	return { accept, reject };
 }
 
 function apiKeyLogin(node: KdlNodeView): CompiledApiKeyLogin {
@@ -372,6 +396,9 @@ function apiKeyLogin(node: KdlNodeView): CompiledApiKeyLogin {
 				leaf(child, []);
 				if (singleString(child) !== "strip-bearer") malformed(child);
 				login.normalize = "strip-bearer";
+				break;
+			case "key-prefix":
+				login.keyPrefix = keyPrefix(child);
 				break;
 			case "validate":
 				login.validate = validation(child);

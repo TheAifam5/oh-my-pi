@@ -400,9 +400,27 @@ export type CompiledAuthValidation =
 			baseUrlEnv?: string;
 			/** Hook returning extra request headers (may throw a configuration error). */
 			headersHook?: string;
+			/** Header carrying the key: `Authorization: Bearer <key>` (default) or `x-api-key: <key>`. */
+			authHeader?: "x-api-key";
 			optional?: boolean;
 			trustForbidden?: boolean;
 	  };
+
+/** A key prefix the login refuses, with the message shown instead of saving it. */
+export interface CompiledKeyPrefixRejection {
+	prefix: string;
+	message: string;
+}
+
+/**
+ * Prefix guard for a pasted key, checked after normalization and before
+ * validation: a matching `reject` prefix refuses the key with its message;
+ * otherwise the key must start with one of `accept`.
+ */
+export interface CompiledKeyPrefix {
+	accept: string[];
+	reject: CompiledKeyPrefixRejection[];
+}
 
 /** Paste-an-API-key login: optional browser hint, prompt, optional validation. */
 export interface CompiledApiKeyLogin {
@@ -414,6 +432,7 @@ export interface CompiledApiKeyLogin {
 	/** Returned for an empty paste; presence also allows an empty answer. */
 	emptyFallback?: string;
 	normalize?: "strip-bearer";
+	keyPrefix?: CompiledKeyPrefix;
 	validate?: CompiledAuthValidation;
 }
 

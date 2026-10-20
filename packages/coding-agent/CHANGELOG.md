@@ -113,6 +113,8 @@
 
 ### Added
 
+- Added "Anthropic (Console API key)" to `/login` and `omp login`, so a Claude Console API key can be stored as an Anthropic account beside a Claude subscription; `omp account` accepts `anthropic-api-key/<fingerprint>`, and `omp auth-broker logout anthropic-api-key` removes only those keys, while other login aliases are refused instead of reporting a logout that removed nothing
+
 - Added strategy lists for model pools: `strategy: [quota, cheapest]` orders members by quota, then by price among ties, and `strategyOptions.tolerance` lets quota treat members with similar remaining quota as tied
 - Resumed pooled sessions (such as subagents restricted to an account pool) keep the pool account that served them under a remote auth broker, even when the pool overrides an account pinned with `/session pin`
 

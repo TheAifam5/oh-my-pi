@@ -6,6 +6,8 @@
 import type { HeadersHook, Lazy, LoginHook } from "./types";
 
 export const API_KEY_HEADERS_HOOKS: Record<string, Lazy<HeadersHook>> = {
+	// Every Anthropic API request, including GET /v1/models, must name the API version.
+	"anthropic-version": async () => () => ({ "anthropic-version": "2023-06-01" }),
 	"coreweave-project": () => import("../oauth/coreweave").then(m => m.requireCoreWeaveProjectHeaders),
 	"cline-pass-client": () => import("@oh-my-pi/pi-catalog/wire/cline-pass").then(m => m.clinePassClientHeaders),
 };

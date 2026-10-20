@@ -374,6 +374,52 @@ describe("auth grammar", () => {
 		);
 	});
 
+	test("api-key key-prefix compiles accept and repeatable reject rules; models-endpoint takes only x-api-key as auth-header", () => {
+		const apiKeyAuth = (validate: string) =>
+			[
+				'auth "x" {',
+				'\tname "X"',
+				'\tlogin "api-key" {',
+				'\t\tprompt "Paste"',
+				'\t\tkey-prefix "x-live-" "x-test-" {',
+				'\t\t\treject "x-admin-" message="Admin keys cannot run requests."',
+				'\t\t\treject "x-oat-" message="Use the OAuth login."',
+				"\t\t}",
+				`\t\t${validate}`,
+				"\t}",
+				"}",
+			].join("\n");
+		const compiled = compileAuth([
+			{ file: "auth/x.kdl", text: apiKeyAuth('validate "models-endpoint" url="https://m" auth-header="x-api-key"') },
+			order("x"),
+		]);
+		expect(compiled.providers[0]?.login).toMatchObject({
+			keyPrefix: {
+				accept: ["x-live-", "x-test-"],
+				reject: [
+					{ prefix: "x-admin-", message: "Admin keys cannot run requests." },
+					{ prefix: "x-oat-", message: "Use the OAuth login." },
+				],
+			},
+			validate: { kind: "models-endpoint", authHeader: "x-api-key" },
+		});
+		expect(() =>
+			compileAuth([
+				{ file: "auth/x.kdl", text: apiKeyAuth('validate "models-endpoint" url="https://m" auth-header="basic"') },
+				order("x"),
+			]),
+		).toThrow(/auth\/x\.kdl:9/);
+		expect(() =>
+			compileAuth([
+				{
+					file: "auth/x.kdl",
+					text: 'auth "x" {\n\tname "X"\n\tlogin "api-key" {\n\t\tprompt "Paste"\n\t\tkey-prefix "a" {\n\t\t\treject "b"\n\t\t}\n\t}\n}',
+				},
+				order("x"),
+			]),
+		).toThrow(/auth\/x\.kdl:6/);
+	});
+
 	test("oauth-code derives callback-port and paste-code; refresh inherits the login token request", () => {
 		const compiled = compileAuth([
 			{

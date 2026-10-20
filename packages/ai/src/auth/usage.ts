@@ -546,11 +546,15 @@ export class UsageService implements UsageApi {
 		headers: Record<string, string>,
 		options?: { sessionId?: string; baseUrl?: string; responseStatus?: number },
 	): boolean {
-		const parseHeaders = this.providerFor(provider)?.parseRateLimitHeaders;
+		const providerImpl = this.providerFor(provider);
+		const parseHeaders = providerImpl?.parseRateLimitHeaders;
 		if (!parseHeaders) return false;
 
 		const credential = this.#deps.affinity.activeOAuth(provider, options?.sessionId);
-		if (!credential) return false;
+		if (!credential) {
+			const parseApiKeyHeaders = providerImpl.parseApiKeyRateLimitHeaders;
+			return parseApiKeyHeaders ? this.#ingestApiKeyHeaders(provider, headers, parseApiKeyHeaders, options) : false;
+		}
 
 		const cacheKey = this.#deps.cache.reportKey(oauthUsageRequest(provider, credential, options?.baseUrl));
 		const now = Date.now();
@@ -618,6 +622,52 @@ export class UsageService implements UsageApi {
 		const expiresAt = Math.max(priorEntry?.expiresAt ?? now - 1, now - 1);
 		this.#deps.cache.set(cacheKey, { value: merged, expiresAt });
 		this.#usageHeaderIngestAt.set(cacheKey, now);
+		return true;
+	}
+
+	/**
+	 * Store the report a stored API key's response headers describe, under the
+	 * same cache key {@link UsageService.report} reads for that key. Applies only
+	 * when the session's recorded credential is a stored API key and no runtime
+	 * or config key overrode it, so the headers came from that key. The report
+	 * replaces the key's previous one and stays stale like other header-only
+	 * reports; resolving a key reference is asynchronous, so the write lands
+	 * after this returns `true` for a parsed report.
+	 */
+	#ingestApiKeyHeaders(
+		provider: Provider,
+		headers: Record<string, string>,
+		parseHeaders: NonNullable<UsageProvider["parseApiKeyRateLimitHeaders"]>,
+		options: { sessionId?: string; baseUrl?: string } | undefined,
+	): boolean {
+		// A broker owns its reports; nothing it serves is written locally.
+		if (this.#deps.store.fetchUsageReports) return false;
+		if (this.#deps.overrides.has(provider)) return false;
+		const sessionCredential = this.#deps.affinity.get(provider, options?.sessionId);
+		if (sessionCredential?.type !== "api_key") return false;
+		const entry = this.#deps.pool.entries(provider)[sessionCredential.index];
+		if (entry?.credential.type !== "api_key") return false;
+		if (sessionCredential.credentialId !== undefined && entry.id !== sessionCredential.credentialId) return false;
+		const now = Date.now();
+		const report = parseHeaders(headers, now, { baseUrl: options?.baseUrl });
+		if (!report) return false;
+		const storedKey = entry.credential.key;
+		void (async () => {
+			const apiKey = await this.#deps.overrides.resolve(storedKey);
+			if (!apiKey) return;
+			const cacheKey = this.#deps.cache.reportKey(
+				usageRequest(provider, { type: "api_key", apiKey }, options?.baseUrl),
+			);
+			const exhausted = report.limits.some(limit => isUsageLimitExhausted(limit));
+			const last = this.#usageHeaderIngestAt.get(cacheKey);
+			if (!exhausted && last !== undefined && now - last < USAGE_HEADER_INGEST_INTERVAL_MS) return;
+			const priorEntry = this.#deps.cache.getStale<UsageReport | null>(cacheKey);
+			const expiresAt = Math.max(priorEntry?.expiresAt ?? now - 1, now - 1);
+			this.#deps.cache.set(cacheKey, { value: report, expiresAt });
+			this.#usageHeaderIngestAt.set(cacheKey, now);
+		})().catch(error => {
+			this.logger?.debug("API-key usage header ingest failed", { provider, error: String(error) });
+		});
 		return true;
 	}
 

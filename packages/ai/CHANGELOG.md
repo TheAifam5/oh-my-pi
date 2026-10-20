@@ -40,7 +40,14 @@
 - Fixed native remote compaction for supported Bedrock Claude models without changing ordinary Converse turns; a custom non-AWS `baseUrl` needs `remoteCompaction.enabled: true` ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 - Fixed Anthropic compaction blocks dropping their signed `tool_changes`, which made the replayed block fail its signature ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 
+### Added
+
+- Added Anthropic Console API-key accounts: `/usage` shows each stored key's per-minute request and token limits from its responses, and its billing reads as metered spend of unknown state
+
 ### Fixed
+
+- Fixed an OAuth login deleting the API keys you had stored for the same provider with `/login`; only keys stored without a login are replaced
+- Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes; requests move to a sibling key and the spent key stays blocked until the time Anthropic states, or the first of the next month for the tier cap
 
 - Fixed an OpenRouter `:free` model hitting its daily free-model quota or rate limit blocking paid models on the same key; `:free` requests now move to another key until the quota resets at midnight UTC while paid models keep using it; `openrouter/free` counts as a free model
 - Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time. A rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too

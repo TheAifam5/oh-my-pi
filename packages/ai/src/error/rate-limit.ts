@@ -7,6 +7,7 @@ import { extractRetryHint } from "@oh-my-pi/pi-utils/fetch-retry";
 
 export type RateLimitReason =
 	| "QUOTA_EXHAUSTED"
+	| "SPEND_LIMIT_REACHED"
 	| "INSUFFICIENT_G1_CREDITS_BALANCE"
 	| "RATE_LIMIT_EXCEEDED"
 	| "CONCURRENT_LIMIT"
@@ -192,7 +193,103 @@ function parseGoogleRpcRateLimitReason(errorMessage: string): RateLimitReason | 
 }
 
 function isQuotaExhaustedReason(reason: RateLimitReason): boolean {
-	return reason === "QUOTA_EXHAUSTED" || reason === "INSUFFICIENT_G1_CREDITS_BALANCE";
+	return (
+		reason === "QUOTA_EXHAUSTED" || reason === "SPEND_LIMIT_REACHED" || reason === "INSUFFICIENT_G1_CREDITS_BALANCE"
+	);
+}
+
+/**
+ * An Anthropic API spend limit that stops every request on the organization's
+ * keys: `tier-cap` is the usage tier's monthly cap (429 `rate_limit_error`
+ * with `details.error_code: enforced_spend_limit_reached`, no `retry-after`),
+ * `user-limit` a lower limit the organization set itself (400
+ * `invalid_request_error`). Neither clears by retrying.
+ * See https://platform.claude.com/docs/en/api/rate-limits#spend-limits.
+ */
+export interface AnthropicSpendLimit {
+	kind: "tier-cap" | "user-limit";
+	/** Epoch ms the error states access resumes, when it states one. */
+	resumesAtMs?: number;
+}
+
+const ANTHROPIC_SPEND_CAP_ERROR_CODE = "enforced_spend_limit_reached";
+/** `"<status> {"` or `"{"`: the shape of an Anthropic API error message. */
+const ANTHROPIC_ERROR_ENVELOPE_START = /^\s*(?:\d{3}\s+)?\{/;
+/**
+ * Longest block a stated resume instant may set: two monthly periods (62 days).
+ * The instant comes from response text, so a far-future or forged date must not
+ * park a key indefinitely; the documented cap resets within a month.
+ */
+export const ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS = 62 * 24 * 60 * 60 * 1000;
+// The documented sentence the error states the resume instant with: "You will
+// regain access on 2026-09-01 at 00:00 UTC."
+const ANTHROPIC_RESUME_AT_PATTERN = /\bregain access on (\d{4})-(\d{2})-(\d{2}) at (\d{2}):(\d{2}) UTC\b/i;
+
+/**
+ * Whether an Anthropic `invalid_request_error` message reports a spend limit
+ * the organization or a workspace set. This 400 carries no error code, so its
+ * documented leading sentence is the only signal.
+ */
+export function isAnthropicUserSpendLimitMessage(message: string): boolean {
+	return /^You have reached your specified (?:workspace )?API usage limits\b/.test(message.trim());
+}
+
+function parseAnthropicResumeAt(message: string): number | undefined {
+	const match = ANTHROPIC_RESUME_AT_PATTERN.exec(message);
+	if (!match) return undefined;
+	const [, year, month, day, hour, minute] = match;
+	const ms = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute));
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * Reads an Anthropic spend-limit failure from the JSON error envelope
+ * (`{"type":"error",…}`) that `message` starts with, optionally after its
+ * status (`"<status> {…}"`). The tier cap is recognized by its error code
+ * alone; the self-set limit by its error type plus
+ * {@link isAnthropicUserSpendLimitMessage}.
+ */
+export function parseAnthropicSpendLimit(message: string): AnthropicSpendLimit | undefined {
+	// Only an Anthropic error envelope heading the message counts: other providers
+	// quote model output (tool-call JSON) inside their error text.
+	if (!ANTHROPIC_ERROR_ENVELOPE_START.test(message)) return undefined;
+	const body = parseJsonBody(message);
+	if (body?.type !== "error") return undefined;
+	const error = asRecord(body.error);
+	if (!error) return undefined;
+	const text = typeof error.message === "string" ? error.message : "";
+	let kind: AnthropicSpendLimit["kind"];
+	if (asRecord(error.details)?.error_code === ANTHROPIC_SPEND_CAP_ERROR_CODE) {
+		kind = "tier-cap";
+	} else if (error.type === "invalid_request_error" && isAnthropicUserSpendLimitMessage(text)) {
+		kind = "user-limit";
+	} else {
+		return undefined;
+	}
+	const resumesAtMs = parseAnthropicResumeAt(text);
+	return resumesAtMs === undefined ? { kind } : { kind, resumesAtMs };
+}
+
+/** Epoch ms of the next 00:00 UTC after `nowMs`. */
+function nextUtcMidnight(nowMs: number): number {
+	const now = new Date(nowMs);
+	return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+}
+
+/**
+ * Epoch ms a spend limit is known to clear: the instant the error states
+ * (capped at {@link ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS} from `nowMs`), else
+ * for the tier cap 00:00 UTC on the first day of the next month, when
+ * Anthropic documents the monthly cap resets. `undefined` for a self-set limit
+ * that states no instant: its period is not documented, so any deadline is a guess.
+ */
+export function anthropicSpendLimitResumeAtMs(limit: AnthropicSpendLimit, nowMs: number): number | undefined {
+	if (limit.resumesAtMs !== undefined && limit.resumesAtMs > nowMs) {
+		return Math.min(limit.resumesAtMs, nowMs + ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS);
+	}
+	if (limit.kind !== "tier-cap") return undefined;
+	const now = new Date(nowMs);
+	return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
 }
 
 /**
@@ -209,6 +306,7 @@ function isQuotaExhaustedReason(reason: RateLimitReason): boolean {
 export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 	const structuredReason = parseGoogleRpcRateLimitReason(errorMessage);
 	if (structuredReason !== undefined) return structuredReason;
+	if (parseAnthropicSpendLimit(errorMessage)) return "SPEND_LIMIT_REACHED";
 	const lowerWithStatus = errorMessage.toLowerCase();
 	const lower = lowerWithStatus.replace(RESOURCE_EXHAUSTED_PATTERN, "");
 	const hasResourceExhaustedStatus = lower !== lowerWithStatus;
@@ -319,6 +417,10 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 		case "INSUFFICIENT_G1_CREDITS_BALANCE":
 		case "QUOTA_EXHAUSTED":
 			return QUOTA_EXHAUSTED_BACKOFF_MS;
+		case "SPEND_LIMIT_REACHED":
+			// A guess for a spend limit stating no resume instant: hold the key
+			// until the next UTC day, never less than the quota backoff.
+			return Math.max(QUOTA_EXHAUSTED_BACKOFF_MS, nextUtcMidnight(Date.now()) - Date.now());
 		case "RATE_LIMIT_EXCEEDED":
 			return RATE_LIMIT_EXCEEDED_BACKOFF_MS;
 		case "CONCURRENT_LIMIT":
@@ -435,6 +537,7 @@ export function isOpaqueStatusBody(message: string): boolean {
 export function matchesUsageLimitText(errorMessage: string): boolean {
 	const structuredReason = parseGoogleRpcRateLimitReason(errorMessage);
 	if (structuredReason !== undefined) return isQuotaExhaustedReason(structuredReason);
+	if (parseAnthropicSpendLimit(errorMessage)) return true;
 	if (isDashScopeTokenLimitText(errorMessage)) return false;
 	// Rolling TPM/RPM windows self-heal, so they never rotate a credential. The
 	// reason re-check is the precedence guard: an account-scoped cap that merely

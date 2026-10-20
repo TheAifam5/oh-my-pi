@@ -26,6 +26,8 @@ type ModelListValidationOptions = {
 	apiKey: string;
 	modelsUrl: string;
 	headers?: Record<string, string> | (() => Record<string, string> | undefined);
+	/** Header carrying the key; defaults to `Authorization: Bearer <key>`. */
+	authHeader?: "x-api-key";
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
 };
@@ -162,8 +164,13 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 		method: "GET",
 		headers: {
 			...resolveValidationHeaders(options.headers),
-			Authorization: `Bearer ${options.apiKey}`,
+			...(options.authHeader === "x-api-key"
+				? { "x-api-key": options.apiKey }
+				: { Authorization: `Bearer ${options.apiKey}` }),
 		},
+		// Fetch strips only `Authorization` on a cross-origin redirect, so an
+		// `x-api-key` probe fails on any redirect instead of forwarding the key.
+		...(options.authHeader === "x-api-key" ? { redirect: "error" as const } : {}),
 		signal,
 	});
 

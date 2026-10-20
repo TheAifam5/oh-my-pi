@@ -29,6 +29,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/account-pins";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { apiKeyFingerprint } from "@oh-my-pi/pi-ai/auth/policy";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
@@ -88,6 +89,19 @@ describe("account administration", () => {
 		const accountB = resolveAccount(authStorage, "anthropic/b@example.com");
 		expect(() => labelAccount(settings, authStorage, accountB, "work")).toThrow(AccountAdminError);
 		expect(cfgAuthAccountPolicies.get(settings)).toEqual([projectPolicy]);
+	});
+
+	it("resolves a provider prefix naming a login alias to the provider that stores its accounts", async () => {
+		const key = "sk-ant-api03-alias-key";
+		await authStorage.credentials.set("anthropic", [
+			oauth("a"),
+			oauth("b"),
+			{ type: "api_key", key, source: "login" },
+		]);
+
+		const ref = resolveAccount(authStorage, `anthropic-api-key/${apiKeyFingerprint(key)}`);
+		expect(ref.provider).toBe("anthropic");
+		expect(ref.account.type).toBe("api_key");
 	});
 
 	it("pins the current project to a named account and logs a named account out", async () => {

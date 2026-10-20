@@ -20,11 +20,20 @@ export function normalizeAnthropicBaseUrl(baseUrl?: string): string | undefined 
 
 /** Resolve the endpoint for a first-party Anthropic model without loading its provider implementation. */
 export function resolveDirectAnthropicBaseUrl(model: Model<Api>): string {
+	return resolveDirectAnthropicBaseUrlFor(model.baseUrl);
+}
+
+/**
+ * Resolve the endpoint a first-party Anthropic request configured with
+ * `baseUrl` reaches: Foundry's `FOUNDRY_BASE_URL`, then a non-official
+ * configured URL, then `ANTHROPIC_BASE_URL`, then the official API.
+ */
+export function resolveDirectAnthropicBaseUrlFor(baseUrl: string | undefined): string {
 	if (isFoundryEnabled()) {
 		const foundryBaseUrl = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
 		if (foundryBaseUrl) return foundryBaseUrl;
 	}
-	const configured = normalizeAnthropicBaseUrl(model.baseUrl);
+	const configured = normalizeAnthropicBaseUrl(baseUrl);
 	if (configured && !isOfficialAnthropicApiUrl(configured)) return configured;
 	return normalizeAnthropicBaseUrl($env.ANTHROPIC_BASE_URL) ?? configured ?? "https://api.anthropic.com";
 }

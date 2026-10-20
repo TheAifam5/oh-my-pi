@@ -1,0 +1,19 @@
+auth "anthropic-api-key" {
+	name "Anthropic (Console API key)"
+	login "api-key" {
+		auth-url "https://platform.claude.com/settings/keys"
+		instructions "Create or copy an API key in the Claude Console"
+		prompt "Paste your Anthropic API key" placeholder="sk-ant-api03-..."
+		normalize "strip-bearer"
+		key-prefix "sk-ant-api" {
+			reject "sk-ant-oat" message="This is a Claude subscription OAuth token, not an API key. Use the \"Anthropic (Claude Pro/Max)\" login for it."
+			reject "sk-ant-admin" message="Admin API keys manage an organization and cannot run requests. Paste a standard API key (sk-ant-api...)."
+		}
+		// GET /v1/models authenticates the key without spending tokens. Only a
+		// 401/403 rejects it; an outage or rate limit still saves the key.
+		validate "models-endpoint" label="Anthropic" url="https://api.anthropic.com/v1/models" \
+			auth-header="x-api-key" headers-hook="anthropic-version" optional=#true
+	}
+	// A pasted Console key joins the `anthropic` account pool as a plain api_key credential.
+	store-as "anthropic"
+}

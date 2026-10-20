@@ -93,7 +93,7 @@ export class OAuthAccounts implements OAuthApi {
 			if (!result) {
 				return undefined;
 			}
-			await this.#deps.pool.storeLoginApiKey(provider, result);
+			await this.#deps.pool.storeLoginApiKey(def.storeCredentialsAs ?? provider, result);
 			return { type: "api_key" };
 		}
 		// Stamp the interactive-login instant: providers with an absolute grant
@@ -105,8 +105,8 @@ export class OAuthAccounts implements OAuthApi {
 			authorizedAt: Date.now(),
 		};
 		// Use pool.upsertOAuth to upsert the new credential.
-		// Any legacy api_key rows from older versions will be cleaned up so they do not
-		// shadow the new OAuth row, while preserving other active OAuth credentials.
+		// Legacy api_key rows (stored without a login) are cleaned up; login-stored
+		// keys and other active OAuth credentials are preserved.
 		await this.#deps.pool.upsertOAuth(def.storeCredentialsAs ?? provider, newCredential);
 		return {
 			type: "oauth",

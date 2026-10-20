@@ -1,15 +1,32 @@
 import { retryResetTimezoneOffsetFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { extractRetryHint } from "@oh-my-pi/pi-utils";
+import {
+	ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS,
+	anthropicSpendLimitResumeAtMs,
+	parseAnthropicSpendLimit,
+} from "../error/rate-limit";
 
 export type HeadersLike = Headers | Record<string, string | undefined> | undefined | null;
 
-/** Extracts retry timing using the provider's catalog-declared timestamp timezone. */
+/**
+ * Extracts retry timing using the provider's catalog-declared timestamp
+ * timezone. An Anthropic spend-limit error contributes its known resume
+ * instant ({@link anthropicSpendLimitResumeAtMs}); the longest signal wins,
+ * capped at {@link ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS} for such an error.
+ */
 export function extractProviderRetryHint(
 	provider: string | undefined,
 	message: string | undefined,
 ): number | undefined {
 	const naiveResetTimezoneOffset = provider === undefined ? undefined : retryResetTimezoneOffsetFor(provider);
-	return extractRetryHint(undefined, message, { naiveResetTimezoneOffset });
+	const hint = extractRetryHint(undefined, message, { naiveResetTimezoneOffset });
+	const spendLimit = message ? parseAnthropicSpendLimit(message) : undefined;
+	if (!spendLimit) return hint;
+	const nowMs = Date.now();
+	const resumeAtMs = anthropicSpendLimitResumeAtMs(spendLimit, nowMs);
+	if (resumeAtMs === undefined) return hint;
+	// Text-derived hints in the same body get the same cap as the stated instant.
+	return Math.min(Math.max(hint ?? 0, resumeAtMs - nowMs), ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS);
 }
 
 const RETRY_AFTER_HINT = "retry-after-ms=";

@@ -32,7 +32,8 @@ import {
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai";
 import { AuthBrokerClient, DEFAULT_AUTH_BROKER_BIND, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
-import { refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
+import { getOAuthCredentialProvider, refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
@@ -285,11 +286,61 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 				rl.close();
 			}
 		}
-		await store.deleteAuthCredentials(providerArg, "logged out by user");
-		process.stdout.write(`Logged out of ${providerArg}\n`);
+		const result = await logoutProviderCredentials(store, providerArg);
+		if (result.scope === "refused") {
+			process.stderr.write(`${result.message}\n`);
+			process.exitCode = 1;
+			return;
+		}
+		process.stdout.write(
+			result.scope === "login-keys"
+				? `Removed ${result.removed} ${providerArg} key${result.removed === 1 ? "" : "s"} from ${result.provider}\n`
+				: `Logged out of ${result.provider}\n`,
+		);
 	} finally {
 		store.close();
 	}
+}
+
+/** What {@link logoutProviderCredentials} removed, or why it removed nothing. */
+export type ProviderLogoutResult =
+	/** Every credential stored under `provider`. */
+	| { provider: string; scope: "provider" }
+	/** Only the login-stored API keys of `provider`, for an API-key login alias. */
+	| { provider: string; scope: "login-keys"; removed: number }
+	/** Nothing: `providerArg` is an OAuth login alias; `message` names the command to use. */
+	| { provider: string; scope: "refused"; message: string };
+
+/**
+ * Logs out of `providerArg`. A provider id removes every credential stored
+ * under it. An API-key login alias (`anthropic-api-key`, stored under
+ * `anthropic`) removes only that provider's login-stored API keys, never its
+ * OAuth accounts or other keys. Any other login alias (`openai-codex-device`)
+ * removes nothing: its credentials are indistinguishable from the provider's
+ * own, so the result names the provider-wide and per-account commands instead.
+ */
+export async function logoutProviderCredentials(
+	store: SqliteAuthCredentialStore,
+	providerArg: string,
+): Promise<ProviderLogoutResult> {
+	const provider = getOAuthCredentialProvider(providerArg);
+	if (provider === providerArg) {
+		await store.deleteAuthCredentials(provider, "logged out by user");
+		return { provider, scope: "provider" };
+	}
+	if (authPolicyFor(providerArg)?.login?.kind !== "api-key") {
+		return {
+			provider,
+			scope: "refused",
+			message: `${providerArg} stores its credentials under ${provider}; nothing was removed. Run \`${APP_NAME} auth-broker logout ${provider}\` to remove every ${provider} credential, or \`${APP_NAME} account logout ${provider}/<account>\` to remove one account.`,
+		};
+	}
+	let removed = 0;
+	for (const row of store.listAuthCredentials(provider)) {
+		if (row.credential.type !== "api_key" || row.credential.source !== "login") continue;
+		if (await store.deleteAuthCredential(row.id, "logged out by user")) removed++;
+	}
+	return { provider, scope: "login-keys", removed };
 }
 
 async function runList(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {

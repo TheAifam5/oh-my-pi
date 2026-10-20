@@ -455,6 +455,17 @@ export interface UsageProvider {
 		now?: number,
 		context?: { responseStatus?: number },
 	): UsageReport | null;
+	/**
+	 * Parse the rate-limit headers of a response served with a stored API key
+	 * (lowercased keys) into that key's usage report; `context.baseUrl` is the
+	 * provider's configured base URL. Providers without it never ingest headers
+	 * for API-key credentials.
+	 */
+	parseApiKeyRateLimitHeaders?(
+		headers: Record<string, string>,
+		now?: number,
+		context?: { baseUrl?: string },
+	): UsageReport | null;
 	supports?(params: UsageFetchParams): boolean;
 	/** True when fetchUsage contacts upstream and can authenticate the credential for health checks. */
 	validatesCredentials?: boolean;

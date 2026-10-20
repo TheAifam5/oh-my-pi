@@ -1,4 +1,5 @@
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
+import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { isAnthropicOAuthToken, toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { slugify } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
@@ -15,12 +16,13 @@ import {
 	type UsageReport,
 	type UsageWindow,
 } from "../usage";
+import { resolveDirectAnthropicBaseUrlFor } from "../providers/anthropic-state";
 import { isRecord } from "../utils";
 import { waitForRetry } from "../utils/retry-wait";
 import { type BillingSource, knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
 import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls } from "./claude-api";
 import { listClaudeResetCredits, parseClaudeResetCreditsFromUsagePayload } from "./claude-reset";
-import { HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
+import { buildUsageAmount as buildCountAmount, HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
@@ -631,6 +633,70 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 	};
 }
 
+/** Report metadata `source` of a report read from an API-key response's rate-limit headers. */
+export const CLAUDE_API_KEY_HEADERS_SOURCE = "api-key-ratelimit-headers";
+
+/** The per-minute buckets an API-key response reports in `anthropic-ratelimit-<bucket>-{limit,remaining,reset}`. */
+const CLAUDE_API_KEY_BUCKETS = [
+	{ bucket: "requests", label: "Requests per minute", unit: "requests" },
+	{ bucket: "tokens", label: "Tokens per minute", unit: "tokens" },
+	{ bucket: "input-tokens", label: "Input tokens per minute", unit: "tokens" },
+	{ bucket: "output-tokens", label: "Output tokens per minute", unit: "tokens" },
+] as const;
+
+function nonNegativeHeaderNumber(value: string | undefined): number | undefined {
+	if (value === undefined || value.trim() === "") return undefined;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Parse the rate-limit headers of a response served with an Anthropic Console
+ * API key into a report of its per-minute request and token buckets.
+ *
+ * Each bucket is a token bucket that refills continuously, so its window is
+ * rolling (`resetLabel`) and its reset is when it is full again (RFC 3339).
+ * The limits carry neither `scope.shared` nor a tier, so the Claude ranking
+ * strategy never blocks or ranks a key on them; they are informational.
+ * Returns `null` when no bucket carries a positive limit and a remaining
+ * count, or when requests configured with `context.baseUrl` resolve to a host
+ * other than the official Anthropic API (`ANTHROPIC_BASE_URL`, Foundry, a proxy).
+ * See https://platform.claude.com/docs/en/api/rate-limits#response-headers.
+ */
+export function parseClaudeApiKeyRateLimitHeaders(
+	headers: Record<string, string>,
+	now = Date.now(),
+	context?: { baseUrl?: string },
+): UsageReport | null {
+	// A gateway or proxy can write any header; only the official API's are trusted.
+	if (!isOfficialAnthropicApiUrl(resolveDirectAnthropicBaseUrlFor(context?.baseUrl))) return null;
+	const limits: UsageLimit[] = [];
+	for (const { bucket, label, unit } of CLAUDE_API_KEY_BUCKETS) {
+		const prefix = `anthropic-ratelimit-${bucket}`;
+		const limit = nonNegativeHeaderNumber(headers[`${prefix}-limit`]);
+		const remaining = nonNegativeHeaderNumber(headers[`${prefix}-remaining`]);
+		if (limit === undefined || limit <= 0 || remaining === undefined) continue;
+		const resetsAt = parseIsoTimestamp(headers[`${prefix}-reset`]);
+		const amount = buildCountAmount({ used: Math.max(0, limit - remaining), limit, remaining, unit });
+		limits.push({
+			id: `anthropic:api-key:${bucket}`,
+			label,
+			scope: { provider: "anthropic", windowId: "1m" },
+			window: {
+				id: "1m",
+				label: "1 Minute",
+				durationMs: 60_000,
+				resetLabel: "refills",
+				...(resetsAt !== undefined ? { resetsAt } : {}),
+			},
+			amount,
+			status: usageStatus(amount.usedFraction),
+		});
+	}
+	if (limits.length === 0) return null;
+	return { provider: "anthropic", fetchedAt: now, limits, metadata: { source: CLAUDE_API_KEY_HEADERS_SOURCE } };
+}
+
 function claudeUsageToken(credential: UsageCredential): string | undefined {
 	if (credential.type === "oauth") return credential.accessToken;
 	const apiKey = credential.apiKey;
@@ -811,7 +877,12 @@ export const claudeUsageProvider: UsageProvider = {
 	failureBackoffMs: FAILURE_BACKOFF_MS,
 	fetchUsage: fetchClaudeUsage,
 	parseRateLimitHeaders: parseClaudeRateLimitHeaders,
-	supports: params => params.provider === "anthropic" && !!claudeUsageToken(params.credential),
+	parseApiKeyRateLimitHeaders: parseClaudeApiKeyRateLimitHeaders,
+	// An API key has no usage endpoint: fetchUsage answers null without a request,
+	// and the key's report is whatever its response headers last left in the cache.
+	supports: params =>
+		params.provider === "anthropic" &&
+		(!!claudeUsageToken(params.credential) || params.credential.type === "api_key"),
 };
 
 function getClaudeModelKind(context: CredentialRankingContext | undefined): ClaudeModelKind | undefined {
@@ -992,11 +1063,16 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 /**
  * Claude subscription billing: the plan allowance, then paid extra usage in
  * USD when the account enabled it. Rate-limit-header reports carry no extra
- * usage fields, so their extra source reads `unknown`.
+ * usage fields, so their extra source reads `unknown`. A Console API-key
+ * report is metered spend in an unknown state: its headers show no balance,
+ * spend, or promotional credit.
  */
 export const claudeBilling: ProviderBilling = {
 	id: "anthropic",
 	readBilling(report) {
+		if (report.metadata?.source === CLAUDE_API_KEY_HEADERS_SOURCE) {
+			return knownBilling(report, [{ mode: "metered", state: "unknown" }]);
+		}
 		const sources: BillingSource[] = [{ mode: "subscription-included", state: "unknown" }];
 		const extraLimit = report.limits.find(limit => limit.id === "anthropic:extra");
 		// The fetcher emits an extra-usage row without a cap only when the account reports no monthly limit.

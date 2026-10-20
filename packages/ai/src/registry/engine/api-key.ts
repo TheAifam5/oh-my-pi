@@ -2,7 +2,7 @@
  * `login "api-key"` engine: open the provider's key page, prompt for a paste,
  * optionally validate the key against a declared probe, return the key.
  */
-import type { CompiledApiKeyLogin, CompiledAuthValidation } from "@oh-my-pi/pi-catalog/compat/types";
+import type { CompiledApiKeyLogin, CompiledAuthValidation, CompiledKeyPrefix } from "@oh-my-pi/pi-catalog/compat/types";
 import { $env } from "@oh-my-pi/pi-utils";
 import * as AIError from "../../error";
 import {
@@ -53,10 +53,34 @@ async function runValidation(
 				apiKey,
 				modelsUrl,
 				headers,
+				authHeader: validate.authHeader,
 				signal: options.signal,
 				fetch: options.fetch,
 			});
 		}
+	}
+}
+
+/** Printable ASCII without spaces: the only bytes a prefixed key may carry. */
+const PRINTABLE_KEY_PATTERN = /^[\x21-\x7e]+$/;
+
+/**
+ * Refuses a pasted key outside the rule's prefix guard with
+ * {@link AIError.ApiKeyRequiredError}: a rejected or unaccepted prefix, or any
+ * byte outside printable ASCII (whitespace, control, or invisible characters
+ * that would corrupt the stored key or a request header). Messages never echo the key.
+ */
+function checkKeyPrefix(keyPrefix: CompiledKeyPrefix, label: string, apiKey: string): void {
+	const rejection = keyPrefix.reject.find(rule => apiKey.startsWith(rule.prefix));
+	if (rejection) throw new AIError.ApiKeyRequiredError(rejection.message);
+	if (!keyPrefix.accept.some(prefix => apiKey.startsWith(prefix))) {
+		const expected = keyPrefix.accept.map(prefix => `${prefix}...`).join(" or ");
+		throw new AIError.ApiKeyRequiredError(`Not a ${label} key: expected one starting with ${expected}`);
+	}
+	if (!PRINTABLE_KEY_PATTERN.test(apiKey)) {
+		throw new AIError.ApiKeyRequiredError(
+			"The pasted key contains spaces, line breaks, or invisible characters; copy the key again and paste only the key",
+		);
 	}
 }
 
@@ -91,6 +115,7 @@ export function createApiKeyLogin(
 			if (rule.emptyFallback !== undefined) return rule.emptyFallback;
 			throw new AIError.ApiKeyRequiredError();
 		}
+		if (rule.keyPrefix) checkKeyPrefix(rule.keyPrefix, label, trimmed);
 		if (rule.validate) {
 			options.onProgress?.(rule.validate.optional ? "Validating API key (optional)..." : "Validating API key...");
 			try {

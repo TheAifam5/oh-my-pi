@@ -18,6 +18,7 @@ import type {
 	DrainSpendClass,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import { AccountPolicies, accountUsageKey, matchesAuthAccountSelector } from "@oh-my-pi/pi-ai/auth/policy";
+import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
 import {
 	type AccountEvidenceMetric,
 	type AccountLimit,
@@ -100,7 +101,8 @@ function storedProviders(authStorage: AuthStorage): string[] {
  */
 export function resolveAccount(authStorage: AuthStorage, selector: string): AccountRef {
 	const slash = selector.indexOf("/");
-	const provider = slash > 0 ? selector.slice(0, slash) : undefined;
+	// A login alias (`anthropic-api-key`) names the provider its accounts are stored under.
+	const provider = slash > 0 ? getOAuthCredentialProvider(selector.slice(0, slash)) : undefined;
 	const wanted = (slash > 0 ? selector.slice(slash + 1) : selector).trim();
 	if (!wanted) throw new AccountAdminError("Name an account: [provider/]<name|email|account id|key fingerprint|#id>.");
 	const credentialId = /^#\d+$/.test(wanted) ? Number(wanted.slice(1)) : undefined;
