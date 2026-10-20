@@ -1473,7 +1473,7 @@ describe("ModelHub", () => {
 			}
 		});
 
-		test("g cycles a pool through the implemented strategies, never into quota, and back to priority", () => {
+		test("g cycles a pool through every strategy, including quota, and back to priority", () => {
 			const settings = pooledSettings();
 			const { hub } = createHub({
 				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
@@ -1483,12 +1483,13 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			const seen: string[] = [];
-			for (let i = 0; i < 9; i++) {
+			for (let i = 0; i < 10; i++) {
 				hub.handleInput("g");
 				seen.push(smolGroup(settings).strategy.name);
 			}
 			expect(seen).toEqual([
 				"random",
+				"quota",
 				"cheapest",
 				"least-used",
 				"least-loaded",
@@ -1498,6 +1499,153 @@ describe("ModelHub", () => {
 				"round-robin",
 				"weighted-random",
 			]);
+		});
+
+		test("g moves a pool with a spending policy into and out of quota, keeping its routing", () => {
+			const settings = Settings.isolated();
+			const routing = {
+				funding: { order: ["included", "metered"] },
+				spending: { policy: "provider-managed" },
+			};
+			settings.setModelRoleSpec("smol", {
+				strategy: "random",
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				routing,
+			});
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+				scoped: true,
+				settings,
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput("g");
+			expect(settings.getModelRoleEntries().smol).toEqual({
+				strategy: "quota",
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				routing,
+			});
+			expect(normalize(hub.render(220))).toContain("SMOL pool · 2 models · quota");
+			hub.handleInput("g");
+			expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy: "cheapest", routing });
+		});
+
+		test("g leaves quota for cheapest without the quota-only tolerance", () => {
+			const settings = Settings.isolated();
+			settings.setModelRoleSpec("smol", {
+				strategy: "quota",
+				strategyOptions: { tolerance: 0.1 },
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+			});
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+				scoped: true,
+				settings,
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput("g");
+			expect(smolGroup(settings).strategy).toEqual({ name: "cheapest" });
+			expect(settings.getModelRoleEntries().smol).not.toHaveProperty("strategyOptions");
+		});
+
+		test("g keeps the cursor on its member when the new strategy lists members in another order", () => {
+			const settings = Settings.isolated();
+			settings.setModelRoleSpec("smol", {
+				strategy: "round-robin",
+				strategyOptions: { order: ["b", "a"] },
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+			});
+			const { hub } = createHub({
+				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+				scoped: true,
+				settings,
+			});
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // SMOL
+			hub.handleInput(DOWN); // member b, first in round-robin order
+			hub.handleInput("g"); // weighted-random lists members in alias order
+			hub.handleInput("w");
+			expect(settings.getModelRoleEntries().smol).toMatchObject({
+				strategy: "weighted-random",
+				models: { a: { model: "test/model-a" }, b: { model: "test/model-b", weight: 1 } },
+			});
+		});
+
+		/** Settings backed by a global config.yml in a temp agent dir holding `config`. */
+		async function fileSettings(tmp: TempDir, config: string): Promise<Settings> {
+			const agentDir = tmp.join("agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(path.join(agentDir, "config.yml"), config);
+			return Settings.loadIsolated({ cwd: tmp.path(), agentDir });
+		}
+
+		const INVALID_SMOL_POOL = [
+			"modelRoles:",
+			"  default: test/model-a",
+			"  smol:",
+			"    strategy: priority",
+			"    models:",
+			"      a: { model: test/model-a }",
+			"",
+		].join("\n");
+
+		/** `modelRoles` as written to the temp agent dir's config.yml after pending saves land. */
+		async function savedRoles(settings: Settings, tmp: TempDir): Promise<unknown> {
+			await settings.flush();
+			const saved: unknown = Bun.YAML.parse(await fs.readFile(path.join(tmp.join("agent"), "config.yml"), "utf8"));
+			return saved && typeof saved === "object" && "modelRoles" in saved ? saved.modelRoles : undefined;
+		}
+
+		test("an invalid global pool shows the validator's problem, and x removes it", async () => {
+			const tmp = TempDir.createSync("@pi-hub-invalid-pool-");
+			try {
+				const settings = await fileSettings(tmp, INVALID_SMOL_POOL);
+				expect(createModelBrowserSource(settings).getPool?.({ kind: "role", key: "smol" })?.invalid).toBe(
+					"modelRoles.smol.strategyOptions: priority requires order listing every member alias exactly once",
+				);
+				const { hub } = createHub({
+					models: [makeModel("test", "model-a")],
+					scoped: true,
+					settings,
+					callbacks: { onUnassign: role => settings.setModelRole(role, undefined) },
+				});
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(normalize(hub.render(220))).toContain(
+					"SMOL invalid pool · skipped · modelRoles.smol.strategyOptions",
+				);
+				expect(footerLine(hub.render(220))).toContain("x clear");
+				hub.handleInput("x");
+				expect(await savedRoles(settings, tmp)).toEqual({ default: "test/model-a" });
+				expect(normalize(hub.render(220))).not.toContain("invalid pool");
+			} finally {
+				AgentStorage.close();
+				tmp.removeSync();
+			}
+		});
+
+		test("Enter on an invalid global pool assigns one model in its place", async () => {
+			const tmp = TempDir.createSync("@pi-hub-invalid-pool-");
+			try {
+				const settings = await fileSettings(tmp, INVALID_SMOL_POOL);
+				const { hub } = createHub({
+					models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
+					scoped: true,
+					settings,
+					callbacks: { onAssign: (_model, role, _level, selector) => settings.setModelRole(role, selector) },
+				});
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(footerLine(hub.render(220))).toContain("⏎ replace");
+				hub.handleInput("\n");
+				for (const ch of "model-b") hub.handleInput(ch);
+				hub.handleInput("\n");
+				expect(await savedRoles(settings, tmp)).toEqual({ default: "test/model-a", smol: "test/model-b" });
+			} finally {
+				AgentStorage.close();
+				tmp.removeSync();
+			}
 		});
 
 		test("g leaves a strategy list as configured, which the pool row shows in order", () => {

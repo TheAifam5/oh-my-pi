@@ -122,6 +122,9 @@
 
 - Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
 - Fixed startup failing when the default role's model pool has a funding or quota policy that excludes every member: the interactive TUI now starts with no model and a warning naming each skipped member and how to fix it, `--print` and RPC launches exit 1 with that one-line reason instead of a fatal stack trace, and a subagent reports only that reason as its task error
+- Fixed the model hub's `g` key never offering the `quota` strategy and refusing to change a pool that already used it; `quota` is now part of the strategy cycle, with or without a spending policy, and leaving it drops `strategyOptions.tolerance`
+- Fixed an invalid model pool in the global config (such as one missing `strategy`) showing as an unset role in the model hub, where `x` did nothing; the role now shows the validation problem, `x` removes the entry, and Enter replaces it with one model
+- Fixed `g` on a pool member row moving the cursor onto another member when the new strategy lists members in a different order
 
 ### Fixed
 

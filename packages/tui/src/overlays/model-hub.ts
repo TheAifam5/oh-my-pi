@@ -147,6 +147,11 @@ export interface ModelHubPool {
 	limits?: string;
 	/** Why the hub must not edit this pool; undefined when it may. */
 	readOnly?: string;
+	/**
+	 * Validation problems of a global entry that the settings merge drops, so the entry selects no
+	 * model; the hub can only remove such an entry. Undefined for a valid pool.
+	 */
+	invalid?: string;
 	/** The entry exactly as configured, present only when the hub may edit it; edits round-trip through a copy. */
 	raw?: Readonly<Record<string, unknown>>;
 }
@@ -167,7 +172,11 @@ export interface ModelHubSource extends ModelBrowserSource {
 	 * matches, if any. Absent hosts have no presets to switch between.
 	 */
 	getModelPresets?(): { names: readonly string[]; active: string | undefined };
-	/** Pool configured at `target`; undefined for a legacy, unset, or invalid entry. Absent hosts have no pools. */
+	/**
+	 * Pool configured at `target`; undefined for a legacy or unset entry, or an invalid entry that is
+	 * not a global role entry. An invalid global role entry yields a pool with `invalid` set. Absent
+	 * hosts have no pools.
+	 */
 	getPool?(target: ModelHubPoolTarget): ModelHubPool | undefined;
 	/** Whether `modelRoles.<role>` may hold a pool; absent means no role does. */
 	roleAcceptsPools?(role: string): boolean;
@@ -384,6 +393,7 @@ const POOL_STRATEGY_CYCLE = [
 	"round-robin",
 	"weighted-random",
 	"random",
+	"quota",
 	"cheapest",
 	"least-used",
 	"least-loaded",
@@ -2271,12 +2281,17 @@ export class ModelHubComponent implements Component {
 		this.#browser.setQuery("");
 		this.#setActiveEntry("roles");
 		this.#focus = "list";
+		this.#landOnPoolMember(assign.target, landed);
+	}
+
+	/** Move the roles cursor to member `alias` of the pool at `target`; a missing member leaves it in place. */
+	#landOnPoolMember(target: ModelHubPoolTarget, alias: string | null): void {
 		const index = this.#rolesRows.findIndex(
 			row =>
 				row.kind === "poolMember" &&
-				row.alias === landed &&
-				row.target.kind === assign.target.kind &&
-				row.target.key === assign.target.key,
+				row.alias === alias &&
+				row.target.kind === target.kind &&
+				row.target.key === target.key,
 		);
 		if (index >= 0) this.#roleIndex = index;
 	}
@@ -2320,18 +2335,14 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
-	 * `g`: step through {@link POOL_STRATEGY_CYCLE}; leaving weighted-random drops member weights it
-	 * alone accepts. A strategy outside the cycle (`quota`) or a strategy list is left for config, so
-	 * `g` declines to change it.
+	 * `g`: step through {@link POOL_STRATEGY_CYCLE}; leaving a strategy drops the `strategyOptions`
+	 * and, leaving weighted-random, the member weights that only it accepts. A strategy list is left
+	 * for config, so `g` declines to change it.
 	 */
 	#cyclePoolStrategy(target: ModelHubPoolTarget): void {
 		const pool = this.#pool(target);
 		if (pool && Array.isArray(pool.raw?.strategy)) {
 			this.#poolNotice(`strategy list ${pool.strategy} is not in the hub's strategy cycle; change it in config`);
-			return;
-		}
-		if (pool && !POOL_STRATEGY_CYCLE.some(name => name === pool.strategy)) {
-			this.#poolNotice(`${pool.strategy} is not in the hub's strategy cycle; change the strategy in config`);
 			return;
 		}
 		this.#editPool(target, draft => {
@@ -2427,6 +2438,7 @@ export class ModelHubComponent implements Component {
 	/** One-line pool summary: members, strategy, funding order, read-only routing, and why it is read-only. */
 	#poolSummary(pool: ModelHubPool | undefined): string {
 		if (!pool) return "invalid pool · fix it in config";
+		if (pool.invalid !== undefined) return sanitizeDisplayLine(`invalid pool · skipped · ${pool.invalid}`);
 		const source =
 			pool.source.kind === "ref"
 				? `pool +${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`
@@ -2842,11 +2854,15 @@ export class ModelHubComponent implements Component {
 	/** Enter/click activation for a Roles-view row. */
 	#activateRolesRow(row: RolesRow): void {
 		switch (row.kind) {
-			case "role":
-				// A pooled role gains a member; replacing the whole pool with one model is `x` then Enter.
-				if (this.#rolePool(row.role)) this.#startAssignPoolMember(row.role, { kind: "role", key: row.role }, null);
-				else this.#startAssign(row.role);
+			case "role": {
+				// A valid pool gains a member; replacing it with one model is `x` then Enter. Any other
+				// role, an invalid pool included, is assigned one model.
+				const pool = this.#rolePool(row.role);
+				if (pool && pool.invalid === undefined) {
+					this.#startAssignPoolMember(row.role, { kind: "role", key: row.role }, null);
+				} else this.#startAssign(row.role);
 				return;
+			}
 			case "chainKey":
 			case "pool":
 				this.#startAssignFallback(row.role, null);
@@ -2986,7 +3002,10 @@ export class ModelHubComponent implements Component {
 				this.#convertToPool(row);
 				return;
 			case "strategy":
-				if (editable) this.#cyclePoolStrategy(editable.target);
+				if (!editable) return;
+				this.#cyclePoolStrategy(editable.target);
+				// The new strategy may list members in another order; the cursor stays on its member.
+				if (row?.kind === "poolMember") this.#landOnPoolMember(row.target, row.alias);
 				return;
 			case "funding":
 				if (editable) this.#cyclePoolFunding(editable.target);
@@ -3326,6 +3345,7 @@ export class ModelHubComponent implements Component {
 		if (row.kind === "role") {
 			hints.push(
 				editable && { label: "add member", keys: ["enter"] },
+				this.#rolePool(row.role)?.invalid !== undefined && { label: "replace", keys: ["enter"] },
 				this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
 				this.#poolClearable(target) && { label: "clear", keys: ["x"] },
 				...(routing || []),
@@ -4884,8 +4904,12 @@ export class ModelHubComponent implements Component {
 
 	/** A pool's preview section: strategy, funding, read-only routing, then each member with effort and weight. */
 	#poolPreview(pool: ModelHubPool | undefined, head: string): NativeChild[] {
-		if (!pool) {
-			return [text([span("This pool is invalid and is skipped; fix it in config.", "warning")], { wrap: "word" })];
+		if (!pool || pool.invalid !== undefined) {
+			const message =
+				pool?.invalid === undefined
+					? "This pool is invalid and is skipped; fix it in config."
+					: `This pool is invalid and is skipped: ${sanitizeDisplayLine(pool.invalid)}. Fix it in config, or clear it with x.`;
+			return [text([span(message, "warning")], { wrap: "word" })];
 		}
 		const row = (key: string, value: string) => ({ k: [span(key, "muted")], v: sanitizeDisplayLine(value) });
 		const facts = [

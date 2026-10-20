@@ -14,6 +14,7 @@ import {
 	isModelGroupForm,
 	type ModelGroup,
 	ModelGroupConfigError,
+	parseModelRoleValue,
 	roleAcceptsGroups,
 } from "../config/model-groups";
 import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
@@ -169,10 +170,15 @@ export function writeModelHubPool(
 	}
 }
 
-/** Pool view of a role or chain entry; undefined for a legacy value, an unset entry, or a value that fails validation. */
+/**
+ * Pool view of a role or chain entry; undefined for a legacy value or an unset entry. A global role
+ * entry the settings merge drops as invalid yields a view with `invalid` set
+ * ({@link invalidGlobalRolePool}); any other invalid entry yields undefined.
+ */
 function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubPool | undefined {
 	const spec =
 		target.kind === "role" ? settings.getModelRoleSpec(target.key) : settings.getFallbackChainSpec(target.key);
+	if (spec === undefined && target.kind === "role") return invalidGlobalRolePool(settings, target.key);
 	if (spec?.kind !== "group" && spec?.kind !== "ref") return undefined;
 	if (spec.kind === "ref") {
 		const source = {
@@ -205,6 +211,25 @@ function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubP
 			: (cfgRetryFallbackChains.get(settings) as Record<string, unknown>)[target.key];
 	if (!isRecord(raw)) return { ...view, readOnly: "not an inline group" };
 	return { ...view, raw };
+}
+
+/**
+ * Pool view of the global `modelRoles.<role>` entry when it is in group form and fails validation;
+ * undefined otherwise. `invalid` lists the validator's problems.
+ */
+function invalidGlobalRolePool(settings: Settings, role: string): ModelHubPool | undefined {
+	const roles = settings.getGlobalSettings().modelRoles;
+	const value = isRecord(roles) && Object.hasOwn(roles, role) ? roles[role] : undefined;
+	if (!isModelGroupForm(value)) return undefined;
+	const parsed = parseModelRoleValue(role, value, "tolerant");
+	if (parsed.ok) return undefined;
+	return {
+		source: { kind: "inline" },
+		strategy: "",
+		members: [],
+		funding: [],
+		invalid: parsed.issues.map(issue => `${issue.path}: ${issue.message}`).join("; "),
+	};
 }
 
 /** `pool` with its local limits summary ({@link poolLimitsSummary}) when it has any. */

@@ -879,13 +879,14 @@ A role or fallback chain whose value is a model group (see `modelGroups` in [Set
 | `Enter` / `x` | member | Replaces / removes the member. |
 | `t` / `w` | member | Sets the member's `defaultEffort` / cycles its weight (weighted-random only, alone or as the last entry of a strategy list). |
 | `[` / `]` | member | Moves the member in a priority or round-robin order, alone or as the last entry of a strategy list. |
-| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, random, cheapest, least-used, least-loaded, p2c, and shuffle-bag; leaving weighted-random drops member weights, and least-used always gets the default window (set `strategyOptions.window` in config). A `quota` pool or a pool with a strategy list keeps its strategy; change it in config. A strategy list shows as its entries joined by `→`. |
+| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, and shuffle-bag, whatever the funding order and spending policy. Leaving a strategy drops its `strategyOptions`: leaving quota drops its `tolerance`, and leaving weighted-random also drops member weights. least-used always gets the default window; set `strategyOptions.window` or a quota `tolerance` in config. A pool with a strategy list keeps its strategy; change it in config. A strategy list shows as its entries joined by `→`. On a member row the cursor stays on that member. |
 | `o` | pooled row | Sets and then cycles the funding order (`included`, `included → free`, `free → included`, `free`); a configured `metered` stays last. It never removes the funding order: a pool without one applies no billing filter, which is wider than any listed order. |
 | `x` | pooled role / fallback pool | Clears the role / removes the chain. |
+| `Enter` / `x` | invalid pooled role | Replaces the entry with one model / removes it. |
 
 How pools pick models at runtime is described in [Model pools](#model-pools).
 
-Edits are written to the global config through the same strict validation as other settings writes. A refused edit shows the validator's message and writes nothing. A pool whose value comes from a project, `--config`, or runtime layer is shown read-only, since a global write would not take effect. A pool that references `modelGroups.<name>` is read-only too, because the group is shared; `x` still removes the reference from the global config.
+Edits are written to the global config through the same strict validation as other settings writes. A refused edit shows the validator's message and writes nothing. A pool whose value comes from a project, `--config`, or runtime layer is shown read-only, since a global write would not take effect. A pool that references `modelGroups.<name>` is read-only too, because the group is shared; `x` still removes the reference from the global config. A global role entry that fails validation (for example, a pool without `strategy`) selects no model; its row shows the validator's message instead of the pool.
 
 ## Context promotion
 
