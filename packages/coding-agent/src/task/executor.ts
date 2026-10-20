@@ -5050,7 +5050,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		} catch (err) {
 			exitCode = 1;
 			if (!abortSignal.aborted) {
-				error = err instanceof Error ? err.stack || err.message : String(err);
+				error =
+					err instanceof RolePoolUnavailableError
+						? err.message
+						: err instanceof Error
+							? err.stack || err.message
+							: String(err);
 			}
 		} finally {
 			const cleanupDeadlineAt = Date.now() + cleanupGraceMs;

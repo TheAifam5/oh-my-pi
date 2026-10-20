@@ -354,6 +354,7 @@ import { EventBus } from "./utils/event-bus";
 import { normalizeProviderContextImagesForModel } from "./utils/image-loading";
 import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
+import { sanitizeNoticeLine } from "./utils/notice-text";
 import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
 import { registerLocalInferenceApi } from "./tiny/local-inference-api";
@@ -946,6 +947,15 @@ export interface CreateAgentSessionOptions {
 	 * this to false. Default: true.
 	 */
 	allowSessionModelFallback?: boolean;
+	/**
+	 * When the default role's pool (`modelRoles.default` or the pool role it aliases) has a funding or
+	 * quota policy that excludes every member,
+	 * create the session with no model and describe the pool, each skipped member, and the fix in
+	 * `modelFallbackMessage` instead of throwing {@link RolePoolUnavailableError}. The blocked pool is
+	 * never replaced by its fallback chain or an unrelated default. Only the interactive TUI sets
+	 * this. Default: false.
+	 */
+	allowBlockedDefaultRolePool?: boolean;
 	/**
 	 * A human can answer synchronous prompts even without a terminal UI (e.g. an
 	 * ACP client rendering elicitation forms). Enables `ask` without enabling
@@ -1896,6 +1906,9 @@ export function createAutoLearnCaptureRunner(
  *   sessionManager: SessionManager.inMemory(),
  * });
  * ```
+ *
+ * @throws RolePoolUnavailableError when no model is requested and the default role's pool has a
+ * funding or quota policy that excludes every member, unless `allowBlockedDefaultRolePool` is set.
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	registerLocalInferenceApi();
@@ -2261,8 +2274,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 
 	// A pool default role resolves by its strategy and funding policy. When its funding or quota
-	// policy excluded a member and nothing else is eligible, it selects nothing and startup fails
-	// below instead of falling back; without a policy skip the legacy resolution and fallbacks apply.
+	// policy excluded a member and nothing else is eligible, it selects nothing: startup throws
+	// RolePoolUnavailableError below, or with `allowBlockedDefaultRolePool` starts with no model and
+	// reports the skips, instead of falling back; without a policy skip the legacy resolution and fallbacks apply.
 	// A `default` that aliases a pool role resolves through that pool, its `:level` replacing the member's effort.
 	const defaultRolePoolTarget = hasExplicitModel ? undefined : rolePoolTarget(settings, "default");
 	const defaultRoleIsPool = defaultRolePoolTarget !== undefined;
@@ -3555,6 +3569,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
 		if (!model && deferredModelPatterns.length === 0) {
+			/** Startup warning for a blocked default pool tolerated by `allowBlockedDefaultRolePool`. */
+			let defaultRolePoolBlockedMessage: string | undefined;
 			// Retry the configured default role against the current catalog,
 			// setting `model` (+ thinking level) when it resolves. Extension
 			// factories register providers AFTER the early `defaultRoleSpec`
@@ -3701,9 +3717,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 				// A blocked default pool is never replaced by its selector chain or an unrelated default.
 				if (!model && defaultRolePoolBlocked) {
-					throw new RolePoolUnavailableError(defaultRolePoolTarget?.role ?? "default", defaultRolePoolSkips);
-				}
-				if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates) && pick) {
+					const blocked = new RolePoolUnavailableError(
+						defaultRolePoolTarget?.role ?? "default",
+						defaultRolePoolSkips,
+					);
+					if (!options.allowBlockedDefaultRolePool) throw blocked;
+					defaultRolePoolBlockedMessage = sanitizeNoticeLine(
+						`${blocked.message}. Select a model with /model or --model, or change the routing.funding or routing.quota policy of modelRoles.${blocked.role}.`,
+					);
+				} else if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates) && pick) {
 					model = pick;
 					adoptThinkingForModel(pick);
 				}
@@ -3712,6 +3734,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (modelFallbackMessage) {
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
+			} else if (defaultRolePoolBlockedMessage) {
+				modelFallbackMessage = defaultRolePoolBlockedMessage;
 			} else {
 				const patterns = cfgEnabledModels.get(settings);
 				modelFallbackMessage =

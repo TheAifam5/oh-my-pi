@@ -60,7 +60,12 @@ import {
 	type ScopedModel,
 } from "./config/model-resolver";
 import { ModelsConfigFile } from "./config/models-config";
-import { rolePoolAliasTarget, rolePoolTarget, warnRolePoolProjection } from "./session/pool-selection";
+import {
+	RolePoolUnavailableError,
+	rolePoolAliasTarget,
+	rolePoolTarget,
+	warnRolePoolProjection,
+} from "./session/pool-selection";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { all, combine, type ProtocolHost, type SettingValueOf } from "./config/registry";
 import { Settings, settings } from "./config/settings";
@@ -2519,15 +2524,7 @@ export async function runRootCommand(
 					)
 				: undefined;
 
-			const {
-				session,
-				setToolUIContext,
-				modelFallbackMessage,
-				startupWarnings,
-				lspServers,
-				mcpManager,
-				startBackgroundModelDiscovery,
-			} = await createSession({
+			const created = await createSession({
 				...sessionOptions,
 				eventBus,
 				subagentEventBus,
@@ -2537,7 +2534,22 @@ export async function runRootCommand(
 				// may still supply defer instead of warning; interactive mode also
 				// waits for the first frame (`startDeferredStartupWork`).
 				deferRetryFallbackValidation: true,
+				allowBlockedDefaultRolePool: isInteractive,
+			}).catch((error: unknown) => {
+				// A blocked default pool fails a non-interactive launch with its one-line reason.
+				if (!(error instanceof RolePoolUnavailableError)) throw error;
+				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+				process.exit(1);
 			});
+			const {
+				session,
+				setToolUIContext,
+				modelFallbackMessage,
+				startupWarnings,
+				lspServers,
+				mcpManager,
+				startBackgroundModelDiscovery,
+			} = created;
 			if (!isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();

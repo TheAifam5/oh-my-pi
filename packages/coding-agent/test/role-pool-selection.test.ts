@@ -76,7 +76,6 @@ describe("model role pools", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
-	const unregisterBilling: Array<() => void> = [];
 	const notices: string[] = [];
 
 	beforeAll(async () => {
@@ -101,20 +100,20 @@ describe("model role pools", () => {
 	});
 
 	afterEach(() => {
-		for (const unregister of unregisterBilling.splice(0)) unregister();
 		vi.restoreAllMocks();
 	});
 
-	/** Reports one billing source per provider through registered readers and a stubbed usage fetch. */
-	function stubBilling(sources: Record<string, BillingSource>): void {
-		for (const [provider, source] of Object.entries(sources)) {
-			unregisterBilling.push(
-				retryFallbackBillingRegistry.register({
-					id: provider,
-					readBilling: report => knownBilling(report, [source]),
-				}),
-			);
-		}
+	/**
+	 * Reports each provider's billing sources through a stubbed billing read, replacing any built-in
+	 * reader, and a stubbed usage fetch.
+	 */
+	function stubBilling(sources: Record<string, BillingSource | BillingSource[]>): void {
+		const read = retryFallbackBillingRegistry.read.bind(retryFallbackBillingRegistry);
+		vi.spyOn(retryFallbackBillingRegistry, "read").mockImplementation((provider, report) => {
+			const source = sources[provider];
+			if (source === undefined || report?.provider !== provider) return read(provider, report);
+			return knownBilling(report, Array.isArray(source) ? source : [source]);
+		});
 		vi.spyOn(modelRegistry.authStorage.usage, "reports").mockResolvedValue(
 			Object.keys(sources).map(provider => ({ provider, fetchedAt: Date.now(), limits: [] })),
 		);
@@ -1489,6 +1488,63 @@ describe("model role pools", () => {
 				[selectorOf(OPENAI), "exhausted"],
 				[selectorOf(GOOGLE), "disabled"],
 			]);
+		});
+
+		it("starts with no model and a warning naming each skip when the user's default pool is blocked", async () => {
+			const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
+			if (!codex) throw new Error("Expected bundled model openai-codex/gpt-6.1-sol");
+			authStorage.keys.setRuntime("openai-codex", "openai-codex-test-key");
+			const settings = Settings.isolated({
+				modelRoles: {
+					default: pool("priority", [ANTHROPIC, codex], {
+						funding: { order: ["free", "metered"] },
+						spending: { policy: "provider-managed" },
+					}),
+				},
+			});
+			expect(resolveRolePoolGroup(settings, "default")).toBeDefined();
+			stubBilling({
+				anthropic: [
+					{ mode: "subscription-included", state: "unknown" },
+					{ mode: "paid-extra-usage", state: "disabled" },
+				],
+				"openai-codex": { mode: "prepaid-credits", state: "exhausted" },
+			});
+
+			try {
+				const thrown = await createAgentSession(startupOptions(settings)).then(
+					async created => {
+						await created.session.dispose();
+						return undefined;
+					},
+					(reason: unknown) => reason,
+				);
+				expect(thrown).toBeInstanceOf(RolePoolUnavailableError);
+				if (thrown instanceof RolePoolUnavailableError) {
+					expect(thrown.skipped.map(entry => [entry.selector, entry.reason.kind])).toEqual([
+						[selectorOf(ANTHROPIC), "disabled"],
+						[selectorOf(codex), "exhausted"],
+					]);
+				}
+
+				const { session, modelFallbackMessage } = await createAgentSession({
+					...startupOptions(settings),
+					allowBlockedDefaultRolePool: true,
+				});
+				try {
+					expect(session.model).toBeUndefined();
+					expect(modelFallbackMessage).toContain('No member of the model role pool "default" is eligible');
+					expect(modelFallbackMessage).toContain(`${selectorOf(ANTHROPIC)} (funding disabled)`);
+					expect(modelFallbackMessage).toContain(`${selectorOf(codex)} (funding exhausted)`);
+					expect(modelFallbackMessage).toContain("/model or --model");
+					expect(modelFallbackMessage).toContain("routing.funding or routing.quota policy of modelRoles.default");
+					expect(modelFallbackMessage).not.toContain("No default model selected");
+				} finally {
+					await session.dispose();
+				}
+			} finally {
+				authStorage.keys.removeRuntime("openai-codex");
+			}
 		});
 
 		it("starts on the first default pool member when no member has billing evidence", async () => {
