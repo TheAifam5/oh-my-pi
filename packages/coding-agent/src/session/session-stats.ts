@@ -490,7 +490,7 @@ export class SessionStatsTracker {
 		if (!provider) return;
 		this.#host.modelRegistry.authStorage.usage.ingestHeaders(provider, response.headers, {
 			sessionId: this.#host.agent.sessionId,
-			baseUrl: this.#host.modelRegistry.getProviderBaseUrl?.(provider),
+			baseUrl: model.baseUrl || this.#host.modelRegistry.getProviderBaseUrl?.(provider),
 			responseStatus: response.status,
 		});
 	}
