@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import { SESSION_PIN_CACHE_PREFIX } from "@oh-my-pi/pi-ai/auth/affinity";
 import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import { AccountUnavailableError, MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
@@ -10,6 +11,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isRecord, logger, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import { SessionAccountPoolScope } from "../src/config/account-pools";
 import { ModelRegistry } from "../src/config/model-registry";
+import { exportFromFile } from "../src/export/html";
 import { Settings } from "../src/config/settings";
 import type { InteractiveModeContext } from "../src/modes/types";
 import * as accountAdmin from "../src/session/account-admin";
@@ -402,6 +404,8 @@ describe("credential pins", () => {
 		// The pool account that served the session does not replace the ignored user pin in the file,
 		recordCredentialPin(storage, manager, sessionId, "anthropic");
 		expect(manager.getCredentialPins().get("anthropic")).toMatchObject({ hash: hashB, exclusive: true });
+		// It is kept beside the pin as the session's affinity instead,
+		expect(affinityHashes(manager)).toEqual([accountHash("a")]);
 		// so a resume without the restriction restores it.
 		storage.sessions.unrestrict("anthropic", sessionId, lease);
 		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
@@ -535,6 +539,181 @@ describe("credential pins", () => {
 		recordCredentialPin(storage, manager, sessionId, "anthropic");
 
 		expect(manager.getCredentialPins().get("anthropic")).toMatchObject({ hash: hashB, exclusive: true });
+	});
+
+	async function storeAccountC(): Promise<void> {
+		await store.saveOAuth("anthropic", mintOAuthCredential("c"));
+		await storage.credentials.reload();
+	}
+
+	function accountHash(suffix: string): string {
+		const hash = credentialPinHash("anthropic", { accountId: `account-${suffix}`, email: `${suffix}@example.com` });
+		if (!hash) throw new Error("expected a pin hash");
+		return hash;
+	}
+
+	function affinityHashes(manager: SessionManager): string[] {
+		return manager.getBranch().flatMap(entry => (entry.type === "credential_affinity" ? [entry.hash] : []));
+	}
+
+	test("a restricted session records the pool account serving an ignored pin beside it, once per change", async () => {
+		await storeAccountC();
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		manager.appendCredentialPin("anthropic", accountHash("b"), true);
+		storage.sessions.restrict("anthropic", sessionId, [identityKey("a"), identityKey("c")]);
+		const now = Date.now();
+		storage.sessions.pin("anthropic", sessionId, storedAccount("c").credentialId, { restoredAtMs: now });
+
+		recordCredentialPin(storage, manager, sessionId, "anthropic");
+		recordCredentialPin(storage, manager, sessionId, "anthropic");
+		expect(affinityHashes(manager)).toEqual([accountHash("c")]);
+
+		storage.sessions.pin("anthropic", sessionId, storedAccount("a").credentialId, { restoredAtMs: now + 1 });
+		recordCredentialPin(storage, manager, sessionId, "anthropic");
+		expect(affinityHashes(manager)).toEqual([accountHash("c"), accountHash("a")]);
+		expect(manager.getCredentialPins().get("anthropic")).toMatchObject({ hash: accountHash("b"), exclusive: true });
+	});
+
+	test("recording appends no affinity while the user's pin is honored", async () => {
+		await storeAccountC();
+		const unrestricted = SessionManager.create(tempDir.path(), tempDir.path());
+		const pooled = SessionManager.create(tempDir.path(), tempDir.path());
+		storage.sessions.restrict("anthropic", pooled.getSessionId(), [identityKey("b"), identityKey("c")]);
+		for (const manager of [unrestricted, pooled]) {
+			const sessionId = manager.getSessionId();
+			manager.appendCredentialPin("anthropic", accountHash("b"), true);
+			expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+			expect(pinnedCredentialId(sessionId)).toBe(storedAccount("b").credentialId);
+
+			recordCredentialPin(storage, manager, sessionId, "anthropic");
+
+			expect(affinityHashes(manager)).toEqual([]);
+		}
+	});
+
+	test("resume seeds the recorded pool account while a restriction ignores the user's pin", async () => {
+		serveStoredTokens();
+		await storeAccountC();
+		const resumed = SessionManager.create(tempDir.path(), tempDir.path());
+		const withoutAffinity = SessionManager.create(tempDir.path(), tempDir.path());
+		for (const manager of [resumed, withoutAffinity]) {
+			manager.appendCredentialPin("anthropic", accountHash("b"), true);
+			storage.sessions.restrict("anthropic", manager.getSessionId(), [identityKey("a"), identityKey("c")]);
+		}
+		resumed.appendCredentialAffinity("anthropic", accountHash("c"));
+
+		for (const manager of [resumed, withoutAffinity]) {
+			expect(seedCredentialPins(storage, manager, manager.getSessionId())).toEqual([]);
+		}
+
+		expect(await storage.keys.get("anthropic", withoutAffinity.getSessionId())).toBe("access-a");
+		expect(await storage.keys.get("anthropic", resumed.getSessionId())).toBe("access-c");
+		expect(pinnedCredentialId(resumed.getSessionId())).toBeUndefined();
+	});
+
+	test("resume ignores an affinity outside the restriction or for an account no longer stored", async () => {
+		serveStoredTokens();
+		await storeAccountC();
+		for (const hash of [accountHash("b"), accountHash("gone")]) {
+			const manager = SessionManager.create(tempDir.path(), tempDir.path());
+			const sessionId = manager.getSessionId();
+			manager.appendCredentialPin("anthropic", accountHash("b"), true);
+			manager.appendCredentialAffinity("anthropic", hash);
+			storage.sessions.restrict("anthropic", sessionId, [identityKey("a"), identityKey("c")]);
+
+			expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+
+			expect(storage.oauth.accounts("anthropic", sessionId).some(account => account.active)).toBe(false);
+			expect(await storage.keys.get("anthropic", sessionId)).toBe("access-a");
+		}
+	});
+
+	test("an unrestricted resume never seeds a recorded affinity", async () => {
+		await storeAccountC();
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		manager.appendCredentialAffinity("anthropic", accountHash("c"));
+
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+
+		expect(storage.oauth.accounts("anthropic", sessionId).some(account => account.active)).toBe(false);
+	});
+
+	test("an honored user pin wins over a recorded affinity on resume", async () => {
+		serveStoredTokens();
+		await storeAccountC();
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionId = manager.getSessionId();
+		manager.appendCredentialPin("anthropic", accountHash("b"), true);
+		manager.appendCredentialAffinity("anthropic", accountHash("c"));
+
+		expect(seedCredentialPins(storage, manager, sessionId)).toEqual([]);
+
+		expect(pinnedCredentialId(sessionId)).toBe(storedAccount("b").credentialId);
+		expect(await storage.keys.get("anthropic", sessionId)).toBe("access-b");
+	});
+
+	test("a session file with affinity entries loads, compacts, forks, and exports like the same file without them", async () => {
+		await storeAccountC();
+		const writer = SessionManager.create(tempDir.path(), tempDir.path());
+		writer.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		writer.appendMessage(assistantMessage("anthropic", Date.now()));
+		const pinId = writer.appendCredentialPin("anthropic", accountHash("b"), true);
+		await writer.flush();
+		const file = writer.getSessionFile();
+		if (!file) throw new Error("expected a persisted session file");
+		// Written raw, as a build that predates the entry type finds it on disk.
+		const affinity = {
+			type: "credential_affinity",
+			id: "aff00001",
+			parentId: pinId,
+			timestamp: new Date().toISOString(),
+			provider: "anthropic",
+			hash: accountHash("c"),
+		};
+		await Bun.write(file, `${await Bun.file(file).text()}${JSON.stringify(affinity)}\n`);
+		const continued = await SessionManager.open(file);
+		continued.appendMessage({ role: "user", content: "second", timestamp: Date.now() });
+		continued.appendMessage(assistantMessage("anthropic", Date.now()));
+		await continued.flush();
+
+		const strippedFile = tempDir.join("stripped.jsonl");
+		const stripped = (await Bun.file(file).text())
+			.split("\n")
+			.filter(line => line.length > 0)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.filter(entry => entry.type !== "credential_affinity")
+			.map(entry => (entry.parentId === affinity.id ? { ...entry, parentId: pinId } : entry));
+		await Bun.write(strippedFile, `${stripped.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+
+		const [withEntries, without] = await Promise.all([SessionManager.open(file), SessionManager.open(strippedFile)]);
+		expect(withEntries.getCredentialPins()).toEqual(without.getCredentialPins());
+		expect(withEntries.buildSessionContext().messages).toEqual(without.buildSessionContext().messages);
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1, remoteEnabled: false };
+		const prepared = prepareCompaction(withEntries.getBranch(), settings);
+		const preparedWithout = prepareCompaction(without.getBranch(), settings);
+		if (!prepared || !preparedWithout) throw new Error("expected compaction preparations");
+		expect(prepared.messagesToSummarize).toEqual(preparedWithout.messagesToSummarize);
+		expect(prepared.recentMessages).toEqual(preparedWithout.recentMessages);
+
+		// Compaction and fork keep the affinity readable, as they keep the pin.
+		withEntries.appendCompaction("summary", undefined, prepared.firstKeptEntryId, prepared.tokensBefore);
+		const forked = await withEntries.fork();
+		if (!forked) throw new Error("expected a forked session file");
+		expect((await SessionManager.open(forked.newSessionFile)).getCredentialAffinities().get("anthropic")?.hash).toBe(
+			accountHash("c"),
+		);
+
+		const outputPath = tempDir.join("export.html");
+		await exportFromFile(file, { outputPath });
+		const html = await Bun.file(outputPath).text();
+		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+		if (!encoded) throw new Error("expected embedded session data");
+		const exported = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as {
+			entries: Array<Record<string, unknown>>;
+		};
+		expect(exported.entries.filter(entry => entry.type === "credential_affinity")).toEqual([affinity]);
 	});
 
 	test("RPC mode reports an unavailable pin found while the session is built as a notice frame", async () => {

@@ -129,6 +129,7 @@ All non-header entries include:
 - `title_change`
 - `ttsr_injection`
 - `credential_pin`
+- `credential_affinity`
 - `session_init`
 - `mode_change`
 
@@ -392,6 +393,10 @@ Append-only audit entry for a session rename. It records `title`, `source` (`aut
 ### `credential_pin`
 
 Records the provider and a pseudonymous SHA-256 account/scope hash used to re-pin resumed OAuth traffic to the serving account and preserve account-scoped prompt-cache reuse. It does not store the raw account identity; exported hashes remain linkable and are not anonymous.
+
+### `credential_affinity`
+
+Records, with the same provider and hash shape as `credential_pin`, the account inside its account pool that served a session whose restriction ignores the user's exclusive `credential_pin` (a pooled subagent, for example). It is appended only when that account changes and never replaces the pin. On resume the pin is applied first; only while a restriction still ignores it (or the restricted session has no pin for the provider) is the latest affinity seeded as an automatic, warm-window affinity, and only if the account is still stored and allowed by the restriction. Builds that predate the entry type load and ignore it.
 
 ### `session_init`
 

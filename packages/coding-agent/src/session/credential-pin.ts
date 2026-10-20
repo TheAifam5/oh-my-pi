@@ -70,11 +70,13 @@ const ignoredPinWarnings = new LRUCache<string, true>({ max: 256 });
  * Appends a `credential_pin` entry only when the account differs from the
  * branch's latest pin, so steady-state sessions add a single entry; the
  * effective last-use time is derived from later assistant turns on read
- * (see `SessionManager.getCredentialPins`). Records nothing while the branch's
- * latest entry is a user pin, so an automatic entry never replaces it on resume,
- * including one an account restriction ignores: a later unrestricted resume
- * restores it. Such a restricted session keeps its in-pool affinity only in the
- * auth store's sticky rows, which a remote auth broker does not persist.
+ * (see `SessionManager.getCredentialPins`). Never appends a `credential_pin`
+ * while the branch's latest pin is a user pin, so an automatic entry never
+ * replaces it on resume, including one an account restriction ignores: a later
+ * unrestricted resume restores it. When a restriction ignores the user pin
+ * (the session is restricted and its active account differs from the pinned
+ * one), the active pool account is recorded as a `credential_affinity` entry
+ * instead, again only when it differs from the branch's latest affinity.
  */
 export function recordCredentialPin(
 	authStorage: AuthStorage,
@@ -82,12 +84,32 @@ export function recordCredentialPin(
 	sessionId: string,
 	provider: string,
 ): void {
-	if (sessionManager.getCredentialPins().get(provider)?.exclusive) return;
+	const pin = sessionManager.getCredentialPins().get(provider);
+	if (pin?.exclusive) {
+		recordCredentialAffinity(authStorage, sessionManager, sessionId, provider, pin.hash);
+		return;
+	}
 	const identity = authStorage.oauth.identity(provider, sessionId);
 	if (!identity) return;
 	const hash = credentialPinHash(provider, identity);
 	if (!hash || sessionManager.getCredentialPins().get(provider)?.hash === hash) return;
 	sessionManager.appendCredentialPin(provider, hash);
+}
+
+/** Record the restricted session's active pool account when it is not the user-pinned account `pinHash`. */
+function recordCredentialAffinity(
+	authStorage: AuthStorage,
+	sessionManager: SessionManager,
+	sessionId: string,
+	provider: string,
+	pinHash: string,
+): void {
+	if (!authStorage.sessions.isRestricted(provider, sessionId)) return;
+	// Restriction-filtered and session-active only: no fallback to an account outside the pool.
+	const serving = authStorage.oauth.accounts(provider, sessionId).find(account => account.active);
+	const hash = serving ? credentialPinHash(provider, serving) : undefined;
+	if (!hash || hash === pinHash || sessionManager.getCredentialAffinities().get(provider)?.hash === hash) return;
+	sessionManager.appendCredentialAffinity(provider, hash);
 }
 
 /**
@@ -121,6 +143,9 @@ export function recordExclusiveCredentialPin(
  * restricted to an account pool instead ignores a user pin it cannot apply
  * (outside its pool, or an account no longer stored, which cannot be shown to
  * be inside it): nothing is persisted and selection stays inside the pool.
+ * After the pins, such a restricted session, or a restricted one with no pin
+ * for the provider, is seeded like an automatic pin from its latest
+ * `credential_affinity` entry, only when that account is stored and allowed.
  *
  * An automatic pin is a no-op when the account is gone (logged out) or when a
  * live sticky for another account exists (same-process branch/session switches
@@ -128,8 +153,9 @@ export function recordExclusiveCredentialPin(
  * use predates the pin is advanced to the pin's time: the persisted sticky is
  * written lazily, so the session file can be newer. It seeds with the
  * session's effective last-use time so stale resumes still fall through to
- * usage ranking. `options.exclusiveOnly` restores only user pins, for a fresh
- * provider session id that wants new automatic routing but keeps the user's pins.
+ * usage ranking. `options.exclusiveOnly` restores only user pins, no automatic
+ * pins or affinities, for a fresh provider session id that wants new automatic
+ * routing but keeps the user's pins.
  * `options.onIgnored` receives each provider whose user pin a restriction
  * overrides; the override is logged once per session and provider.
  */
@@ -140,7 +166,9 @@ export function seedCredentialPins(
 	options?: { exclusiveOnly?: boolean; onIgnored?: (provider: string) => void },
 ): string[] {
 	const unavailable: string[] = [];
-	for (const [provider, pin] of sessionManager.getCredentialPins()) {
+	const ignored = new Set<string>();
+	const pins = sessionManager.getCredentialPins();
+	for (const [provider, pin] of pins) {
 		if (pin.exclusive) {
 			const pinned = authStorage.sessions
 				.accounts(provider, sessionId)
@@ -155,6 +183,7 @@ export function seedCredentialPins(
 					});
 				}
 				options?.onIgnored?.(provider);
+				ignored.add(provider);
 				continue;
 			}
 			authStorage.sessions.pinMissing(provider, sessionId);
@@ -163,15 +192,35 @@ export function seedCredentialPins(
 			continue;
 		}
 		if (options?.exclusiveOnly) continue;
-		const accounts = authStorage.oauth.accounts(provider, sessionId);
-		if (accounts.length === 0) continue;
-		const match = accounts.find(account => credentialPinHash(provider, account) === pin.hash);
-		if (!match) continue;
-		const active = accounts.find(account => account.active);
-		if (active && (active !== match || (active.lastUsedAtMs ?? 0) >= pin.lastUsedAt)) continue;
-		authStorage.sessions.pin(provider, sessionId, match.credentialId, {
-			restoredAtMs: pin.lastUsedAt,
-		});
+		restoreAutomaticAffinity(authStorage, sessionId, provider, pin);
+	}
+	if (options?.exclusiveOnly) return unavailable;
+	for (const [provider, affinity] of sessionManager.getCredentialAffinities()) {
+		if (pins.has(provider) && !ignored.has(provider)) continue;
+		if (!authStorage.sessions.isRestricted(provider, sessionId)) continue;
+		restoreAutomaticAffinity(authStorage, sessionId, provider, affinity);
 	}
 	return unavailable;
+}
+
+/**
+ * Seed the stored account whose hash is `recorded.hash` as the session's
+ * sticky, backdated to `recorded.lastUsedAt`. A no-op when that account is not
+ * listed for the session (logged out, or outside its restriction) or a live
+ * sticky for another account, or a newer one for the same account, exists.
+ */
+function restoreAutomaticAffinity(
+	authStorage: AuthStorage,
+	sessionId: string,
+	provider: string,
+	recorded: { hash: string; lastUsedAt: number },
+): void {
+	const accounts = authStorage.oauth.accounts(provider, sessionId);
+	const match = accounts.find(account => credentialPinHash(provider, account) === recorded.hash);
+	if (!match) return;
+	const active = accounts.find(account => account.active);
+	if (active && (active !== match || (active.lastUsedAtMs ?? 0) >= recorded.lastUsedAt)) return;
+	authStorage.sessions.pin(provider, sessionId, match.credentialId, {
+		restoredAtMs: recorded.lastUsedAt,
+	});
 }

@@ -2107,11 +2107,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// account wins) and cold-miss the child's whole prefix. An explicit parent pin is
 		// the user's choice and still reaches the child.
 		const ownPins = sessionManager.getCredentialPins();
+		const ownAffinities = sessionManager.getCredentialAffinities();
 		const sessions = modelRegistry.authStorage.sessions;
 		sessions.inherit(
 			options.credentialSourceSessionId,
 			providerSessionId,
-			(provider, explicit) => explicit || !ownPins.has(provider),
+			(provider, explicit) => explicit || (!ownPins.has(provider) && !ownAffinities.has(provider)),
 		);
 		// A started session forgets these copies when it is disposed; a failed start forgets them here.
 		startupCleanup.defer(() => sessions.forgetInherited(providerSessionId));

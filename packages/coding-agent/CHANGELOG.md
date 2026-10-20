@@ -114,6 +114,7 @@
 ### Added
 
 - Added strategy lists for model pools: `strategy: [quota, cheapest]` orders members by quota, then by price among ties, and `strategyOptions.tolerance` lets quota treat members with similar remaining quota as tied
+- Resumed pooled sessions (such as subagents restricted to an account pool) keep the pool account that served them under a remote auth broker, even when the pool overrides an account pinned with `/session pin`
 
 ### Fixed
 

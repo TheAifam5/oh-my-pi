@@ -225,6 +225,7 @@ declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 	interface CustomCompactionSessionEntries {
 		titleChange: TitleChangeEntry;
 		credentialPin: CredentialPinEntry;
+		credentialAffinity: CredentialAffinityEntry;
 		modelUsage: ModelUsageEntry;
 	}
 }
@@ -254,6 +255,24 @@ export interface CredentialPinEntry extends SessionEntryBase {
 	hash: string;
 	/** Set when the user pinned the account (`/session pin`): resume restores it as the session's only account. */
 	exclusive?: true;
+}
+
+/**
+ * Records which account inside its account pool served a session whose
+ * restriction ignores the user's exclusive `credential_pin` for `provider`.
+ *
+ * It never replaces that pin: resume applies the pin first and seeds this
+ * account as an automatic, warm-window affinity only while a restriction still
+ * ignores the pin, and only when the account is stored and inside the pool.
+ * The hash has the same `credentialPinHash()` contract and linkability as
+ * `CredentialPinEntry.hash`.
+ */
+export interface CredentialAffinityEntry extends SessionEntryBase {
+	type: "credential_affinity";
+	/** Provider id the affinity applies to (e.g. "anthropic"). */
+	provider: string;
+	/** `credentialPinHash()` of the serving account's identity + scope tuple. */
+	hash: string;
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -343,6 +362,7 @@ export type SessionEntry =
 	| SessionInitEntry
 	| ModeChangeEntry
 	| CredentialPinEntry
+	| CredentialAffinityEntry
 	| ResetBoundaryEntry;
 
 /** Leaf selected when replaying one entry; an off-branch entry restores the active leaf captured at append time. */

@@ -52,6 +52,7 @@ import {
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	type CredentialAffinityEntry,
 	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -503,6 +504,7 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 		case "service_tier_change":
 		case "mode_change":
 		case "credential_pin":
+		case "credential_affinity":
 			return true;
 		default:
 			return false;
@@ -3775,6 +3777,36 @@ export class SessionManager {
 			}
 		}
 		return pins;
+	}
+
+	/** Append a credential affinity recording which pool account served `provider` while its pin was ignored. */
+	appendCredentialAffinity(provider: string, hash: string): string {
+		const entry: CredentialAffinityEntry = {
+			type: "credential_affinity",
+			...this.#freshEntryFields(),
+			provider,
+			hash,
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Latest credential affinity per provider on the current branch (root →
+	 * leaf), with an effective last-use time advanced by later assistant turns
+	 * for that provider, as in {@link getCredentialPins}.
+	 */
+	getCredentialAffinities(): Map<string, { hash: string; lastUsedAt: number }> {
+		const affinities = new Map<string, { hash: string; lastUsedAt: number }>();
+		for (const entry of this.getBranch()) {
+			if (entry.type === "credential_affinity") {
+				affinities.set(entry.provider, { hash: entry.hash, lastUsedAt: new Date(entry.timestamp).getTime() });
+			} else if (entry.type === "message" && entry.message.role === "assistant") {
+				const affinity = affinities.get(entry.message.provider);
+				if (affinity) affinity.lastUsedAt = Math.max(affinity.lastUsedAt, entry.message.timestamp);
+			}
+		}
+		return affinities;
 	}
 
 	getLeafId(): string | null {

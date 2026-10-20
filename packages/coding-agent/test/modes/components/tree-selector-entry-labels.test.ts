@@ -32,7 +32,8 @@ const userEntry: SessionEntry = {
 const bookkeeping: SessionEntry[] = [
 	{ ...base("title", "u1"), type: "title_change", title: "fork cleanup", source: "user" },
 	{ ...base("pin", "title"), type: "credential_pin", provider: "anthropic", hash: "abc123" },
-	{ ...base("mode", "pin"), type: "mode_change", mode: "plan" },
+	{ ...base("affinity", "pin"), type: "credential_affinity", provider: "anthropic", hash: "def456" },
+	{ ...base("mode", "affinity"), type: "mode_change", mode: "plan" },
 	{ ...base("tier", "mode"), type: "service_tier_change", serviceTier: { claude: "priority" } },
 	{ ...base("tier-off", "tier"), type: "service_tier_change", serviceTier: null },
 	{ ...base("ttsr", "tier-off"), type: "ttsr_injection", injectedRules: ["prefer-bun"] },
@@ -91,6 +92,7 @@ describe("tree selector entry labels", () => {
 		const rows = visibleRows(selector).join("\n");
 		expect(rows).toContain("[title: fork cleanup]");
 		expect(rows).toContain("[credential pin: anthropic]");
+		expect(rows).toContain("[credential affinity: anthropic]");
 		expect(rows).toContain("[mode: plan]");
 		expect(rows).toContain("[service tier: claude:priority]");
 		// A cleared tier is a real transition, so it says so rather than "null".
@@ -128,6 +130,7 @@ describe("tree selector entry labels", () => {
 		for (const label of [
 			"[title:",
 			"[credential pin:",
+			"[credential affinity",
 			"[mode:",
 			"[service tier:",
 			"[ttsr",

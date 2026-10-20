@@ -99,6 +99,7 @@ Shows conversational nodes plus any entry types not explicitly suppressed. It hi
 - `service_tier_change`
 - `title_change`
 - `credential_pin`
+- `credential_affinity`
 - `session_init`
 - `ttsr_injection`
 - `mode_change`
