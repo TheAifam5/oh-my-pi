@@ -9,6 +9,18 @@ import { removeWithRetries } from "../../utils/src/temp";
 
 const HOUR_MS = 60 * 60 * 1000;
 
+/**
+ * `hour`:`minute` UTC on the day after the real current date. The credential
+ * store stamps block rows and cache expiry with SQLite's real clock, so faked
+ * test time must stay ahead of it for its probe windows to elapse.
+ */
+function nextUtcDayAt(hour: number, minute: number): number {
+	const today = new Date();
+	return Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1, hour, minute);
+}
+
+const NEXT_DAY_NOON = nextUtcDayAt(12, 0);
+
 describe("AuthStorage Z.AI API-key usage ranking", () => {
 	let tempDir = "";
 	let store: AuthCredentialStore | null = null;
@@ -285,7 +297,7 @@ describe("AuthStorage Z.AI API-key usage ranking", () => {
 
 	test("a live report showing recovered token quota lifts a Z.AI API key's quota block", async () => {
 		if (!authStorage || !store?.listCredentialBlocks) throw new Error("test setup failed");
-		const start = Date.UTC(2026, 9, 20, 12, 0);
+		const start = NEXT_DAY_NOON;
 		setSystemTime(start);
 		const quota = (id: string, unit: "requests" | "tokens", used: number) => ({
 			id,
@@ -330,7 +342,7 @@ describe("AuthStorage Z.AI API-key usage ranking", () => {
 
 	test("a Z.AI usage-limit error's retry hint outlasts a recovered quota, while the report's quota block lifts", async () => {
 		if (!authStorage || !store?.listCredentialBlocks) throw new Error("test setup failed");
-		const start = Date.UTC(2026, 9, 20, 12, 0);
+		const start = NEXT_DAY_NOON;
 		setSystemTime(start);
 		const tokens = (used: number): UsageReport => ({
 			provider: "zai",

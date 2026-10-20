@@ -15,7 +15,19 @@ import { removeWithRetries } from "../../utils/src/temp";
 
 const FREE_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
 const PAID_MODEL = "meta-llama/llama-3.3-70b-instruct";
-const NOW = Date.UTC(2026, 9, 20, 15, 30);
+/**
+ * `hour`:`minute` UTC on the day after the real current date. The credential
+ * store stamps block rows and cache expiry with SQLite's real clock, so faked
+ * test time must stay ahead of it for its probe windows to elapse.
+ */
+function nextUtcDayAt(hour: number, minute: number): number {
+	const today = new Date();
+	return Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1, hour, minute);
+}
+
+const NOW = nextUtcDayAt(15, 30);
+/** Ten minutes before the free-model counter of {@link NOW}'s day resets. */
+const LATE_EVENING = nextUtcDayAt(23, 50);
 /** Past every jittered usage-cache expiry and the block's probe window, well before midnight UTC. */
 const AFTER_PROBE_WINDOW = NOW + 2 * USAGE_REPORT_TTL_MS;
 
@@ -222,7 +234,7 @@ describe("AuthStorage OpenRouter free-model quota", () => {
 
 	test("a retained report from before the midnight reset does not re-block the key during an outage", async () => {
 		const storage = await setKeys("or-free-spent", "or-free-healthy");
-		const lateEvening = Date.UTC(2026, 9, 20, 23, 50);
+		const lateEvening = LATE_EVENING;
 		setSystemTime(lateEvening);
 		bodies.set("or-free-spent", keyBody(90, SPENT_FREE));
 		bodies.set("or-free-healthy", keyBody(90, HEALTHY_FREE));
