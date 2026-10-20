@@ -98,14 +98,24 @@ describe("ZAI usage-block healing", () => {
 	});
 
 	it("selects a previously blocked account after a healthy scoped quota probe", async () => {
-		const { storage, blocks } = makeStorage(report(0.013), "credits");
+		const { storage, blocks } = makeStorage(report(0.013), "quota");
 		storages.push(storage);
 		await storage.credentials.reload();
 
 		await storage.health.model("zai", { modelId: "glm-5.3", reserveFraction: 0.1 });
 
 		expect(await storage.keys.get("zai", "recovered-scoped", { modelId: "glm-5.3" })).toBe("zai-access");
-		expect(blocks.has("credits")).toBe(false);
+		expect(blocks.has("quota")).toBe(false);
+	});
+
+	it("keeps a usage-limit error's block, whose retry hint a healthy report cannot vouch for", async () => {
+		const { storage, blocks } = makeStorage(report(0.013), "credits");
+		storages.push(storage);
+		await storage.credentials.reload();
+
+		await storage.health.model("zai", { modelId: "glm-5.3", reserveFraction: 0.1 });
+
+		expect(blocks.has("credits")).toBe(true);
 	});
 
 	it("keeps the block when the weekly credits are still exhausted", async () => {

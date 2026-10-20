@@ -32,6 +32,7 @@ import {
 	isUsageLimitExhausted,
 	isUsageLimitReached,
 	scopedUsageLimits,
+	usageReportBlockScope,
 	usageResetAtMs,
 	windowResetAt,
 } from "./usage-report";
@@ -53,6 +54,8 @@ export type CredentialBlockRouting = {
 	rankingContext: CredentialRankingContext;
 	blockScope: string | undefined;
 	siblingBlockScopes: readonly string[];
+	/** Scopes whose live deadlines count as the credential's prior block; defaults to {@link blockScope}. */
+	priorBlockScopes?: readonly string[];
 };
 
 /** Dependencies for rate-limit marking and credential rotation. */
@@ -153,14 +156,15 @@ export class RateLimits implements LimitsApi {
 		// request (longest-wins), and recovery that replaces this call's
 		// heuristic fallback with an authoritative report window still needs
 		// the prior response's provider-stated deadline.
+		const priorScopes = routing.priorBlockScopes ?? routing.blockScope;
 		const priorBlockedUntilMs =
 			targetIndex >= 0
-				? this.#deps.blocks.blockedUntil(provider, routing.providerKey, targetIndex, routing.blockScope)
+				? this.#deps.blocks.blockedUntil(provider, routing.providerKey, targetIndex, priorScopes)
 				: undefined;
 		const targetId = targetIndex >= 0 ? this.#deps.pool.entries(provider)[targetIndex]?.id : undefined;
 		const priorBlockedUntilTimed =
 			targetId !== undefined && priorBlockedUntilMs !== undefined
-				? this.#deps.blocks.isTimed(routing.providerKey, routing.blockScope, targetId, priorBlockedUntilMs)
+				? this.#deps.blocks.isTimed(routing.providerKey, priorScopes, targetId, priorBlockedUntilMs)
 				: false;
 		if (targetIndex >= 0) {
 			this.#deps.blocks.mark(
@@ -247,6 +251,12 @@ export class RateLimits implements LimitsApi {
 		const targetCredentialId = target.id;
 
 		const routing = this.#credentialBlockRouting(provider, credentialType, options?.modelId);
+		// A report-confirmed reset lives in its own scope, and still counts as the prior block.
+		if (routing.strategy?.reportBlockScope) {
+			routing.priorBlockScopes = [
+				...new Set([...(routing.blockScope ? [routing.blockScope] : []), ...routing.siblingBlockScopes]),
+			];
+		}
 		const now = Date.now();
 		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? DEFAULT_BLOCK_MS);
 		let blockedUntil = requestedBlockedUntilMs;
@@ -261,6 +271,8 @@ export class RateLimits implements LimitsApi {
 		// independently of whether the report extends the hint so a shorter
 		// authoritative window still counts as provider timing.
 		let reportResetAtMs: number | undefined;
+		// A strategy that scopes report-derived blocks keeps the report's reset off the error's block.
+		let reportBlock: { scope: string | undefined; until: number } | undefined;
 		if (target && routing.strategy) {
 			const report = await raceSignal(
 				this.#deps.usage.report(provider, target.credential, options),
@@ -271,7 +283,17 @@ export class RateLimits implements LimitsApi {
 				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext);
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
-					if (resetAtMs && resetAtMs > blockedUntil) {
+					if (resetAtMs && routing.strategy.reportBlockScope) {
+						reportBlock = {
+							scope: usageReportBlockScope(
+								routing.strategy,
+								scopedLimits,
+								routing.rankingContext,
+								routing.blockScope,
+							),
+							until: resetAtMs,
+						};
+					} else if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
 						providerTimed = true;
 					}
@@ -302,6 +324,10 @@ export class RateLimits implements LimitsApi {
 			routing,
 			providerTimed,
 		);
+		if (reportBlock && targetIndex >= 0) {
+			this.#deps.blocks.mark(provider, routing.providerKey, targetIndex, reportBlock.until, reportBlock.scope, true);
+			rotation.blockedUntilMs = Math.max(rotation.blockedUntilMs ?? 0, reportBlock.until);
+		}
 		return {
 			...rotation,
 			requestedBlockedUntilMs,

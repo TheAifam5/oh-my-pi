@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { USAGE_REPORT_TTL_MS } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import type { UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import { removeWithRetries } from "../../utils/src/temp";
 
@@ -39,6 +40,7 @@ describe("AuthStorage Z.AI API-key usage ranking", () => {
 	});
 
 	afterEach(async () => {
+		setSystemTime();
 		authStorage?.close();
 		store?.close();
 		store = null;
@@ -279,5 +281,98 @@ describe("AuthStorage Z.AI API-key usage ranking", () => {
 		});
 
 		expect(await authStorage.keys.get("zai")).toBe("zai-feature-exhausted");
+	});
+
+	test("a live report showing recovered token quota lifts a Z.AI API key's quota block", async () => {
+		if (!authStorage || !store?.listCredentialBlocks) throw new Error("test setup failed");
+		const start = Date.UTC(2026, 9, 20, 12, 0);
+		setSystemTime(start);
+		const quota = (id: string, unit: "requests" | "tokens", used: number) => ({
+			id,
+			label: id,
+			scope: { provider: "zai", windowId: "5h", shared: true },
+			window: { id: "5h", label: "5 Hour", durationMs: 5 * HOUR_MS, resetsAt: start + 4 * HOUR_MS },
+			amount: {
+				unit,
+				used,
+				limit: 100,
+				remaining: 100 - used,
+				usedFraction: used / 100,
+				remainingFraction: 1 - used / 100,
+			},
+			status: used >= 100 ? ("exhausted" as const) : ("ok" as const),
+		});
+		const zaiReport = (requestsUsed: number, tokensUsed: number): UsageReport => ({
+			provider: "zai",
+			fetchedAt: Date.now(),
+			limits: [quota("zai:requests:5h", "requests", requestsUsed), quota("zai:tokens:5h", "tokens", tokensUsed)],
+		});
+		await authStorage.credentials.set("zai", [
+			{ type: "api_key", key: "zai-recovering", source: "login" },
+			{ type: "api_key", key: "zai-busier", source: "login" },
+		]);
+		usageByKey.set("zai-recovering", zaiReport(10, 100));
+		usageByKey.set("zai-busier", zaiReport(70, 20));
+		expect(await authStorage.keys.get("zai")).toBe("zai-busier");
+		const recovering = store
+			.listAuthCredentials("zai")
+			.find(entry => entry.credential.type === "api_key" && entry.credential.key === "zai-recovering");
+		if (!recovering) throw new Error("blocked credential missing");
+		expect(store.listCredentialBlocks([recovering.id]).map(block => block.blockScope)).toEqual(["quota"]);
+
+		// A report still inside the block's probe window cannot lift it; a later live one can.
+		setSystemTime(start + 2 * USAGE_REPORT_TTL_MS);
+		usageByKey.set("zai-recovering", zaiReport(10, 30));
+		usageByKey.set("zai-busier", zaiReport(70, 20));
+		expect(await authStorage.keys.get("zai")).toBe("zai-recovering");
+		expect(store.listCredentialBlocks([recovering.id])).toEqual([]);
+	});
+
+	test("a Z.AI usage-limit error's retry hint outlasts a recovered quota, while the report's quota block lifts", async () => {
+		if (!authStorage || !store?.listCredentialBlocks) throw new Error("test setup failed");
+		const start = Date.UTC(2026, 9, 20, 12, 0);
+		setSystemTime(start);
+		const tokens = (used: number): UsageReport => ({
+			provider: "zai",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "zai:tokens:5h",
+					label: "ZAI Token Quota",
+					scope: { provider: "zai", windowId: "5h", shared: true },
+					window: { id: "5h", label: "5 Hour", durationMs: 5 * HOUR_MS, resetsAt: start + 4 * HOUR_MS },
+					amount: { unit: "tokens", used, limit: 100, usedFraction: used / 100 },
+					status: used >= 100 ? "exhausted" : "ok",
+				},
+			],
+		});
+		await authStorage.credentials.set("zai", [
+			{ type: "api_key", key: "zai-limited", source: "login" },
+			{ type: "api_key", key: "zai-sibling", source: "login" },
+		]);
+		usageByKey.set("zai-limited", tokens(100));
+		usageByKey.set("zai-sibling", tokens(80));
+		await authStorage.limits.markReached("zai", "session-hint", {
+			apiKey: "zai-limited",
+			retryAfterMs: 2 * HOUR_MS,
+			providerTimed: true,
+		});
+		const limited = store
+			.listAuthCredentials("zai")
+			.find(entry => entry.credential.type === "api_key" && entry.credential.key === "zai-limited");
+		const listBlocks = store.listCredentialBlocks.bind(store);
+		if (!limited) throw new Error("blocked credential missing");
+		const blocks = () =>
+			listBlocks([limited.id]).map(({ blockScope, blockedUntilMs }) => ({ blockScope, blockedUntilMs }));
+		expect(blocks()).toEqual([
+			{ blockScope: "credits", blockedUntilMs: start + 2 * HOUR_MS },
+			{ blockScope: "quota", blockedUntilMs: start + 4 * HOUR_MS },
+		]);
+
+		setSystemTime(start + 2 * USAGE_REPORT_TTL_MS);
+		usageByKey.set("zai-limited", tokens(10));
+		await authStorage.usage.reports();
+		expect(blocks()).toEqual([{ blockScope: "credits", blockedUntilMs: start + 2 * HOUR_MS }]);
+		expect(await authStorage.keys.get("zai")).toBe("zai-sibling");
 	});
 });

@@ -508,6 +508,11 @@ export class CredentialBlocks implements BlocksApi {
 		return this.#deps.strategies(provider)?.healableBlockScopes !== undefined;
 	}
 
+	/** OAuth blocks heal for every healing provider; API-key blocks only for one that opts in. */
+	#healsCredentialType(provider: Provider, type: AuthCredential["type"]): boolean {
+		return type === "oauth" || this.#deps.strategies(provider)?.healsApiKeyBlocks === true;
+	}
+
 	/**
 	 * Whether a fresh report could lift what currently blocks this credential.
 	 *
@@ -521,8 +526,9 @@ export class CredentialBlocks implements BlocksApi {
 		blockScopeOrScopes: string | readonly string[] | undefined,
 	): boolean {
 		if (!this.supportsHealing(provider)) return false;
-		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
-		if (credentialId === undefined) return false;
+		const entry = this.#deps.pool.entries(provider)[credentialIndex];
+		if (!entry || !this.#healsCredentialType(provider, entry.credential.type)) return false;
+		const credentialId = entry.id;
 		// One persisted read serves the protected-scope, global, and requested checks.
 		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
 		if (
@@ -547,9 +553,10 @@ export class CredentialBlocks implements BlocksApi {
 	 * verdicts via {@link CredentialRankingStrategy.healableBlockScopes}.
 	 */
 	reconcile(provider: Provider, credentialId: number, report: UsageReport): void {
-		const providerKey = providerTypeKey(provider, "oauth");
-		const credentialIndex = this.#deps.pool.entries(provider).findIndex(entry => entry.id === credentialId);
-		if (credentialIndex < 0) return;
+		const entry = this.#deps.pool.entries(provider).find(candidate => candidate.id === credentialId);
+		if (!entry || !this.#healsCredentialType(provider, entry.credential.type)) return;
+		// Blocks live under the credential's own type key.
+		const providerKey = providerTypeKey(provider, entry.credential.type);
 		const strategy = this.#deps.strategies(provider);
 		// Only a live report proves recovery. A broker can serve its retained
 		// last-good report for hours after `/usage` starts failing, and those

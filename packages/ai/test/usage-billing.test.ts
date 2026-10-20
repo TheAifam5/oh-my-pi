@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isUsageLimitReached } from "@oh-my-pi/pi-ai/auth/usage-report";
+import { isUsageLimitReached, scopedUsageLimits } from "@oh-my-pi/pi-ai/auth/usage-report";
 import { TeamsTier } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
@@ -30,7 +30,13 @@ import { minimaxCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/minimax-code";
 import { ollamaUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 import { codexBilling, openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
-import { limitResetAt, openrouterBilling, openrouterUsageProvider } from "@oh-my-pi/pi-ai/usage/openrouter";
+import {
+	limitResetAt,
+	OPENROUTER_FREE_BLOCK_SCOPE,
+	openrouterBilling,
+	openrouterRankingStrategy,
+	openrouterUsageProvider,
+} from "@oh-my-pi/pi-ai/usage/openrouter";
 import { defaultBillingReader } from "@oh-my-pi/pi-ai/usage/registry";
 import { syntheticBilling, syntheticUsageProvider } from "@oh-my-pi/pi-ai/usage/synthetic";
 import { xaiOauthBilling } from "@oh-my-pi/pi-ai/usage/xai-oauth";
@@ -580,13 +586,43 @@ describe("OpenRouter billing", () => {
 			expect(resetsAt - report.fetchedAt).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
 		});
 
-		it("warns on a spent counter without blocking the key's paid models", async () => {
+		it("exhausts a spent counter for :free requests only, leaving paid requests to the key cap", async () => {
 			const report = await keyReport({
 				...freeKey,
+				limit: 10,
+				limit_remaining: 4,
 				free_model_daily_requests: { used: 50, limit: 50, remaining: 0 },
 			});
-			expect(report.limits[0]).toMatchObject({ amount: { remaining: 0, usedFraction: 1 }, status: "warning" });
-			expect(isUsageLimitReached(report.limits)).toBe(false);
+			const scoped = (modelId: string | undefined) =>
+				scopedUsageLimits(openrouterRankingStrategy, report, { modelId }).map(limit => limit.id);
+			expect(report.limits[1]).toMatchObject({ amount: { remaining: 0, usedFraction: 1 }, status: "exhausted" });
+			expect(scoped("meta-llama/llama-3.3-70b-instruct:free")).toEqual([
+				"openrouter:key-limit",
+				"openrouter:free-model-daily-requests",
+			]);
+			expect(scoped("meta-llama/llama-3.3-70b-instruct")).toEqual(["openrouter:key-limit"]);
+			expect(scoped(undefined)).toEqual(["openrouter:key-limit"]);
+			expect(isUsageLimitReached(scopedUsageLimits(openrouterRankingStrategy, report, { modelId: "x/y" }))).toBe(
+				false,
+			);
+		});
+
+		it("reads only a last :free suffix of the bare id as a free-model request", () => {
+			const scope = (modelId: string) => openrouterRankingStrategy.blockScope?.({ modelId });
+			expect(scope("openrouter/deepseek/deepseek-r1:free")).toBe(OPENROUTER_FREE_BLOCK_SCOPE);
+			expect(scope("deepseek/deepseek-r1:FREE")).toBe(OPENROUTER_FREE_BLOCK_SCOPE);
+			expect(scope("deepseek/deepseek-r1:free:nitro")).toBeUndefined();
+			expect(scope("deepseek/deepseek-r1:nitro")).toBeUndefined();
+			expect(scope("free:org/deepseek-r1")).toBeUndefined();
+			expect(scope("deepseek/deepseek-r1-free")).toBeUndefined();
+		});
+
+		it("reads the openrouter/free router, which picks a free model, as a free-model request", () => {
+			const scope = (modelId: string) => openrouterRankingStrategy.blockScope?.({ modelId });
+			expect(scope("openrouter/free")).toBe(OPENROUTER_FREE_BLOCK_SCOPE);
+			expect(scope("openrouter/openrouter/free")).toBe(OPENROUTER_FREE_BLOCK_SCOPE);
+			expect(scope("openrouter/auto")).toBeUndefined();
+			expect(scope("acme/free")).toBeUndefined();
 		});
 
 		it("emits no counter when a field is missing, negative, or not finite", async () => {

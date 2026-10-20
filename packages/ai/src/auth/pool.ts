@@ -1,7 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, apiKeyFingerprint } from "./policy";
 import type { AuthCredentialStore } from "./store";
 import { REMOTE_REFRESH_SENTINEL } from "./types";
 import type {
@@ -92,6 +92,8 @@ export class CredentialPool implements CredentialsApi {
 	#data: Map<string, StoredCredential[]> = new Map();
 	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
+	/** Fingerprint of the resolved secret of each API-key row whose stored key is a reference; used to attribute usage reports. */
+	#resolvedApiKeyFingerprints: Map<string, Map<number, string>> = new Map();
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
 	/**
 	 * Buffer for credential_disabled events fired while no listener is subscribed.
@@ -345,6 +347,16 @@ export class CredentialPool implements CredentialsApi {
 			}
 			if (trackedBearerFingerprints.size === 0) this.#oauthBearerFingerprints.delete(provider);
 		}
+		const resolvedApiKeys = this.#resolvedApiKeyFingerprints.get(provider);
+		if (resolvedApiKeys) {
+			const apiKeyRows = new Set(
+				credentials.filter(entry => entry.credential.type === "api_key").map(entry => entry.id),
+			);
+			for (const credentialId of resolvedApiKeys.keys()) {
+				if (!apiKeyRows.has(credentialId)) resolvedApiKeys.delete(credentialId);
+			}
+			if (resolvedApiKeys.size === 0) this.#resolvedApiKeyFingerprints.delete(provider);
+		}
 		if (credentials.length === 0) {
 			this.#data.delete(provider);
 		} else {
@@ -363,6 +375,25 @@ export class CredentialPool implements CredentialsApi {
 		if (nextHistory.length > OAUTH_BEARER_FINGERPRINT_HISTORY_LIMIT) nextHistory.shift();
 		byCredentialId.set(credentialId, nextHistory);
 		this.#oauthBearerFingerprints.set(provider, byCredentialId);
+	}
+
+	/**
+	 * Record what an API-key row's stored key currently resolves to, so a usage
+	 * report fetched with that secret maps back to the row. Each call replaces the
+	 * previous record; a key used as stored, or one that resolves to nothing,
+	 * clears it, so a rotated reference never keeps matching its old secret.
+	 */
+	noteResolvedApiKey(provider: string, credentialId: number, resolvedKey: string | undefined): void {
+		const byCredentialId = this.#resolvedApiKeyFingerprints.get(provider);
+		const entry = this.entries(provider).find(candidate => candidate.id === credentialId);
+		if (entry?.credential.type !== "api_key" || !resolvedKey || entry.credential.key === resolvedKey) {
+			byCredentialId?.delete(credentialId);
+			if (byCredentialId?.size === 0) this.#resolvedApiKeyFingerprints.delete(provider);
+			return;
+		}
+		const next = byCredentialId ?? new Map<number, string>();
+		next.set(credentialId, apiKeyFingerprint(resolvedKey));
+		this.#resolvedApiKeyFingerprints.set(provider, next);
 	}
 
 	idForBearer(provider: string, bearer: string): number | undefined {
@@ -790,11 +821,26 @@ export class CredentialPool implements CredentialsApi {
 
 	/**
 	 * Find the stored credential id matching a {@link UsageCredential} so the
-	 * refresh override can address the row. Mirrors the matching logic in
-	 * `UsageService.persistRefreshedCredential`.
+	 * refresh override and block healing can address the row. An OAuth row
+	 * matches by token or identity, mirroring `UsageService.persistRefreshedCredential`;
+	 * an API-key row matches when it alone holds the secret, as its stored key or its latest resolution.
 	 */
 	findIdForUsageCredential(provider: string, previous: UsageCredential): number | undefined {
 		const entries = this.entries(provider);
+		if (previous.type === "api_key") {
+			const apiKey = previous.apiKey;
+			if (!apiKey) return undefined;
+			// One row must own the secret: a stored literal, or a reference whose latest
+			// resolution it is. Rows sharing it are ambiguous and match none.
+			const resolved = this.#resolvedApiKeyFingerprints.get(provider);
+			const fingerprint = apiKeyFingerprint(apiKey);
+			const owners = entries.filter(
+				entry =>
+					entry.credential.type === "api_key" &&
+					(entry.credential.key === apiKey || resolved?.get(entry.id) === fingerprint),
+			);
+			return owners.length === 1 ? owners[0]?.id : undefined;
+		}
 		// Broker-backed rows all carry REMOTE_REFRESH_SENTINEL as their refresh
 		// token — it identifies nothing, and comparing it would match the FIRST
 		// OAuth row regardless of which account/org is being refreshed.

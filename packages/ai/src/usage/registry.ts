@@ -25,7 +25,7 @@ import { novitaBilling, novitaUsageProvider } from "./novita";
 import { ollamaCloudUsageProvider, ollamaUsageProvider } from "./ollama";
 import { codexBilling, codexRankingStrategy, openaiCodexUsageProvider } from "./openai-codex";
 import { opencodeGoBilling, opencodeGoRankingStrategy, opencodeGoUsageProvider } from "./opencode-go";
-import { openrouterBilling, openrouterUsageProvider } from "./openrouter";
+import { openrouterBilling, openrouterRankingStrategy, openrouterUsageProvider } from "./openrouter";
 import {
 	siliconflowBilling,
 	siliconflowCnBilling,
@@ -100,6 +100,7 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 	["opencode-go", opencodeGoRankingStrategy],
 	["xai-oauth", xaiOauthRankingStrategy],
 	["commandcode", commandCodeRankingStrategy],
+	["openrouter", openrouterRankingStrategy],
 ]);
 
 /** Built-in ranking strategy for `provider`. */

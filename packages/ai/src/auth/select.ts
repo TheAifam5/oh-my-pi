@@ -61,6 +61,8 @@ import {
 	remainingUsageFraction,
 	usedUsageFraction,
 	scopedUsageLimits,
+	usageReportBlockScope,
+	describedWindowLimits,
 	usageResetAtMs,
 	windowRequiredDrain,
 } from "./usage-report";
@@ -345,25 +347,41 @@ export class CredentialSelector {
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				const blockedUntil = this.#deps.blocks.blockedUntil(
+				let blockedUntil = this.#deps.blocks.blockedUntil(
 					args.provider,
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
 				);
-				if (blockedUntil !== undefined) {
+				if (blockedUntil === undefined) {
+					const usage = await this.#deps.usage.report(args.provider, selection.credential, {
+						...args.options,
+						timeoutMs: this.#deps.usage.requestTimeoutMs,
+					});
+					return { selection, usage, usageChecked: true, blockedUntil: undefined };
+				}
+				if (
+					!this.#deps.blocks.canHeal(
+						args.provider,
+						args.providerKey,
+						selection.index,
+						args.blockScopes ?? args.blockScope,
+					)
+				) {
 					return { selection, usage: null, usageChecked: false, blockedUntil };
 				}
+				// A live report fetched after the block's probe window may lift it (a raised cap, bought credits).
 				const usage = await this.#deps.usage.report(args.provider, selection.credential, {
 					...args.options,
 					timeoutMs: this.#deps.usage.requestTimeoutMs,
 				});
-				return {
-					selection,
-					usage,
-					usageChecked: true,
-					blockedUntil: undefined,
-				};
+				blockedUntil = this.#deps.blocks.blockedUntil(
+					args.provider,
+					args.providerKey,
+					selection.index,
+					args.blockScopes ?? args.blockScope,
+				);
+				return { selection, usage, usageChecked: true, blockedUntil };
 			}),
 		);
 		const timeoutSignal = Promise.withResolvers<null>();
@@ -400,12 +418,12 @@ export class CredentialSelector {
 					args.providerKey,
 					selection.index,
 					blockedUntil,
-					args.blockScope,
+					usageReportBlockScope(strategy, scopedLimits, args.rankingContext, args.blockScope),
 					resetAtMs !== undefined,
 				);
 				blocked = true;
 			}
-			const windows = usage ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
+			const windows = usage ? describedWindowLimits(strategy, usage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
 			const usageMeasured = primary !== undefined || secondary !== undefined;
@@ -735,7 +753,7 @@ export class CredentialSelector {
 					spendClass => spendClass !== "plan" && classAvailable(billing?.snapshot, spendClass),
 				) ?? false;
 			const scopedLimits = usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
-			if (!blocked && !fundedOverage && scopedLimits && isUsageLimitReached(scopedLimits)) {
+			if (strategy && !blocked && !fundedOverage && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
 				this.#deps.blocks.mark(
@@ -743,12 +761,12 @@ export class CredentialSelector {
 					args.providerKey,
 					selection.index,
 					blockedUntil,
-					args.blockScope,
+					usageReportBlockScope(strategy, scopedLimits, args.rankingContext, args.blockScope),
 					resetAtMs !== undefined,
 				);
 				blocked = true;
 			}
-			const windows = usage && strategy ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
+			const windows = usage && strategy ? describedWindowLimits(strategy, usage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
 			const remainingFraction = remainingUsageFraction(strategy, usage, args.rankingContext, nowMs);
@@ -1713,7 +1731,7 @@ export class CredentialSelector {
 						providerKey,
 						selection.index,
 						resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS,
-						blockScope,
+						usageReportBlockScope(strategy, scopedLimits, rankingContext, blockScope),
 						resetAtMs !== undefined,
 					);
 					return undefined;
@@ -1782,7 +1800,7 @@ export class CredentialSelector {
 							providerKey,
 							selection.index,
 							resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS,
-							blockScope,
+							usageReportBlockScope(strategy, scopedLimits, rankingContext, blockScope),
 							resetAtMs !== undefined,
 						);
 						return undefined;

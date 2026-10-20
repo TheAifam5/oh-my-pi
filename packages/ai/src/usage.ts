@@ -514,6 +514,16 @@ export interface CredentialRankingStrategy {
 	 */
 	blockScope?(context?: CredentialRankingContext): string | undefined;
 	/**
+	 * Scope for a block whose deadline comes from `exhausted`, the request's
+	 * exhausted report limits, when it must differ from {@link blockScope}: a
+	 * credential selection preflight that finds a spent limit, or the confirmed
+	 * reset a report adds to a usage-limit error. Keeping report-derived blocks
+	 * apart from error-derived ones lets {@link healableBlockScopes} vouch only for
+	 * blocks a report can explain, never for a provider retry hint. Every scope it
+	 * returns must be listed by {@link blockScopes} for the requests it gates.
+	 */
+	reportBlockScope?(exhausted: UsageLimit[], context?: CredentialRankingContext): string | undefined;
+	/**
 	 * Scopes that apply to a request, most specific first. With a context, the
 	 * request's own scope plus any legacy catch-all scope whose blocks still
 	 * apply to everything. Without one — reconciliation runs with no request —
@@ -535,6 +545,12 @@ export interface CredentialRankingStrategy {
 	 * non-empty limits with none exhausted.
 	 */
 	healableBlockScopes?(report: UsageReport): { blockScope: string; limits: UsageLimit[]; healthy?: boolean }[];
+	/**
+	 * Whether {@link healableBlockScopes} also heals blocks on API-key credentials.
+	 * Opt in only when an API key's usage report describes the quota that key's
+	 * blocks stand for; OAuth credentials always heal.
+	 */
+	healsApiKeyBlocks?: boolean;
 	/** Whether fresh reports can heal legacy account-wide quota backoffs. */
 	healsGlobalBlocks?: boolean;
 	/** Fallback window durations (ms) when limits don't specify durationMs. */

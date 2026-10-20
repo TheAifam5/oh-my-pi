@@ -164,13 +164,66 @@ export function isUsageLimitExhausted(limit: UsageLimit): boolean {
 	return false;
 }
 
-/** Return the usage limits that apply to the requested model for this strategy. */
+/**
+ * Whether `report` still describes `limit`'s window at `nowMs`: false only for a
+ * full-reset window whose reset passed after the report was fetched (a retained
+ * last-good report served through an outage). A window the report already saw
+ * past its reset is kept, so a provider still reporting a spent window with a
+ * stale reset keeps it exhausted, and a rolling window (`resetLabel`, such as a
+ * regeneration tick) is kept because its reset does not restore the whole quota.
+ */
+export function usageWindowDescribed(limit: UsageLimit, report: UsageReport, nowMs: number): boolean {
+	const window = limit.window;
+	const resetsAt = window?.resetsAt;
+	if (resetsAt === undefined || window?.resetLabel !== undefined) return true;
+	return resetsAt > nowMs || report.fetchedAt >= resetsAt;
+}
+
+/**
+ * Return the usage limits that apply to the requested model for this strategy,
+ * without limits whose window the report no longer describes ({@link usageWindowDescribed}).
+ */
 export function scopedUsageLimits(
 	strategy: CredentialRankingStrategy,
 	report: UsageReport,
 	context: CredentialRankingContext,
 ): UsageLimit[] {
-	return strategy.scopeLimits?.(report, context) ?? report.limits;
+	const nowMs = Date.now();
+	return (strategy.scopeLimits?.(report, context) ?? report.limits).filter(limit =>
+		usageWindowDescribed(limit, report, nowMs),
+	);
+}
+
+/** The strategy's ranking windows for the request, without windows the report no longer describes. */
+export function describedWindowLimits(
+	strategy: CredentialRankingStrategy,
+	report: UsageReport,
+	context: CredentialRankingContext,
+): { primary?: UsageLimit; secondary?: UsageLimit } {
+	const nowMs = Date.now();
+	const { primary, secondary } = strategy.findWindowLimits(report, context);
+	return {
+		...(primary && usageWindowDescribed(primary, report, nowMs) ? { primary } : {}),
+		...(secondary && usageWindowDescribed(secondary, report, nowMs) ? { secondary } : {}),
+	};
+}
+
+/**
+ * Scope for a block whose deadline comes from exhausted report limits: the
+ * strategy's {@link CredentialRankingStrategy.reportBlockScope} for the exhausted
+ * limits, else `fallback`, the request's own scope.
+ */
+export function usageReportBlockScope(
+	strategy: CredentialRankingStrategy,
+	limits: readonly UsageLimit[],
+	context: CredentialRankingContext,
+	fallback: string | undefined,
+): string | undefined {
+	if (!strategy.reportBlockScope) return fallback;
+	return strategy.reportBlockScope(
+		limits.filter(limit => isUsageLimitExhausted(limit)),
+		context,
+	);
 }
 
 /** Returns true if usage indicates rate limit has been reached. */

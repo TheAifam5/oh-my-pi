@@ -383,6 +383,8 @@ export const zaiUsageProvider: UsageProvider = {
 export const zaiRankingStrategy: CredentialRankingStrategy = {
 	// Pre-scoping ZAI quota blocks are unscoped; let the usage preflight probe them.
 	healsGlobalBlocks: true,
+	// An API key's quota report covers the same shared pool its blocks stand for.
+	healsApiKeyBlocks: true,
 	findWindowLimits(report) {
 		const ranked = rankZaiRequestLimits(report);
 		return { primary: ranked[0], secondary: ranked[1] };
@@ -391,10 +393,18 @@ export const zaiRankingStrategy: CredentialRankingStrategy = {
 		const limits = getZaiCredentialLimits(report);
 		return limits;
 	},
-	// All GLM requests share the account's quota pool; keep reactive blocks
-	// separate from provider-wide failures that a usage report cannot heal.
+	// All GLM requests share the account's quota pool. A usage-limit error blocks
+	// "credits" for its retry hint and expires by clock, since the hint can outlast
+	// what a report shows; a spent quota read from a report blocks "quota" until its
+	// reset, and a live report showing the pool recovered lifts it.
 	blockScope() {
 		return "credits";
+	},
+	reportBlockScope() {
+		return "quota";
+	},
+	blockScopes() {
+		return ["credits", "quota"];
 	},
 	healableBlockScopes(report) {
 		const limits = getZaiCredentialLimits(report);
@@ -403,7 +413,7 @@ export const zaiRankingStrategy: CredentialRankingStrategy = {
 			return [];
 		}
 		return [
-			{ blockScope: "credits", limits },
+			{ blockScope: "quota", limits },
 			{ blockScope: "", limits },
 		];
 	},

@@ -695,6 +695,7 @@ export class UsageService implements UsageApi {
 					// skipped: probing with the literal reference string would
 					// 401 and flag a working credential as bad.
 					const apiKey = await this.#deps.overrides.resolve(credential.key);
+					this.#deps.pool.noteResolvedApiKey(provider, entry.id, apiKey);
 					if (!apiKey) continue;
 					request = usageRequest(provider, { type: "api_key", apiKey }, baseUrl);
 				} else {
@@ -733,6 +734,12 @@ export class UsageService implements UsageApi {
 		const usageCredential = buildUsageCredential(credential);
 		if (credential.type === "api_key") {
 			const resolvedApiKey = await this.#deps.overrides.resolve(credential.key);
+			// Every row storing this key resolves the same way; recording all keeps shared secrets ambiguous.
+			for (const entry of this.#deps.pool.entries(provider)) {
+				if (entry.credential.type === "api_key" && entry.credential.key === credential.key) {
+					this.#deps.pool.noteResolvedApiKey(provider, entry.id, resolvedApiKey);
+				}
+			}
 			if (!resolvedApiKey) return null;
 			usageCredential.apiKey = resolvedApiKey;
 		}

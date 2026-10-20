@@ -42,6 +42,9 @@
 
 ### Fixed
 
+- Fixed an OpenRouter `:free` model hitting its daily free-model quota or rate limit blocking paid models on the same key; `:free` requests now move to another key until the quota resets at midnight UTC while paid models keep using it; `openrouter/free` counts as a free model
+- Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time. A rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too
+- Fixed a usage report kept from before a quota reset blocking the account again for a minute when the usage endpoint is unreachable after the reset
 - Fixed a retired session account pool lifting once more than 256 other pools were retired, so a deferred lookup under its session id could use any account or API key; a retired pool now holds for 24 hours
 
 ## [18.12.3] - 2026-10-19
