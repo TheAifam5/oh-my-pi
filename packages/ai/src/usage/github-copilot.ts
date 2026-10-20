@@ -19,7 +19,7 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
-import { type BillingMode, knownBilling, type ProviderBilling } from "./billing";
+import { type BillingMode, knownBilling, type ProviderBilling, subscriptionStateFromLimits } from "./billing";
 import { parseIsoTimestamp } from "./shared";
 
 type CopilotQuotaDetail = {
@@ -236,6 +236,7 @@ function buildLimitFromQuota(
 		scope: {
 			provider: "github-copilot",
 			accountId,
+			shared: true,
 			tier: plan,
 			windowId: window?.id,
 		},
@@ -317,6 +318,7 @@ function normalizeBillingUsage(data: BillingUsageResponse): UsageLimit[] {
 		scope: {
 			provider: "github-copilot",
 			accountId: data.user,
+			shared: true,
 			windowId: window.id,
 		},
 		window,
@@ -482,7 +484,15 @@ export const githubCopilotBilling: ProviderBilling = {
 		const permitted = report.metadata?.premiumOveragePermitted;
 		const overageState = permitted === true ? "available" : permitted === false ? "disabled" : "unknown";
 		return knownBilling(report, [
-			{ mode: planMode, state: "unknown" },
+			{
+				mode: planMode,
+				state: subscriptionStateFromLimits(
+					report.limits.filter(
+						limit =>
+							limit.id === "copilot:premium" && limit.scope.shared === true && limit.scope.modelId === undefined,
+					),
+				),
+			},
 			{ mode: "paid-extra-usage", state: overageState },
 		]);
 	},

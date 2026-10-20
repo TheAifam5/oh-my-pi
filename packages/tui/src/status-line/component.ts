@@ -2066,7 +2066,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const signal = AbortSignal.timeout(STATUS_USAGE_REFRESH_TIMEOUT_MS);
 		let reportsPromise: Promise<unknown> | undefined;
 		try {
-			reportsPromise = this.host.fetchUsageReports(session, signal);
+			reportsPromise = this.host.fetchUsageReports(session);
 			this.#applyUsageRefreshReports(
 				session,
 				await this.#raceUsageRefreshWithSignal(reportsPromise, signal),

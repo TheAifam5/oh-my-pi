@@ -9,6 +9,7 @@ import {
 	type ModelUsageHealth,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { parseClaudeUsagePayload } from "@oh-my-pi/pi-ai/usage/claude";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
@@ -133,6 +134,28 @@ describe("model role pools", () => {
 	}
 
 	describe("funding", () => {
+		it("keeps a member eligible through an available sibling and skips it when all included windows are spent", async () => {
+			const settings = Settings.isolated({
+				modelRoles: {
+					engineer: pool("priority", [ANTHROPIC], { funding: { order: ["included"] } }),
+				},
+			});
+			const spent = parseClaudeUsagePayload({ five_hour: { utilization: 100 }, extra_usage: { is_enabled: false } });
+			const available = parseClaudeUsagePayload({
+				five_hour: { utilization: 20 },
+				extra_usage: { is_enabled: false },
+			});
+			if (!spent || !available) throw new Error("fixture did not parse");
+			const polls = vi.spyOn(authStorage.usage, "reports").mockResolvedValue([spent, available]);
+			const picked = await resolveRolePool("engineer", deps(settings));
+			expect(picked?.kind).toBe("picked");
+			polls.mockResolvedValue([spent, spent]);
+			const exhausted = await resolveRolePool("engineer", deps(settings));
+			expect(exhausted?.kind).toBe("none");
+			if (exhausted?.kind !== "none") throw new Error("expected exhausted member");
+			expect(exhausted.skipped.map(entry => entry.reason.kind)).toEqual(["exhausted"]);
+		});
+
 		it("picks the funded included member past an exhausted one, naming the skip in a notice", async () => {
 			const settings = Settings.isolated({
 				modelRoles: {

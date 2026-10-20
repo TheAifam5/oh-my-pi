@@ -120,6 +120,8 @@
 
 ### Fixed
 
+- Background usage reports finishing after the status line's two-second wait remain available to the model hub
+- The model hub shows available or exhausted subscription billing from account-wide plan windows
 - Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
 - Fixed startup failing when the default role's model pool has a funding or quota policy that excludes every member: the interactive TUI now starts with no model and a warning naming each skipped member and how to fix it, `--print` and RPC launches exit 1 with that one-line reason instead of a fatal stack trace, and a subagent reports only that reason as its task error
 - Fixed the model hub's `g` key never offering the `quota` strategy and refusing to change a pool that already used it; `quota` is now part of the strategy cycle, with or without a spending policy, and leaving it drops `strategyOptions.tolerance`

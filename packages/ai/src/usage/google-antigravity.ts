@@ -773,11 +773,10 @@ function antigravityCounterRecovery(limits: readonly UsageLimit[]): number | nul
 }
 
 /**
- * Antigravity billing: one source of unknown mode, since the reports do not
- * say how the quota is paid for. Each backend counter meters its own model
- * family, so the source is `exhausted` only when every counter is (see
- * {@link antigravityCounterRecovery}), and then resets when the first counter
- * recovers; otherwise its state is `unknown`.
+ * Antigravity billing has unknown funding mode. It reads `available` when
+ * every reported bucket is healthy, `exhausted` when every backend counter
+ * is exhausted (see {@link antigravityCounterRecovery}), and `unknown`
+ * otherwise. An exhausted source recovers when the first counter recovers.
  */
 export const antigravityBilling: ProviderBilling = {
 	id: "google-antigravity",
@@ -794,7 +793,12 @@ export const antigravityBilling: ProviderBilling = {
 		const recoveries: (number | undefined)[] = [];
 		for (const limits of counters.values()) {
 			const recovery = antigravityCounterRecovery(limits);
-			if (recovery === null) return knownBilling(report, [{ mode: "unknown", state: "unknown" }]);
+			if (recovery === null) {
+				const available =
+					report.limits.length > 0 &&
+					report.limits.every(limit => limit.status === "ok" || limit.status === "warning");
+				return knownBilling(report, [{ mode: "unknown", state: available ? "available" : "unknown" }]);
+			}
 			recoveries.push(recovery);
 		}
 		const source: BillingSource = { mode: "unknown", state: "exhausted" };

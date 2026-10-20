@@ -1,9 +1,10 @@
 /**
- * OpenRouter API key spending cap and free-model daily request usage provider.
+ * OpenRouter key spending caps, free-model daily requests, and purchased credits.
  *
- * The response shape follows the official API reference:
+ * API response contracts:
  * https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key
- * and the free-model counter semantics follow https://openrouter.ai/docs/api/reference/limits
+ * https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits
+ * https://openrouter.ai/docs/api/reference/limits
  */
 import { ProviderHttpError } from "../error";
 import type {
@@ -15,7 +16,7 @@ import type {
 	UsageReport,
 } from "../usage";
 import { isRecord } from "../utils";
-import { knownBilling, type ProviderBilling, unknownBilling } from "./billing";
+import { knownBilling, moneyFromDecimal, type ProviderBilling, unknownBilling } from "./billing";
 import { DAY_MS, usageStatus } from "./shared";
 
 const PROVIDER = "openrouter";
@@ -115,6 +116,18 @@ function freeModelDailyLimit(data: Record<string, unknown>, now: number): UsageL
 	};
 }
 
+function creditBalance(total: number, used: number): UsageLimit {
+	const rounded = Math.round((total - used) * 100) / 100;
+	const remaining = rounded === 0 ? 0 : rounded;
+	return {
+		id: "openrouter:credit-balance",
+		label: "Credit balance",
+		scope: { provider: PROVIDER, shared: true },
+		amount: { limit: total, used, remaining, unit: "usd" },
+		status: remaining > 0 ? "ok" : "exhausted",
+	};
+}
+
 async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== PROVIDER) return null;
 	const credential = params.credential;
@@ -154,12 +167,44 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 	const limits = [keyLimit(data, fetchedAt), freeModelDailyLimit(data, fetchedAt)].filter(
 		(limit): limit is UsageLimit => limit !== undefined,
 	);
+	const metadata: UsageReport["metadata"] =
+		typeof data.is_free_tier === "boolean" ? { isFreeTier: data.is_free_tier } : {};
+	if (data.is_free_tier !== true) {
+		try {
+			const response = await ctx.fetch(`${baseUrl}/credits`, {
+				headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
+				signal: params.signal,
+			});
+			if (response.status === 401 || response.status === 403) {
+				metadata.creditsUnavailableReason = "permission-denied";
+			} else if (response.ok) {
+				const payload: unknown = await response.json();
+				if (isRecord(payload) && isRecord(payload.data)) {
+					const total = finiteNumber(payload.data.total_credits);
+					const used = finiteNumber(payload.data.total_usage);
+					if (total !== undefined && total >= 0 && used !== undefined && used >= 0) {
+						metadata.totalCredits = total;
+						metadata.totalUsage = used;
+						limits.push(creditBalance(total, used));
+					} else {
+						metadata.creditsUnavailableReason = "malformed";
+					}
+				} else {
+					metadata.creditsUnavailableReason = "malformed";
+				}
+			} else {
+				metadata.creditsUnavailableReason = "no-evidence";
+			}
+		} catch {
+			metadata.creditsUnavailableReason = "no-evidence";
+		}
+	}
 	return {
 		provider: PROVIDER,
 		fetchedAt,
 		limits,
 		// `is_free_tier` describes the account (it has never purchased credits), not the key.
-		metadata: typeof data.is_free_tier === "boolean" ? { isFreeTier: data.is_free_tier } : {},
+		metadata,
 	};
 }
 
@@ -245,15 +290,30 @@ export const openrouterRankingStrategy: CredentialRankingStrategy = {
 };
 
 /**
- * OpenRouter billing: a free-tier account reads `free`. The key's spending cap
- * is a ceiling enforced as a usage limit, not a funding source, so any other
- * report is no evidence, never free.
+ * OpenRouter billing: free-tier accounts read `free`; paid accounts use
+ * purchased USD credits minus usage from `/credits`, rounded to cents.
+ * A refused credits request reads unknown; key caps are not funding sources.
  */
 export const openrouterBilling: ProviderBilling = {
 	id: PROVIDER,
 	readBilling(report) {
-		return report.metadata?.isFreeTier === true
-			? knownBilling(report, [{ mode: "free", state: "unknown" }])
-			: unknownBilling(report, "no-evidence");
+		if (report.metadata?.isFreeTier === true) return knownBilling(report, [{ mode: "free", state: "unknown" }]);
+		const reason = report.metadata?.creditsUnavailableReason;
+		if (reason === "permission-denied" || reason === "malformed") return unknownBilling(report, reason);
+		const total = report.metadata?.totalCredits;
+		const used = report.metadata?.totalUsage;
+		if (typeof total !== "number" || typeof used !== "number") return unknownBilling(report, "no-evidence");
+		const limit = moneyFromDecimal(total, "USD", "floor");
+		const spent = moneyFromDecimal(used, "USD", "ceil");
+		const balance = Math.round((total - used) * 100) / 100;
+		const remaining = moneyFromDecimal(balance === 0 ? 0 : balance, "USD", "half-even");
+		if (!limit || !spent || !remaining) return unknownBilling(report, "malformed");
+		return knownBilling(report, [
+			{
+				mode: "prepaid-credits",
+				state: remaining.amountMinor > 0 ? "available" : "exhausted",
+				allowance: { kind: "money", limit, used: spent, remaining },
+			},
+		]);
 	},
 };

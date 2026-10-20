@@ -60,8 +60,9 @@ describe("AuthStorage OpenRouter free-model quota", () => {
 
 	let slowUsage = false;
 
-	const usageFetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+	const usageFetch = (async (input: string | URL | Request, init?: RequestInit) => {
 		const key = new Headers(init?.headers).get("authorization")?.replace(/^Bearer /, "") ?? "";
+		if (String(input).endsWith("/credits")) return new Response("{}", { status: 403 });
 		fetchedKeys.push(key);
 		if (slowUsage) {
 			// Answers only when the request's own timeout aborts it.

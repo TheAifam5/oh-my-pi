@@ -192,7 +192,7 @@ describe("Claude billing", () => {
 		);
 		if (!report) throw new Error("fixture did not parse");
 		expect(sources(claudeBilling.readBilling(overWire(report)))).toEqual([
-			{ mode: "subscription-included", state: "unknown" },
+			{ mode: "subscription-included", state: "available" },
 			{
 				mode: "paid-extra-usage",
 				state: "available",
@@ -229,6 +229,20 @@ describe("Claude billing", () => {
 		});
 		expect(sources(claudeBilling.readBilling(silent))[1]).toEqual({ mode: "paid-extra-usage", state: "unknown" });
 	});
+	it("uses only shared plan windows for subscription funding, not model-specific or extra windows", () => {
+		for (const [payload, expected] of [
+			[{ five_hour: { utilization: 100 }, seven_day_sonnet: { utilization: 0 } }, "exhausted"],
+			[{ five_hour: { utilization: 10 }, seven_day_sonnet: { utilization: 100 } }, "available"],
+			[{ seven_day_sonnet: { utilization: 100 } }, "unknown"],
+		] as const) {
+			const report = parseClaudeUsagePayload(payload);
+			if (!report) throw new Error("fixture did not parse");
+			expect(sources(claudeBilling.readBilling(overWire(report)))[0]?.state).toBe(expected);
+		}
+		expect(sources(claudeBilling.readBilling({ provider: "anthropic", fetchedAt: 1, limits: [] }))[0]?.state).toBe(
+			"unknown",
+		);
+	});
 });
 
 describe("Codex billing", () => {
@@ -253,7 +267,7 @@ describe("Codex billing", () => {
 	it("reads the prepaid credit balance through the wire", async () => {
 		const report = await codexReport({ credits: { has_credits: true, unlimited: false, balance: "489.25" } });
 		expect(sources(codexBilling.readBilling(report))).toEqual([
-			{ mode: "subscription-included", state: "unknown" },
+			{ mode: "subscription-included", state: "available" },
 			{
 				mode: "prepaid-credits",
 				state: "available",
@@ -273,9 +287,42 @@ describe("Codex billing", () => {
 	it("classifies the free plan and leaves absent credits unknown", async () => {
 		const report = await codexReport({ plan_type: "free" });
 		expect(sources(codexBilling.readBilling(report))).toEqual([
-			{ mode: "free", state: "unknown" },
+			{ mode: "free", state: "available" },
 			{ mode: "prepaid-credits", state: "unknown" },
 		]);
+	});
+	it("keeps a spent plan exhausted even when prepaid credits allow overage", async () => {
+		const report = await codexReport({
+			rate_limit: {
+				allowed: false,
+				limit_reached: true,
+				primary_window: { used_percent: 100, limit_window_seconds: 18000 },
+			},
+			credits: { has_credits: true, balance: "10" },
+		});
+		expect(sources(codexBilling.readBilling(report)).map(source => source.state)).toEqual(["exhausted", "available"]);
+	});
+
+	it("uses account-wide rejection flags without windows and leaves absent plan evidence unknown", async () => {
+		expect(
+			sources(
+				codexBilling.readBilling(
+					await codexReport({
+						rate_limit: { allowed: false, limit_reached: true },
+					}),
+				),
+			)[0]?.state,
+		).toBe("exhausted");
+		expect(
+			sources(
+				codexBilling.readBilling({
+					provider: "openai-codex",
+					fetchedAt: 1,
+					limits: [],
+					metadata: { planType: "plus" },
+				}),
+			)[0]?.state,
+		).toBe("unknown");
 	});
 });
 
@@ -344,9 +391,25 @@ describe("GitHub Copilot billing", () => {
 		);
 		if (!report) throw new Error("fixture did not parse");
 		expect(sources(githubCopilotBilling.readBilling(overWire(report)))).toEqual([
-			{ mode: "subscription-included", state: "unknown" },
+			{ mode: "subscription-included", state: "exhausted" },
 			{ mode: "paid-extra-usage", state },
 		]);
+	});
+	it("reads healthy premium quota as available and absent premium quota as unknown", async () => {
+		for (const [quota_snapshots, state] of [
+			[
+				{ premium_interactions: { entitlement: 300, remaining: 250, percent_remaining: 83, unlimited: false } },
+				"available",
+			],
+			[{}, "unknown"],
+		] as const) {
+			const report = await githubCopilotUsageProvider.fetchUsage(
+				{ provider: "github-copilot", credential: { type: "oauth", accessToken: "token", accountId: "octo" } },
+				{ fetch: jsonFetch({ copilot_plan: "individual", quota_snapshots }) },
+			);
+			if (!report) throw new Error("fixture did not parse");
+			expect(sources(githubCopilotBilling.readBilling(overWire(report)))[0]?.state).toBe(state);
+		}
 	});
 });
 
@@ -470,10 +533,21 @@ describe("OpenRouter billing", () => {
 
 	type Seen = { url: string; authorization: string | null };
 
-	async function openrouterReport(body: unknown, options: { status?: number; baseUrl?: string } = {}) {
+	async function openrouterReport(
+		body: unknown,
+		options: {
+			status?: number;
+			baseUrl?: string;
+			credits?: unknown;
+			creditsStatus?: number;
+		} = {},
+	) {
 		const seen: Seen[] = [];
 		const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 			seen.push({ url: String(input), authorization: new Headers(init?.headers).get("authorization") });
+			if (String(input).endsWith("/credits")) {
+				return new Response(JSON.stringify(options.credits ?? {}), { status: options.creditsStatus ?? 403 });
+			}
 			return new Response(JSON.stringify(body), { status: options.status ?? 200 });
 		}) as unknown as FetchImpl;
 		const report = await openrouterUsageProvider.fetchUsage(
@@ -496,7 +570,10 @@ describe("OpenRouter billing", () => {
 	it("keeps the documented key cap as a usage limit but not as a funding source", async () => {
 		const { report, seen } = await openrouterReport({ data: documentedKey });
 		if (!report) throw new Error("fixture did not parse");
-		expect(seen).toEqual([{ url: "https://openrouter.ai/api/v1/key", authorization: "Bearer sk-or-v1-test" }]);
+		expect(seen).toEqual([
+			{ url: "https://openrouter.ai/api/v1/key", authorization: "Bearer sk-or-v1-test" },
+			{ url: "https://openrouter.ai/api/v1/credits", authorization: "Bearer sk-or-v1-test" },
+		]);
 		expect(report.limits).toMatchObject([
 			{
 				id: "openrouter:key-limit",
@@ -505,9 +582,67 @@ describe("OpenRouter billing", () => {
 				status: "ok",
 			},
 		]);
-		expect(openrouterBilling.readBilling(report)).toMatchObject({ status: "unknown", reason: "no-evidence" });
+		expect(openrouterBilling.readBilling(report)).toMatchObject({ status: "unknown", reason: "permission-denied" });
 		const { is_free_tier: _tier, ...unreported } = documentedKey;
-		expect(openrouterBilling.readBilling(await keyReport(unreported))).toMatchObject({ reason: "no-evidence" });
+		expect(openrouterBilling.readBilling(await keyReport(unreported))).toMatchObject({ reason: "permission-denied" });
+	});
+
+	it.each([
+		[25.75, "available", 7475],
+		[100.5, "exhausted", 0],
+		[101, "exhausted", -50],
+	] as const)("reads real purchased credits minus %s USD usage as %s", async (usage, state, remaining) => {
+		const { report } = await openrouterReport(
+			{ data: documentedKey },
+			{
+				credits: { data: { total_credits: 100.5, total_usage: usage } },
+				creditsStatus: 200,
+			},
+		);
+		if (!report) throw new Error("fixture did not parse");
+		expect(sources(openrouterBilling.readBilling(report))).toEqual([
+			{
+				mode: "prepaid-credits",
+				state,
+				allowance: {
+					kind: "money",
+					limit: usd(10050),
+					used: usd(Math.round(usage * 100)),
+					remaining: usd(remaining),
+				},
+			},
+		]);
+	});
+
+	it("rounds floating point dust to an exhausted zero balance", async () => {
+		const { report } = await openrouterReport(
+			{ data: documentedKey },
+			{
+				credits: { data: { total_credits: 0.3, total_usage: 0.30000000000000004 } },
+				creditsStatus: 200,
+			},
+		);
+		if (!report) throw new Error("fixture did not parse");
+		const balance = report.limits.find(limit => limit.id === "openrouter:credit-balance");
+		expect(balance?.amount.remaining).toBe(0);
+		expect(Object.is(balance?.amount.remaining, -0)).toBe(false);
+		expect(sources(openrouterBilling.readBilling(report))[0]).toMatchObject({
+			state: "exhausted",
+			allowance: { remaining: usd(0) },
+		});
+	});
+
+	it("leaves malformed and unavailable credit data unknown without losing key limits", async () => {
+		for (const [creditsStatus, credits, reason] of [
+			[200, { data: { total_credits: "100", total_usage: 1 } }, "malformed"],
+			[401, {}, "permission-denied"],
+			[500, {}, "no-evidence"],
+		] as const) {
+			const { report } = await openrouterReport({ data: documentedKey }, { creditsStatus, credits });
+			if (!report) throw new Error("fixture did not parse");
+			expect(report.limits[0]?.id).toBe("openrouter:key-limit");
+			expect(openrouterBilling.readBilling(report)).toMatchObject({ status: "unknown", reason });
+		}
 	});
 
 	it("reads a capped free-tier key as free only, even with the cap exhausted", async () => {
@@ -675,6 +810,12 @@ describe("Antigravity billing", () => {
 		];
 		expect(sources(read(oneBucketSpent))).toEqual([{ mode: "unknown", state: "unknown" }]);
 		expect(defaultBillingReader("google-antigravity")).toBe(antigravityBilling);
+	});
+
+	it("reports every healthy counter as available and unknown counters as unknown", () => {
+		const healthy = [counterLimit("google", "daily", 0.5, 5_000), counterLimit("anthropic", "weekly", 0.7, 9_000)];
+		expect(sources(read(healthy))).toEqual([{ mode: "unknown", state: "available" }]);
+		expect(sources(read([{ ...healthy[0]!, status: "unknown" }]))).toEqual([{ mode: "unknown", state: "unknown" }]);
 	});
 
 	it("reads a single fully spent counter as exhausted until its windows reset", () => {

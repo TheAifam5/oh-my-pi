@@ -19,7 +19,14 @@ import {
 import { resolveDirectAnthropicBaseUrlFor } from "../providers/anthropic-state";
 import { isRecord } from "../utils";
 import { waitForRetry } from "../utils/retry-wait";
-import { type BillingSource, knownBilling, type ProviderBilling, sourceFromLimit, unknownBilling } from "./billing";
+import {
+	type BillingSource,
+	knownBilling,
+	type ProviderBilling,
+	sourceFromLimit,
+	subscriptionStateFromLimits,
+	unknownBilling,
+} from "./billing";
 import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls } from "./claude-api";
 import { listClaudeResetCredits, parseClaudeResetCreditsFromUsagePayload } from "./claude-reset";
 import { buildUsageAmount as buildCountAmount, HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
@@ -1073,7 +1080,17 @@ export const claudeBilling: ProviderBilling = {
 		if (report.metadata?.source === CLAUDE_API_KEY_HEADERS_SOURCE) {
 			return knownBilling(report, [{ mode: "metered", state: "unknown" }]);
 		}
-		const sources: BillingSource[] = [{ mode: "subscription-included", state: "unknown" }];
+		const sources: BillingSource[] = [
+			{
+				mode: "subscription-included",
+				state: subscriptionStateFromLimits(
+					report.limits.filter(
+						limit =>
+							limit.scope.shared === true && limit.scope.modelId === undefined && limit.id !== "anthropic:extra",
+					),
+				),
+			},
+		];
 		const extraLimit = report.limits.find(limit => limit.id === "anthropic:extra");
 		// The fetcher emits an extra-usage row without a cap only when the account reports no monthly limit.
 		const extraSource = extraLimit

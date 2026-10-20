@@ -25,6 +25,7 @@ import {
 	knownBilling,
 	type ProviderBilling,
 	quantitySign,
+	subscriptionStateFromLimits,
 	unknownBilling,
 } from "./billing";
 import { normalizeCodexBaseUrl } from "./openai-codex-base-url";
@@ -717,6 +718,8 @@ export const openaiCodexUsageProvider: UsageProvider = {
 			...(resetCredits ? { resetCredits } : {}),
 			metadata: {
 				planType,
+				planAllowed: parsed?.allowed,
+				planLimitReached: parsed?.limitReached,
 				...buildPlanMeterState(parsed?.allowed, parsed?.limitReached, creditOverage),
 				email,
 				accountId,
@@ -937,6 +940,20 @@ export const codexBilling: ProviderBilling = {
 		const planMode = CODEX_PLAN_BILLING_MODES[classifyOpenAICodexPlan(report)];
 		const credits = codexCreditsSource(report.metadata?.credits);
 		if (!credits) return unknownBilling(report, "malformed");
-		return knownBilling(report, [{ mode: planMode, state: "unknown" }, credits]);
+		const limits = report.limits.filter(
+			limit =>
+				limit.scope.shared === true &&
+				limit.scope.modelId === undefined &&
+				(limit.id === "openai-codex:primary" || limit.id === "openai-codex:secondary"),
+		);
+		const allowed = report.metadata?.planAllowed ?? report.metadata?.allowed;
+		const limitReached = report.metadata?.planLimitReached ?? report.metadata?.limitReached;
+		const state =
+			limitReached === true
+				? "exhausted"
+				: allowed === true && limitReached === false
+					? "available"
+					: subscriptionStateFromLimits(limits);
+		return knownBilling(report, [{ mode: planMode, state }, credits]);
 	},
 };

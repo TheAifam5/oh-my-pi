@@ -208,7 +208,7 @@ describe("StatusLineComponent usage refresh", () => {
 		expect(calls).toBe(0);
 	});
 
-	it("passes a startup timeout signal to the background usage fetch", async () => {
+	it("keeps the startup wait timeout out of the background usage fetch", async () => {
 		let signal: AbortSignal | undefined;
 		const component = new StatusLineComponent(
 			makeSession(async nextSignal => {
@@ -222,7 +222,7 @@ describe("StatusLineComponent usage refresh", () => {
 		vi.advanceTimersByTime(0);
 		await flushMicrotasks();
 
-		expect(signal).toBeInstanceOf(AbortSignal);
+		expect(signal).toBeUndefined();
 	});
 
 	it("backs off after the startup timeout when usage fetching hangs", async () => {

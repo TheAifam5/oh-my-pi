@@ -1349,7 +1349,7 @@ describe("ModelHub", () => {
 				return billingSummary("anthropic", [report], now);
 			};
 			expect(claude({ used: { amount_minor: 4200, exponent: 2, currency: "USD" }, limit: null })).toBe(
-				"subscription-included unknown, paid-extra-usage available uncapped",
+				"subscription-included available, paid-extra-usage available uncapped",
 			);
 			expect(billingSummary("charm-hyper", [hyperReport(-0.5, "usd", now)], now)).toBe(
 				"prepaid-credits exhausted -$0.50",

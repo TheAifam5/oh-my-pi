@@ -46,6 +46,8 @@
 
 ### Fixed
 
+- Subscription billing reports available or exhausted from account-wide plan windows; Antigravity billing reports available when every counter has room
+- Paid OpenRouter billing reports the real remaining USD credit balance; keys refused access to the credits endpoint report permission-denied billing evidence
 - Fixed an OAuth login deleting the API keys you had stored for the same provider with `/login`; only keys stored without a login are replaced
 - Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes; requests move to a sibling key and the spent key stays blocked until the time Anthropic states, or the first of the next month for the tier cap
 
