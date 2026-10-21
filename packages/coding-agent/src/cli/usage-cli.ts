@@ -36,6 +36,7 @@ import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { resetAccountLockKey } from "../session/codex-auto-reset";
 import { checkCodexBalance, type ResetMarker, resetLockPath, withResetFence } from "../session/reset-fence";
 import { collapseSharedUsageReports, summarizeUsageResetCredits } from "@oh-my-pi/pi-tui/overlays/usage-display";
+import { formatUsageProjection } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 import { reportMatchesStatus } from "../session/claude-auto-reset";
 import {
 	classifyResetExpiry,
@@ -410,6 +411,8 @@ function formatLimitLine(limit: UsageLimit, labelWidth: number, nowMs: number): 
 	const title = limitTitle(limit);
 	const padded = title.padEnd(labelWidth);
 	const details: string[] = [describeAmount(limit)];
+	const projection = formatUsageProjection(limit, nowMs);
+	if (projection) details.push(projection);
 	const resetsAt = limit.window?.resetsAt;
 	if (resetsAt !== undefined && resetsAt > nowMs) {
 		details.push(`${limit.window?.resetLabel ?? "resets"} in ${formatDuration(resetsAt - nowMs)}`);

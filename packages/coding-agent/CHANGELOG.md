@@ -43,6 +43,7 @@
 
 ### Added
 
+- `omp usage` and `/usage` show credit-balance spending rates and projected run-out countdowns
 - `auth.accountPolicies` entries take `resetOn` (`5h`, `7d`) and `autoRedeem` (`yes`, `no`, `unset`) for per-account Claude and Codex saved-reset redemption, set with `omp account reset <account> --on <windows> --auto <mode>` and shown by `omp account list` and `/account`
 - `omp account disable <account>` and `omp account enable <account>` (and `e` in `/account`) stop and resume using a stored account without logging it out; a disabled account is listed as disabled by `omp account list`, `/account`, and `omp usage`, and requests to a provider whose accounts are all disabled fail naming `omp account enable`
 

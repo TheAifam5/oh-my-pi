@@ -123,6 +123,49 @@ describe("AgentSession retry delay cap", () => {
 		tempDir.removeSync();
 	});
 
+	it("surfaces exhausted spend limits with the earliest local reset and recovery actions", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const now = Date.UTC(2026, 9, 21, 10);
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const resetAt = now + 3_600_000;
+		const spendError =
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"Monthly spend limit reached. You will regain access on 2026-10-21 at 11:00 UTC.","details":{"error_code":"enforced_spend_limit_reached"}}} retry-after-ms=3600000';
+		const mock = createMockModel({ handler: () => ({ throw: spendError }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.modelFallback": false,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const events: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") events.push(event);
+		});
+		await session.prompt("Trigger spend limit");
+		await session.waitForIdle();
+		expect(events).toHaveLength(1);
+		const error = events[0]?.finalError;
+		expect(error).toContain("Every anthropic key/account is at its spend limit.");
+		expect(error).toContain(new Date(resetAt).toLocaleString());
+		expect(error).toContain("(in 1h)");
+		expect(error).toContain("Claude Console");
+		expect(error).toContain("omp login anthropic-api-key");
+		expect(error).toContain(`\nOriginal provider message: ${spendError}`);
+		expect(error).not.toContain("exceeds retry.maxDelayMs");
+	});
+
 	it("bails immediately when retry-after exceeds retry.maxDelayMs", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {

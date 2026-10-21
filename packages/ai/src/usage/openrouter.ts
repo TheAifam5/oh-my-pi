@@ -23,6 +23,7 @@ const PROVIDER = "openrouter";
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const CANONICAL_HOST = "openrouter.ai";
 const KEY_PATH = "/key";
+const CREDITS_REQUEST_TIMEOUT_MS = 3_000;
 const KEY_LIMIT_ID = "openrouter:key-limit";
 const FREE_MODEL_LIMIT_ID = "openrouter:free-model-daily-requests";
 /** Block scope of usage-limit errors on free-model requests; it expires by clock only. */
@@ -116,15 +117,36 @@ function freeModelDailyLimit(data: Record<string, unknown>, now: number): UsageL
 	};
 }
 
-function creditBalance(total: number, used: number): UsageLimit {
+/** USD per second spent by this key only; spending through other keys is excluded. */
+function keySpendingPace(data: Record<string, unknown>, now: number): number | undefined {
+	const date = new Date(now);
+	const today = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+	const weekElapsed = now - (today - ((date.getUTCDay() + 6) % 7) * DAY_MS);
+	const elapsed = weekElapsed >= DAY_MS ? weekElapsed : now - Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+	const spent = finiteNumber(weekElapsed >= DAY_MS ? data.usage_weekly : data.usage_monthly);
+	return spent === undefined || elapsed <= 0 ? undefined : spent / (elapsed / 1000);
+}
+
+function creditBalance(total: number, used: number, data: Record<string, unknown>, now: number): UsageLimit {
 	const rounded = Math.round((total - used) * 100) / 100;
 	const remaining = rounded === 0 ? 0 : rounded;
+	const pace = keySpendingPace(data, now);
+	const projectedExhaustAt =
+		remaining > 0 && pace !== undefined && pace > 0 ? now + (remaining / pace) * 1000 : undefined;
 	return {
 		id: "openrouter:credit-balance",
 		label: "Credit balance",
 		scope: { provider: PROVIDER, shared: true },
-		amount: { limit: total, used, remaining, unit: "usd" },
+		amount: {
+			limit: total,
+			used,
+			remaining,
+			unit: "usd",
+			...(pace !== undefined ? { spendingRatePerDay: pace * 86400 } : {}),
+		},
+		...(projectedExhaustAt !== undefined && Number.isFinite(projectedExhaustAt) ? { projectedExhaustAt } : {}),
 		status: remaining > 0 ? "ok" : "exhausted",
+		notes: ["Spending pace counts this key only; spending through other keys is excluded."],
 	};
 }
 
@@ -133,6 +155,25 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 	const credential = params.credential;
 	if (credential.type !== "api_key" || !credential.apiKey) return null;
 	const baseUrl = (params.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+	const creditsTimeout = AbortSignal.timeout(CREDITS_REQUEST_TIMEOUT_MS);
+	const creditsController = new AbortController();
+	const creditsSignal = AbortSignal.any([
+		creditsTimeout,
+		creditsController.signal,
+		...(params.signal ? [params.signal] : []),
+	]);
+	const creditsRequest = (async () => {
+		try {
+			const response = await ctx.fetch(`${baseUrl}/credits`, {
+				headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
+				signal: creditsSignal,
+			});
+			const payload: unknown = response.ok ? await response.json() : undefined;
+			return { response, payload, timedOut: false };
+		} catch {
+			return { response: undefined, payload: undefined, timedOut: creditsTimeout.aborted };
+		}
+	})();
 
 	let data: Record<string, unknown> | undefined;
 	try {
@@ -160,6 +201,8 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 			error: error instanceof Error ? error.name : "unknown",
 		});
 		return null;
+	} finally {
+		if (!data || data.is_free_tier === true) creditsController.abort();
 	}
 	if (!data) return null;
 
@@ -170,22 +213,20 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 	const metadata: UsageReport["metadata"] =
 		typeof data.is_free_tier === "boolean" ? { isFreeTier: data.is_free_tier } : {};
 	if (data.is_free_tier !== true) {
-		try {
-			const response = await ctx.fetch(`${baseUrl}/credits`, {
-				headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
-				signal: params.signal,
-			});
+		const { response, payload, timedOut } = await creditsRequest;
+		if (!response) {
+			metadata.creditsUnavailableReason = timedOut ? "timeout" : "no-evidence";
+		} else {
 			if (response.status === 401 || response.status === 403) {
 				metadata.creditsUnavailableReason = "permission-denied";
 			} else if (response.ok) {
-				const payload: unknown = await response.json();
 				if (isRecord(payload) && isRecord(payload.data)) {
 					const total = finiteNumber(payload.data.total_credits);
 					const used = finiteNumber(payload.data.total_usage);
 					if (total !== undefined && total >= 0 && used !== undefined && used >= 0) {
 						metadata.totalCredits = total;
 						metadata.totalUsage = used;
-						limits.push(creditBalance(total, used));
+						limits.push(creditBalance(total, used, data, fetchedAt));
 					} else {
 						metadata.creditsUnavailableReason = "malformed";
 					}
@@ -195,8 +236,6 @@ async function fetchOpenRouterUsage(params: UsageFetchParams, ctx: UsageFetchCon
 			} else {
 				metadata.creditsUnavailableReason = "no-evidence";
 			}
-		} catch {
-			metadata.creditsUnavailableReason = "no-evidence";
 		}
 	}
 	return {
@@ -299,7 +338,9 @@ export const openrouterBilling: ProviderBilling = {
 	readBilling(report) {
 		if (report.metadata?.isFreeTier === true) return knownBilling(report, [{ mode: "free", state: "unknown" }]);
 		const reason = report.metadata?.creditsUnavailableReason;
-		if (reason === "permission-denied" || reason === "malformed") return unknownBilling(report, reason);
+		if (reason === "permission-denied" || reason === "malformed" || reason === "timeout") {
+			return unknownBilling(report, reason);
+		}
 		const total = report.metadata?.totalCredits;
 		const used = report.metadata?.totalUsage;
 		if (typeof total !== "number" || typeof used !== "number") return unknownBilling(report, "no-evidence");

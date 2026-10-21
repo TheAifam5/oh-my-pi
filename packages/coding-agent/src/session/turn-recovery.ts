@@ -22,7 +22,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { calculateRateLimitBackoffMs, parseRateLimitReason } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
+import { extractProviderRetryHint, formatSpendLimitError } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-credit";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
@@ -1012,6 +1012,7 @@ export class TurnRecovery {
 					this.#host.sessionId(),
 					{
 						retryAfterMs,
+						reason: parseRateLimitReason(errorMessage),
 						// Provider-stated timing only when the error text parsed;
 						// the 30-minute fallback is a guess.
 						providerTimed: parsedRetryAfterMs !== undefined,
@@ -3860,7 +3861,19 @@ export class TurnRecovery {
 				{
 					success: false,
 					attempt,
-					finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+					finalError:
+						rateLimitReason === "SPEND_LIMIT_REACHED" && currentModel
+							? formatSpendLimitError(
+									currentModel.provider,
+									errorMessage,
+									effectiveUsageLimitWaitMs !== undefined &&
+										(parsedRetryAfterMs !== undefined ||
+											recordedUsageLimitOutcome?.reportResetAtMs !== undefined ||
+											recordedUsageLimitOutcome?.priorBlockedUntilTimed === true)
+										? Date.now() + effectiveUsageLimitWaitMs
+										: undefined,
+								)
+							: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
 				},
 				{ terminalTurn: message },
 			);

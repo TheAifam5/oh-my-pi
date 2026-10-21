@@ -14,12 +14,16 @@
 
 ### Added
 
+- OpenRouter credit balances include a projected exhaustion timestamp and daily spending rate from this key's UTC weekly usage, or monthly usage during the first day of the week
 - Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries
 - Added user-disabled credentials: `credentials.setEnabled()` stores the state in a new `user_disabled_at` column of `agent.db` (schema 9) or through the auth broker's new `POST /v1/credential/:id/enabled`; a disabled credential stays stored, is listed by `credentials.listUserDisabled()`, `credentials.listDisabled()`, and `sessions.accounts()` without a session, and is never selected
 - Added `workspaceId` to stored API-key credentials (`ApiKeyCredential`, `OAuthRequestIdentity`): `login "api-key"` rules with `workspace-prompt` store the entered ID through `OAuthController.onWorkspaceId`, and the Anthropic provider sends it as `anthropic-workspace-id`
 
 ### Fixed
 
+- Exhausted Anthropic spend limits show the earliest local and relative unblock time, Console and login recovery actions, and the original provider message
+- Spend-limit failures block the whole credential across model tiers
+- OpenRouter fetches key limits and credits concurrently, preserving key limits when the independent three-second credits deadline expires
 - Reset-only account policies do not enable usage-reserve routing, and API-key policies reject `resetOn` and `autoRedeem`
 - Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
 

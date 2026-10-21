@@ -1,4 +1,5 @@
 import type { ApiKeyResolver, ResolvedApiKey } from "../auth-retry";
+import type { RateLimitReason } from "../error/rate-limit";
 import type {
 	OAuthAuthInfo,
 	OAuthController,
@@ -881,6 +882,7 @@ export type ObservedUsageInput = {
 /** Mark a session credential blocked with caller and provider timing. */
 export type MarkUsageLimitOptions = {
 	retryAfterMs?: number;
+	reason?: RateLimitReason;
 	/**
 	 * Whether `retryAfterMs` came from provider-stated timing (a parsed
 	 * retry hint) rather than a heuristic/default guess. A report reset

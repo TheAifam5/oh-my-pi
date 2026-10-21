@@ -44,6 +44,8 @@ export interface UsageAmount {
 	unit: UsageUnit;
 	/** ISO 4217 code of money amounts in major units that {@link unit} cannot name; `unit` is then `unknown`. */
 	currency?: string;
+	/** Average spending per UTC day in {@link unit}, over the provider's observed period. */
+	spendingRatePerDay?: number;
 }
 
 /** Scope metadata describing what the limit applies to. */
@@ -69,6 +71,8 @@ export interface UsageLimit {
 	scope: UsageScope;
 	window?: UsageWindow;
 	amount: UsageAmount;
+	/** Projected exhaustion timestamp in milliseconds since epoch, not a reset boundary. */
+	projectedExhaustAt?: number;
 	status?: UsageStatus;
 	notes?: string[];
 }
@@ -330,6 +334,7 @@ export const usageAmountSchema = type({
 	"remainingFraction?": "number",
 	unit: usageUnitSchema,
 	"currency?": "string",
+	"spendingRatePerDay?": "number",
 });
 
 export const usageScopeSchema = type({
@@ -350,6 +355,7 @@ export const usageLimitSchema = type({
 	scope: usageScopeSchema,
 	"window?": usageWindowSchema,
 	amount: usageAmountSchema,
+	"projectedExhaustAt?": "number",
 	"status?": usageStatusSchema,
 	"notes?": "string[]",
 });

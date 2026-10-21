@@ -105,7 +105,11 @@ import {
 	formatLimitTitle,
 	summarizeUsageResetCredits,
 } from "@oh-my-pi/pi-tui/overlays/usage-display";
-import { formatRemainingOnlyTotal, isUsedOnlyAbsoluteAmount } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
+import {
+	formatRemainingOnlyTotal,
+	formatUsageProjection,
+	isUsedOnlyAbsoluteAmount,
+} from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 import type { UnavailableUsageAccount } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 
 import { cfgTerminalShowImages } from "../settings";
@@ -2776,7 +2780,11 @@ export function renderUsageReports(
 			const bars = sortedLimits.map(limit =>
 				padColumn(renderUsageBar(limit, uiTheme, sectionBarWidth), sectionColumnWidth),
 			);
-			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
+			const projections = [
+				...new Set(sortedLimits.map(limit => formatUsageProjection(limit, nowMs)).filter(Boolean)),
+			];
+			const details = [amountText, ...projections].filter(Boolean).join(" · ");
+			lines.push(`  ${bars.join(" ")} ${details}`.trimEnd());
 			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
 			if (resetText) {
 				lines.push(`  ${uiTheme.fg("dim", resetText)}`.trimEnd());

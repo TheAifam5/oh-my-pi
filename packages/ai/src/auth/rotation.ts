@@ -1,6 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
-import { isUsageLimitOutcome } from "../error/rate-limit";
+import { isUsageLimitOutcome, parseRateLimitReason, type RateLimitReason } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import type { CredentialRankingContext, CredentialRankingStrategy } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
@@ -123,12 +123,13 @@ export class RateLimits implements LimitsApi {
 		credentialType: AuthCredential["type"],
 		modelId: string | undefined,
 		blockScopeOverride?: string,
+		reason?: RateLimitReason,
 	): CredentialBlockRouting {
 		const providerKey = providerTypeKey(provider, credentialType);
 		const strategy = this.#deps.strategies(provider);
 		const rankingContext: CredentialRankingContext = { modelId };
 		const defaultBlockScope = strategy?.blockScope?.(rankingContext);
-		const blockScope = blockScopeOverride ?? defaultBlockScope;
+		const blockScope = reason === "SPEND_LIMIT_REACHED" ? undefined : (blockScopeOverride ?? defaultBlockScope);
 		const requestBlockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, defaultBlockScope);
 		const siblingBlockScopes =
 			blockScopeOverride && !requestBlockScopes.includes(blockScopeOverride)
@@ -250,7 +251,13 @@ export class RateLimits implements LimitsApi {
 		const credentialType = sessionCredential.type;
 		const targetCredentialId = target.id;
 
-		const routing = this.#credentialBlockRouting(provider, credentialType, options?.modelId);
+		const routing = this.#credentialBlockRouting(
+			provider,
+			credentialType,
+			options?.modelId,
+			undefined,
+			options?.reason,
+		);
 		// A report-confirmed reset lives in its own scope, and still counts as the prior block.
 		if (routing.strategy?.reportBlockScope) {
 			routing.priorBlockScopes = [
@@ -445,6 +452,7 @@ export class RateLimits implements LimitsApi {
 				const retryAfterMs = extractProviderRetryHint(provider, message);
 				await this.markReached(provider, sessionId, {
 					retryAfterMs,
+					reason: parseRateLimitReason(message ?? ""),
 					providerTimed: retryAfterMs !== undefined,
 					modelId: options?.modelId,
 					apiKey: options?.apiKey,
@@ -461,6 +469,7 @@ export class RateLimits implements LimitsApi {
 			const retryAfterMs = extractProviderRetryHint(provider, message);
 			const mark = await this.markReached(provider, sessionId, {
 				retryAfterMs,
+				reason: parseRateLimitReason(message ?? ""),
 				providerTimed: retryAfterMs !== undefined,
 				modelId: options?.modelId,
 				apiKey: options?.apiKey,

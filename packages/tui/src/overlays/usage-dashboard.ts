@@ -27,7 +27,7 @@ import {
 } from "./usage-display";
 import { colorToAnsi } from "../theme/color";
 import { ensureThemeSync, theme } from "../theme/theme";
-import { formatAbsoluteOnlyAmount } from "../prompt/usage-amounts";
+import { formatAbsoluteOnlyAmount, formatUsageProjection } from "../prompt/usage-amounts";
 import { truncateMiddleToWidth } from "../render/render-utils";
 import { sanitizeDisplayLine } from "./extensions/display-text";
 import {
@@ -69,6 +69,8 @@ export interface CardWindowRow {
 	resetMs?: number;
 	/** Absolute one-sided amount (e.g. `$12.34 used`, `100 credits left`) for limits without a fraction. */
 	usedText?: string;
+	/** Spending rate and run-out countdown of the worst account, when available. */
+	projectionText?: string;
 }
 
 /** A connected account whose usage lookup produced no attributable report. */
@@ -202,6 +204,7 @@ export function buildProviderCards(
 				status: aggregateStatus(bucket.limits),
 				resetMs: resetsAt !== undefined && resetsAt > nowMs ? resetsAt - nowMs : undefined,
 				usedText: fraction === undefined ? formatAbsoluteOnlyAmount(bucket.limits) : undefined,
+				projectionText: formatUsageProjection(worst, nowMs) || undefined,
 			};
 		});
 		// Cards render at most CARD_MAX_WINDOWS rows; when a provider declares
@@ -835,6 +838,10 @@ export class UsageDashboardComponent implements Component {
 			if (window.fraction === undefined) {
 				const text = theme.fg("dim", window.usedText ?? "no data");
 				for (const line of wrapTextWithAnsi(`${prefix}${text}`, contentWidth)) lines.push(`  ${line}`);
+				if (window.projectionText) {
+					for (const line of wrapTextWithAnsi(theme.fg("dim", window.projectionText), contentWidth))
+						lines.push(`  ${line}`);
+				}
 				continue;
 			}
 			const freePct = Math.max(0, Math.round((1 - window.fraction) * 100));
@@ -846,6 +853,10 @@ export class UsageDashboardComponent implements Component {
 				contentWidth,
 			)) {
 				lines.push(`  ${line}`);
+			}
+			if (window.projectionText) {
+				for (const line of wrapTextWithAnsi(theme.fg("dim", window.projectionText), contentWidth))
+					lines.push(`  ${line}`);
 			}
 		}
 		if (hidden > 0) lines.push(`  ${theme.fg("dim", `+${hidden} more`)}`);
@@ -1448,6 +1459,15 @@ export class UsageDashboardComponent implements Component {
 					}
 				}
 				rows.push(node("row", { role: "omp.usage.window", gap: "md", align: "center" }, cells, `w${index}`));
+				if (window.projectionText) {
+					rows.push(
+						text([span(window.projectionText, "dim")], {
+							role: "omp.usage.projection",
+							truncate: "end",
+							title: window.projectionText,
+						}),
+					);
+				}
 			}
 			const hidden = entry.windows.length - CARD_MAX_WINDOWS;
 			if (hidden > 0) {
@@ -1700,7 +1720,7 @@ export class UsageDashboardComponent implements Component {
 											"dim",
 										),
 									]
-								: "",
+								: formatUsageProjection(limit, nowMs),
 					});
 					for (const note of limit.notes ?? []) limitNotes.push(sanitizeDisplayLine(note));
 				}

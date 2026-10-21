@@ -303,6 +303,21 @@ describe("AuthStorage Claude Fable tier fallback", () => {
 		expect(["oat-2", "oat-3"]).toContain(retryKey as string);
 	});
 
+	it("blocks a spend-limited Fable key before another model can select it", async () => {
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(null);
+		const firstKey = await storage.keys.get("anthropic", "spend-session", { modelId: "claude-fable-5" });
+		expect(firstKey).toBe("oat-1");
+		await storage.limits.rotate("anthropic", "spend-session", {
+			apiKey: firstKey,
+			modelId: "claude-fable-5",
+			error: new ProviderHttpError(
+				'429 {"type":"error","error":{"type":"rate_limit_error","message":"Monthly spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}',
+				429,
+			),
+		});
+		expect(await storage.keys.get("anthropic", "spend-session", { modelId: "claude-sonnet-4-5" })).toBe("oat-2");
+	});
+
 	it("keeps an organization denial blocked across model tiers and healthy usage reports", async () => {
 		const now = Date.now();
 		vi.spyOn(Date, "now").mockReturnValue(now);

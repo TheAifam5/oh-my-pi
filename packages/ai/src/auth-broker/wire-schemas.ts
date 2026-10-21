@@ -229,6 +229,7 @@ const usageAmountSchema = type({
 	"remainingFraction?": "number",
 	unit: "'percent' | 'tokens' | 'requests' | 'credits' | 'usd' | 'minutes' | 'bytes' | 'unknown'",
 	"currency?": "string",
+	"spendingRatePerDay?": "number",
 });
 
 const usageScopeSchema = type({
@@ -249,6 +250,7 @@ const usageLimitSchema = type({
 	scope: usageScopeSchema,
 	"window?": usageWindowSchema,
 	amount: usageAmountSchema,
+	"projectedExhaustAt?": "number",
 	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
 	"notes?": "string[]",
 });

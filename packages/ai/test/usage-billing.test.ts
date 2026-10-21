@@ -571,8 +571,8 @@ describe("OpenRouter billing", () => {
 		const { report, seen } = await openrouterReport({ data: documentedKey });
 		if (!report) throw new Error("fixture did not parse");
 		expect(seen).toEqual([
-			{ url: "https://openrouter.ai/api/v1/key", authorization: "Bearer sk-or-v1-test" },
 			{ url: "https://openrouter.ai/api/v1/credits", authorization: "Bearer sk-or-v1-test" },
+			{ url: "https://openrouter.ai/api/v1/key", authorization: "Bearer sk-or-v1-test" },
 		]);
 		expect(report.limits).toMatchObject([
 			{
@@ -679,6 +679,7 @@ describe("OpenRouter billing", () => {
 		);
 		expect(proxied.report).toBeNull();
 		expect(proxied.seen).toEqual([
+			{ url: "https://proxy.example/openrouter/v1/credits", authorization: "Bearer sk-or-v1-test" },
 			{ url: "https://proxy.example/openrouter/v1/key", authorization: "Bearer sk-or-v1-test" },
 		]);
 	});

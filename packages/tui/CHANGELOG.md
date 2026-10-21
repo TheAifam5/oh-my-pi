@@ -12,6 +12,10 @@
 
 - Fixed the `/agents` and `/models` hubs in Tern squeezing the left sidebar as long lines (such as a streaming new-agent draft) widen the body pane
 
+### Added
+
+- Usage dashboard details show credit-balance spending rates and projected run-out countdowns
+
 ## [18.12.4] - 2026-10-20
 
 ### Added

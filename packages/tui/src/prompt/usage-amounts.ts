@@ -1,4 +1,5 @@
 import { resolveUsedFraction, type UsageLimit } from "@oh-my-pi/pi-ai/usage";
+import { formatDuration, sanitizeText } from "@oh-my-pi/pi-utils";
 
 /**
  * Formatting for usage limits that carry an absolute amount but no fraction,
@@ -103,4 +104,22 @@ export function formatAbsoluteOnlyAmount(limits: readonly UsageLimit[]): string 
 		return formatQuantity(used, unit, currency, "used");
 	}
 	return formatRemainingOnlyTotal(limits);
+}
+
+/** Spending rate and projected exhaustion countdown for a limit. */
+export function formatUsageProjection(limit: UsageLimit, nowMs: number): string {
+	const parts: string[] = [];
+	const rate = limit.amount.spendingRatePerDay;
+	if (rate !== undefined && Number.isFinite(rate)) {
+		parts.push(
+			limit.amount.unit === "usd"
+				? `$${rate.toFixed(2)}/day`
+				: `${rate.toFixed(2)} ${sanitizeText((limit.amount.currency ?? limit.amount.unit).replace(/[\r\n\t]+/g, " "))}/day`,
+		);
+	}
+	const at = limit.projectedExhaustAt;
+	if (at !== undefined && Number.isFinite(at)) {
+		parts.push(`runs out in ${formatDuration(Math.max(0, at - nowMs)).replace(/([a-z])(?=\d)/g, "$1 ")}`);
+	}
+	return parts.join(" · ");
 }

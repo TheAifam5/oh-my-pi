@@ -2124,6 +2124,7 @@ export class SessionAdvisors {
 				advisor.providerSessionId,
 				{
 					retryAfterMs,
+					reason: AIError.parseRateLimitReason(message),
 					providerTimed: retryAfterMs !== undefined,
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,

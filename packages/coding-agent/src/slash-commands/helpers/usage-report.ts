@@ -2,6 +2,7 @@ import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { OAuthAccountIdentity } from "../../session/auth-storage";
 import { collapseSharedUsageReports, summarizeUsageResetCredits } from "@oh-my-pi/pi-tui/overlays/usage-display";
+import { formatUsageProjection } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 import type { SlashCommandRuntime } from "../types";
 import { formatCodexUsageReportLabel, reportMatchesActiveAccount } from "./active-oauth-account";
 import { formatCoarseDuration, formatProviderName, renderAsciiBar } from "@oh-my-pi/pi-tui/chrome/format";
@@ -144,6 +145,8 @@ function renderUsageReports(
 					`  ${formatUsageReportAccount(report, providerReports, limit, index)}: ${formatUsageAmount(limit)}${inUse ? "  ← in use by this session" : ""}`,
 				);
 				lines.push(`  ${renderAsciiBar(limit.amount.usedFraction)}`);
+				const projection = formatUsageProjection(limit, nowMs);
+				if (projection) lines.push(`  ${projection}`);
 				if (limit.window?.resetsAt && limit.window.resetsAt > nowMs) {
 					lines.push(
 						`  ${limit.window.resetLabel ?? "resets"} in ${formatCoarseDuration(limit.window.resetsAt - nowMs)}`,

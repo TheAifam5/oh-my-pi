@@ -98,6 +98,7 @@ export interface BillingSnapshot {
  * - `malformed`: the report contradicts itself or belongs to another provider.
  * - `stale`: the evidence is older than the caller's freshness bound.
  * - `permission-denied`: the credential cannot access the provider's billing endpoint.
+ * - `timeout`: the provider's billing endpoint exceeded its request deadline.
  */
 export type BillingUnknownReason =
 	| "no-reader"
@@ -105,6 +106,7 @@ export type BillingUnknownReason =
 	| "no-evidence"
 	| "malformed"
 	| "stale"
+	| "timeout"
 	| "permission-denied";
 
 /** Billing evidence, or a typed reason it is unavailable. Consumers must never read `unknown` as free. */

@@ -1,5 +1,5 @@
 import { retryResetTimezoneOffsetFor } from "@oh-my-pi/pi-catalog/compat/behavior";
-import { extractRetryHint } from "@oh-my-pi/pi-utils";
+import { extractRetryHint, formatDuration } from "@oh-my-pi/pi-utils";
 import {
 	ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS,
 	anthropicSpendLimitResumeAtMs,
@@ -27,6 +27,17 @@ export function extractProviderRetryHint(
 	if (resumeAtMs === undefined) return hint;
 	// Text-derived hints in the same body get the same cap as the stated instant.
 	return Math.min(Math.max(hint ?? 0, resumeAtMs - nowMs), ANTHROPIC_SPEND_LIMIT_MAX_BLOCK_MS);
+}
+
+export function formatSpendLimitError(provider: string, message: string, retryAtMs?: number): string {
+	const nowMs = Date.now();
+	const limit = parseAnthropicSpendLimit(message);
+	const resumeAtMs = retryAtMs ?? (limit ? anthropicSpendLimitResumeAtMs(limit, nowMs) : undefined);
+	const timing =
+		resumeAtMs !== undefined && resumeAtMs > nowMs
+			? ` Earliest unblock: ${new Date(resumeAtMs).toLocaleString()} (in ${formatDuration(resumeAtMs - nowMs)}).`
+			: " No reset time is known.";
+	return `Every ${provider} key/account is at its spend limit.${timing} Raise the limit in the Claude Console or add a key with \`omp login anthropic-api-key\`.\nOriginal provider message: ${message}`;
 }
 
 const RETRY_AFTER_HINT = "retry-after-ms=";
