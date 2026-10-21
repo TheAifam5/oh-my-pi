@@ -298,6 +298,12 @@ const CODEX_RETRYABLE_EVENT_CODES = new Set([
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
+/**
+ * Provider-session key of the native-lane steering record. The host closes
+ * {@link CODEX_PROVIDER_SESSION_STATE_KEY} on model switches and history
+ * rewrites; this record stays until the host closes or releases the session.
+ */
+const CODEX_STEERING_SESSION_STATE_KEY = "openai-codex-responses:steering";
 
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
@@ -459,8 +465,6 @@ type CodexWebSocketSessionState = {
 	 * pending tool output; see {@link planSteeredRequest}.
 	 */
 	acceptedSteering?: { connection: CodexWebSocketConnection; steers: CodexAcceptedSteer[] };
-	/** The server refused steering for this session (native turn lane); later responses are not steered. */
-	steeringUnsupported?: boolean;
 	lastTransport?: CodexTransport;
 	fallbackCount: number;
 	lastFallbackAt?: number;
@@ -1129,6 +1133,60 @@ function getCodexProviderSessionState(
 	const created = createCodexProviderSessionState();
 	providerSessionState.set(CODEX_PROVIDER_SESSION_STATE_KEY, created);
 	return created;
+}
+
+/**
+ * Models whose native turn lane refused live steering, per routing session.
+ * `releaseSession` forgets one session; `close` forgets all of them.
+ */
+interface CodexSteeringSessionState extends ProviderSessionState {
+	unsupportedModels: Map<string, Set<string>>;
+}
+
+function isCodexSteeringSessionState(state: ProviderSessionState | undefined): state is CodexSteeringSessionState {
+	return state !== undefined && "unsupportedModels" in state && state.unsupportedModels instanceof Map;
+}
+
+function isCodexSteeringUnsupported(
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+	sessionId: string | undefined,
+	modelId: string,
+): boolean {
+	if (!sessionId) return false;
+	const state = providerSessionState?.get(CODEX_STEERING_SESSION_STATE_KEY);
+	return isCodexSteeringSessionState(state) && state.unsupportedModels.get(sessionId)?.has(modelId) === true;
+}
+
+function createCodexSteeringSessionState(): CodexSteeringSessionState {
+	const unsupportedModels = new Map<string, Set<string>>();
+	return {
+		unsupportedModels,
+		releaseSession: sessionId => {
+			const normalized = normalizeOpenAIPromptCacheKey(sessionId);
+			if (normalized) unsupportedModels.delete(normalized);
+		},
+		close: () => unsupportedModels.clear(),
+	};
+}
+
+/** Stop steering `modelId` for the rest of routing session `sessionId`. */
+function markCodexSteeringUnsupported(
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+	sessionId: string | undefined,
+	modelId: string,
+): void {
+	if (!providerSessionState || !sessionId) return;
+	const existing = providerSessionState.get(CODEX_STEERING_SESSION_STATE_KEY);
+	let state: CodexSteeringSessionState;
+	if (isCodexSteeringSessionState(existing)) {
+		state = existing;
+	} else {
+		state = createCodexSteeringSessionState();
+		providerSessionState.set(CODEX_STEERING_SESSION_STATE_KEY, state);
+	}
+	const models = state.unsupportedModels.get(sessionId);
+	if (models) models.add(modelId);
+	else state.unsupportedModels.set(sessionId, new Set([modelId]));
 }
 
 function isCodexWebSocketRetryableStreamError(error: unknown): boolean {
@@ -2558,7 +2616,11 @@ class CodexStreamProcessor {
 		if (
 			!source ||
 			!connection ||
-			state?.steeringUnsupported ||
+			isCodexSteeringUnsupported(
+				this.options?.providerSessionState,
+				this.requestContext.transportSessionId,
+				this.model.id,
+			) ||
 			this.#steerPump ||
 			typeof responseId !== "string" ||
 			this.runtime.transport !== "websocket" ||
@@ -2852,7 +2914,11 @@ class CodexStreamProcessor {
 		) {
 			return;
 		}
-		state.steeringUnsupported = true;
+		markCodexSteeringUnsupported(
+			this.options?.providerSessionState,
+			this.requestContext.transportSessionId,
+			this.model.id,
+		);
 		state.connection?.close("native-lane-steer-rejected");
 		state.connection = undefined;
 		resetCodexWebSocketAppendState(state);

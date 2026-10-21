@@ -84,10 +84,10 @@ function installSocket(onFrame: (frame: Frame, socket: ScriptedWebSocket) => voi
 	global.WebSocket = ScriptedWebSocket as unknown as typeof WebSocket;
 }
 
-function createGpt6Model(): Model<"openai-codex-responses"> {
+function createGpt6Model(id = "gpt-6-sol"): Model<"openai-codex-responses"> {
 	return buildModel({
-		id: "gpt-6-sol",
-		name: "GPT-6 Sol",
+		id,
+		name: id,
 		api: "openai-codex-responses",
 		provider: "openai-codex",
 		baseUrl: "https://chatgpt.com/backend-api",
@@ -100,9 +100,9 @@ function createGpt6Model(): Model<"openai-codex-responses"> {
 	});
 }
 
-function createToken(): string {
+function createToken(accountId = "acc_test"): string {
 	const payload = Buffer.from(
-		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
 		"utf8",
 	).toBase64();
 	return `aaa.${payload}.bbb`;
@@ -146,16 +146,71 @@ function oneShotSteering(text: string): { source: LiveSteering; settled: () => "
 	return { source, settled: () => outcome };
 }
 
-function options(providerSessionState: Map<string, ProviderSessionState>, liveSteering?: LiveSteering) {
+function options(
+	providerSessionState: Map<string, ProviderSessionState>,
+	liveSteering?: LiveSteering,
+	{ accountId, sessionId = "ws-steer-session" }: { accountId?: string; sessionId?: string } = {},
+) {
 	return {
-		apiKey: createToken(),
-		sessionId: "ws-steer-session",
+		apiKey: createToken(accountId),
+		sessionId,
 		providerSessionState,
 		liveSteering,
 		fetch: vi.fn(async () => {
 			throw new Error("SSE fallback should not run");
 		}) as FetchImpl,
 	};
+}
+
+/**
+ * Native turn lane: a response finishes once pending microtasks drain unless a
+ * steer arrives first, which the lane rejects by dropping the response and its socket.
+ */
+function installNativeLaneSocket(): void {
+	installSocket((frame, socket) => {
+		if (frame.type === "response.steer") {
+			socket.emit({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					code: "unsupported_native_inflight_message",
+					message: "The experimental native turn lane cannot accept stateful WebSocket messages.",
+				},
+			});
+			queueMicrotask(() => {
+				socket.readyState = ScriptedWebSocket.CLOSED;
+				socket.onclose?.(new CloseEvent("close", { code: 1000 }));
+			});
+			return;
+		}
+		const id = `resp_${creates().length}`;
+		socket.emit({ type: "response.created", response: { id } });
+		setImmediate(() => {
+			if (socket.readyState !== ScriptedWebSocket.OPEN) return;
+			socket.emit(...messageFrames(`msg_${id}`, "Hi"), {
+				type: "response.completed",
+				response: { id, status: "completed", usage: USAGE },
+			});
+		});
+	});
+}
+
+/** Run one steerable turn; true when the provider sent the steer to the server. */
+async function steerAttempted(
+	model: Model<"openai-codex-responses">,
+	state: Map<string, ProviderSessionState>,
+	overrides?: { accountId?: string; sessionId?: string },
+): Promise<boolean> {
+	const before = steers().length;
+	const steering = oneShotSteering("one more thing");
+	const user: UserMessage = { role: "user", content: "Hello", timestamp: Date.now() };
+	const result = await streamOpenAICodexResponses(
+		model,
+		{ systemPrompt: SYSTEM, messages: [user] },
+		options(state, steering.source, overrides),
+	).result();
+	expect(result.stopReason).toBe("stop");
+	return steers().length > before;
 }
 
 const SYSTEM = ["You are a helpful assistant."];
@@ -386,6 +441,53 @@ describe("codex live steering", () => {
 		expect(next.settled()).toBeUndefined();
 		expect(steers()).toHaveLength(1);
 		expect(creates()).toHaveLength(3);
+	});
+
+	it("keeps steering off for the session after the host replaces its Codex provider state", async () => {
+		installNativeLaneSocket();
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		expect(await steerAttempted(model, state)).toBe(true);
+
+		// Model switches, history rewrites and context rollover close and drop
+		// the Codex transport state while the session continues.
+		state.get("openai-codex-responses")?.close();
+		state.delete("openai-codex-responses");
+		expect(await steerAttempted(model, state)).toBe(false);
+		expect(steers()).toHaveLength(1);
+	});
+
+	it("keeps steering off for the session after the credential switches accounts", async () => {
+		installNativeLaneSocket();
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		expect(await steerAttempted(model, state, { accountId: "acc_first" })).toBe(true);
+		expect(await steerAttempted(model, state, { accountId: "acc_second" })).toBe(false);
+		expect(steers()).toHaveLength(1);
+	});
+
+	it("still steers other sessions and other models after a native-lane rejection", async () => {
+		installNativeLaneSocket();
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		expect(await steerAttempted(model, state)).toBe(true);
+
+		expect(await steerAttempted(model, state, { sessionId: "other-routing-session" })).toBe(true);
+		expect(await steerAttempted(createGpt6Model("gpt-6-luna"), state)).toBe(true);
+		expect(await steerAttempted(model, new Map())).toBe(true);
+	});
+
+	it("steers the session again once the host releases or closes it", async () => {
+		installNativeLaneSocket();
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		expect(await steerAttempted(model, state)).toBe(true);
+
+		for (const record of state.values()) record.releaseSession?.("ws-steer-session");
+		expect(await steerAttempted(model, state)).toBe(true);
+
+		for (const record of state.values()) record.close();
+		expect(await steerAttempted(model, state)).toBe(true);
 	});
 
 	it("leaves a native-lane rejection after streamed reasoning to the agent retry, which no longer steers", async () => {
