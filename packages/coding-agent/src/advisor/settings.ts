@@ -211,4 +211,12 @@ export const cfgAdvisorAggregationJudgeAllowCrossDomain = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "boolean",
 	default: false,
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Findings Judge Cross-Domain",
+		description:
+			"Off by default. When enabled, advisor finding text (anchors, defects, impact, fix) is sent to a judge on a different provider, base URL or account than the reporting advisors.",
+		condition: "advisorEnabled",
+	},
 });
