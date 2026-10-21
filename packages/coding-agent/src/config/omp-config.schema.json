@@ -1754,9 +1754,9 @@
               "additionalProperties": false,
               "properties": {
                 "enabled": {
-                  "description": "After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its provider matches every reporting advisor's.",
+                  "description": "Off by default. After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its disclosure domain (provider, base URL origin, authentication source/account, and local or remote endpoint) matches every reporting advisor's, unless allowCrossDomain is enabled.",
                   "type": "boolean",
-                  "default": true
+                  "default": false
                 },
                 "model": {
                   "type": "string",
@@ -1766,7 +1766,7 @@
                   "type": "number",
                   "default": 10000
                 },
-                "allowCrossProvider": {
+                "allowCrossDomain": {
                   "type": "boolean",
                   "default": false
                 }

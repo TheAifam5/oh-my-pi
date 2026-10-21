@@ -1,13 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import { type Judge, type JudgmentRequest, type Model, tokenUsage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { cfgAdvisorAggregationJudgeEnabled } from "../../src/advisor/settings";
+import { all } from "../../src/config/registry";
+import { Settings } from "../../src/config/settings";
 import {
 	type AdvisorCategory,
 	type AdvisorFinding,
 	AdvisorFindingsLedger,
 	type AdvisorReportInput,
+	type DisclosureDomain,
 	type FindingsJudgeCandidates,
 	type FindingsJudgeSettings,
 	judgeFindingGroups,
+	modelDisclosureDomain,
 } from "../../src/advisor";
 
 const CATEGORIES: AdvisorCategory[] = [
@@ -21,7 +27,7 @@ const SETTINGS: FindingsJudgeSettings = {
 	enabled: true,
 	model: "@judge",
 	timeoutMs: 10_000,
-	allowCrossProvider: false,
+	allowCrossDomain: false,
 };
 
 function input(overrides: Partial<AdvisorReportInput> = {}): AdvisorReportInput {
@@ -56,6 +62,8 @@ function ledgerWithPair(): { ledger: AdvisorFindingsLedger; findings: AdvisorFin
 
 interface Candidate {
 	provider: string;
+	baseUrl?: string;
+	account?: string;
 	/** Verdict per question; omitted answers `same`. */
 	verdict?: string;
 	fail?: boolean;
@@ -70,7 +78,13 @@ function chain(candidates: Candidate[]): { judge: FindingsJudgeCandidates; reque
 		async withCandidate(run, options) {
 			let lastError: unknown;
 			for (const candidate of candidates) {
-				const model = { provider: candidate.provider, id: `${candidate.provider}-judge` } as Model;
+				const model = {
+					...getBundledModel("anthropic", "claude-sonnet-4-5")!,
+					provider: candidate.provider,
+					id: `${candidate.provider}-judge`,
+					baseUrl: candidate.baseUrl ?? "https://api.example.test/v1",
+					headers: { account: candidate.account ?? "account-1" },
+				} satisfies Model;
 				const candidateJudge: Judge = {
 					label: candidate.provider,
 					async judge(request: JudgmentRequest, judgeOptions) {
@@ -113,9 +127,43 @@ function chain(candidates: Candidate[]): { judge: FindingsJudgeCandidates; reque
 	return { judge, requests, questions };
 }
 
-const sameProvider = () => "anthropic";
+const sameDomain = (): DisclosureDomain => ({
+	provider: "anthropic",
+	origin: "https://api.example.test",
+	auth: "account-1",
+	local: false,
+});
+
+function candidateDomain(model: Model): DisclosureDomain | undefined {
+	return modelDisclosureDomain(model, model.baseUrl, model.headers?.account);
+}
 
 describe("judgeFindingGroups", () => {
+	for (const host of ["interactive", "rpc", "acp"] as const) {
+		it(`does not disclose reports to the judge by default in ${host} sessions`, async () => {
+			const settings = Settings.isolated();
+			if (host !== "interactive") {
+				for (const setting of all()) {
+					if (setting.definition.protocolDefault?.includes(host)) setting.pinDefault(settings);
+				}
+			}
+			const { ledger, findings } = ledgerWithPair();
+			const { judge, requests } = chain([{ provider: "anthropic" }]);
+			const outcome = await judgeFindingGroups({
+				ledger,
+				touched: findings,
+				categories: CATEGORIES,
+				settings: { ...SETTINGS, enabled: cfgAdvisorAggregationJudgeEnabled.get(settings) },
+				judge,
+				advisorDomain: sameDomain,
+				judgeDomain: candidateDomain,
+			});
+			expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 0, failed: 0 });
+			expect(requests).toEqual([]);
+			expect(ledger.list()).toHaveLength(2);
+		});
+	}
+
 	it("merges a same pair into the highest-precedence category without dropping report text", async () => {
 		const { ledger, findings } = ledgerWithPair();
 		const { judge, requests } = chain([{ provider: "anthropic" }]);
@@ -125,7 +173,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome).toEqual({ judged: 1, merged: 1, blocked: 0, failed: 0 });
 		expect(requests).toEqual(["anthropic"]);
@@ -151,7 +200,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome).toEqual({ judged: 1, merged: 0, blocked: 0, failed: 0 });
 		expect(ledger.list().map(finding => finding.id)).toEqual(["F1", "F2"]);
@@ -166,7 +216,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
 		expect(requests).toEqual([]);
@@ -182,22 +233,24 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: advisor => (advisor === "Security" ? "openai" : "anthropic"),
+			advisorDomain: advisor => ({ ...sameDomain(), provider: advisor === "Security" ? "openai" : "anthropic" }),
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome.blocked).toBe(1);
 		expect(requests).toEqual([]);
 	});
 
-	it("sends cross-provider only with allowCrossProvider", async () => {
+	it("sends cross-domain only with allowCrossDomain", async () => {
 		const { ledger, findings } = ledgerWithPair();
 		const { judge, requests } = chain([{ provider: "openai" }]);
 		const outcome = await judgeFindingGroups({
 			ledger,
 			touched: findings,
 			categories: CATEGORIES,
-			settings: { ...SETTINGS, allowCrossProvider: true },
+			settings: { ...SETTINGS, allowCrossDomain: true },
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome.merged).toBe(1);
 		expect(requests).toEqual(["openai"]);
@@ -212,8 +265,118 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
+		expect(requests).toEqual(["anthropic"]);
+		expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
+		expect(ledger.list()).toHaveLength(2);
+	});
+
+	for (const candidate of [{ baseUrl: "https://other.example.test/v1" }, { account: "account-2" }]) {
+		it(`blocks same-provider reports with a different ${candidate.baseUrl ? "base URL origin" : "account"}`, async () => {
+			const { ledger, findings } = ledgerWithPair();
+			const { judge, requests } = chain([{ provider: "anthropic", ...candidate }]);
+			const outcome = await judgeFindingGroups({
+				ledger,
+				touched: findings,
+				categories: CATEGORIES,
+				settings: SETTINGS,
+				judge,
+				advisorDomain: sameDomain,
+				judgeDomain: candidateDomain,
+			});
+			expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
+			expect(requests).toEqual([]);
+			expect(ledger.list()).toHaveLength(2);
+		});
+	}
+
+	for (const [advisorAuth, judgeAuth] of [
+		[undefined, undefined],
+		[undefined, "account-1"],
+		["account-1", undefined],
+	] as const) {
+		it(`blocks unknown authentication identities (${advisorAuth ?? "unknown"} advisor, ${judgeAuth ?? "unknown"} judge)`, async () => {
+			const { ledger, findings } = ledgerWithPair();
+			const { judge, requests } = chain([{ provider: "anthropic" }]);
+			const outcome = await judgeFindingGroups({
+				ledger,
+				touched: findings,
+				categories: CATEGORIES,
+				settings: SETTINGS,
+				judge,
+				advisorDomain: () => ({ ...sameDomain(), auth: advisorAuth }),
+				judgeDomain: () => ({ ...sameDomain(), auth: judgeAuth }),
+			});
+			expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
+			expect(requests).toEqual([]);
+			expect(ledger.list()).toHaveLength(2);
+		});
+	}
+
+	it("judges matching explicitly keyless local endpoints without an auth identity", async () => {
+		const { ledger, findings } = ledgerWithPair();
+		const { judge, requests } = chain([{ provider: "anthropic" }]);
+		const localModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const outcome = await judgeFindingGroups({
+			ledger,
+			touched: findings,
+			categories: CATEGORIES,
+			settings: SETTINGS,
+			judge,
+			advisorDomain: () => modelDisclosureDomain(localModel, "http://localhost:1234/v1", undefined, true),
+			judgeDomain: () => modelDisclosureDomain(localModel, "http://localhost:1234/v1", undefined, true),
+		});
+		expect(outcome).toEqual({ judged: 1, merged: 1, blocked: 0, failed: 0 });
+		expect(requests).toEqual(["anthropic"]);
+		expect(ledger.list()).toHaveLength(1);
+	});
+
+	for (const [baseUrl, explicitlyKeyless] of [
+		["http://localhost:1234/v1", false],
+		["https://api.example.test/v1", true],
+		["http://localhost:1234/other", true],
+	] as const) {
+		it(`blocks an unauthenticated endpoint without a matching explicit keyless local domain (${baseUrl}, keyless=${explicitlyKeyless})`, async () => {
+			const { ledger, findings } = ledgerWithPair();
+			const { judge, requests } = chain([{ provider: "anthropic" }]);
+			const localModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const outcome = await judgeFindingGroups({
+				ledger,
+				touched: findings,
+				categories: CATEGORIES,
+				settings: SETTINGS,
+				judge,
+				advisorDomain: () => modelDisclosureDomain(localModel, "http://localhost:1234/v1", undefined, true),
+				judgeDomain: () => modelDisclosureDomain(localModel, baseUrl, undefined, explicitlyKeyless),
+			});
+			expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
+			expect(requests).toEqual([]);
+			expect(ledger.list()).toHaveLength(2);
+		});
+	}
+
+	it("blocks a fallback member with the same provider but a different disclosure domain", async () => {
+		const { ledger, findings } = ledgerWithPair();
+		const { judge, requests } = chain([
+			{ provider: "anthropic", fail: true },
+			{ provider: "anthropic", baseUrl: "https://other.example.test/v1" },
+		]);
+		let resolutions = 0;
+		const outcome = await judgeFindingGroups({
+			ledger,
+			touched: findings,
+			categories: CATEGORIES,
+			settings: SETTINGS,
+			judge,
+			advisorDomain: () => {
+				resolutions++;
+				return sameDomain();
+			},
+			judgeDomain: candidateDomain,
+		});
+		expect(resolutions).toBeGreaterThan(2);
 		expect(requests).toEqual(["anthropic"]);
 		expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 1, failed: 0 });
 		expect(ledger.list()).toHaveLength(2);
@@ -228,7 +391,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: { ...SETTINGS, timeoutMs: 20 },
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(requests).toEqual(["anthropic"]);
 		expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 0, failed: 1 });
@@ -244,7 +408,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome.failed).toBe(1);
 		expect(ledger.list()).toHaveLength(2);
@@ -259,7 +424,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: { ...SETTINGS, enabled: false },
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(outcome).toEqual({ judged: 0, merged: 0, blocked: 0, failed: 0 });
 		expect(requests).toEqual([]);
@@ -277,7 +443,8 @@ describe("judgeFindingGroups", () => {
 				categories: CATEGORIES,
 				settings: SETTINGS,
 				judge,
-				providerOf: sameProvider,
+				advisorDomain: sameDomain,
+				judgeDomain: candidateDomain,
 			}),
 		).toEqual({ judged: 0, merged: 0, blocked: 0, failed: 0 });
 		expect(
@@ -287,7 +454,8 @@ describe("judgeFindingGroups", () => {
 				categories: CATEGORIES,
 				settings: SETTINGS,
 				judge,
-				providerOf: sameProvider,
+				advisorDomain: sameDomain,
+				judgeDomain: candidateDomain,
 			}),
 		).toEqual({ judged: 0, merged: 0, blocked: 0, failed: 0 });
 		expect(requests).toEqual([]);
@@ -306,7 +474,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		expect(questions).toEqual([["F1_F3", "F2_F3"]]);
 	});
@@ -321,7 +490,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		const [lead] = ledger.list();
 		const merged = lead!.reports.filter(report => report.category === "logic").map(report => report.defect);
@@ -341,7 +511,8 @@ describe("judgeFindingGroups", () => {
 			categories: CATEGORIES,
 			settings: SETTINGS,
 			judge,
-			providerOf: sameProvider,
+			advisorDomain: sameDomain,
+			judgeDomain: candidateDomain,
 		});
 		const restored = new AdvisorFindingsLedger({ ownerOf: category => OWNERS[category] });
 		restored.load(structuredClone(ledger.toEntry()));

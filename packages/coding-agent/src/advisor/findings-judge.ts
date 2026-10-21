@@ -11,8 +11,75 @@ export interface FindingsJudgeSettings {
 	/** Model selector; `@judge` is the `judge` model role. */
 	model: string;
 	timeoutMs: number;
-	/** Whether report text may reach a judge on another provider than its advisors'. */
-	allowCrossProvider: boolean;
+	/** Whether report text may reach a judge whose disclosure domain differs from its advisors'. */
+	allowCrossDomain: boolean;
+}
+
+/**
+ * Models share a disclosure domain only with matching known auth identities,
+ * or matching explicitly keyless local endpoints.
+ */
+export interface DisclosureDomain {
+	provider: string;
+	/** Origin of the resolved base URL; empty for in-process inference. */
+	origin: string;
+	/** Credential/account source, including auth-broker URL when used; undefined when unknown or keyless. */
+	auth: string | undefined;
+	/** Whether the endpoint runs on this machine (in-process or loopback). */
+	local: boolean;
+	/** Normalized base URL of an explicitly keyless local request; empty for in-process inference. */
+	keylessLocalEndpoint?: string;
+}
+
+/**
+ * Disclosure domain of a request to `model` at `baseUrl` authenticated by
+ * `auth`. Undefined when a remote model has no parseable base URL.
+ */
+export function modelDisclosureDomain(
+	model: Pick<Model, "provider" | "api">,
+	baseUrl: string | undefined,
+	auth: string | undefined,
+	explicitlyKeyless = false,
+): DisclosureDomain | undefined {
+	if (model.api === "local-inference") {
+		return { provider: model.provider, origin: "", auth, local: true, keylessLocalEndpoint: "" };
+	}
+	if (!baseUrl) return undefined;
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		return undefined;
+	}
+	const local = isLoopbackHost(url.hostname);
+	return {
+		provider: model.provider,
+		origin: url.origin,
+		auth,
+		local,
+		...(explicitlyKeyless && local ? { keylessLocalEndpoint: url.href } : {}),
+	};
+}
+
+function isLoopbackHost(hostname: string): boolean {
+	const host = hostname.toLowerCase();
+	return host === "localhost" || host.endsWith(".localhost") || host === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+function sameDisclosureDomain(a: DisclosureDomain | undefined, b: DisclosureDomain | undefined): boolean {
+	return (
+		a !== undefined &&
+		b !== undefined &&
+		a.provider === b.provider &&
+		a.origin === b.origin &&
+		a.auth === b.auth &&
+		(a.auth !== undefined ||
+			(a.local &&
+				b.local &&
+				a.keylessLocalEndpoint !== undefined &&
+				a.keylessLocalEndpoint === b.keylessLocalEndpoint)) &&
+		a.local === b.local
+	);
 }
 
 /** Judge candidates tried in chain order; `model` is the candidate a call is about to reach. */
@@ -31,8 +98,10 @@ export interface FindingsJudgePass {
 	categories: readonly AdvisorCategory[];
 	settings: FindingsJudgeSettings;
 	judge: FindingsJudgeCandidates;
-	/** Provider of the advisor named `advisor`'s model; undefined when unknown. */
-	providerOf: (advisor: string) => string | undefined;
+	/** Current disclosure domain of the advisor named `advisor`; undefined when unknown. */
+	advisorDomain: (advisor: string) => DisclosureDomain | undefined;
+	/** Disclosure domain of a judge candidate whose credential is resolved; undefined when unknown. */
+	judgeDomain: (model: Model) => DisclosureDomain | undefined;
 }
 
 /** What one judge pass did, counted per anchor group. */
@@ -41,7 +110,7 @@ export interface FindingsJudgeOutcome {
 	judged: number;
 	/** Findings merged into another one. */
 	merged: number;
-	/** Groups skipped because a candidate's provider differs from a source advisor's. */
+	/** Groups skipped because a candidate's disclosure domain differs from a source advisor's. */
 	blocked: number;
 	/** Groups whose judgment failed, timed out, or returned an unusable answer. */
 	failed: number;
@@ -73,10 +142,11 @@ function findingState(finding: AdvisorFinding): JsonValue {
  * touched, are judged, one request per group with one `same`/`distinct`
  * question per pair that includes a touched finding. Findings judged `same`
  * merge into the one whose category has the highest precedence (the oldest on
- * a tie). Before each candidate call, the candidate's provider must equal the
- * provider of every advisor that reported a judged finding unless
- * `allowCrossProvider` is set; otherwise the group is not judged. A failed,
- * timed-out, or malformed judgment leaves the group unchanged.
+ * a tie). Before each candidate call, the candidate's disclosure domain and
+ * every reporting advisor's current domain are resolved; unless
+ * `allowCrossDomain` is set, they must all be equal, otherwise nothing is sent
+ * and the group is not judged. A failed, timed-out, or malformed judgment
+ * leaves the group unchanged.
  */
 export async function judgeFindingGroups(pass: FindingsJudgePass): Promise<FindingsJudgeOutcome> {
 	const outcome: FindingsJudgeOutcome = { judged: 0, merged: 0, blocked: 0, failed: 0 };
@@ -114,8 +184,7 @@ async function judgePairs(
 	pairs: readonly [AdvisorFinding, AdvisorFinding][],
 ): Promise<Verdict[] | typeof BLOCKED | undefined> {
 	const findings = [...new Set(pairs.flat())];
-	const sources = new Set(findings.flatMap(finding => finding.reports.map(report => report.advisor)));
-	const providers = [...sources].map(advisor => pass.providerOf(advisor));
+	const sources = [...new Set(findings.flatMap(finding => finding.reports.map(report => report.advisor)))];
 	const questions: Record<string, ChoiceQuestion<Verdict>> = {};
 	const ids = pairs.map(([a, b]) => `${a.id}_${b.id}`);
 	pairs.forEach(([a, b], index) => {
@@ -130,8 +199,11 @@ async function judgePairs(
 	try {
 		const result = await pass.judge.withCandidate(
 			async (judge, _kind, model) => {
-				if (!pass.settings.allowCrossProvider && !providers.every(provider => provider === model.provider)) {
-					return BLOCKED;
+				if (!pass.settings.allowCrossDomain) {
+					const candidate = pass.judgeDomain(model);
+					if (!sources.every(advisor => sameDisclosureDomain(candidate, pass.advisorDomain(advisor)))) {
+						return BLOCKED;
+					}
 				}
 				return judge.judge({ state, questions }, { signal });
 			},

@@ -73,6 +73,7 @@ import {
 	buildAdvisorQuarantineSourceText,
 	canReadFileAnchor,
 	compareAdvisorNotes,
+	type DisclosureDomain,
 	type FindingsJudgeCandidates,
 	type FindingsJudgeSettings,
 	discoverWorkspaceRoots,
@@ -84,6 +85,7 @@ import {
 	isInterruptingSeverity,
 	judgeFindingGroups,
 	meetsAdvisorSeverity,
+	modelDisclosureDomain,
 	normalizeAdvisorNote,
 	quarantineAdvisorUnsafeOutput,
 	renderFindingsDigest,
@@ -145,7 +147,7 @@ import type { YieldQueue } from "./yield-queue";
 
 import {
 	cfgAdvisorContinueSeverity,
-	cfgAdvisorAggregationJudgeAllowCrossProvider,
+	cfgAdvisorAggregationJudgeAllowCrossDomain,
 	cfgAdvisorAggregationJudgeEnabled,
 	cfgAdvisorAggregationJudgeModel,
 	cfgAdvisorAggregationJudgeTimeoutMs,
@@ -1663,7 +1665,7 @@ export class SessionAdvisors {
 						currentAdvisorInput = "";
 					}
 					if (quarantined) throw new AdvisorOutputQuarantinedError(quarantined);
-					await this.#judgeUpdateFindings(reportsBefore);
+					await this.queueFindingsJudgePass(reportsBefore);
 				},
 				abort: reason => advisorAgent.abort(reason),
 				reset: () => {
@@ -3058,8 +3060,9 @@ export class SessionAdvisors {
 	 * `advisor.aggregation.judge`. Passes of parallel advisors run one at a
 	 * time, each on the ledger the previous one left. Errors leave the ledger
 	 * unchanged.
+	 * @internal
 	 */
-	#judgeUpdateFindings(reportsBefore: ReadonlySet<AdvisorReport>): Promise<void> {
+	queueFindingsJudgePass(reportsBefore: ReadonlySet<AdvisorReport>): Promise<void> {
 		const pass = this.#findingsJudgePass.then(() => this.#runFindingsJudgePass(reportsBefore));
 		this.#findingsJudgePass = pass.catch(error => {
 			logger.warn("advisor findings judge pass failed", { error: String(error) });
@@ -3073,7 +3076,7 @@ export class SessionAdvisors {
 			enabled: cfgAdvisorAggregationJudgeEnabled.get(settings),
 			model: cfgAdvisorAggregationJudgeModel.get(settings),
 			timeoutMs: cfgAdvisorAggregationJudgeTimeoutMs.get(settings),
-			allowCrossProvider: cfgAdvisorAggregationJudgeAllowCrossProvider.get(settings),
+			allowCrossDomain: cfgAdvisorAggregationJudgeAllowCrossDomain.get(settings),
 		};
 		if (!judgeSettings.enabled) return;
 		const touched = this.#findings
@@ -3089,15 +3092,30 @@ export class SessionAdvisors {
 				categories: this.#advisorCategories,
 				settings: judgeSettings,
 				judge,
-				providerOf: name =>
-					this.#advisors.find(advisor => advisor.name.trim().toLowerCase() === name.trim().toLowerCase())?.agent
-						.state.model?.provider,
+				advisorDomain: name => {
+					const advisor = this.#advisors.find(
+						advisor => advisor.name.trim().toLowerCase() === name.trim().toLowerCase(),
+					);
+					const model = advisor?.agent.state.model;
+					return model ? this.#findingsDisclosureDomain(model, advisor?.providerSessionId) : undefined;
+				},
+				judgeDomain: model => this.#findingsDisclosureDomain(model, this.#host.sessionId()),
 			});
 			if (outcome.judged + outcome.blocked + outcome.failed > 0)
 				logger.debug("advisor findings judged", { ...outcome });
 		} catch (error) {
 			logger.warn("advisor findings judge pass failed", { error: String(error) });
 		}
+	}
+
+	#findingsDisclosureDomain(model: Model, sessionId: string | undefined): DisclosureDomain | undefined {
+		const registry = this.#host.modelRegistry;
+		return modelDisclosureDomain(
+			model,
+			model.baseUrl || registry.getProviderBaseUrl(model.provider),
+			registry.authStorage.keys.describe(model.provider, sessionId),
+			registry.isKeylessProvider(model.provider),
+		);
 	}
 
 	/** The judge candidates for `advisor.aggregation.judge.model`; `@judge` is the `judge` model role chain. */

@@ -501,10 +501,12 @@ Advisors review primary turns on a configurable cadence and can inject advice. E
 | `advisor.maxNotesPerUpdate` | number | `4` | Non-blocker notes accepted per advisor review, from 1–32. Higher-severity notes can replace only pending notes from the same review. `WATCHDOG.yml` top-level or per-advisor values override this default. |
 | `advisor.evictStaleResults` | boolean | `true` | Before each review, replace the advisor's `read`/`grep`/`glob` output from older reviews with a short placeholder. The latest review is kept. |
 | `advisor.findingsDigest` | boolean | `true` | Before each review, show each advisor the open advisor findings (id, category, severity, owner, reporter count). |
-| `advisor.aggregation.judge.enabled` | boolean | `true` | After an advisor update, judge whether open findings of different categories on one anchor are the same defect and merge those that are. |
+| `advisor.aggregation.judge.enabled` | boolean | `false` | Off by default in interactive, RPC, and ACP sessions. When enabled, judge whether open findings of different categories on one anchor are the same defect and merge those that are. Report text stays within matching disclosure domains unless `allowCrossDomain` is enabled. |
 | `advisor.aggregation.judge.model` | string | `@judge` | Findings judge model; only `@judge` (the `judge` role chain) is supported, other values skip the judge. |
 | `advisor.aggregation.judge.timeoutMs` | number | `10000` | Deadline of one anchor group's judgment; on timeout the findings stay as recorded. |
-| `advisor.aggregation.judge.allowCrossProvider` | boolean | `false` | Let report text reach a judge candidate whose provider differs from the reporting advisors'. |
+| `advisor.aggregation.judge.allowCrossDomain` | boolean | `false` | Let report text reach a judge candidate whose disclosure domain (provider id, resolved base URL origin, authentication source/account including auth-broker URL, local versus remote endpoint) differs from any reporting advisor's. Domains are re-resolved before every fallback candidate call. |
+
+Without `allowCrossDomain`, missing authentication identities block judging, even when both are missing. Only explicitly keyless local endpoints may match without an identity, with the same normalized base URL (or both in-process on the same provider).
 
 ### Thinking
 

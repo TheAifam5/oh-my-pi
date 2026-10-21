@@ -3297,7 +3297,8 @@ export class ModelRegistry {
 		return model.headers ? { ...model.headers } : undefined;
 	}
 
-	#isKeylessProvider(provider: string): boolean {
+	/** Whether this provider is explicitly keyless and has no credential override or active auth source. */
+	isKeylessProvider(provider: string): boolean {
 		return (
 			(this.#keylessProviders.has(provider) || this.authStorage.keys.keyless(provider)) &&
 			this.authStorage.keys.source(provider) === undefined
@@ -3313,7 +3314,7 @@ export class ModelRegistry {
 		// A disabled provider gets no credential, so no request reaches it however
 		// its model was obtained.
 		if (this.#isProviderDisabled(model.provider)) return undefined;
-		if (this.#isKeylessProvider(model.provider)) {
+		if (this.isKeylessProvider(model.provider)) {
 			return kNoAuth;
 		}
 		return this.authStorage.keys.get(model.provider, sessionId, {
@@ -3375,7 +3376,7 @@ export class ModelRegistry {
 	): Promise<ResolvedApiKey | undefined> {
 		if (this.#isProviderDisabled(provider)) return undefined;
 		if (options?.forceRefresh) this.#invalidateProviderCommandConfigs(provider);
-		if (this.#isKeylessProvider(provider)) {
+		if (this.isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
 		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;

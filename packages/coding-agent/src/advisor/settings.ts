@@ -181,13 +181,13 @@ export const cfgAdvisorAggregationJudgeEnabled = register({
 	id: "advisor.aggregation.judge.enabled",
 	protocolDefault: ["rpc", "acp"],
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "model",
 		group: "Advisor",
 		label: "Advisor Findings Judge",
 		description:
-			"After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its provider matches every reporting advisor's.",
+			"Off by default. After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its disclosure domain (provider, base URL origin, authentication source/account, and local or remote endpoint) matches every reporting advisor's, unless allowCrossDomain is enabled.",
 		condition: "advisorEnabled",
 	},
 });
@@ -206,8 +206,8 @@ export const cfgAdvisorAggregationJudgeTimeoutMs = register({
 	default: 10_000,
 });
 
-export const cfgAdvisorAggregationJudgeAllowCrossProvider = register({
-	id: "advisor.aggregation.judge.allowCrossProvider",
+export const cfgAdvisorAggregationJudgeAllowCrossDomain = register({
+	id: "advisor.aggregation.judge.allowCrossDomain",
 	protocolDefault: ["rpc", "acp"],
 	type: "boolean",
 	default: false,

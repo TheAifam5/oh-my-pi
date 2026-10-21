@@ -291,10 +291,10 @@ A finding is `open` until its owner reports `resolved`, the user resolves it wit
 
 | Setting                                        | Default  | Effect                                                                              |
 | ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------- |
-| `advisor.aggregation.judge.enabled`            | `true`   | Run the pass.                                                                       |
+| `advisor.aggregation.judge.enabled`            | `false`  | Run the pass; off by default in interactive, RPC, and ACP sessions.                    |
 | `advisor.aggregation.judge.model`              | `@judge` | Judge model; `@judge` is the `judge` model role chain. Other values skip the pass.  |
 | `advisor.aggregation.judge.timeoutMs`          | `10000`  | Deadline of one group's judgment, fallback candidates included.                     |
-| `advisor.aggregation.judge.allowCrossProvider` | `false`  | Send report text to a judge candidate whose provider differs from the advisors'.    |
+| `advisor.aggregation.judge.allowCrossDomain`   | `false`  | Send report text to a judge candidate with a different disclosure domain.              |
 
 Only anchor groups are judged: open findings sharing one [anchor identity](#anchors), in at least two categories, one of which gained a report during the update. Each group is one judgment holding every judged finding's id, category, anchor display, and reports (kind, severity, defect, impact, fix), with one choice question per pair that includes a finding touched by the update; each answer must be `same` or `distinct`, and any other answer fails the group. Findings judged `same` merge into the one whose category has the highest precedence (the oldest on a tie): every report of the merged finding joins the lead (none is dropped by the report cap), the lead keeps the higher severity, and the merged finding's id and category become aliases, so `/advisor findings resolve` on the old id and later reports in its category on that anchor reach the lead. Merges persist in the `advisor_findings` entry (`merged`). Delivery already routed during the update is unchanged.
 
@@ -308,7 +308,8 @@ A failed, timed-out, or malformed judgment leaves the group as recorded. When th
 
 - Anchor identities, line hashes, and read-gate results stay in the host; models never see them.
 - The digest shows other advisors' findings as metadata only (see [Findings digest](#findings-digest)).
-- Report text reaches the findings judge only when the provider of the judge candidate about to be called equals the provider of every advisor that reported a judged finding (an advisor no longer in the roster has no known provider). The check runs before each candidate call, because the `judge` role chain may fall back to another provider; a candidate that fails the check ends the group's judgment without sending anything, and the group is not judged. `allowCrossProvider: true` disables the check.
+- The findings judge is off by default. When enabled, report text reaches a judge candidate only when its disclosure domain equals every reporting advisor's current domain: provider id, resolved base URL origin, authentication source (credential/account identity, including the auth-broker URL when used), and local versus remote endpoint. Domains are resolved again before each candidate call, including fallback models and account changes. An advisor no longer in the roster or an endpoint with no known origin has no known domain. A candidate that fails the check ends the group's judgment without receiving report text, and the group is not judged. `advisor.aggregation.judge.allowCrossDomain: true` bypasses the domain check.
+- Missing authentication identities never match, including another missing identity. The only unauthenticated exception is an explicitly keyless local endpoint: both sides must be local and keyless, with the same normalized base URL (or both in-process on the same provider).
 
 ### Emission guard
 

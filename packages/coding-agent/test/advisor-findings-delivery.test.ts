@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -10,6 +10,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionAdvisors } from "@oh-my-pi/pi-coding-agent/session/session-advisors";
+import { ChainJudge } from "@oh-my-pi/pi-coding-agent/judgment";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import {
@@ -17,6 +19,8 @@ import {
 	type AdviseParams,
 	AdviseTool,
 	type AdvisorCategory,
+	AdvisorFindingsLedger,
+	type AdvisorReportInput,
 	formatAdvisorBatchContent,
 } from "../src/advisor";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -482,6 +486,50 @@ describe("advisor findings delivery", () => {
 		}
 	});
 
+	it("saves a finding in its original session before a same-tick session switch", async () => {
+		const tools = enable();
+		const originalId = sessionManager.getSessionId();
+		const branchPoint = sessionManager.appendCustomEntry("before-finding", {});
+		let originalEntries = structuredClone(sessionManager.getEntries());
+		const record = AdvisorFindingsLedger.prototype.record;
+		const recordSpy = spyOn(AdvisorFindingsLedger.prototype, "record").mockImplementation(function (
+			this: AdvisorFindingsLedger,
+			input: AdvisorReportInput,
+		) {
+			const result = record.call(this, input);
+			originalEntries = structuredClone(sessionManager.getEntries());
+			sessionManager.createBranchedSession(branchPoint);
+			return result;
+		});
+		try {
+			await advise(tools.get("Correctness"), report("security", "Token compared with ==.", "nit"));
+			expect(sessionManager.getSessionId()).not.toBe(originalId);
+			expect(
+				originalEntries.filter(
+					entry => entry.type === "custom" && entry.customType === ADVISOR_FINDINGS_ENTRY_TYPE,
+				),
+			).toEqual([
+				expect.objectContaining({
+					data: expect.objectContaining({
+						findings: [
+							expect.objectContaining({
+								id: "F1",
+								reports: [expect.objectContaining({ advisor: "Correctness" })],
+							}),
+						],
+					}),
+				}),
+			]);
+			expect(
+				sessionManager
+					.getEntries()
+					.filter(entry => entry.type === "custom" && entry.customType === ADVISOR_FINDINGS_ENTRY_TYPE),
+			).toEqual([]);
+		} finally {
+			recordSpy.mockRestore();
+		}
+	});
+
 	describe("resume", () => {
 		const persisted = {
 			id: "F4",
@@ -664,8 +712,6 @@ describe("advisor findings delivery", () => {
 		};
 
 		interface JudgeHarness {
-			/** Both advisors end their updates together: each waits for the other after its `advise` call. */
-			together?: boolean;
 			/** The judge answers only after this settles. */
 			judgeHold?: Promise<void>;
 			/** Called, not awaited, on the first judge request with the live request list. */
@@ -708,18 +754,10 @@ describe("advisor findings delivery", () => {
 				SOURCE,
 			);
 			const primaryMock = createMockModel({ provider: "anthropic", responses: [{ content: ["done"] }] });
-			const reviewed = { count: 0, both: Promise.withResolvers<void>() };
 			const advisorMock = (params: AdviseParams) =>
 				createMockModel({
 					provider: "fakeco",
 					responses: [{ content: [{ type: "toolCall", name: "advise", arguments: { ...params } }] }],
-					handler: async () => {
-						if (harness.together) {
-							if (++reviewed.count === 2) reviewed.both.resolve();
-							await reviewed.both.promise;
-						}
-						return { content: ["Reviewed."] };
-					},
 				});
 			const advisorMocks: Record<"Security" | "Correctness", MockModel> = {
 				Security: advisorMock(report("security", "Non-constant-time token check.")),
@@ -727,6 +765,7 @@ describe("advisor findings delivery", () => {
 			};
 			const settings = Settings.isolated({
 				"advisor.syncBacklog": "strict",
+				"advisor.aggregation.judge.enabled": true,
 				"compaction.enabled": false,
 				"todo.enabled": false,
 			});
@@ -787,24 +826,43 @@ describe("advisor findings delivery", () => {
 
 		it("runs the judge passes of advisors finishing together one at a time", async () => {
 			const release = Promise.withResolvers<void>();
+			const bothUpdatesReady = Promise.withResolvers<void>();
+			const bothQueued = Promise.withResolvers<void>();
+			const queuePass = SessionAdvisors.prototype.queueFindingsJudgePass;
+			let queued = 0;
+			let ready = 0;
+			const candidatePassSpy = spyOn(ChainJudge.prototype, "withCandidate");
 			let inFlight = -1;
-			const requests = await reviewWithJudge("fakeco/adv-1", {
-				together: true,
-				judgeHold: release.promise,
-				onFirstJudgeRequest: async live => {
-					// A queued pass emits no event to await; a short real wait gives an unqueued
-					// second pass time to reach the judge, which this test asserts never happens.
-					await Bun.sleep(100);
-					inFlight = live.length;
-					release.resolve();
+			const queuedSpy = spyOn(SessionAdvisors.prototype, "queueFindingsJudgePass").mockImplementation(
+				async function (this: SessionAdvisors, reportsBefore) {
+					if (++ready === 2) bothUpdatesReady.resolve();
+					await bothUpdatesReady.promise;
+					const pass = queuePass.call(this, reportsBefore);
+					if (++queued === 2) bothQueued.resolve();
+					return pass;
 				},
-			});
-			expect(inFlight).toBe(1);
-			// The second pass ran after the first merged, so it found nothing left to judge.
-			expect(requests).toHaveLength(1);
-			const findings = session.getAdvisorFindings();
-			expect(findings).toHaveLength(1);
-			expect(findings[0]?.merged?.map(merged => merged.category)).toEqual(["logic"]);
+			);
+			try {
+				const requests = await reviewWithJudge("fakeco/adv-1", {
+					judgeHold: release.promise,
+					onFirstJudgeRequest: async () => {
+						await bothQueued.promise;
+						inFlight = candidatePassSpy.mock.calls.length;
+						release.resolve();
+					},
+				});
+				expect(queued).toBe(2);
+				expect(inFlight).toBe(1);
+				expect(candidatePassSpy).toHaveBeenCalledTimes(1);
+				expect(requests).toHaveLength(1);
+				const findings = session.getAdvisorFindings();
+				expect(findings).toHaveLength(1);
+				expect(findings[0]?.merged?.map(merged => merged.category)).toEqual(["logic"]);
+			} finally {
+				release.resolve();
+				queuedSpy.mockRestore();
+				candidatePassSpy.mockRestore();
+			}
 		});
 	});
 
