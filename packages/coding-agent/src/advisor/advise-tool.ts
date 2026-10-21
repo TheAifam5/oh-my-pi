@@ -21,6 +21,7 @@ import {
 	adviseWhereSchema,
 	emptyAnchorFields,
 	formatAnchorDisplay,
+	isApproachIdentity,
 	resolveAnchorIdentity,
 } from "./anchor-identity";
 import { AdvisorEmissionGuard, type AdvisorSuppressionReason, advisorDedupeKey } from "./emission-guard";
@@ -50,7 +51,7 @@ const adviseShape = {
 	"relation?": type
 		.enumerated(...ADVISOR_RELATIONS)
 		.describe(
-			"How the report relates to `relatesTo`: duplicate (same anchor), adds, escalates (higher severity), disputes, resolved (owner only).",
+			"How the report relates to `relatesTo`: duplicate (same anchor; any topic between two approach anchors), adds, escalates (higher severity), disputes, resolved (owner only).",
 		),
 };
 
@@ -592,7 +593,8 @@ export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> 
 	/**
 	 * The open finding a report names through `relatesTo`, with the relation
 	 * it takes effect as: `duplicate` only when the report's anchor identity
-	 * matches the finding's, `resolved` only from the finding's owner (else
+	 * matches the finding's or both anchors are `approach` anchors (whose
+	 * topics are free text), `resolved` only from the finding's owner (else
 	 * `disputes`). Undefined for an unknown or closed id or an unmatched
 	 * duplicate: the report then counts as unrelated.
 	 */
@@ -603,7 +605,13 @@ export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> 
 		if (args.relatesTo === undefined || args.relation === undefined) return undefined;
 		const finding = this.#ledger.get(args.relatesTo);
 		if (!finding || finding.status !== "open") return undefined;
-		if (args.relation === "duplicate" && finding.identity !== anchorIdentity) return undefined;
+		if (
+			args.relation === "duplicate" &&
+			finding.identity !== anchorIdentity &&
+			!(isApproachIdentity(finding.identity) && isApproachIdentity(anchorIdentity))
+		) {
+			return undefined;
+		}
 		if (args.relation === "resolved" && !this.#ledger.isOwner(finding, this.#advisor)) {
 			return { finding, relation: "disputes" };
 		}

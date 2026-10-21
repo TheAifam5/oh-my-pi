@@ -37,6 +37,7 @@
 - Changed advisor delivery to interrupt once per anchor per primary turn: a report on another category's finding at an already-interrupted anchor arrives as an aside unless its severity is strictly higher (once); terminal-boundary batches lead each anchor with its highest-precedence category
 - Changed advisor attachment delivery to a per-advisor, per-update cap equal to that advisor's budget: further reports on existing findings are recorded on the finding but not delivered
 - Changed the findings judge privacy gate to reject unknown authentication identities; explicitly keyless local endpoints may match without credentials only on the same normalized base URL
+- Changed advisor findings linking: the open-findings digest shows readable file anchors and `approach` topics and advisors are told to relate reports to listed findings, a `duplicate` between two `approach` anchors is accepted whatever the topics, and a relative file anchor resolves under the git worktree where the primary last edited or wrote that path instead of always the session cwd
 
 ### Added
 

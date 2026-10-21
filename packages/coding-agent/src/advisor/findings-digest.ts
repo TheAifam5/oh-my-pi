@@ -1,6 +1,6 @@
 import { prompt } from "@oh-my-pi/pi-utils";
 import findingsDigestTemplate from "../prompts/advisor/findings-digest.md" with { type: "text" };
-import { parseFileAnchor } from "./anchor-identity";
+import { isApproachIdentity, parseFileAnchor } from "./anchor-identity";
 import type { AdvisorFileAnchor, AdvisorFinding } from "./findings-ledger";
 
 /** Most findings one digest lists; the rest are counted. */
@@ -28,8 +28,9 @@ function fileAnchorDisplay(where: AdvisorFileAnchor): string {
  * open blockers first, then concerns, then nits, newest first; at most
  * {@link ADVISOR_FINDINGS_DIGEST_LIMIT} entries, then `and N more`. A file
  * anchor's path and line follow only when `viewer.canReadAnchor` allows the
- * file; no other anchor text and no report text is included. The owner's
- * entries add `possibly-fixed` when the anchored line changed.
+ * file; an `approach` anchor's topic follows as `approach="<topic>"`. No
+ * other anchor text and no report text is included. The owner's entries add
+ * `possibly-fixed` when the anchored line changed.
  */
 export function renderFindingsDigest(
 	findings: readonly AdvisorFinding[],
@@ -49,6 +50,9 @@ export function renderFindingsDigest(
 	const entries = open.slice(0, ADVISOR_FINDINGS_DIGEST_LIMIT).map(finding => {
 		let entry = `${finding.id} ${finding.category || "-"} ${finding.severity ?? "nit"} owner=${finding.owner ?? "-"} reporters=${new Set(finding.reports.map(report => report.advisor)).size}`;
 		if (finding.where && viewer.canReadAnchor(finding)) entry += ` at ${fileAnchorDisplay(finding.where)}`;
+		else if (!finding.where && isApproachIdentity(finding.identity)) {
+			entry += ` approach=${JSON.stringify(finding.anchor.trim().replace(/\s+/g, " "))}`;
+		}
 		if (finding.possiblyFixed && viewer.owns(finding)) entry += " possibly-fixed";
 		return entry;
 	});

@@ -3,6 +3,7 @@ import { type } from "@oh-my-pi/omptype";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { isAllowedWithoutPrompt } from "@oh-my-pi/pi-coding-agent/tools/approval";
@@ -16,6 +17,7 @@ import {
 	discoverWorkspaceRoots,
 	formatAnchorDisplay,
 	parseFileAnchor,
+	recordWrittenPaths,
 	resolveAnchorIdentity,
 } from "../../src/advisor";
 
@@ -291,5 +293,89 @@ describe("resolveAnchorIdentity", () => {
 		expect(await resolveAnchorIdentity(file(path.join(sibling, "lib.ts"), 2), { ...siblingCtx, roots: [repo] })).toBe(
 			`file:${path.join(sibling, "lib.ts")}:2`,
 		);
+	});
+
+	describe("relative anchors after primary writes", () => {
+		let worktree: string;
+		let worktreeCtx: AnchorIdentityContext;
+
+		const turn = (...results: { toolName: string; details: unknown; isError?: boolean }[]): AgentMessage[] => [
+			{ role: "user", content: "go", timestamp: 0 },
+			{ role: "assistant", content: [], timestamp: 0 } as unknown as AgentMessage,
+			...results.map((result, index): AgentMessage => ({
+				role: "toolResult",
+				toolCallId: `call-${index}`,
+				toolName: result.toolName,
+				content: [],
+				details: result.details,
+				isError: result.isError ?? false,
+				timestamp: 0,
+			})),
+		];
+
+		beforeEach(async () => {
+			worktree = path.join(base, "worktree");
+			await fs.mkdir(path.join(worktree, "a"), { recursive: true });
+			await fs.mkdir(path.join(root, "a"), { recursive: true });
+			await Bun.write(path.join(worktree, "a", "b.ts"), "one\ntwo\nworktree line\n");
+			await Bun.write(path.join(root, "a", "b.ts"), "one\ntwo\nmain line\n");
+			worktreeCtx = { ...ctx, roots: [root, worktree] };
+		});
+
+		it("resolves a relative path under the worktree the primary last wrote it in", async () => {
+			const written = new Set<string>();
+			recordWrittenPaths(
+				written,
+				turn({ toolName: "edit", details: { path: path.join(worktree, "a", "b.ts") } }),
+				root,
+			);
+			const withWrites = { ...worktreeCtx, writtenPaths: written };
+			const absolute = await resolveAnchorIdentity(file(path.join(worktree, "a", "b.ts"), 3), withWrites);
+			expect(await resolveAnchorIdentity(file("a/b.ts", 3), withWrites)).toBe(absolute);
+			expect(await resolveAnchorIdentity(file("a/b.ts:3"), withWrites)).toBe(absolute);
+
+			recordWrittenPaths(
+				written,
+				turn({ toolName: "write", details: { resolvedPath: path.join(root, "a", "b.ts") } }),
+				root,
+			);
+			expect(await resolveAnchorIdentity(file("a/b.ts", 3), withWrites)).toBe(
+				await resolveAnchorIdentity(file(path.join(root, "a", "b.ts"), 3), withWrites),
+			);
+		});
+
+		it("resolves a relative path against cwd without a matching write", async () => {
+			const cwdIdentity = await resolveAnchorIdentity(file(path.join(root, "a", "b.ts"), 3), worktreeCtx);
+			const worktreeIdentity = await resolveAnchorIdentity(file(path.join(worktree, "a", "b.ts"), 3), worktreeCtx);
+			expect(cwdIdentity).not.toBe(worktreeIdentity);
+			expect(await resolveAnchorIdentity(file("a/b.ts", 3), worktreeCtx)).toBe(cwdIdentity);
+			const elsewhere = new Set<string>();
+			recordWrittenPaths(
+				elsewhere,
+				turn({ toolName: "edit", details: { path: path.join(worktree, "other.ts") } }),
+				root,
+			);
+			expect(await resolveAnchorIdentity(file("a/b.ts", 3), { ...worktreeCtx, writtenPaths: elsewhere })).toBe(
+				cwdIdentity,
+			);
+		});
+
+		it("records only successful edit and write results of the last turn", () => {
+			const written = new Set<string>();
+			const earlier = turn({ toolName: "edit", details: { path: path.join(worktree, "old.ts") } });
+			recordWrittenPaths(
+				written,
+				[
+					...earlier,
+					...turn(
+						{ toolName: "edit", details: { perFileResults: [{ path: "a/b.ts" }, { path: "local://notes.md" }] } },
+						{ toolName: "write", details: { resolvedPath: path.join(worktree, "failed.ts") }, isError: true },
+						{ toolName: "read", details: { resolvedPath: path.join(worktree, "read.ts") } },
+					),
+				],
+				worktree,
+			);
+			expect([...written]).toEqual([path.join(worktree, "a", "b.ts")]);
+		});
 	});
 });

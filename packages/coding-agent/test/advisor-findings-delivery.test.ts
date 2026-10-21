@@ -340,6 +340,30 @@ describe("advisor findings delivery", () => {
 			});
 		});
 
+		it("links a duplicate between approach anchors with different topics", async () => {
+			const tools = enable();
+			session.agent.state.isStreaming = true;
+			try {
+				await advise(tools.get("Correctness"), {
+					...report("logic", "Edits land in the main checkout."),
+					where: { type: "approach", topic: "worktree isolation" },
+				});
+				session.agent.clearSteeringQueue();
+				await advise(tools.get("Performance"), {
+					...related("logic", "Changes bypass the sibling worktree.", "F1", "duplicate"),
+					where: { type: "approach", topic: "editing the wrong checkout" },
+				});
+				const findings = session.getAdvisorFindings();
+				expect(findings.map(finding => finding.id)).toEqual(["F1"]);
+				expect(findings[0]?.reports.map(r => r.advisor)).toEqual(["Correctness", "Performance"]);
+				expect(steered()).toHaveLength(0);
+				expect(asides().join("\n")).toContain('relation="duplicate"');
+			} finally {
+				session.agent.clearSteeringQueue();
+				session.agent.state.isStreaming = false;
+			}
+		});
+
 		it("records a duplicate repeating the lead report without delivering it", async () => {
 			await withOpenFinding(async tools => {
 				const ack = await advise(

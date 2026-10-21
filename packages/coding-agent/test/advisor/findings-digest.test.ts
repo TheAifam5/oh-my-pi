@@ -83,6 +83,16 @@ describe("renderFindingsDigest", () => {
 		expect(blind).not.toContain("src/auth.ts");
 	});
 
+	it("shows an approach topic to every advisor and no other non-file anchor text", () => {
+		const approach = finding(1, { identity: "approach:worktree-isolation", anchor: "worktree\n isolation" });
+		const command = finding(2, { identity: "command:rm -rf build", anchor: "rm -rf build" });
+		const blind = { owns: () => false, canReadAnchor: () => false };
+		const digest = renderFindingsDigest([approach, command], blind)!;
+		expect(digest).toContain('- F1 logic concern owner=Correctness reporters=2 approach="worktree isolation"\n');
+		expect(digest).toContain("- F2 logic concern owner=Correctness reporters=2\n");
+		expect(digest).not.toContain("rm -rf");
+	});
+
 	it("is undefined when nothing is open", () => {
 		expect(renderFindingsDigest([finding(1, { status: "expired" })], viewAll)).toBeUndefined();
 	});

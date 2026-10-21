@@ -9,6 +9,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { type } from "@oh-my-pi/omptype";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -147,10 +148,17 @@ export function formatAnchorDisplay(where: AdviseWhere): string {
 
 /** Host facts the file-anchor read gate needs. */
 export interface AnchorIdentityContext {
-	/** Session cwd; relative anchor paths resolve against it. */
+	/** Session cwd; relative anchor paths not matched through `writtenPaths` resolve against it. */
 	cwd: string;
 	/** Absolute workspace roots (see {@link discoverWorkspaceRoots}); only files whose real path lies inside one are read. */
 	roots: readonly string[];
+	/**
+	 * Absolute paths the primary agent wrote this session, least recent first
+	 * (see {@link recordWrittenPaths}). A relative anchor path resolves under
+	 * the workspace root (`cwd` or a root in `roots`) where that path was most
+	 * recently written; without such a write, against `cwd`.
+	 */
+	writtenPaths?: ReadonlySet<string>;
 	/**
 	 * Whether the reporting advisor may read the absolute file path without a
 	 * prompt; consulted for the lexical and the real path before any read.
@@ -169,6 +177,70 @@ function collapseWhitespace(text: string): string {
 
 function sha256(text: string): string {
 	return Bun.SHA256.hash(text, "hex");
+}
+
+/** Absolute path of a file anchor's path (see {@link AnchorIdentityContext.writtenPaths}). */
+function resolveAnchorPath(anchorPath: string, ctx: AnchorIdentityContext): string {
+	const expanded = expandTilde(anchorPath, ctx.home);
+	const fallback = path.resolve(ctx.cwd, expanded);
+	if (path.isAbsolute(expanded) || !ctx.writtenPaths?.size) return fallback;
+	const candidates = new Set([fallback, ...ctx.roots.map(root => path.resolve(root, expanded))]);
+	let latest: string | undefined;
+	for (const written of ctx.writtenPaths) if (candidates.has(written)) latest = written;
+	return latest ?? fallback;
+}
+
+/** Most paths {@link recordWrittenPaths} keeps; the least recently written is dropped first. */
+export const MAX_TRACKED_WRITTEN_PATHS = 1024;
+
+const URL_PATH = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/** `value` when it is a non-empty host path (not an internal URL), else undefined. */
+function hostPath(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 && !URL_PATH.test(value) ? value : undefined;
+}
+
+/** Files a `write` (`resolvedPath`) or `edit` (`path`, `perFileResults[].path`) result changed. */
+function changedPaths(details: unknown): string[] {
+	if (typeof details !== "object" || details === null) return [];
+	const paths: string[] = [];
+	const single =
+		("resolvedPath" in details ? hostPath(details.resolvedPath) : undefined) ??
+		("path" in details ? hostPath(details.path) : undefined);
+	if (single !== undefined) paths.push(single);
+	if ("perFileResults" in details && Array.isArray(details.perFileResults)) {
+		for (const entry of details.perFileResults) {
+			const changed =
+				typeof entry === "object" && entry !== null && "path" in entry ? hostPath(entry.path) : undefined;
+			if (changed !== undefined) paths.push(changed);
+		}
+	}
+	return paths;
+}
+
+/**
+ * Record the files changed by the successful `edit` and `write` results of
+ * the last turn of `messages` (the tool results after its last assistant
+ * message) into `written` as absolute paths resolved against `cwd`, each
+ * moved to the most recent position. Past {@link MAX_TRACKED_WRITTEN_PATHS}
+ * the least recent paths are dropped.
+ */
+export function recordWrittenPaths(written: Set<string>, messages: readonly AgentMessage[], cwd: string): void {
+	let start = messages.length;
+	while (start > 0 && messages[start - 1]!.role !== "assistant") start--;
+	for (const message of messages.slice(start)) {
+		if (message.role !== "toolResult" || message.isError) continue;
+		if (message.toolName !== "edit" && message.toolName !== "write") continue;
+		for (const changed of changedPaths(message.details)) {
+			const absolute = path.resolve(cwd, changed);
+			written.delete(absolute);
+			written.add(absolute);
+		}
+	}
+	for (const oldest of written) {
+		if (written.size <= MAX_TRACKED_WRITTEN_PATHS) break;
+		written.delete(oldest);
+	}
 }
 
 /** `target` relative to the longest root containing it (POSIX separators), or undefined outside every root. */
@@ -210,7 +282,7 @@ async function fileIdentity(
 	const parsed = parseFileAnchor(where);
 	const lineSuffix = parsed.line === undefined ? "" : `:${parsed.line}`;
 	if (!ctx) return `file:${path.posix.normalize(parsed.path.replaceAll("\\", "/"))}${lineSuffix}`;
-	const absolute = path.resolve(ctx.cwd, expandTilde(parsed.path, ctx.home));
+	const absolute = resolveAnchorPath(parsed.path, ctx);
 	const lexical = rootRelative(absolute, ctx.roots) ?? absolute;
 	if (parsed.line !== undefined) {
 		try {
@@ -260,12 +332,17 @@ export async function resolveAnchorIdentity(where: AdviseWhere, ctx?: AnchorIden
 	}
 }
 
+/** Whether `identity` (see {@link resolveAnchorIdentity}) is an `approach` anchor's. */
+export function isApproachIdentity(identity: string): boolean {
+	return identity.startsWith("approach:");
+}
+
 /** The lexical absolute path of a file anchor and, when it exists, its real path. */
 async function anchorPaths(
 	where: Extract<AdviseWhere, { type: "file" }>,
 	ctx: AnchorIdentityContext,
 ): Promise<{ absolute: string; realPath: string | undefined }> {
-	const absolute = path.resolve(ctx.cwd, expandTilde(parseFileAnchor(where).path, ctx.home));
+	const absolute = resolveAnchorPath(parseFileAnchor(where).path, ctx);
 	try {
 		return { absolute, realPath: await fs.realpath(absolute) };
 	} catch {

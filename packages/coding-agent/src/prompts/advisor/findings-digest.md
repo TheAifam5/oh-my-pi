@@ -1,5 +1,5 @@
 <open-findings>
-Open advisor findings. Relate a report to one with `relatesTo` + `relation`; do not re-raise them unchanged.
+Open advisor findings. Before reporting, check this list: a report about one of them MUST name it with `relatesTo` + `relation` instead of opening a new finding.
 {{#each entries}}
 - {{this}}
 {{/each}}

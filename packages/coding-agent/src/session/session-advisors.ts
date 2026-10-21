@@ -88,6 +88,7 @@ import {
 	modelDisclosureDomain,
 	normalizeAdvisorNote,
 	quarantineAdvisorUnsafeOutput,
+	recordWrittenPaths,
 	renderFindingsDigest,
 	resolveAdvisorCategories,
 	resolveAdvisorDeliveryChannel,
@@ -630,6 +631,10 @@ export class SessionAdvisors {
 	#advisorCategories: readonly AdvisorCategory[];
 	/** Session findings ledger shared by every advisor; survives runtime rebuilds. */
 	readonly #findings: AdvisorFindingsLedger;
+	/** Absolute paths the primary wrote this session, least recent first; relative file anchors resolve through it. */
+	readonly #primaryWrittenPaths = new Set<string>();
+	/** Session id {@link #primaryWrittenPaths} was recorded in. */
+	#primaryWrittenPathsSessionId: string | undefined;
 	/** Whether the unsupported `advisor.aggregation.judge.model` warning was logged. */
 	#findingsJudgeModelWarned = false;
 	/** Tail of the serialized findings judge passes; never rejects. */
@@ -734,6 +739,10 @@ export class SessionAdvisors {
 		// Delivery state follows primary boundaries even when review cadence skips a callback.
 		this.#advisorPrimaryWillContinue = willContinue === true;
 		this.#advisorPrimaryTurnsCompleted++;
+		const writesSessionId = this.#host.sessionManager.getSessionId();
+		if (writesSessionId !== this.#primaryWrittenPathsSessionId) this.#primaryWrittenPaths.clear();
+		this.#primaryWrittenPathsSessionId = writesSessionId;
+		recordWrittenPaths(this.#primaryWrittenPaths, messages, this.#host.sessionManager.getCwd());
 		this.#findings.advanceTurn();
 		this.#anchorInterrupts.clear();
 		// Marks the terminal-boundary window (flush + catch-up wait) for
@@ -1436,6 +1445,7 @@ export class SessionAdvisors {
 				return {
 					cwd,
 					roots: await discoverWorkspaceRoots(cwd),
+					writtenPaths: this.#primaryWrittenPathsSessionId === sessionId ? this.#primaryWrittenPaths : undefined,
 					canRead: absolutePath =>
 						readTool !== undefined &&
 						isAllowedWithoutPrompt(readTool, { path: absolutePath }, toolContext, sessionId),
