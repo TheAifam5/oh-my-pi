@@ -24,7 +24,7 @@ function account(id: string, provider: string, overrides: Partial<AccountManager
 		provider,
 		identity: `${id}@example.com`,
 		badges: [],
-		details: [{ label: "billing", value: "included available" }],
+		details: [{ label: "billing", value: "5h 75% left · resets in 2h10m" }],
 		fields: [
 			{ id: "priority", label: "priority", key: "p", value: "default", input: { initial: "", hint: "a number" } },
 			{ id: "drain", label: "drain", key: "d", value: "off", on: false },
@@ -63,7 +63,10 @@ beforeAll(async () => {
 describe("AccountManager", () => {
 	test("lists every account under its provider with the selected account's details", () => {
 		const { screen } = createManager([
-			account("a", "anthropic", { name: "work", badges: ["priority 10", "session pin"] }),
+			account("a", "anthropic", {
+				name: "work",
+				badges: ["priority 10", "session pin", "5h 75% left · resets in 2h10m"],
+			}),
 			account("b", "openai"),
 		]);
 		const text = screen();
@@ -72,7 +75,7 @@ describe("AccountManager", () => {
 		expect(text).toMatch(/openai\s+1/);
 		expect(text).toMatch(/work\s+anthropic\s+a@example\.com.*priority 10 · session pin/);
 		expect(text).toContain("(unnamed)");
-		expect(text).toContain("included available");
+		expect(text).toContain("5h 75% left · resets in 2h10m");
 	});
 
 	test("applies an input field through the host with the typed value", async () => {

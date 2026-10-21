@@ -205,7 +205,7 @@ describe("account manager deps", () => {
 				snapshot: {
 					provider: "acme",
 					fetchedAt: report.fetchedAt,
-					sources: [{ mode: "prepaid-credits", state: "available" }],
+					sources: [{ mode: "paid-extra-usage", state: "disabled" }],
 				},
 			}),
 		});
@@ -226,10 +226,124 @@ describe("account manager deps", () => {
 					.filter(account => account.provider === "acme")
 					.map(account => account.details.find(detail => detail.label === "billing")?.value);
 			expect(billing()).toEqual(["unknown (no-report)", "unknown (no-report)"]);
-			reports = [{ provider: "acme", fetchedAt: Date.now(), limits: [], metadata: { email: "x@acme.test" } }];
-			expect(billing()).toEqual(["prepaid-credits available", "unknown (no-report)"]);
+			reports = [
+				{
+					provider: "acme",
+					fetchedAt: Date.now(),
+					metadata: { email: "x@acme.test" },
+					limits: [
+						{
+							id: "balance",
+							label: "Balance",
+							scope: { provider: "acme", shared: true },
+							amount: { unit: "credits", remaining: 20 },
+						},
+					],
+				},
+			];
+			expect(billing()).toEqual(["Balance 20 credits left, extra usage disabled", "unknown (no-report)"]);
 		} finally {
 			unregister();
 		}
+	});
+
+	it("shows account windows, exhaustion, saved resets and stale ages without model windows in rows", async () => {
+		const now = 1_800_000_000_000;
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const reports: UsageReport[] = [
+			{
+				provider: "anthropic",
+				fetchedAt: now - 3_600_000,
+				metadata: { email: "a@example.com" },
+				resetCredits: { availableCount: 2 },
+				limits: [
+					{
+						id: "5h",
+						label: "5h",
+						scope: { provider: "anthropic", shared: true, sharedGroup: "5h" },
+						window: { id: "5h", label: "5h", resetsAt: now + 7_800_000 },
+						amount: { unit: "percent", usedFraction: 0.25 },
+					},
+					{
+						id: "copy",
+						label: "copy",
+						scope: { provider: "anthropic", shared: true, sharedGroup: "5h", modelId: "copy" },
+						amount: { unit: "percent", usedFraction: 0.25 },
+					},
+					{
+						id: "7d",
+						label: "7d",
+						scope: { provider: "anthropic", shared: true },
+						window: { id: "7d", label: "7d", resetsAt: now + 86_400_000 },
+						amount: { unit: "percent", usedFraction: 1 },
+						status: "exhausted",
+					},
+					{
+						id: "model",
+						label: "Model weekly",
+						scope: { provider: "anthropic", shared: true, modelId: "model-only" },
+						amount: { unit: "percent", remainingFraction: 0.4 },
+					},
+					{
+						id: "tier",
+						label: "Tier weekly",
+						scope: { provider: "anthropic", tier: "fable" },
+						window: { id: "tier", label: "7d" },
+						amount: { unit: "percent", remainingFraction: 0.6 },
+					},
+				],
+			},
+		];
+		const { deps } = await open({}, undefined, () => reports);
+		const account = deps.load().find(account => account.provider === "anthropic")!;
+		const summary = account.badges.join(" · ");
+		expect(summary).toContain("5h 75% left · resets in 2h10m");
+		expect(summary).toContain("7d exhausted · resets in 1d");
+		expect(summary).toContain("2 saved resets");
+		expect(summary).toContain("fetched 1h ago");
+		expect(summary).not.toContain("copy");
+		expect(summary).not.toContain("model-only");
+		expect(summary).not.toContain("fable");
+		expect(summary).not.toMatch(/included|available/);
+		expect(account.details.find(detail => detail.label === "model usage")?.value).toContain(
+			"model-only · Model weekly 40% left",
+		);
+		expect(
+			account.details
+				.filter(detail => detail.label === "model usage")
+				.map(detail => detail.value)
+				.join("\n"),
+		).toContain("fable · 7d 60% left");
+	});
+
+	it("shows prepaid amounts with spending projections and count limits as remaining over limit", async () => {
+		const now = 1_800_000_000_000;
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const reports: UsageReport[] = [
+			{
+				provider: "openai",
+				fetchedAt: now,
+				limits: [
+					{
+						id: "balance",
+						label: "Balance",
+						scope: { provider: "openai", shared: true },
+						amount: { unit: "usd", remaining: 12.5, spendingRatePerDay: 2.5 },
+						projectedExhaustAt: now + 432_000_000,
+					},
+					{
+						id: "requests",
+						label: "Requests",
+						scope: { provider: "openai", shared: true },
+						amount: { unit: "requests", limit: 100, used: 25 },
+					},
+				],
+			},
+		];
+		const { deps } = await open({}, undefined, () => reports);
+		const account = deps.load().find(account => account.provider === "openai")!;
+		const billing = account.details.find(detail => detail.label === "billing")?.value;
+		expect(billing).toContain("Balance $12.50 left · $2.50/day · runs out in 5d");
+		expect(billing).toContain("Requests 75/100 requests left");
 	});
 });

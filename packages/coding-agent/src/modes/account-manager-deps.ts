@@ -1,4 +1,4 @@
-import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { resolveUsedFraction, type UsageLimit, type UsageReport } from "@oh-my-pi/pi-ai/usage";
 import type { AccountLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import type {
 	AccountManagerAccount,
@@ -8,8 +8,14 @@ import type {
 	AccountManagerResult,
 } from "@oh-my-pi/pi-tui/overlays/account-manager";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import {
+	collapseSharedUsageReports,
+	formatLimitTitle,
+	summarizeUsageResetCredits,
+} from "@oh-my-pi/pi-tui/overlays/usage-display";
+import { formatAbsoluteOnlyAmount, formatUsageProjection } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { logger, withTimeout } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatNumber, logger, withTimeout } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import {
 	type AccountListing,
@@ -39,9 +45,9 @@ import type { SessionPinOutcome, SessionUnpinOutcome } from "../session/agent-se
 import { loadEffectiveAuthAccountPolicyConfig } from "../session/auth-broker-config";
 import type { AuthStorage } from "../session/auth-storage";
 import { formatLimitUsage } from "../session/local-limits";
+import { DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS, providerBillingResults } from "../session/retry-fallback-groups";
 import { describeSessionPinOutcome, describeSessionUnpinOutcome } from "../slash-commands/helpers/session-pin";
 import { reportIdentifiers } from "../slash-commands/helpers/usage-accounts";
-import { billingSummary } from "./model-browser-source";
 
 /** The session the manager pins accounts for. */
 export interface AccountManagerSession {
@@ -98,22 +104,82 @@ function reportNamesAccount(report: UsageReport, account: AccountListing["accoun
 	return (account.orgId?.toLowerCase() || undefined) === (reportOrg || undefined);
 }
 
-/**
- * Billing evidence for `row` from `reports`: the reports that name an OAuth account, or for an
- * API key, the provider's reports when it is the provider's only stored account.
- */
+function accountUsageLimit(limit: UsageLimit, nowMs: number): string {
+	const { amount, window } = limit;
+	const fraction = resolveUsedFraction(limit);
+	const remaining =
+		amount.remaining ??
+		(amount.limit !== undefined
+			? amount.used !== undefined
+				? amount.limit - amount.used
+				: fraction !== undefined
+					? amount.limit * Math.max(0, 1 - fraction)
+					: undefined
+			: undefined);
+	let value: string | undefined;
+	if (amount.unit !== "percent" && amount.limit !== undefined && remaining !== undefined) {
+		value = `${formatNumber(Math.max(0, remaining))}/${formatNumber(amount.limit)} ${amount.currency ?? amount.unit} left`;
+	} else if (fraction !== undefined) {
+		value =
+			limit.status === "exhausted" || fraction >= 1
+				? "exhausted"
+				: `${Number((Math.max(0, 1 - fraction) * 100).toFixed(1))}% left`;
+	} else {
+		value = formatAbsoluteOnlyAmount([limit]) ?? (limit.status === "exhausted" ? "exhausted" : "unknown");
+	}
+	const title = window?.label ?? formatLimitTitle(limit);
+	const parts = [`${title} ${value}`];
+	const projection = formatUsageProjection(limit, nowMs);
+	if (projection) parts.push(projection);
+	if (window?.resetsAt !== undefined) {
+		parts.push(`${window.resetLabel ?? "resets"} in ${formatDuration(Math.max(0, window.resetsAt - nowMs))}`);
+	}
+	return parts.join(" · ");
+}
+
+/** Usage from reports naming this OAuth account, or the provider's only stored API key. */
 function accountBilling(
 	row: AccountListing,
 	reports: readonly UsageReport[],
 	providerAccountCount: number,
-): string | undefined {
+): { summary?: string; models: string[] } {
 	const { account, provider } = row;
-	const own = reports.filter(
-		report =>
-			report.provider === provider &&
-			(account.type === "api_key" ? providerAccountCount === 1 : reportNamesAccount(report, account)),
+	const nowMs = Date.now();
+	const own = collapseSharedUsageReports(
+		reports.filter(
+			report =>
+				report.provider === provider &&
+				(account.type === "api_key" ? providerAccountCount === 1 : reportNamesAccount(report, account)),
+		),
 	);
-	return billingSummary(provider, own, Date.now());
+	const parts = new Set<string>();
+	const models = new Set<string>();
+	for (const report of own) {
+		const stale =
+			nowMs - report.fetchedAt > DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS
+				? ` · fetched ${formatDuration(nowMs - report.fetchedAt)} ago`
+				: "";
+		for (const limit of report.limits) {
+			const line = accountUsageLimit(limit, nowMs) + stale;
+			if (!limit.scope.modelId && (limit.scope.shared || !limit.scope.tier)) parts.add(line);
+			else models.add(`${limit.scope.modelId ?? limit.scope.tier} · ${line}`);
+		}
+		const resets = summarizeUsageResetCredits(report.resetCredits, nowMs);
+		if (resets) parts.add(`${resets.bankedCount} saved reset${resets.bankedCount === 1 ? "" : "s"}${stale}`);
+	}
+	const hasNumbers = parts.size > 0;
+	for (const result of providerBillingResults(provider, own, nowMs, DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS)) {
+		if (result.status === "unknown") {
+			if (!hasNumbers && result.reason !== "no-reader") parts.add(`unknown (${result.reason})`);
+		} else {
+			for (const source of result.snapshot.sources) {
+				if (source.state === "disabled") parts.add("extra usage disabled");
+				else if (!hasNumbers && source.state === "exhausted") parts.add("exhausted");
+			}
+		}
+	}
+	if (parts.size === 0 && own.length > 0) parts.add("unknown (no-report)");
+	return { summary: parts.size > 0 ? [...parts].join(", ") : undefined, models: [...models] };
 }
 
 function limitLine(limit: AccountListing["limits"][number]): string {
@@ -352,7 +418,8 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					? row.limits.map(limit => ({ label: "limit", value: limitLine(limit) }))
 					: [{ label: "limits", value: "none", tone: "dim" as const }]),
 			];
-			if (billing !== undefined) details.push({ label: "billing", value: billing });
+			if (billing?.summary !== undefined) details.push({ label: "billing", value: billing.summary });
+			for (const value of billing?.models ?? []) details.push({ label: "model usage", value });
 			if (row.resetOn !== undefined || row.autoRedeem !== undefined) {
 				details.push({
 					label: "resets",
@@ -372,6 +439,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				...(name !== undefined ? { name } : {}),
 				identity: row.label,
 				badges: [
+					billing?.summary,
 					row.priority !== undefined ? `priority ${row.priority}` : undefined,
 					row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
 					row.drain ? "drain" : undefined,
