@@ -52,6 +52,7 @@ import {
 	type AdvisorReviewMode,
 	AdvisorEmissionGuard,
 	type AdvisorHeldUpdates,
+	type AdvisorKind,
 	AdvisorLoopGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
@@ -1330,7 +1331,7 @@ export class SessionAdvisors {
 			// accepted notes and acknowledges truthfully. No separate accept wrapper.
 			const emissionGuard = new AdvisorEmissionGuard({ budgetPerUpdate });
 			const adviseTool = new AdviseTool(
-				(note, severity, turn) => this.#routeAdvice(advisorRef, note, severity, turn),
+				(note, severity, turn, kind) => this.#routeAdvice(advisorRef, note, severity, turn, kind),
 				emissionGuard,
 			);
 
@@ -1730,7 +1731,13 @@ export class SessionAdvisors {
 	 * admission — the note cleared the emission guard inside AdviseTool when it was
 	 * emitted, so a deferred flush replays the backlog without re-filtering.
 	 */
-	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity, turn?: number): void {
+	#routeAdvice(
+		advisor: ActiveAdvisor,
+		note: string,
+		severity: AdvisorSeverity | undefined,
+		turn: number | undefined,
+		kind: AdvisorKind,
+	): void {
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
@@ -1747,12 +1754,13 @@ export class SessionAdvisors {
 			this.#advisorBoundaryNotes.push({
 				note,
 				severity,
+				kind,
 				advisor: source,
 				turn: turn ?? this.#advisorPrimaryTurnsCompleted,
 			});
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		const notes: AdvisorNote[] = [{ note, severity, kind, advisor: source }];
 		const terminalAnswerNoQueuedWork = this.#hasTerminalTextAnswerWithoutQueuedWork();
 		// A note that lands after the boundary window closed (catch-up off, or a
 		// review slower than its wait) gets exactly what the merged boundary flush
@@ -1776,7 +1784,7 @@ export class SessionAdvisors {
 			interruptImmuneTurnActive: this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", { note, severity, kind, advisor: source });
 			return;
 		}
 		this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), channel === "steer");

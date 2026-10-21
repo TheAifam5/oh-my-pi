@@ -1,6 +1,11 @@
 import { type } from "@oh-my-pi/omptype";
-import { type AdvisorSeverity, type AdvisorNote } from "@oh-my-pi/pi-tui/chat/messages";
-export { type AdvisorSeverity, type AdvisorNote, type AdvisorMessageDetails } from "@oh-my-pi/pi-tui/chat/messages";
+import { type AdvisorKind, type AdvisorNote, type AdvisorSeverity } from "@oh-my-pi/pi-tui/chat/messages";
+export {
+	type AdvisorKind,
+	type AdvisorMessageDetails,
+	type AdvisorNote,
+	type AdvisorSeverity,
+} from "@oh-my-pi/pi-tui/chat/messages";
 import type {
 	AgentIdentity,
 	AgentTelemetryConfig,
@@ -11,22 +16,103 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import { escapeXmlAttribute, escapeXmlText, logger } from "@oh-my-pi/pi-utils";
 import adviseDescription from "../prompts/advisor/advise-tool.md" with { type: "text" };
-import { AdvisorEmissionGuard, type AdvisorSuppressionReason, normalizeAdvisorNote } from "./emission-guard";
+import { AdvisorEmissionGuard, type AdvisorSuppressionReason, advisorDedupeKey } from "./emission-guard";
 
 const adviseSchema = type({
-	note: type("string").describe(
-		"One concrete piece of advice for the agent you are watching. Terse, specific, actionable.",
+	kind: type("'defect' | 'concern' | 'unverified' | 'suggestion'").describe(
+		"defect: wrong now; concern: likely wrong; unverified: a claim or result nobody checked; suggestion: a better approach.",
 	),
 	"severity?": type("'nit' | 'concern' | 'blocker'").describe("How strongly to weigh this. Omit for a plain nit."),
+	where: type({
+		type: type("'file' | 'command' | 'tool-call' | 'instruction' | 'claim' | 'approach'").describe(
+			"What the finding is anchored to; `approach` anchors a plan, strategy, or verification approach.",
+		),
+		ref: type("string").describe(
+			"The concrete anchor: path[:line], command, tool call, quoted instruction or claim, or the plan step.",
+		),
+	}).describe("Where the finding is."),
+	defect: type("string").describe("What is wrong, in one line. For `suggestion`, the advice itself."),
+	"impact?": type("string").describe(
+		"What breaks if left as is. Required for defect/concern/unverified at severity concern or blocker.",
+	),
+	"fix?": type("string").describe(
+		"The concrete correction. Required for defect/concern/unverified at severity concern or blocker.",
+	),
 });
 
 export type AdviseParams = typeof adviseSchema.infer;
 
+/** Anchor of a structured advisor finding. */
+export type AdviseWhere = AdviseParams["where"];
+
 export interface AdviseDetails {
+	/** Rendered note body (see {@link formatAdviseNote}); the only field in transcripts written before structured advice. */
 	note: string;
 	severity?: AdvisorSeverity;
+	kind?: AdvisorKind;
+	where?: AdviseWhere;
+	defect?: string;
+	impact?: string;
+	fix?: string;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
+}
+
+/**
+ * Render the note body of a structured finding:
+ * `<where.ref> — <defect>`, then ` → <impact>` and ` → <fix>` when present.
+ * Fields are trimmed; the result is plain text (escape before embedding in XML).
+ */
+export function formatAdviseNote(advice: {
+	where: { ref: string };
+	defect: string;
+	impact?: string;
+	fix?: string;
+}): string {
+	let note = `${advice.where.ref.trim()} — ${advice.defect.trim()}`;
+	const impact = advice.impact?.trim();
+	if (impact) note += ` → ${impact}`;
+	const fix = advice.fix?.trim();
+	if (fix) note += ` → ${fix}`;
+	return note;
+}
+
+/**
+ * Free-text strings of an `advise` tool call's raw arguments — `where.ref`,
+ * `defect`, `impact`, `fix`, and the legacy `note` — for content screening
+ * and summaries. Non-string values are skipped.
+ */
+export function adviseArgumentTexts(args: Record<string, unknown>): string[] {
+	const texts: string[] = [];
+	const where = args.where;
+	if (where && typeof where === "object" && "ref" in where && typeof where.ref === "string") texts.push(where.ref);
+	for (const field of ["defect", "impact", "fix", "note"] as const) {
+		const value = args[field];
+		if (typeof value === "string") texts.push(value);
+	}
+	return texts;
+}
+
+const ADVISE_SILENCE_RULE = "A review with nothing to report ends without calling `advise`.";
+
+/**
+ * Validate raw `advise` arguments: the schema shape and enums, non-empty
+ * `where.ref` and `defect`, and non-empty `impact`/`fix` for a
+ * defect/concern/unverified finding at severity concern or blocker. Returns
+ * the parsed params, or the rejection text naming every failing field.
+ */
+export function validateAdviseArgs(raw: unknown): AdviseParams | string {
+	const parsed = adviseSchema(raw);
+	if (parsed instanceof type.errors) return `Rejected: ${parsed.summary}\n${ADVISE_SILENCE_RULE}`;
+	const missing: string[] = [];
+	if (!parsed.where.ref.trim()) missing.push("where.ref");
+	if (!parsed.defect.trim()) missing.push("defect");
+	if (parsed.kind !== "suggestion" && (parsed.severity === "concern" || parsed.severity === "blocker")) {
+		if (!parsed.impact?.trim()) missing.push("impact");
+		if (!parsed.fix?.trim()) missing.push("fix");
+	}
+	if (missing.length === 0) return parsed;
+	return `Rejected: missing or empty ${missing.join(", ")}. \`impact\` and \`fix\` are required for kind defect, concern, or unverified at severity concern or blocker.\n${ADVISE_SILENCE_RULE}`;
 }
 
 /**
@@ -39,20 +125,22 @@ const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 
 /**
  * Render a batch of advisor notes as the agent-facing message body: one
- * `<advisory>` element per note, severity as an attribute. Shared by the
- * non-interrupting YieldQueue dispatcher and the interrupting steer path so both
- * build byte-identical content.
+ * `<advisory>` element per note, severity and kind as attributes, the
+ * XML-escaped note body as text. Shared by the non-interrupting YieldQueue
+ * dispatcher and the interrupting steer path so both build byte-identical
+ * content.
  */
 export function formatAdvisorBatchContent(notes: readonly AdvisorNote[], opts?: { currentTurn?: number }): string {
 	return notes
 		.map(n => {
-			const severity = n.severity ? ` severity="${n.severity}"` : "";
+			const severity = n.severity ? ` severity="${escapeXmlAttribute(n.severity)}"` : "";
+			const kind = n.kind ? ` kind="${escapeXmlAttribute(n.kind)}"` : "";
 			const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
 			const age =
 				opts?.currentTurn !== undefined && n.turn !== undefined && opts.currentTurn > n.turn
 					? ` turns_ago="${opts.currentTurn - n.turn}"`
 					: "";
-			return `<advisory${who}${severity}${age} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
+			return `<advisory${who}${severity}${kind}${age} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
 		})
 		.join("\n");
 }
@@ -164,10 +252,6 @@ export function deriveAdvisorTelemetry(
  */
 export const ADVISOR_DEFAULT_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "grep", "glob"]);
 
-function advisorNoteDedupeKey(note: string): string {
-	return normalizeAdvisorNote(note);
-}
-
 /** Rank advisor severities so the dedupe state can detect a real escalation
  *  (nit → concern → blocker) versus a verbatim repeat. `undefined` defers to
  *  `nit` because the schema treats an omitted severity as a plain nit. */
@@ -199,6 +283,8 @@ const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
 	duplicate: "Dropped: already raised.",
 	"rate-limit": "Dropped: this update's advice budget is spent.",
 };
+/** A malformed call after this update's single retry was spent. */
+const ADVISOR_ACK_INVALID_DROPPED = "Dropped: invalid call; this update's retry is spent.";
 
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
 	readonly name = "advise";
@@ -208,6 +294,8 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	readonly description = adviseDescription;
 	readonly parameters = adviseSchema;
 	readonly intent = "omit" as const;
+	/** Malformed calls reach {@link execute}, which owns rejection and the per-update retry limit. */
+	readonly lenientArgValidation = true;
 	/**
 	 * Single admission authority for every emission. The tool owns no parallel
 	 * dedupe/budget state: the guard's {@link AdvisorAdmission} decides whether
@@ -227,8 +315,11 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *  notes can be displaced by the guard; routed notes are never retracted. */
 	#deferredNotes: {
 		key: string;
+		defect: string;
+		ref: string;
 		note: string;
 		severity?: AdviseDetails["severity"];
+		kind: AdvisorKind;
 		turn?: number;
 	}[] = [];
 
@@ -242,7 +333,12 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *   {@link ADVISOR_DEFAULT_BUDGET_PER_UPDATE}).
 	 */
 	constructor(
-		private readonly onAdvice: (note: string, severity: AdviseDetails["severity"] | undefined, turn?: number) => void,
+		private readonly onAdvice: (
+			note: string,
+			severity: AdviseDetails["severity"] | undefined,
+			turn: number | undefined,
+			kind: AdvisorKind,
+		) => void,
 		guard?: AdvisorEmissionGuard,
 	) {
 		this.#guard = guard ?? new AdvisorEmissionGuard();
@@ -288,13 +384,16 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 
 	async execute(
 		_toolCallId: string,
-		args: AdviseParams,
+		rawArgs: AdviseParams,
 		_signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AdviseDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<AdviseDetails>> {
+		const args = validateAdviseArgs(rawArgs);
+		if (typeof args === "string") return this.#rejected(args);
+		const note = formatAdviseNote(args);
 		const rank = advisorSeverityRank(args.severity);
-		const key = advisorNoteDedupeKey(args.note);
+		const key = advisorDedupeKey(args.defect, args.where.ref);
 		if (this.#inProgressUpdate && args.severity !== "blocker") {
 			// Withheld, not delivered: reserve for the deterministic flush at the
 			// completed-update transition / terminal boundary.
@@ -302,15 +401,19 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 			if (pending) {
 				// Re-raise of a still-queued note is not a new admission: escalate
 				// severity in place (never a second slot) and keep the dedupe rank
-				// coherent so equal/lower repeats of the text stay suppressed.
+				// coherent so equal/lower repeats of the finding stay suppressed.
 				if (rank > advisorSeverityRank(pending.severity)) {
 					pending.severity = args.severity;
-					this.#guard.escalatePending(args.note, rank);
+					this.#guard.escalatePending(args.defect, rank, args.where.ref);
 				}
-				return this.#result(ADVISOR_ACK_DEFERRED, args);
+				return this.#result(ADVISOR_ACK_DEFERRED, args, note);
 			}
-			const decision = this.#guard.admit(args.note, { rank, pending: true });
-			if (!decision.accepted) return this.#suppressed(args, decision.reason);
+			const decision = this.#guard.admit(args.defect, {
+				rank,
+				pending: true,
+				ref: args.where.ref,
+			});
+			if (!decision.accepted) return this.#suppressed(args, note, decision.reason);
 			// The guard centrally names the still-pending note displaced by this
 			// strictly-higher-severity admission; only same-update pending notes
 			// can be displaced, so the backlog lookup is a drop, not a policy.
@@ -318,8 +421,16 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				const displacedIndex = this.#deferredNotes.findIndex(item => item.key === decision.displacedKey);
 				if (displacedIndex !== -1) this.#deferredNotes.splice(displacedIndex, 1);
 			}
-			this.#deferredNotes.push({ key, note: args.note, severity: args.severity, turn: this.#coveredTurn });
-			return this.#result(ADVISOR_ACK_DEFERRED, args);
+			this.#deferredNotes.push({
+				key,
+				defect: args.defect,
+				ref: args.where.ref,
+				note,
+				severity: args.severity,
+				kind: args.kind,
+				turn: this.#coveredTurn,
+			});
+			return this.#result(ADVISOR_ACK_DEFERRED, args, note);
 		}
 		// Live path (completed update, or a blocker that must interrupt now). A
 		// blocker re-raise of a still-queued note pulls the reservation first:
@@ -328,10 +439,14 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		// lower deferred severity.
 		const reservedIndex = this.#deferredNotes.findIndex(item => item.key === key);
 		if (reservedIndex !== -1) this.#deferredNotes.splice(reservedIndex, 1);
-		const decision = this.#guard.admit(args.note, { rank, pending: false });
-		if (!decision.accepted) return this.#suppressed(args, decision.reason);
-		this.onAdvice(args.note, args.severity, this.#coveredTurn);
-		return this.#result(ADVISOR_ACK_SENT, args);
+		const decision = this.#guard.admit(args.defect, {
+			rank,
+			pending: false,
+			ref: args.where.ref,
+		});
+		if (!decision.accepted) return this.#suppressed(args, note, decision.reason);
+		this.onAdvice(note, args.severity, this.#coveredTurn, args.kind);
+		return this.#result(ADVISOR_ACK_SENT, args, note);
 	}
 
 	/** Route every withheld note, oldest first, without re-admission — each was
@@ -341,23 +456,49 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (this.#deferredNotes.length === 0) return;
 		const pending = this.#deferredNotes;
 		this.#deferredNotes = [];
-		for (const { note, severity, turn } of pending) {
-			this.#guard.markRouted(note);
-			this.onAdvice(note, severity, turn ?? this.#coveredTurn);
+		for (const { defect, ref, note, severity, kind, turn } of pending) {
+			this.#guard.markRouted(defect, ref);
+			this.onAdvice(note, severity, turn ?? this.#coveredTurn, kind);
 		}
+	}
+
+	/** Malformed call: the first rejection this update is a tool error the
+	 *  advisor may correct once; later ones are dropped without delivery. */
+	#rejected(problem: string): AgentToolResult<AdviseDetails> {
+		if (this.#guard.recordInvalidCall()) {
+			return { content: [{ type: "text", text: problem }], details: { note: "" }, isError: true };
+		}
+		logger.debug("advisor advice dropped after a spent retry");
+		return {
+			content: [{ type: "text", text: ADVISOR_ACK_INVALID_DROPPED }],
+			details: { note: "" },
+			useless: true,
+		};
 	}
 
 	/** Truthful suppression acknowledgment keyed by the guard's reason: a
 	 *  rejected note is never described as recorded, queued, or delivered. */
-	#suppressed(args: AdviseParams, reason: AdvisorSuppressionReason | undefined): AgentToolResult<AdviseDetails> {
+	#suppressed(
+		args: AdviseParams,
+		note: string,
+		reason: AdvisorSuppressionReason | undefined,
+	): AgentToolResult<AdviseDetails> {
 		logger.debug("advisor advice suppressed by emission guard", { reason, severity: args.severity });
-		return this.#result(ADVISOR_ACK_SUPPRESSED[reason ?? "duplicate"], args);
+		return this.#result(ADVISOR_ACK_SUPPRESSED[reason ?? "duplicate"], args, note);
 	}
 
-	#result(text: string, args: AdviseParams): AgentToolResult<AdviseDetails> {
+	#result(text: string, args: AdviseParams, note: string): AgentToolResult<AdviseDetails> {
 		return {
 			content: [{ type: "text", text }],
-			details: { note: args.note, severity: args.severity },
+			details: {
+				note,
+				severity: args.severity,
+				kind: args.kind,
+				where: args.where,
+				defect: args.defect,
+				impact: args.impact,
+				fix: args.fix,
+			},
 			useless: true,
 		};
 	}

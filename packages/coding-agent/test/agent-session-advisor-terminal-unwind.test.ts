@@ -150,7 +150,9 @@ it.each([
 					advisorStarted.resolve();
 					await releaseAdvisor.promise;
 					return toolResponse("advice-1", "advise", {
-						note: "late terminal advice",
+						kind: "suggestion",
+						where: { type: "approach", ref: "review" },
+						defect: "late terminal advice",
 						severity,
 					});
 				}
@@ -246,7 +248,12 @@ it.each([
 					releaseContinuation.resolve();
 					await aborted;
 				}
-				await advise.execute("live-continuation", { note: continuationMarker, severity: continuation });
+				await advise.execute("live-continuation", {
+					kind: "suggestion",
+					where: { type: "approach", ref: "review" },
+					defect: continuationMarker,
+					severity: continuation,
+				});
 				releaseContinuation.resolve();
 			}
 			await run;
@@ -277,7 +284,9 @@ it.each([
 			await nextProviderStarted.promise;
 			expect(session.agent.state.isStreaming).toBe(true);
 			await advise.execute("live-next", {
-				note: "live next-turn concern",
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: "live next-turn concern",
 				severity: "concern",
 			});
 			releaseNextProvider.resolve();
@@ -345,7 +354,12 @@ it("continues once on a late nit at advisor.continueSeverity=nit without re-revi
 			if (context?.willContinue === false && streamingAtNote === undefined) {
 				streamingAtNote = agent.state.isStreaming;
 				const advise = session.getAdvisorAgent()?.state.tools.find(tool => tool.name === "advise");
-				await advise?.execute("late-nit", { note: lateNote, severity: "nit" });
+				await advise?.execute("late-nit", {
+					kind: "suggestion",
+					where: { type: "approach", ref: "review" },
+					defect: lateNote,
+					severity: "nit",
+				});
 			}
 		});
 	};

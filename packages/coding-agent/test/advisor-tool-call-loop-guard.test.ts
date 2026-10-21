@@ -114,7 +114,8 @@ describe("advisor tool-call loop guard", () => {
 			const advising = queued !== undefined || (advice !== undefined && turn === 0);
 			const repeating = advising || turn < maxRepeatedTurns;
 			turn++;
-			const adviceArgs = queued ?? { note: advice, severity: adviceSeverity };
+			const { note, severity } = queued ?? { note: advice, severity: adviceSeverity };
+			const adviceArgs = { kind: "suggestion", where: { type: "approach", ref: "review" }, defect: note, severity };
 			const message: AssistantMessage = repeating
 				? {
 						role: "assistant",
@@ -523,7 +524,9 @@ describe("advisor tool-call loop guard", () => {
 		session.agent.state.isStreaming = true;
 		try {
 			await advise.execute("first-note", {
-				note: "The first operation loses the selected file.",
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: "The first operation loses the selected file.",
 				severity: "concern",
 			});
 			await new Promise<void>(resolve => setImmediate(resolve));
@@ -561,7 +564,9 @@ describe("advisor tool-call loop guard", () => {
 		await liveStarted.promise;
 		try {
 			await advise.execute("next-note", {
-				note: "The next operation overwrites the destination file.",
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: "The next operation overwrites the destination file.",
 				severity: "concern",
 			});
 			await new Promise<void>(resolve => setImmediate(resolve));
@@ -593,7 +598,9 @@ describe("advisor tool-call loop guard", () => {
 		session.agent.state.isStreaming = true;
 		try {
 			await advise.execute("arm-immune", {
-				note: "The running step loses the selected file.",
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: "The running step loses the selected file.",
 				severity: "concern",
 			});
 			await new Promise<void>(resolve => setImmediate(resolve));
@@ -664,7 +671,12 @@ describe("advisor tool-call loop guard", () => {
 						{
 							type: "toolCall",
 							name: "advise",
-							arguments: { note: "final review found a stale fixture", severity: "nit" },
+							arguments: {
+								kind: "suggestion",
+								where: { type: "approach", ref: "review" },
+								defect: "final review found a stale fixture",
+								severity: "nit",
+							},
 						},
 					],
 				},

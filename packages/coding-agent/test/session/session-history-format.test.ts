@@ -311,6 +311,33 @@ describe("formatSessionHistoryMarkdown", () => {
 		expect(output).not.toContain("Recorded.");
 	});
 
+	it("summarizes structured advise calls by severity, anchor, and finding", () => {
+		const output = formatSessionHistoryMarkdown([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "tc-advise-2",
+						name: "advise",
+						arguments: {
+							kind: "defect",
+							severity: "blocker",
+							where: { type: "file", ref: "src/retry.ts:42" },
+							defect: "budget never decrements",
+							impact: "loops forever",
+							fix: "decrement before sleeping",
+						},
+					},
+				],
+				timestamp: 1,
+			},
+		]);
+		expect(output).toContain(
+			"advise(blocker: src/retry.ts:42 — budget never decrements — loops forever — decrement before sleeping)",
+		);
+	});
+
 	it("attributes a user bang command to the user, not the preceding agent turn", () => {
 		const delta = [
 			{

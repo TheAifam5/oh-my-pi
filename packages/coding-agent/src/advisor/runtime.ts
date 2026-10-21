@@ -16,6 +16,7 @@ import {
 	formatSessionHistoryMarkdown,
 	PRIMARY_CONTEXT_CUSTOM_TYPES,
 } from "../session/session-history-format";
+import { adviseArgumentTexts } from "./advise-tool";
 import { ADVISOR_RENDER_OPTIONS, advisorToolIOTransform, renderAdvisorDeltaChunks } from "./delta-split";
 import { fingerprintMessage } from "./message-fingerprint";
 
@@ -156,8 +157,8 @@ export function quarantineAdvisorUnsafeOutput(
 	const reasons: string[] = [];
 	const generatedParts: string[] = [];
 	for (const block of message.content) {
-		if (block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string") {
-			generatedParts.push(block.arguments.note);
+		if (block.type === "toolCall" && block.name === "advise") {
+			generatedParts.push(...adviseArgumentTexts(block.arguments));
 		}
 		if (block.type === "text") generatedParts.push(block.text);
 	}

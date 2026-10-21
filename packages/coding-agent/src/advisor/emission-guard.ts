@@ -39,6 +39,18 @@ export function normalizeAdvisorNote(note: string): string {
 }
 
 /**
+ * Dedupe key for one finding: the trimmed `where.ref` anchor plus the
+ * {@link normalizeAdvisorNote normalized} defect; the normalized defect alone
+ * without a ref. Empty when the defect normalizes to nothing.
+ */
+export function advisorDedupeKey(defect: string, ref?: string): string {
+	const normalized = normalizeAdvisorNote(defect);
+	if (!normalized) return "";
+	const anchor = ref?.trim();
+	return anchor ? `${anchor}\n${normalized}` : normalized;
+}
+
+/**
  * Normalized phrases the advisor occasionally emits that carry no concrete
  * actionable content. Each must be the output of {@link normalizeAdvisorNote}
  * so a single membership check covers every punctuation/casing variant
@@ -92,6 +104,92 @@ const SUPPRESSED_NORMALIZED_PHRASES: Record<string, true> = {
 	continue: true,
 	"carry on": true,
 };
+
+/** Longest note (trimmed characters) {@link isNoFindingNote} may classify as filler. */
+const NO_FINDING_MAX_LENGTH = 200;
+
+/**
+ * Raw-text markers of concrete content: code spans, digits (line numbers,
+ * counts, SHAs), `file.ext`, paths, CLI flags, camelCase / snake_case
+ * identifiers, calls, `#refs`, assignments, arrows. Any match keeps the note.
+ */
+const CONTENT_TOKEN = /`|\d|\w\.[A-Za-z]{1,6}\b|(?:^|\s)[~.]?\/\w|(?:^|\s)--?\w|\b[a-z]+[A-Z]\w*|\w_\w|\(\)|#\w|=|->/;
+
+/** Normalized-text cues of a finding or directive. Any match keeps the note. */
+const FINDING_CUE =
+	/\b(?:but|however|though|although|instead|except|unless|should|must|never|missing|wrong|broken|fails?|failed|failing|failure|errors?|bugs?|leaks?|race|deadlock|crash\w*|regress\w*|unsafe|incorrect|invalid|stale|caution|warning|careful|make sure|before|after|if you|please|don t|do not)\b/;
+
+/** Parenthesized list right after an ownership word, e.g. `domain (CI/release)`. */
+const OWNERSHIP_PARENTHETICAL = /\b(lane|domain|scope|area)\s*\([^()`]{0,80}\)/gi;
+
+/** Clause boundaries: sentence punctuation, dashes, and `so` / `, and` joins (not `so far`). */
+const CLAUSE_SPLIT = /[.;:!?\n—–]+|,\s*(?:so|and)\s+|\s+so\s+(?!far\b)/i;
+
+/** Longest clause (normalized words) tested against {@link NO_FINDING_MARKER_CLAUSES}. */
+const NO_FINDING_MAX_CLAUSE_WORDS = 16;
+
+const OWNERSHIP = String.raw`(?:\w+ ){0,3}(?:lane|domain|scope|side|area)`;
+const SCOPE_NOUN = String.raw`(?:update|updates|step|steps|turn|transcript|segment|diff|change|changes|exploration|investigation|session|review|spawn|task|tasks|proposal|stage|point)`;
+const SCOPE_TAIL = String.raw`(?: (?:yet|here|now|so far|for now|from me|for me|at this (?:stage|point)|this (?:turn|update|step)|to (?:add|flag|report|advise|raise|review)(?: for \w+)?|(?:in|within|from|outside|out of|beyond) (?:my |the |this )?${OWNERSHIP}|(?:in|on|for|from|at|during|with|about) (?:\w+ )?(?:this|the|my|that|these|its|your)(?: \w+){0,3} ${SCOPE_NOUN})){0,3}`;
+const FINDING_NOUN = String.raw`(?:finding|findings|advice|issue|issues|concern|concerns|problem|problems|defect|defects|risk|risks|note|notes|critique|objection|objections|comment|comments)`;
+
+/**
+ * Whole-clause shapes (over {@link normalizeAdvisorNote} output) stating no
+ * finding, silence, or the advisor's own lane. A no-finding note needs at
+ * least one such clause.
+ */
+const NO_FINDING_MARKER_CLAUSES: readonly RegExp[] = [
+	String.raw`(?:nit|concern|blocker|none|n a|lgtm|ok|okay|on track|carry on|continue|looks good|all good)`,
+	String.raw`(?:(?:so )?i(?: m| am| will| ll) )?(?:staying |remaining |stay |remain |keep(?:ing)? )?(?:silent|silence)(?: (?:on|about) \w+(?: \w+)?)?${SCOPE_TAIL}`,
+	String.raw`(?:so )?i(?: m| am)? (?:withhold|withholding|holding|hold)(?: my| further)? critique${SCOPE_TAIL}`,
+	String.raw`(?:i have |still )?nothing(?: new| further| more| else)?(?: (?:\w+ ){0,3}(?:owned|related))?(?: (?:to|for me to) (?:add|flag|report|advise|raise|say|note))?${SCOPE_TAIL}`,
+	String.raw`(?:\w+ check )?(?:there is |there are |i have |i see )?no (?:\w+ ){0,6}${FINDING_NOUN}${SCOPE_TAIL}`,
+	String.raw`no further (?:\w+ ){0,2}(?:is |are )?(?:needed|required)${SCOPE_TAIL}`,
+	String.raw`(?:out of|outside|not in|beyond) (?:my|the) ${OWNERSHIP}`,
+].map(source => new RegExp(`^${source}$`));
+
+/**
+ * Whole-clause shapes describing the watched agent's progress or the review
+ * context. Accepted only alongside a {@link NO_FINDING_MARKER_CLAUSES} clause.
+ */
+const NO_FINDING_CONTEXT_CLAUSES: readonly RegExp[] = [
+	String.raw`(?:(?:\w+ )?(?:investigation|exploration|scouting|reading) only )?no (?:changed )?(?:lines|code|changes)(?: changed)?(?: (?:to review|under review))?(?: for \w+)?${SCOPE_TAIL}`,
+	String.raw`(?:just )?(?:the |this )?(?:main )?(?:agent|user|scout|engineer)(?: is| s| has)? (?:has (?:made|asked|sent) (?:a |an |the )?\w+ and is )?(?:still |now |already |just )?(?:mid turn|mid investigation|mid flight|on track|in progress|(?:waiting|awaiting)(?: on| for)?(?: \w+){0,4}|(?:reading|locating|investigating|exploring|scouting|researching|doing read only)(?: \w+){0,8})(?: and (?:on track|mid turn))?`,
+	String.raw`(?:the )?agent (?:has )?already (?:corrected|acted on|addressed|caught|handled)(?: \w+){0,6}`,
+	String.raw`(?:\w+ ){0,2}(?:mid turn|mid investigation|mid flight|in progress)(?: and on track)?`,
+	String.raw`(?:\w+ ){0,3}(?:is|are|looks) fine`,
+	String.raw`(?:just )?(?:a |the )?read only (?:\w+ ){0,3}(?:task|scout|agent|spawn|lookup|exploration)(?: (?:has been|was|is) (?:spawned|started|launched|running))?`,
+	String.raw`(?:the |this )?(?:proposal|update|step|change|task) (?:is|was) (?:a |an |just |only ){0,2}(?:\w+ ){0,4}(?:proposal|change|question|exploration|investigation|scouting|research|reading|mapping|task)(?: (?:outside|out of|beyond) (?:my|the) ${OWNERSHIP})?`,
+	String.raw`(?:the )?answer is (?:\w+ )?(?:caveated|hedged|scoped)(?: \w+){0,6}`,
+	String.raw`wait(?:ing)? (?:for|on) (?:the |a )?(?:\w+ ){0,2}(?:answer|answers|reply|result|results|user|engineer|scout|choices?)`,
+	String.raw`\w+ check`,
+].map(source => new RegExp(`^${source}$`));
+
+/**
+ * Whether a note carries no finding: at most {@link NO_FINDING_MAX_LENGTH}
+ * characters, no {@link CONTENT_TOKEN} or {@link FINDING_CUE}, every clause
+ * matching a marker or context shape, and at least one marker clause
+ * ("Nothing in verification scope; no advice.", "Out of my lane (CI/release);
+ * no owned finding. Silent.", a bare "nit"). A note citing a location,
+ * identifier, or number never matches.
+ *
+ * Exported for tests.
+ */
+export function isNoFindingNote(note: string): boolean {
+	const text = note.trim();
+	if (!text || text.length > NO_FINDING_MAX_LENGTH) return false;
+	if (CONTENT_TOKEN.test(text)) return false;
+	if (FINDING_CUE.test(normalizeAdvisorNote(text))) return false;
+	let marked = false;
+	for (const part of text.replace(OWNERSHIP_PARENTHETICAL, "$1").split(CLAUSE_SPLIT)) {
+		const clause = normalizeAdvisorNote(part);
+		if (!clause) continue;
+		if (clause.split(" ").length > NO_FINDING_MAX_CLAUSE_WORDS) return false;
+		if (NO_FINDING_MARKER_CLAUSES.some(shape => shape.test(clause))) marked = true;
+		else if (!NO_FINDING_CONTEXT_CLAUSES.some(shape => shape.test(clause))) return false;
+	}
+	return marked;
+}
 
 /**
  * Bounds the dedupe history. Sessions with very long advisor activity could
@@ -174,6 +272,8 @@ export class AdvisorEmissionGuard {
 	 *  primary turn: only those may be displaced by a strictly-higher-rank
 	 *  admission; routed notes stay charged. */
 	#slots: { key: string; rank: number; pending: boolean }[] = [];
+	/** Malformed `advise` calls rejected this update. */
+	#invalidCalls = 0;
 	readonly #capacity: number;
 	readonly #budgetPerUpdate: number;
 
@@ -196,6 +296,7 @@ export class AdvisorEmissionGuard {
 		this.#seen.clear();
 		this.#seenOrder.length = 0;
 		this.#slots = [];
+		this.#invalidCalls = 0;
 	}
 
 	/**
@@ -207,18 +308,30 @@ export class AdvisorEmissionGuard {
 	 */
 	beginUpdate(): void {
 		this.#slots = [];
+		this.#invalidCalls = 0;
+	}
+
+	/**
+	 * Count one malformed `advise` call against this update. Returns `true` for
+	 * the first rejection (the advisor may retry once) and `false` once the
+	 * update's single retry is spent (the call is dropped).
+	 */
+	recordInvalidCall(): boolean {
+		this.#invalidCalls++;
+		return this.#invalidCalls === 1;
 	}
 
 	/**
 	 * Record that a still-pending note was re-raised at a strictly higher
 	 * severity and is being escalated in place — no new admission, no extra
 	 * budget. Keeps the dedupe rank and any current-update slot coherent, so a
-	 * later equal/lower repeat of the text stays suppressed and displacement
-	 * compares the note's real rank. No-op when `rank` does not exceed the
-	 * recorded rank.
+	 * later equal/lower repeat of the finding stays suppressed and displacement
+	 * compares the note's real rank. The finding is identified by `defect` and
+	 * `ref` as in {@link admit}. No-op when `rank` does not exceed the recorded
+	 * rank.
 	 */
-	escalatePending(note: string, rank: number): void {
-		const key = normalizeAdvisorNote(note);
+	escalatePending(defect: string, rank: number, ref?: string): void {
+		const key = advisorDedupeKey(defect, ref);
 		if (!key) return;
 		const seenRank = this.#seen.get(key) ?? 0;
 		if (rank <= seenRank) return;
@@ -248,38 +361,41 @@ export class AdvisorEmissionGuard {
 	}
 
 	/**
-	 * Mark a previously admitted pending note as routed to the primary (a
-	 * deferred flush delivered it). Its budget slot — when still within the
-	 * originating update — becomes non-displaceable: a routed note cannot be
-	 * retracted to free budget. No-op once the update boundary has cleared the
-	 * slot.
+	 * Mark a previously admitted pending finding (`defect` and `ref` as in
+	 * {@link admit}) as routed to the primary (a deferred flush delivered it).
+	 * Its budget slot — when still within the originating update — becomes
+	 * non-displaceable: a routed note cannot be retracted to free budget. No-op
+	 * once the update boundary has cleared the slot.
 	 */
-	markRouted(note: string): void {
-		const key = normalizeAdvisorNote(note);
+	markRouted(defect: string, ref?: string): void {
+		const key = advisorDedupeKey(defect, ref);
 		const slot = this.#slots.find(s => s.key === key);
 		if (slot) slot.pending = false;
 	}
 
 	/**
-	 * Decide whether the proposed note may reach the primary. The decision is
-	 * the single admission authority: on `accepted` the guard has recorded the
-	 * note (consumed budget where due, updated the dedupe rank) and names any
-	 * displaced pending note; on rejection the `reason` is the truthful
+	 * Decide whether the proposed finding may reach the primary. The decision
+	 * is the single admission authority: on `accepted` the guard has recorded
+	 * the note (consumed budget where due, updated the dedupe rank) and names
+	 * any displaced pending note; on rejection the `reason` is the truthful
 	 * classification for the advisor-facing acknowledgment.
 	 *
-	 * `pending` declares the caller's routing intent: withheld behind an
-	 * in-progress primary turn (displaceable by a later strictly-higher-rank
-	 * admission this update) versus routed immediately (charged, never
-	 * displaceable). A note that fails the noise/empty/dedupe filter never
-	 * consumes the budget, so a suppressed phrase cannot burn the update's
-	 * slot ahead of a substantive concern. Empty / whitespace-only notes are
-	 * suppressed defensively even though the tool-args contract requires a
-	 * non-empty string.
+	 * `defect` is filtered against the content-free phrase list and
+	 * {@link isNoFindingNote}, independent of the anchor. Dedupe keys on
+	 * {@link advisorDedupeKey}(`defect`, `ref`). `pending` declares the caller's
+	 * routing intent: withheld behind an in-progress primary turn (displaceable
+	 * by a later strictly-higher-rank admission this update) versus routed
+	 * immediately (charged, never displaceable). A note that fails the
+	 * noise/empty/dedupe filter never consumes the budget, so a suppressed
+	 * phrase cannot burn the update's slot ahead of a substantive concern.
 	 */
-	admit(note: string, opts: { rank: number; pending: boolean }): AdvisorAdmission {
-		const key = normalizeAdvisorNote(note);
-		if (!key) return { accepted: false, reason: "empty" };
-		if (SUPPRESSED_NORMALIZED_PHRASES[key]) return { accepted: false, reason: "noise" };
+	admit(defect: string, opts: { rank: number; pending: boolean; ref?: string }): AdvisorAdmission {
+		const normalized = normalizeAdvisorNote(defect);
+		if (!normalized) return { accepted: false, reason: "empty" };
+		if (SUPPRESSED_NORMALIZED_PHRASES[normalized] || isNoFindingNote(defect)) {
+			return { accepted: false, reason: "noise" };
+		}
+		const key = advisorDedupeKey(defect, opts.ref);
 		const rank = opts.rank;
 		const seenRank = this.#seen.get(key) ?? 0;
 		if (rank <= seenRank) return { accepted: false, reason: "duplicate" };

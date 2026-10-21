@@ -146,7 +146,20 @@ A `WATCHDOG.yml` roster entry may select any subset of built-ins that were actua
 
 Advisor tools are built against the isolated advisor `ToolSession` and wrapped with `ExtensionToolWrapper`, so `tools.approvalMode`, per-tool approval policies, and `autoApprove` apply just as they do to registry tools. Cursor's server-side exec bridge uses the same approval context and only exposes delete/edit/search capabilities when the corresponding advisor grant exists.
 
-The `advise` tool accepts one note and an optional severity:
+The `advise` tool accepts one structured finding:
+
+| Field      | Required                                                               | Meaning                                                                                                                                                     |
+| ---------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`     | yes                                                                    | `defect` (wrong now), `concern` (likely wrong), `unverified` (claim or result nobody checked), `suggestion` (better approach).                              |
+| `severity` | no (omitted = `nit`)                                                   | `nit`, `concern`, or `blocker`; drives delivery, budget, and dedupe escalation as below.                                                                    |
+| `where`    | yes                                                                    | `{ type, ref }`: `type` is `file`, `command`, `tool-call`, `instruction`, `claim`, or `approach` (plan, strategy, verification); `ref` is the anchor.       |
+| `defect`   | yes                                                                    | What is wrong; for a `suggestion`, the advice itself.                                                                                                       |
+| `impact`   | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | What breaks if left as is.                                                                                                                                  |
+| `fix`      | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | The concrete correction.                                                                                                                                    |
+
+Validation is shape-only: enums, and required strings that are non-empty after trimming. A call that fails validation returns a tool error naming the failing fields and stating that a review with nothing to report ends without calling `advise`. The advisor may retry once per update; a second rejected call in the same update is dropped and acknowledged as dropped.
+
+Severity routing:
 
 | Severity        | Delivery                                                                                                                                                             | Intended use                                                                 |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
@@ -154,13 +167,15 @@ The `advise` tool accepts one note and an optional severity:
 | `concern`       | Interrupting steering when delivery constraints permit it. After a terminal answer it requests a continuation at the default `advisor.continueSeverity`; set the threshold to `blocker` to leave a visible card instead. | Material risk, likely wrong direction, missing constraint, hallucinated API. |
 | `blocker`       | Interrupting steering message when the delivery constraints below permit it. A terminal answer never prevents it from triggering a turn.                            | Continuing would clearly waste work or produce broken output.                |
 
-Accepted notes are rendered into the primary transcript as XML-escaped `<advisory>` elements. Named roster advisors add an `advisor` attribute:
+Accepted notes are rendered into the primary transcript as `<advisory>` elements whose body is `<where.ref> — <defect>`, followed by ` → <impact>` and ` → <fix>` when present, XML-escaped. `kind` is an attribute; named roster advisors add an `advisor` attribute:
 
 ```text
-<advisory advisor="Architecture" severity="concern" guidance="weigh, don't blindly obey">
-note text
+<advisory advisor="Architecture" severity="concern" kind="defect" guidance="weigh, don't blindly obey">
+src/retry.ts:42 — the retry budget is never decremented → the loop never terminates on a persistent 503 → decrement before the backoff sleep
 </advisory>
 ```
+
+`advise` tool-result details store the rendered body as `note` alongside the structured fields; primary advisor cards store `note` and `kind`. Transcripts written before structured advice carry only `note` and render unchanged.
 
 When you deliberately interrupt the agent (Esc, or a cancel from collab, ACP, RPC, the SDK, or an extension), the advisor stops auto-resuming it. An interrupting `concern`/`blocker` raised while the run is stopped is recorded as a visible advisor card instead of restarting the turn, and a concern already in flight when you interrupt is preserved the same way rather than driving a surprise resume. The advice re-enters context the next time you resume — a new message, the `.`/`c` continue shortcut, or a steer/follow-up.
 
@@ -187,13 +202,13 @@ While an advisor update reviews work still in progress, `AdviseTool` defers `nit
 Each advisor has its own `AdvisorEmissionGuard` (`src/advisor/emission-guard.ts`) on the route from `AdviseTool` to the YieldQueue/steer channel. It enforces the system prompt's per-update non-blocker advice budget and no-repeat rules:
 
 1. **Normalization.** Lowercase, NFKC, collapse every run of non-alphanumeric characters to one space, then trim. `"Stop."`, `"*Stop*"`, and `"  stop  "` all key to `stop`.
-2. **Content-free phrase filter.** Short phrases with no concrete reason — `stop`, `done`, `complete`, `no issue continue`, `lgtm`, `nothing to add`, and similar — are suppressed.
-3. **Severity-aware dedupe.** A repeated normalized note is dropped at equal or lower severity. A higher-severity re-raise (`nit` → `concern` → `blocker`) remains eligible even after the earlier note was delivered. The prompt is stricter: it permits re-raising prior non-blocker advice only as a `blocker`, once new transcript evidence meets `blocker` criteria. The FIFO history holds at most 4096 entries.
+2. **Content-free filter.** A `defect` consisting only of a short phrase with no concrete reason — `stop`, `done`, `complete`, `no issue continue`, `lgtm`, `nothing to add`, and similar — is suppressed. Whatever the anchor, a short `defect` (at most 200 characters) is also suppressed when its own text cites no code, number, path, or flag, carries no finding cue (`but`, `missing`, `fails`, `should`, …), and every clause only states no finding, silence, being out of lane, or the agent's progress ("Nothing in verification scope; no advice.", "Silent.", "Out of my lane; no owned finding.").
+3. **Severity-aware dedupe.** Findings key on the trimmed `where.ref` plus the normalized `defect`. A repeated finding is dropped at equal or lower severity. A higher-severity re-raise (`nit` → `concern` → `blocker`) remains eligible even after the earlier note was delivered. The prompt is stricter: it permits re-raising prior non-blocker advice only as a `blocker`, once new transcript evidence meets `blocker` criteria. The FIFO history holds at most 4096 entries.
 4. **Per-update rank budget.** Up to N non-blocker notes per advisor model `prompt()` cycle (default 4, configurable from 1–32). At capacity, a higher-severity note may replace the lowest-rank still-pending note from the same update. Routed notes retain their slots; earlier updates' pending notes remain reserved. Blockers are exempt, and suppressed noise consumes no budget. Precedence: per-advisor config > shared `WATCHDOG.yml` top-level > `advisor.maxNotesPerUpdate` setting > default 4. There is no additional aggregate backlog budget.
 
-Acknowledgments distinguish acceptance, conditional deferral, duplicates, noise, and budget suppression. Acceptance means the host accepted the note for primary delivery, not that the primary model consumed it. Deferred acceptance warns that a higher-severity finding from the same review may displace the note. A rejected note receives no delivery promise; the advisor should not rephrase rejected findings to evade the guard.
+Acknowledgments distinguish acceptance, conditional deferral, duplicates, noise, budget suppression, and invalid calls: the first malformed call in an update is a tool error naming the failing fields; later ones are acknowledged as `Dropped: invalid call`. Acceptance means the host accepted the note for primary delivery, not that the primary model consumed it. Deferred acceptance warns that a higher-severity finding from the same review may displace the note. A rejected note receives no delivery promise; the advisor should not rephrase rejected findings to evade the guard.
 
-The guard's full state — dedupe history and per-update gate — clears on every advisor reset (compaction, session switch, `/new`), so a re-primed reviewer can re-raise issues it already raised against the rewritten transcript.
+The guard's full state — dedupe history, per-update gate, and the per-update invalid-call retry — clears on every advisor reset (compaction, session switch, `/new`), so a re-primed reviewer can re-raise issues it already raised against the rewritten transcript. The per-update budget and invalid-call retry also reset at the start of every advisor update.
 
 ## Catch-up with `advisor.syncBacklog`
 

@@ -1178,7 +1178,9 @@ describe("AgentSession advisor toggle", () => {
 			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
 			adviseTool.beginUpdate(true);
 			const deferred = await adviseTool.execute("deferred-before-quota", {
-				note: "The final result still needs a regression test.",
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: "The final result still needs a regression test.",
 				severity: "nit",
 			});
 			if (deferred.content.length === 0) throw new Error("Expected the advise tool to acknowledge the call");
@@ -1245,13 +1247,17 @@ describe("AgentSession advisor toggle", () => {
 			tool.beginUpdate(true);
 			for (let i = 1; i <= budget; i++) {
 				const result = await tool.execute(`${prefix}-${i}`, {
-					note: `${prefix} note ${i}`,
+					kind: "suggestion",
+					where: { type: "approach", ref: "review" },
+					defect: `${prefix} note ${i}`,
 					severity: "concern",
 				});
 				expect(JSON.stringify(result.content)).toContain("Queued for the end of the turn");
 			}
 			const rejected = await tool.execute(`${prefix}-${budget + 1}`, {
-				note: `${prefix} note ${budget + 1}`,
+				kind: "suggestion",
+				where: { type: "approach", ref: "review" },
+				defect: `${prefix} note ${budget + 1}`,
 				severity: "concern",
 			});
 			expect(JSON.stringify(rejected.content)).toContain("budget is spent");

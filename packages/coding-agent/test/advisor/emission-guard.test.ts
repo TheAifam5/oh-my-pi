@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { AdvisorEmissionGuard, normalizeAdvisorNote } from "../../src/advisor/emission-guard";
+import {
+	AdvisorEmissionGuard,
+	advisorDedupeKey,
+	isNoFindingNote,
+	normalizeAdvisorNote,
+} from "../../src/advisor/emission-guard";
 
 describe("normalizeAdvisorNote", () => {
 	it("collapses punctuation, casing, and surrounding whitespace into one canonical key", () => {
@@ -317,5 +322,148 @@ describe("AdvisorEmissionGuard", () => {
 			}
 		}
 		expect(accepted).toEqual(["Concrete-but-repeated nit: x"]);
+	});
+
+	it("keys dedupe on the trimmed ref plus the normalized defect", () => {
+		expect(advisorDedupeKey("Budget never decrements!", " src/retry.ts:42 ")).toBe(
+			"src/retry.ts:42\nbudget never decrements",
+		);
+		expect(advisorDedupeKey("...", "src/retry.ts")).toBe("");
+		const guard = new AdvisorEmissionGuard();
+		const defect = "Budget never decrements.";
+		expect(guard.admit(defect, { rank: 1, pending: false, ref: "src/retry.ts:42" }).accepted).toBe(true);
+		expect(guard.admit("budget never decrements", { rank: 1, pending: false, ref: "src/retry.ts:42" })).toEqual({
+			accepted: false,
+			reason: "duplicate",
+		});
+		expect(guard.admit(defect, { rank: 1, pending: false, ref: "src/queue.ts:7" }).accepted).toBe(true);
+		expect(guard.admit(defect, { rank: 2, pending: false, ref: "src/retry.ts:42" }).accepted).toBe(true);
+		expect(guard.admit("Done.", { rank: 1, pending: false, ref: "src/retry.ts:42" })).toEqual({
+			accepted: false,
+			reason: "noise",
+		});
+	});
+
+	it("allows one invalid-call retry per update and resets it with the update and on reset", () => {
+		const guard = new AdvisorEmissionGuard();
+		expect(guard.recordInvalidCall()).toBe(true);
+		expect(guard.recordInvalidCall()).toBe(false);
+		expect(guard.recordInvalidCall()).toBe(false);
+		guard.beginUpdate();
+		expect(guard.recordInvalidCall()).toBe(true);
+		guard.reset();
+		expect(guard.recordInvalidCall()).toBe(true);
+	});
+});
+
+describe("isNoFindingNote", () => {
+	// Real advise() notes from watchdog advisor transcripts that reached the
+	// primary as `<advisory>` cards while carrying no finding.
+	const realFiller = [
+		"Nothing in verification scope; no advice.",
+		"Silent: agent is mid-investigation and on track.",
+		"No finding from me: this update is a UI/billing-text proposal, outside my domain (dependencies, build, CI, release, packaging).",
+		"Out of my lane (dependency/CI/release); no owned finding in this transcript segment. Silent.",
+		"Mid-turn; no UI-domain concern here. Silent.",
+		"nit",
+		"Silence.",
+		"Silent.",
+		"Outside my domain (delivery/dependency/CI/release config). No finding to report.",
+		"Nothing to flag in my lane.",
+		"Silent: no owned style finding in the transcript so far.",
+		"Rebase mid-flight is fine; nothing to flag yet.",
+		"Nothing to flag: no code changed this turn, so there is no layout issue to report.",
+		"Nothing new to flag. The agent has already corrected its overclaim about evidence, so no further advice is needed.",
+		"Docs check: no finding. Rebasing is in progress; I'm silent.",
+		"No owned install/upgrade/persisted-state finding in this update.",
+		"Nothing from the concurrency/resource domain to flag on this update.",
+		"No concurrency or resource issue here; the proposal is a display-only change.",
+		"Nothing verification-owned; the agent has made a proposal and is awaiting the user's choices.",
+		"Nothing in verification scope; the answer is correctly caveated as docs/code-read, not tested.",
+		"Nothing to add on the new tasks yet. This is mid-investigation, so I withhold critique.",
+		"Nothing for me to flag in this update, so I'm staying silent.",
+	];
+
+	// Real advise() notes from the same transcripts that carry a finding,
+	// including ones that open with a no-finding phrase.
+	const realFindings = [
+		"Nothing in verification scope; continue reading resolveCliModel at model-resolver.ts:2188.",
+		"Nothing in the transcript's changed lines needs a style note yet. When you edit model-browser.ts:730 and the billing summary, run `oxfmt` on the changed files and keep one statement per line.",
+		"No verification issue; keep tracing resolveCliModel for @role-with-pool, then state the answer with its read-only basis.",
+		"Nothing in verification scope; wait for the build/smoke-test result before claiming the rebuild.",
+		"Nothing in my domain. The pin-persistence question (session-file credential_pin) is a design choice with no concrete before/after migration or recovery transition yet.",
+		"Silent on concurrency: the agent is reading how `auth.accountPolicies` is structured, which is the natural home for a per-account reset policy. It has not written any code yet.",
+		"Don't edit global WATCHDOG.md or WATCHDOG.yml to fix silence.",
+		"The isolated rerun exited 1 with no output, so it gave no evidence either way.",
+		"`cargo metadata failed` is most likely caused by the isolated HOME. cargo and rustup resolve ~/.cargo and ~/.rustup from HOME.",
+		"You killed StatsAccountsPage mid-run. Run `git status` in the maxxed worktree now.",
+	];
+
+	it("classifies real content-free advisor notes as no-finding", () => {
+		expect(realFiller.filter(note => !isNoFindingNote(note))).toEqual([]);
+	});
+
+	it("keeps real findings, including ones that open with a no-finding phrase", () => {
+		expect(realFindings.filter(note => isNoFindingNote(note))).toEqual([]);
+	});
+
+	it("classifies stay/remain/keep and future-tense silence statements as no-finding", () => {
+		for (const note of [
+			"I will stay silent.",
+			"I'll keep silent here.",
+			"Remaining silent for now.",
+			"Keeping silent this turn.",
+			"Staying silent on this update.",
+		]) {
+			expect(isNoFindingNote(note)).toBe(true);
+		}
+	});
+
+	it("keeps short findings phrased with no-finding words", () => {
+		for (const note of [
+			"No lock around the cache write; two writers can interleave.",
+			"No tests for the new path; nothing else to flag.",
+			"No issue with the parser, the retry loop spins forever.",
+			"Nothing handles the empty queue case.",
+			"No owned finding, but the lease push needs the old tip.",
+			"No concern on style; see emission-guard.ts:282.",
+			"Nothing in the lock protects the cache write.",
+			"No input in the request body.",
+			"Outside my domain (token exposed at auth.ts:42). No finding to report.",
+			"Silent failure: the catch block swallows the write error.",
+		]) {
+			expect(isNoFindingNote(note)).toBe(false);
+		}
+	});
+
+	it("keeps progress-only notes that state no explicit absence of findings", () => {
+		for (const note of ["Agent is still reading the old schema and deleting live rows.", "looks fine"]) {
+			expect(isNoFindingNote(note)).toBe(false);
+		}
+	});
+
+	it("keeps notes beyond the length bound", () => {
+		expect(isNoFindingNote(`Nothing to flag ${"in this update ".repeat(20)}`)).toBe(false);
+	});
+
+	it("bounds matching time on adversarial clause repetition", () => {
+		let note = "nothing";
+		while (note.length < 180) note += " in my lane";
+		const started = performance.now();
+		expect(isNoFindingNote(`${note} b c d e f`)).toBe(false);
+		expect(performance.now() - started).toBeLessThan(250);
+	});
+
+	it("drops a no-finding defect as noise without spending the budget, whatever the anchor", () => {
+		const guard = new AdvisorEmissionGuard({ budgetPerUpdate: 1 });
+		for (const ref of ["review", "src/retry.ts:42", "`bun test`", undefined]) {
+			for (const defect of realFiller) {
+				expect(guard.admit(defect, { rank: 2, pending: false, ref })).toEqual({
+					accepted: false,
+					reason: "noise",
+				});
+			}
+		}
+		expect(guard.admit(realFindings[0]!, { rank: 2, pending: false, ref: "review" })).toEqual({ accepted: true });
 	});
 });

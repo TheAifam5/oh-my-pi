@@ -1614,7 +1614,8 @@ function newBlockState(): BlockState {
 // dispatch to prove a bridge built over the advisor's tool set executes the
 // `advise` MCP call and returns a success frame.
 describe("CursorExecHandlers advise routing (issue #5680)", () => {
-	function adviseServerMessage(note: string) {
+	function adviseServerMessage(defect: string) {
+		const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 		return create(AgentServerMessageSchema, {
 			message: {
 				case: "execServerMessage",
@@ -1628,7 +1629,11 @@ describe("CursorExecHandlers advise routing (issue #5680)", () => {
 							toolName: "advise",
 							toolCallId: "call-advise-1",
 							providerIdentifier: "pi-agent",
-							args: { note: new TextEncoder().encode(JSON.stringify(note)) },
+							args: {
+								kind: encode("suggestion"),
+								where: encode({ type: "approach", ref: "input parsing" }),
+								defect: encode(defect),
+							},
 						}),
 					},
 				}),
@@ -1676,7 +1681,7 @@ describe("CursorExecHandlers advise routing (issue #5680)", () => {
 			[],
 		);
 
-		expect(advised).toEqual([{ note: "Consider the empty-input edge case", severity: undefined }]);
+		expect(advised).toEqual([{ note: "input parsing — Consider the empty-input edge case", severity: undefined }]);
 		expect(written.length).toBe(1);
 		expect(decodeMcpResultCase(written[0])).toBe("success");
 	});

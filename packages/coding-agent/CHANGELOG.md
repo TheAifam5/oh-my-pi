@@ -30,6 +30,7 @@
 ### Changed
 
 - Changed `/account` to show each account's remaining quota, reset countdowns, balances and spending projections instead of billing classes; older numbers keep their fetched age
+- Changed the advisor `advise` tool to take one structured finding (`kind`, `where` anchor, `defect`, plus `impact`/`fix` for concern and blocker findings) instead of a free-form note; malformed calls get one retry per update, advisories carry a `kind` attribute, and a `defect` that only states no finding, silence, or being out of lane is dropped whatever its anchor
 
 ## [18.12.5] - 2026-10-21
 

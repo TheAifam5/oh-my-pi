@@ -10,6 +10,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { countNewlines, escapeXmlText } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { adviseArgumentTexts } from "../advisor/advise-tool";
 import type {
 	BashExecutionMessage,
 	BranchSummaryMessage,
@@ -184,7 +185,7 @@ function primaryArgText(name: string, args: Record<string, unknown> | undefined)
 	if (!args || typeof args !== "object") return "";
 	// Advisor note is the most informative summary; preserve severity too.
 	if (name === "advise") {
-		const note = typeof args.note === "string" ? args.note : "";
+		const note = adviseArgumentTexts(args).join(" — ");
 		const severity = typeof args.severity === "string" ? args.severity : "";
 		if (note && severity) return `${severity}: ${note}`;
 		if (note) return note;

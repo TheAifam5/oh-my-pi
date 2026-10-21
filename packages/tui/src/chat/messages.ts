@@ -291,10 +291,16 @@ export const ADVISOR_SEVERITIES = ["nit", "concern", "blocker"] as const;
 
 export type AdvisorSeverity = (typeof ADVISOR_SEVERITIES)[number];
 
+/** What a structured advisor note reports. */
+export type AdvisorKind = "defect" | "concern" | "unverified" | "suggestion";
+
 /** One queued advice note. */
 export interface AdvisorNote {
+	/** Rendered note body; free text in transcripts written before structured advice. */
 	note: string;
 	severity?: AdvisorSeverity;
+	/** Finding kind; absent in transcripts written before structured advice. */
+	kind?: AdvisorKind;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
 	/** Primary turns completed when note was emitted. */

@@ -191,7 +191,12 @@ describe("AgentSession advisor auto-resume suppression", () => {
 						{
 							type: "toolCall",
 							name: "advise",
-							arguments: { note: "Fixture verdict confirmed", severity },
+							arguments: {
+								kind: "suggestion",
+								where: { type: "approach", ref: "review" },
+								defect: "Fixture verdict confirmed",
+								severity,
+							},
 						},
 					],
 				},
@@ -281,7 +286,12 @@ describe("AgentSession advisor auto-resume suppression", () => {
 						{
 							type: "toolCall",
 							name: "advise",
-							arguments: { note: "Final yield needs correction", severity: "blocker" },
+							arguments: {
+								kind: "suggestion",
+								where: { type: "approach", ref: "review" },
+								defect: "Final yield needs correction",
+								severity: "blocker",
+							},
 						},
 					],
 				},
@@ -694,7 +704,12 @@ describe("AgentSession advisor auto-resume suppression", () => {
 						{
 							type: "toolCall",
 							name: "advise",
-							arguments: { note: "shipped code deletes the audit table", severity: "blocker" },
+							arguments: {
+								kind: "suggestion",
+								where: { type: "approach", ref: "review" },
+								defect: "shipped code deletes the audit table",
+								severity: "blocker",
+							},
 						},
 						{ type: "toolCall", name: "read", arguments: { path: "audit.sql" } },
 					],
