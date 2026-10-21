@@ -10,13 +10,16 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { claudeRankingStrategy } from "@oh-my-pi/pi-ai/usage/claude";
 import {
+	type AccountResetPolicy,
 	ATTEMPT_COOLDOWN_MS,
+	accountResetEnabled,
 	DEBOUNCE_BUCKET_MS,
 	IMMINENT_RESET_EXPIRY_MS,
 	REPORT_FRESHNESS_MS,
 	SALVAGE_MIN_USED_FRACTION,
 	type CodexResetTrigger,
 } from "./codex-auto-reset";
+import type { ResetAutoRedeemMode } from "./settings";
 
 const CLAUDE_PROVIDER = "anthropic";
 const JUNIPER_PROGRAM = "juniper_tide";
@@ -52,7 +55,8 @@ export type ClaudeResetSkipReason =
 	| "window-mostly-free"
 	| "already-attempted"
 	| "deferred"
-	| "cooldown";
+	| "cooldown"
+	| "reset-on-excluded";
 
 /** Live grant eligibility and usage evidence for one deterministic planning pass. */
 export interface ClaudeResetPlanInput {
@@ -75,6 +79,11 @@ export interface ClaudeResetPlanInput {
 	statuses: readonly ResetCreditAccountStatus[];
 	/** Blocked recovery: whether a stored credential may serve the blocked session; absent allows every account. */
 	permitsCredential?: (credentialId: number) => boolean;
+	/**
+	 * Per-account policy; absent leaves every account to `settings`. With it, an
+	 * account's `autoRedeem` replaces `settings.enabled` for that account.
+	 */
+	accountResetPolicy?: (target: ResetCreditTarget) => AccountResetPolicy | undefined;
 	attemptedKeys: ReadonlySet<string>;
 	deferredUntilByKey: ReadonlyMap<string, number>;
 	lastAttemptAtByAccount: ReadonlyMap<string, number>;
@@ -99,6 +108,8 @@ export interface ClaudeResetAction {
 	program: string;
 	title?: string;
 	requiresLimit: boolean;
+	/** The account's `autoRedeem` override; absent: the provider setting applies. */
+	autoRedeem?: ResetAutoRedeemMode;
 }
 
 /** Account-scoped diagnostic explaining why a planning rule did not spend. */
@@ -122,6 +133,7 @@ interface ClaudeAccountSnapshot {
 	availableCount: number;
 	credit: UsageResetCredit;
 	limits: UsageLimit[];
+	policy: AccountResetPolicy | undefined;
 }
 
 function normalized(value: unknown): string | undefined {
@@ -275,7 +287,7 @@ function skipForEpisode(
  */
 export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeResetPlan {
 	const skipped: ClaudeResetSkip[] = [];
-	if (!input.settings.enabled) {
+	if (!input.settings.enabled && !input.accountResetPolicy) {
 		return { actions: [], skipped: [{ accountKey: "*", rule: "account", reason: "disabled" }] };
 	}
 	if (input.trigger === "blocked" && input.provider !== CLAUDE_PROVIDER) {
@@ -293,6 +305,17 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 			continue;
 		}
 		const skip = (reason: ClaudeResetSkipReason) => skipped.push({ accountKey, rule: "account", reason });
+		const policy = input.accountResetPolicy?.({
+			provider: CLAUDE_PROVIDER,
+			credentialId: status.credentialId,
+			accountId: status.accountId,
+			email: status.email,
+			orgId: status.orgId,
+		});
+		if (!accountResetEnabled(input.settings.enabled, policy)) {
+			skip("disabled");
+			continue;
+		}
 		if (status.error) {
 			skip("credits-unknown");
 			continue;
@@ -379,6 +402,7 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 			availableCount: status.availableCount,
 			credit,
 			limits,
+			policy,
 		});
 	}
 
@@ -415,6 +439,16 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 			}
 			if (blockers.some(id => !snapshot.limits.some(limit => limit.id === id))) {
 				skip("unsupported-window");
+				continue;
+			}
+			const resetOn = snapshot.policy?.resetOn;
+			if (
+				resetOn &&
+				!snapshot.limits.some(
+					limit => blockers.includes(limit.id) && resetOn.some(window => window === limit.window?.id),
+				)
+			) {
+				skip("reset-on-excluded");
 				continue;
 			}
 			if (blockers.some(id => !clears.has(id))) {
@@ -504,6 +538,7 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 				program: best.snapshot.credit.program ?? "",
 				title: best.snapshot.credit.title,
 				requiresLimit: best.snapshot.credit.requiresLimit === true,
+				...(best.snapshot.policy?.autoRedeem ? { autoRedeem: best.snapshot.policy.autoRedeem } : {}),
 			};
 		}
 	}
@@ -560,6 +595,11 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 			skip("window-mostly-free");
 			continue;
 		}
+		const resetOn = snapshot.policy?.resetOn;
+		if (resetOn && !resetOn.some(window => window === fullest.limit.window?.id)) {
+			skip("reset-on-excluded");
+			continue;
+		}
 		if (snapshot.credit.requiresLimit === true && serverBlockers.length === 0 && !covered.some(isExhausted)) {
 			skip("no-blocked-window");
 			continue;
@@ -589,6 +629,7 @@ export function planClaudeResetRedemptions(input: ClaudeResetPlanInput): ClaudeR
 			program: snapshot.credit.program ?? "",
 			title: snapshot.credit.title,
 			requiresLimit: snapshot.credit.requiresLimit === true,
+			...(snapshot.policy?.autoRedeem ? { autoRedeem: snapshot.policy.autoRedeem } : {}),
 		});
 	}
 	salvages.sort((left, right) => (left.expiresInMs ?? 0) - (right.expiresInMs ?? 0));

@@ -140,6 +140,17 @@ export function getOAuthCredentialsForProvider(authStorage: AuthStorage, provide
 	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
 }
 
+/** Workspace id stored with `provider`'s API-key credential `apiKey`, when one was entered at login. */
+export function getApiKeyWorkspaceId(authStorage: AuthStorage, provider: string, apiKey: string): string | undefined {
+	const providerEntry = authStorage.credentials.all()[provider];
+	if (!providerEntry) return undefined;
+	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
+	for (const entry of entries) {
+		if (entry.type === "api_key" && entry.key === apiKey) return entry.workspaceId;
+	}
+	return undefined;
+}
+
 /**
  * Resolve every stored OAuth account of an account-scoped discovery provider
  * (Codex `/models`, Antigravity `fetchAvailableModels`), refreshing each

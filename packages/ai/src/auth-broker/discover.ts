@@ -27,9 +27,13 @@ import {
 	DRAIN_SPEND_CLASSES,
 	DRAIN_TRIGGER_SPEND_CLASS,
 	type DrainReturnTrigger,
+	RESET_AUTO_REDEEM_MODES,
+	RESET_ON_WINDOWS,
+	type ResetAutoRedeemOverride,
+	type ResetOnWindow,
 	SqliteAuthCredentialStore,
 } from "../auth-storage";
-import { accountLimitsIssue } from "../auth/policy";
+import { accountLimitsIssue, RESET_POLICY_OAUTH_ONLY } from "../auth/policy";
 import * as AIError from "../error";
 import { parseAccountLimits } from "../usage/limits";
 import { AuthBrokerClient, AuthBrokerError } from "./client";
@@ -128,6 +132,8 @@ const POLICY_FIELDS = [
 	"spend",
 	"returnWhen",
 	"limits",
+	"resetOn",
+	"autoRedeem",
 ];
 
 /** Whether `value` is a list of members of `allowed`. */
@@ -243,6 +249,20 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 		) {
 			throw new AIError.ConfigurationError(`${path}.reclaimAbovePct must be a finite number`);
 		}
+		const { resetOn, autoRedeem } = policy;
+		if (rawAccount.keyFingerprint !== undefined && (resetOn !== undefined || autoRedeem !== undefined)) {
+			throw new AIError.ConfigurationError(`${path}: ${RESET_POLICY_OAUTH_ONLY}`);
+		}
+		if (resetOn !== undefined && (!isEnumList(resetOn, RESET_ON_WINDOWS) || resetOn.length === 0)) {
+			throw new AIError.ConfigurationError(
+				`${path}.resetOn must be a non-empty list of ${RESET_ON_WINDOWS.join(", ")}`,
+			);
+		}
+		if (autoRedeem !== undefined && !(RESET_AUTO_REDEEM_MODES as readonly unknown[]).includes(autoRedeem)) {
+			throw new AIError.ConfigurationError(
+				`${path}.autoRedeem must be one of ${RESET_AUTO_REDEEM_MODES.join(", ")}`,
+			);
+		}
 
 		return {
 			provider,
@@ -265,6 +285,8 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			...(returnWhen !== undefined
 				? { returnWhen: returnWhen as DrainReturnTrigger | readonly DrainReturnTrigger[] }
 				: {}),
+			...(resetOn !== undefined ? { resetOn: resetOn as readonly ResetOnWindow[] } : {}),
+			...(autoRedeem !== undefined ? { autoRedeem: autoRedeem as ResetAutoRedeemOverride } : {}),
 		};
 	});
 }

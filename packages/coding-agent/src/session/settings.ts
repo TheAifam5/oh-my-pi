@@ -1335,7 +1335,7 @@ export const cfgCodexResetsAutoRedeem = register({
 		group: "Services",
 		label: "Codex Auto-Redeem Saved Resets",
 		description:
-			"Spend saved Codex rate-limit resets automatically: restore an account blocked by an exhausted 5h or weekly window when a turn is stuck and no other account can take over, and salvage credits that are about to expire. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables both checks.",
+			"Spend saved Codex rate-limit resets automatically: restore an account blocked by an exhausted 5h or weekly window when a turn is stuck and no other account can take over, and salvage credits that are about to expire. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables both checks. An account's auth.accountPolicies autoRedeem overrides this for that account.",
 		options: [
 			{
 				value: "unset",
@@ -1410,7 +1410,7 @@ export const cfgClaudeResetsAutoRedeem = register({
 		group: "Services",
 		label: "Claude Auto-Redeem Resets",
 		description:
-			"Spend eligible Claude Cedar or Juniper resets automatically. Cedar is spent only for covered limits; Juniper can only recover a sole 5-hour block. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables blocked recovery and expiry salvage.",
+			"Spend eligible Claude Cedar or Juniper resets automatically. Cedar is spent only for covered limits; Juniper can only recover a sole 5-hour block. unset asks before the first spend (with no prompt UI, it spends only a reset expiring within 5 minutes), yes spends without prompting, and no disables blocked recovery and expiry salvage. An account's auth.accountPolicies autoRedeem overrides this for that account.",
 		options: [
 			{
 				value: "unset",

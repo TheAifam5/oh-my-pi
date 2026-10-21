@@ -228,7 +228,7 @@ function credentialEntryWithBlocks(
  * credential; the id is the map key). Used only for equality, never persisted.
  */
 function credentialContentHash(entry: SnapshotEntry): number | bigint {
-	return Bun.hash(`${entry.provider}\u0000${JSON.stringify(entry.credential)}`);
+	return Bun.hash(`${entry.provider}\u0000${entry.userDisabledAtMs ?? ""}\u0000${JSON.stringify(entry.credential)}`);
 }
 
 function emptySnapshot(): SnapshotResponse {
@@ -878,6 +878,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const out: StoredAuthCredential[] = [];
 		for (const entry of this.#snapshot.credentials) {
 			if (provider !== undefined && entry.provider !== provider) continue;
+			if (entry.userDisabledAtMs !== undefined) continue;
 			out.push({
 				id: entry.id,
 				provider: entry.provider,
@@ -886,6 +887,68 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			});
 		}
 		return out;
+	}
+
+	listUserDisabledCredentials(provider?: string): StoredAuthCredential[] {
+		this.#noteActivity();
+		const out: StoredAuthCredential[] = [];
+		for (const entry of this.#snapshot.credentials) {
+			if (provider !== undefined && entry.provider !== provider) continue;
+			if (entry.userDisabledAtMs === undefined) continue;
+			out.push({
+				id: entry.id,
+				provider: entry.provider,
+				credential: entry.credential as AuthCredential,
+				disabledCause: null,
+				userDisabledAtMs: entry.userDisabledAtMs,
+			});
+		}
+		return out;
+	}
+
+	/**
+	 * Persist the enable state through `POST /v1/credential/:id/enabled`, then
+	 * adopt the broker's current snapshot, so a reply that races a later toggle
+	 * never overwrites the broker's state. A disable holds locally from before
+	 * the request; only a definitive HTTP refusal restores the row.
+	 *
+	 * @throws Error when the broker predates the route (404 without a credential miss).
+	 */
+	async setAuthCredentialEnabled(id: number, enabled: boolean): Promise<boolean> {
+		this.#noteActivity();
+		const previous = this.#snapshot.credentials.find(entry => entry.id === id);
+		if (!previous) return false;
+		if (!enabled && previous.userDisabledAtMs === undefined) {
+			// A stale, lower-generation, or lost reply below cannot undo the disable.
+			this.#replaceSnapshotEntry({ ...previous, userDisabledAtMs: Date.now() });
+		}
+		try {
+			await this.#client.setCredentialEnabled(id, enabled);
+		} catch (error) {
+			if (!(error instanceof AuthBrokerError) || error.status === undefined) throw error;
+			if (!enabled && previous.userDisabledAtMs === undefined) this.#replaceSnapshotEntry(previous);
+			if (error.status === 404) {
+				if (error.body?.includes("No credential with id")) return false;
+				throw new Error(
+					"The auth broker does not support enabling or disabling accounts; update the broker to this omp version.",
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+		const result = await this.#client.fetchSnapshot();
+		// A stream frame newer than this read already carries a later toggle.
+		if (result.status === 200 && result.generation >= this.#generation) {
+			this.#applySnapshot(result.snapshot, result.generation);
+		}
+		return true;
+	}
+
+	#replaceSnapshotEntry(next: SnapshotEntry): void {
+		const credentials = this.#snapshot.credentials.map(entry => (entry.id === next.id ? next : entry));
+		this.#snapshot = { ...this.#snapshot, credentials };
+		this.#dirtyCredentialIds.add(next.id);
+		this.#refreshCredentialRevision();
 	}
 
 	/** Broker-backed disabled tombstones; empty against brokers predating the endpoint. */
@@ -1122,7 +1185,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * key clobbers any previously stored key for the same provider.
 	 */
 	async replaceAuthCredentials(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]> {
-		const existing = this.listAuthCredentials(provider);
+		const existing = this.#snapshot.credentials.filter(entry => entry.provider === provider);
 		for (const entry of existing) {
 			try {
 				await this.#client.disableCredential(entry.id, "replaced by newer credential");
@@ -1151,7 +1214,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * post-state in the background.
 	 */
 	async deleteAuthCredentials(provider: string, disabledCause: string): Promise<void> {
-		const existing = this.listAuthCredentials(provider);
+		const existing = this.#snapshot.credentials.filter(entry => entry.provider === provider);
 		for (const entry of existing) {
 			try {
 				await this.#client.disableCredential(entry.id, disabledCause);
@@ -1168,13 +1231,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {
-		// `entries` is the broker's authoritative post-upsert list of rows for
-		// `provider`. Drop our existing rows for the same provider and splice in
-		// the fresh set — preserving every other provider's rows in place.
+		// `entries` is the broker's authoritative post-upsert list of the
+		// provider's enabled rows. Drop our existing enabled rows for the same
+		// provider and splice in the fresh set — preserving user-disabled rows and
+		// every other provider's rows in place.
 		const existingBlocks = new Map<number, readonly CredentialBlockSnapshot[] | undefined>();
+		const incomingIds = new Set(entries.map(entry => entry.id));
 		const others: SnapshotEntry[] = [];
 		for (const entry of this.#snapshot.credentials) {
-			if (entry.provider !== provider) {
+			if (entry.provider !== provider || (entry.userDisabledAtMs !== undefined && !incomingIds.has(entry.id))) {
 				others.push(entry);
 				continue;
 			}
@@ -1193,8 +1258,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			return false;
 		}
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
-		const existingBlocks = index === -1 ? undefined : this.#snapshot.credentials[index]?.blocks;
-		const incoming = credentialEntryWithBlocks(entry, existingBlocks);
+		const existing = index === -1 ? undefined : this.#snapshot.credentials[index];
+		const incoming = credentialEntryWithBlocks(entry, existing?.blocks);
+		// A refresh reply never re-enables a row this client already holds as user-disabled.
+		if (existing?.userDisabledAtMs !== undefined) incoming.userDisabledAtMs = existing.userDisabledAtMs;
 		this.#dirtyCredentialIds.add(entry.id);
 		if (index === -1) {
 			this.#snapshot = { ...this.#snapshot, credentials: [...this.#snapshot.credentials, incoming] };

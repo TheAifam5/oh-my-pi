@@ -109,6 +109,7 @@ import {
 	type BuiltInDiscoveryResult,
 	extractGoogleOAuthProjectId,
 	extractGoogleOAuthToken,
+	getApiKeyWorkspaceId,
 	getOAuthCredentialsForProvider,
 	isAuthenticated,
 	isDiscoveryBearerApiKey,
@@ -2475,6 +2476,7 @@ export class ModelRegistry {
 					region: identity?.region,
 					inferenceRegion: identity?.inferenceRegion,
 					orgId: identity?.orgId,
+					workspaceId: apiKey ? getApiKeyWorkspaceId(this.authStorage, descriptor.providerId, apiKey) : undefined,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

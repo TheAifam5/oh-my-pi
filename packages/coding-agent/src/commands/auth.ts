@@ -71,9 +71,18 @@ function parseCredential(value: unknown, where: string): AuthCredential {
 		if (typeof value.key !== "string" || value.key.length === 0) {
 			throw new AuthTransferError(`${where}: API key credential has no key.`);
 		}
-		return value.source === "login"
-			? { type: "api_key", key: value.key, source: "login" }
-			: { type: "api_key", key: value.key };
+		if (
+			value.workspaceId !== undefined &&
+			(typeof value.workspaceId !== "string" || !/^wrkspc_[A-Za-z0-9]+$/.test(value.workspaceId))
+		) {
+			throw new AuthTransferError(`${where}: API key workspace ID is not wrkspc_ followed by letters and digits.`);
+		}
+		return {
+			type: "api_key",
+			key: value.key,
+			...(value.source === "login" ? { source: "login" as const } : {}),
+			...(typeof value.workspaceId === "string" ? { workspaceId: value.workspaceId } : {}),
+		};
 	}
 	if (value.type === "oauth") {
 		if (typeof value.access !== "string" || typeof value.refresh !== "string" || typeof value.expires !== "number") {

@@ -38,6 +38,16 @@ export interface CredentialRowStore {
 	acknowledgeLocalChanges?(): void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
 	/**
+	 * Live rows the user disabled, each with `userDisabledAtMs`. They are absent
+	 * from {@link listAuthCredentials} and from the rows the write methods return.
+	 */
+	listUserDisabledCredentials?(provider?: string): StoredAuthCredential[];
+	/**
+	 * Persist the user enable/disable state on one live row; refreshes and
+	 * credential upserts keep it. Resolves `false` when no live row has this ID.
+	 */
+	setAuthCredentialEnabled?(id: number, enabled: boolean): Promise<boolean>;
+	/**
 	 * Optional store hook to re-hydrate the credential snapshot from its
 	 * backing source. Remote broker stores re-fetch `GET /v1/snapshot` so a
 	 * disk-cached snapshot (up to an hour stale) cannot be paired with live

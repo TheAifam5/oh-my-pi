@@ -64,6 +64,7 @@ import type {
 	OAuthAccountIdentity,
 	ResetCreditAccountStatus,
 	ResetCreditTarget,
+	ResetOnWindow,
 	UsageLimit,
 	UsageReport,
 	UsageResetCreditDetail,
@@ -99,6 +100,17 @@ export function shouldEvaluateCodexAutoRedeem(mode: ResetAutoRedeemMode): boolea
 
 export function shouldPromptCodexAutoRedeem(mode: ResetAutoRedeemMode): boolean {
 	return mode === "unset";
+}
+
+/** An account's saved-reset policy: `auth.accountPolicies[].resetOn` and `.autoRedeem`. */
+export interface AccountResetPolicy {
+	resetOn?: readonly ResetOnWindow[];
+	autoRedeem?: ResetAutoRedeemMode;
+}
+
+/** Whether the planner may spend for an account: its `autoRedeem` override, else the provider setting. */
+export function accountResetEnabled(enabled: boolean, policy: AccountResetPolicy | undefined): boolean {
+	return policy?.autoRedeem === undefined ? enabled : shouldEvaluateCodexAutoRedeem(policy.autoRedeem);
 }
 
 /**
@@ -156,7 +168,8 @@ export type CodexResetSkipReason =
 	| "no-expiring-credit"
 	| "window-mostly-free"
 	| "already-attempted"
-	| "cooldown";
+	| "cooldown"
+	| "reset-on-excluded";
 
 export interface CodexResetPlanInput {
 	nowMs: number;
@@ -178,6 +191,11 @@ export interface CodexResetPlanInput {
 	identity: OAuthAccountIdentity | undefined;
 	/** `blocked-account`: whether a stored credential may serve the blocked session; absent allows every account. */
 	permitsCredential?: (credentialId: number) => boolean;
+	/**
+	 * Per-account policy; absent leaves every account to `settings`. With it, an
+	 * account's `autoRedeem` replaces `settings.enabled` for that account.
+	 */
+	accountResetPolicy?: (target: ResetCreditTarget) => AccountResetPolicy | undefined;
 	/** Usage reports for ALL stored accounts (one per account for Codex). */
 	reports: UsageReport[] | null;
 	attemptedKeys: ReadonlySet<string>;
@@ -219,6 +237,8 @@ export interface CodexResetAction {
 	creditId?: string;
 	/** True when this is the session's active account. */
 	active: boolean;
+	/** The account's `autoRedeem` override; absent: the provider setting applies. */
+	autoRedeem?: ResetAutoRedeemMode;
 }
 
 export interface CodexResetSkip {
@@ -271,6 +291,7 @@ interface AccountSnapshot {
 	limitReached: boolean;
 	creditExpiresAtMs: number | undefined;
 	creditId: string | undefined;
+	policy: AccountResetPolicy | undefined;
 }
 
 function classifyChatWindow(limit: UsageLimit, fallback: CodexChatWindow): CodexChatWindow {
@@ -284,6 +305,10 @@ function classifyChatWindow(limit: UsageLimit, fallback: CodexChatWindow): Codex
 	if (windowId === "7d" || scopeWindowId === "7d") return "weekly";
 	if (windowId === "5h" || scopeWindowId === "5h") return "5h";
 	return fallback;
+}
+
+function resetOnWindow(window: CodexChatWindow): ResetOnWindow {
+	return window === "weekly" ? "7d" : "5h";
 }
 
 function snapshotChatWindow(limit: UsageLimit, fallback: CodexChatWindow): CodexChatWindowSnapshot {
@@ -344,7 +369,9 @@ function usedFractionForWindow(snapshot: AccountSnapshot, window: CodexChatWindo
 export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexResetPlan {
 	const { nowMs, settings } = input;
 	const skipped: CodexResetSkip[] = [];
-	if (!settings.enabled) return { actions: [], skipped: [{ accountKey: "*", rule: "account", reason: "disabled" }] };
+	if (!settings.enabled && !input.accountResetPolicy) {
+		return { actions: [], skipped: [{ accountKey: "*", rule: "account", reason: "disabled" }] };
+	}
 
 	// Rule-wide gates for `blocked-account`: a redeem can only unblock the turn
 	// when the turn is actually on Codex, and it is unknown whether a credit
@@ -376,6 +403,18 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 			continue;
 		}
 		const accountKey = `openai-codex|${orgId?.trim().toLowerCase() ?? "-"}|${credentialId}`;
+		const target: ResetCreditTarget = {
+			provider: "openai-codex",
+			credentialId,
+			accountId,
+			email,
+			...(orgId ? { orgId } : {}),
+		};
+		const policy = input.accountResetPolicy?.(target);
+		if (!accountResetEnabled(settings.enabled, policy)) {
+			skipped.push({ accountKey, rule: "account", reason: "disabled" });
+			continue;
+		}
 		const isActive =
 			report.metadata?.resetCreditActive === true || reportMatchesActiveAccount(report, input.identity);
 		if (nowMs - report.fetchedAt > REPORT_FRESHNESS_MS) {
@@ -398,13 +437,7 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 		const soonestCredit = soonestAvailableCredit(report.resetCredits?.credits, nowMs);
 		snapshots.push({
 			accountKey,
-			target: {
-				provider: "openai-codex",
-				credentialId,
-				accountId,
-				email,
-				...(orgId ? { orgId } : {}),
-			},
+			target,
 			label,
 			active: isActive,
 			availableCount: available,
@@ -412,6 +445,7 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 			limitReached: report.metadata?.limitReached === true,
 			creditExpiresAtMs: soonestCredit?.expiresAtMs,
 			creditId: soonestCredit?.id,
+			policy,
 		});
 	}
 
@@ -497,6 +531,11 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 				skip("no-exhausted-window");
 				continue;
 			}
+			const resetOn = snapshot.policy?.resetOn;
+			if (resetOn && !blockedWindows.some(window => resetOn.includes(resetOnWindow(window)))) {
+				skip("reset-on-excluded");
+				continue;
+			}
 			const remainingMs = unblockAtMs - nowMs;
 			// Anti-waste: too close to the natural unblock — let it roll over.
 			if (remainingMs < settings.minBlockedMinutes * 60_000) {
@@ -553,6 +592,7 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 				creditId: best.snapshot.creditId,
 				blockedWindows: best.blockedWindows,
 				active: best.snapshot.active,
+				...(best.snapshot.policy?.autoRedeem ? { autoRedeem: best.snapshot.policy.autoRedeem } : {}),
 			};
 		}
 	}
@@ -582,6 +622,11 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 			skip("window-mostly-free");
 			continue;
 		}
+		const resetOn = snapshot.policy?.resetOn;
+		if (resetOn && (!fullestWindow || !resetOn.includes(resetOnWindow(fullestWindow.window)))) {
+			skip("reset-on-excluded");
+			continue;
+		}
 		const attemptKey = salvageAttemptKey(snapshot.accountKey, expiresAtMs);
 		if (input.attemptedKeys.has(attemptKey)) {
 			skip("already-attempted");
@@ -609,6 +654,7 @@ export function planCodexResetRedemptions(input: CodexResetPlanInput): CodexRese
 			expiresInMs: expiresAtMs - nowMs,
 			creditId: snapshot.creditId,
 			active: snapshot.active,
+			...(snapshot.policy?.autoRedeem ? { autoRedeem: snapshot.policy.autoRedeem } : {}),
 		});
 	}
 	salvages.sort((a, b) => (a.expiresInMs ?? 0) - (b.expiresInMs ?? 0));

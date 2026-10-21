@@ -422,6 +422,19 @@ export interface CompiledKeyPrefix {
 	reject: CompiledKeyPrefixRejection[];
 }
 
+/**
+ * Optional second prompt for a workspace id stored with the key. An empty
+ * answer stores none; a non-empty answer must match `pattern` or the login
+ * fails with `message`. The validation request sends a stored id in `header`.
+ */
+export interface CompiledWorkspacePrompt {
+	prompt: string;
+	placeholder?: string;
+	pattern: string;
+	message: string;
+	header: string;
+}
+
 /** Paste-an-API-key login: optional browser hint, prompt, optional validation. */
 export interface CompiledApiKeyLogin {
 	kind: "api-key";
@@ -433,6 +446,7 @@ export interface CompiledApiKeyLogin {
 	emptyFallback?: string;
 	normalize?: "strip-bearer";
 	keyPrefix?: CompiledKeyPrefix;
+	workspacePrompt?: CompiledWorkspacePrompt;
 	validate?: CompiledAuthValidation;
 }
 

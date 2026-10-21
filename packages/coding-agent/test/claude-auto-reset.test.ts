@@ -1,11 +1,18 @@
 import { describe, expect, it } from "bun:test";
-import type { OAuthAccountSummary, ResetCreditAccountStatus, UsageReport, UsageResetCredit } from "@oh-my-pi/pi-ai";
+import type {
+	OAuthAccountSummary,
+	ResetCreditAccountStatus,
+	ResetCreditTarget,
+	UsageReport,
+	UsageResetCredit,
+} from "@oh-my-pi/pi-ai";
 import {
 	claudeResetStatusesFromReports,
 	planClaudeResetRedemptions,
 	type ClaudeResetPlanInput,
 	type ClaudeResetSkipReason,
 } from "@oh-my-pi/pi-coding-agent/session/claude-auto-reset";
+import type { AccountResetPolicy } from "@oh-my-pi/pi-coding-agent/session/codex-auto-reset";
 
 const NOW = 1_700_000_040_000;
 const HOUR = 3_600_000;
@@ -594,6 +601,87 @@ describe("planClaudeResetRedemptions: expiry salvage", () => {
 		expect(plan.actions.map(action => action.accountKey)).toEqual(["anthropic|org-a|11", "anthropic|org-b|22"]);
 		expect(new Set(plan.actions.map(action => action.attemptKey)).size).toBe(2);
 		expect(plan.actions.map(action => action.target.credentialId)).toEqual([11, 22]);
+	});
+});
+
+describe("planClaudeResetRedemptions: per-account policy", () => {
+	const policyFor =
+		(policies: Record<number, AccountResetPolicy>) =>
+		(target: ResetCreditTarget): AccountResetPolicy | undefined =>
+			policies[target.credentialId];
+	const fiveHourOnly = status({
+		credit: { blocking: ["anthropic:5h"], usedFractions: { "anthropic:5h": 1, "anthropic:7d": 0.5 } },
+	});
+
+	it("resetOn [7d] skips an account whose only exhausted window is 5h", () => {
+		const plan = planClaudeResetRedemptions(
+			input({
+				reports: [report({ fiveHourUsed: 1, weeklyUsed: 0.5 })],
+				statuses: [fiveHourOnly],
+				accountResetPolicy: policyFor({ 11: { resetOn: ["7d"] } }),
+			}),
+		);
+		expect(plan.actions.filter(action => action.reason === "blocked-account")).toEqual([]);
+		expect(plan.skipped).toContainEqual({
+			accountKey: "anthropic|org-a|11",
+			rule: "blocked-account",
+			reason: "reset-on-excluded",
+		});
+	});
+
+	it("resetOn [7d] redeems when the 7-day window is exhausted", () => {
+		const plan = planClaudeResetRedemptions(input({ accountResetPolicy: policyFor({ 11: { resetOn: ["7d"] } }) }));
+		expect(plan.actions).toEqual([
+			expect.objectContaining({ reason: "blocked-account", blockedWindows: ["anthropic:7d"] }),
+		]);
+	});
+
+	it("resetOn [5h] skips salvage that would restore the 7-day window", () => {
+		const plan = planClaudeResetRedemptions(
+			input({
+				trigger: "sweep",
+				reports: [report({ weeklyUsed: 0.6 })],
+				statuses: [
+					status({
+						credit: { requiresLimit: false, blocking: [], usedFractions: { "anthropic:7d": 0.6 } },
+					}),
+				],
+				accountResetPolicy: policyFor({ 11: { resetOn: ["5h"] } }),
+			}),
+		);
+		expect(plan.actions).toEqual([]);
+		expect(plan.skipped).toContainEqual({
+			accountKey: "anthropic|org-a|11",
+			rule: "expiring-credit",
+			reason: "reset-on-excluded",
+		});
+	});
+
+	it("autoRedeem no skips one account while another redeems", () => {
+		const plan = planClaudeResetRedemptions(
+			input({
+				reports: [report({ orgId: "org-a" }), report({ orgId: "org-b" })],
+				statuses: [
+					status({ credentialId: 11, orgId: "org-a", active: true }),
+					status({ credentialId: 22, orgId: "org-b", active: false, credit: { id: "cedar-2" } }),
+				],
+				accountResetPolicy: policyFor({ 11: { autoRedeem: "no" } }),
+			}),
+		);
+		expect(plan.skipped).toContainEqual({ accountKey: "anthropic|org-a|11", rule: "account", reason: "disabled" });
+		expect(plan.actions).toEqual([
+			expect.objectContaining({ reason: "blocked-account", accountKey: "anthropic|org-b|22" }),
+		]);
+	});
+
+	it("autoRedeem yes enables one account while the provider setting is off, and is carried on its action", () => {
+		const plan = planClaudeResetRedemptions(
+			input({
+				settings: { enabled: false, minBlockedMinutes: 60, keepCredits: 0, salvageHorizonMs: 12 * HOUR },
+				accountResetPolicy: policyFor({ 11: { autoRedeem: "yes" } }),
+			}),
+		);
+		expect(plan.actions).toEqual([expect.objectContaining({ accountKey: "anthropic|org-a|11", autoRedeem: "yes" })]);
 	});
 });
 

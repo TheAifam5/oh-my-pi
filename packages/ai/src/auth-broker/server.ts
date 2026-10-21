@@ -24,6 +24,7 @@ import type {
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
 	CredentialDisableResponse,
+	CredentialEnabledResponse,
 	CredentialRefreshResponse,
 	CredentialUploadResponse,
 	DisabledCredentialsResponse,
@@ -45,6 +46,7 @@ import {
 	OBSERVED_USAGE_MAX_FUTURE_SKEW_MS,
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_USER_DISABLED_CREDENTIALS,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -65,6 +67,7 @@ import {
 	credentialBlockDeleteRequestSchema,
 	credentialBlockRequestSchema,
 	credentialDisableRequestSchema,
+	credentialEnabledRequestSchema,
 	credentialUploadRequestSchema,
 	sharedCachePutRequestSchema,
 } from "./wire-schemas";
@@ -132,13 +135,24 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	return tokens.has(match[1].trim());
 }
 
-function supportsCodexMeterBlockScopes(req: Request): boolean {
+function supportsCapability(req: Request, wanted: string): boolean {
 	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
-	return (
-		capabilities
-			?.split(",")
-			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
-	);
+	return capabilities?.split(",").some(capability => capability.trim() === wanted) ?? false;
+}
+
+/** Client-dependent shape of a served snapshot. */
+interface SnapshotFlavour {
+	/** Independent Codex `chat` and `spark` block scopes. */
+	codexMeterBlockScopes: boolean;
+	/** User-disabled rows, carrying `userDisabledAtMs`; omitted otherwise. */
+	userDisabledCredentials: boolean;
+}
+
+function snapshotFlavour(req: Request): SnapshotFlavour {
+	return {
+		codexMeterBlockScopes: supportsCapability(req, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES),
+		userDisabledCredentials: supportsCapability(req, AUTH_BROKER_CAPABILITY_USER_DISABLED_CREDENTIALS),
+	};
 }
 
 /**
@@ -209,6 +223,7 @@ async function parseBody<t>(
 
 const REFRESH_ROUTE = /^\/v1\/credential\/(\d+)\/refresh$/;
 const DISABLE_ROUTE = /^\/v1\/credential\/(\d+)\/disable$/;
+const ENABLED_ROUTE = /^\/v1\/credential\/(\d+)\/enabled$/;
 const BLOCK_ROUTE = /^\/v1\/credential\/(\d+)\/block$/;
 const BLOCKS_ROUTE = /^\/v1\/credential\/(\d+)\/blocks$/;
 const STATIC_ROUTES: Record<string, true> = {
@@ -228,7 +243,9 @@ const STATIC_ROUTES: Record<string, true> = {
 /** Only known routes reach logs verbatim; unknown paths may carry caller-supplied secrets. */
 function loggablePath(pathname: string): string {
 	if (Object.hasOwn(STATIC_ROUTES, pathname)) return pathname;
-	const dynamic = [REFRESH_ROUTE, DISABLE_ROUTE, BLOCK_ROUTE, BLOCKS_ROUTE].some(route => route.test(pathname));
+	const dynamic = [REFRESH_ROUTE, DISABLE_ROUTE, ENABLED_ROUTE, BLOCK_ROUTE, BLOCKS_ROUTE].some(route =>
+		route.test(pathname),
+	);
 	return dynamic ? pathname : "<unrouted>";
 }
 
@@ -504,16 +521,19 @@ class SnapshotSource {
 	}
 
 	/** Wire snapshot for one client flavour, projected at the current server time. */
-	build(clientSupportsCodexMeterBlockScopes: boolean): SnapshotResponse {
+	build(flavour: SnapshotFlavour): SnapshotResponse {
 		const rows = this.#currentRows();
 		const serverNowMs = Date.now();
 		const { wire, nextSweepAt } = resolveRefresherSchedule(this.#refresher, serverNowMs);
+		const served = flavour.userDisabledCredentials
+			? rows.credentials
+			: rows.credentials.filter(entry => entry.userDisabledAtMs === undefined);
 		const blocksByCredentialId = buildCredentialBlockGroups(
-			this.#storage.blocks.list(rows.credentials.map(entry => entry.id)),
+			this.#storage.blocks.list(served.map(entry => entry.id)),
 			serverNowMs,
-			clientSupportsCodexMeterBlockScopes,
+			flavour.codexMeterBlockScopes,
 		);
-		const credentials: SnapshotEntry[] = rows.credentials.map(entry => {
+		const credentials: SnapshotEntry[] = served.map(entry => {
 			const blocks = blocksByCredentialId.get(entry.id);
 			const rotatesInMs = computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs);
 			return blocks && blocks.length > 0 ? { ...entry, rotatesInMs, blocks } : { ...entry, rotatesInMs };
@@ -544,13 +564,13 @@ async function serveSnapshot(
 	peer: string,
 ): Promise<Response> {
 	await source.reload();
-	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const flavour = snapshotFlavour(req);
 	let currentGeneration = source.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(flavour);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -570,7 +590,7 @@ async function serveSnapshot(
 	await source.reload();
 	currentGeneration = source.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(flavour);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -600,6 +620,7 @@ function fingerprintEntry(entry: SnapshotEntry): string {
 		entry.rotatesInMs,
 		entry.credential,
 		entry.blocks ?? [],
+		entry.userDisabledAtMs ?? null,
 	]);
 }
 
@@ -610,7 +631,7 @@ function sseEvent(event: string, body: unknown): Uint8Array {
 /** One open `GET /v1/snapshot/stream` connection, as seen by {@link SnapshotStreamHub}. */
 interface SnapshotStreamSubscriber {
 	readonly peer: string;
-	readonly codexMeterBlockScopes: boolean;
+	readonly flavour: SnapshotFlavour;
 	/** Fingerprint of the last entry frame sent per credential id. */
 	readonly sent: Map<number, string>;
 	lastGeneration: number;
@@ -765,12 +786,13 @@ class SnapshotStreamHub {
 	}
 
 	#fanOut(): void {
-		const frames = new Map<boolean, SnapshotStreamFrame>();
+		const frames = new Map<string, SnapshotStreamFrame>();
 		for (const subscriber of Array.from(this.#subscribers)) {
-			let frame = frames.get(subscriber.codexMeterBlockScopes);
+			const key = `${subscriber.flavour.codexMeterBlockScopes}:${subscriber.flavour.userDisabledCredentials}`;
+			let frame = frames.get(key);
 			if (!frame) {
-				frame = new SnapshotStreamFrame(this.#source.build(subscriber.codexMeterBlockScopes));
-				frames.set(subscriber.codexMeterBlockScopes, frame);
+				frame = new SnapshotStreamFrame(this.#source.build(subscriber.flavour));
+				frames.set(key, frame);
 			}
 			deliverStreamFrame(subscriber, frame);
 		}
@@ -824,7 +846,7 @@ function serveSnapshotStream(
 
 	const subscriber: SnapshotStreamSubscriber = {
 		peer,
-		codexMeterBlockScopes: supportsCodexMeterBlockScopes(req),
+		flavour: snapshotFlavour(req),
 		sent: new Map(),
 		lastGeneration: -1,
 		write,
@@ -834,7 +856,7 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await source.reload();
-			const initial = source.build(subscriber.codexMeterBlockScopes);
+			const initial = source.build(subscriber.flavour);
 			subscriber.lastGeneration = initial.generation;
 			for (const entry of initial.credentials) subscriber.sent.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -1151,7 +1173,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (req.method === "GET" && pathname === "/v1/credentials/disabled") {
 					const provider = url.searchParams.get("provider") ?? undefined;
 					const disabled = await opts.storage.credentials.listDisabled(provider, req.signal);
-					const body: DisabledCredentialsResponse = { generatedAt: Date.now(), disabled };
+					// User-disabled rows reach clients through the snapshot.
+					const body: DisabledCredentialsResponse = {
+						generatedAt: Date.now(),
+						disabled: disabled.filter(summary => !summary.userDisabled),
+					};
 					return json(200, body);
 				}
 				const refreshMatch = req.method === "POST" ? pathname.match(REFRESH_ROUTE) : null;
@@ -1164,6 +1190,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 							req.signal,
 							authRecovery ? AUTH_RECOVERY_REFRESH_OPTIONS : undefined,
 						);
+						// A row disabled or removed while the refresh ran is never handed back as selectable.
+						if (!opts.storage.credentials.list(entry.provider).some(row => row.id === id)) {
+							logger.info("auth-broker refresh dropped for an unavailable credential", { id, peer });
+							return json(404, { error: `No credential with id=${id}` });
+						}
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {
 							id,
@@ -1195,6 +1226,20 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					}
 					logger.info("auth-broker credential disabled", { id, peer, cause });
 					const response: CredentialDisableResponse = { ok: true };
+					return json(200, response);
+				}
+				const enabledMatch = req.method === "POST" ? pathname.match(ENABLED_ROUTE) : null;
+				if (enabledMatch) {
+					const id = Number.parseInt(enabledMatch[1], 10);
+					const parsed = await parseBody(req, credentialEnabledRequestSchema);
+					if (!parsed.ok) return parsed.response;
+					const { enabled } = parsed.data;
+					if (!(await opts.storage.credentials.setEnabled(id, enabled))) {
+						logger.info("auth-broker credential enabled miss", { id, peer, enabled });
+						return json(404, { error: `No credential with id=${id}` });
+					}
+					logger.info("auth-broker credential enabled set", { id, peer, enabled });
+					const response: CredentialEnabledResponse = { ok: true };
 					return json(200, response);
 				}
 				const blockMatch = req.method === "POST" ? pathname.match(BLOCK_ROUTE) : null;

@@ -9,6 +9,7 @@ import type { AccountTarget, SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
 import type { AccountRefusals, CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
+	ApiKeyCredential,
 	AuthApiKeyOptions,
 	AuthPeekOptions,
 	AuthCredential,
@@ -26,6 +27,11 @@ import type {
 async function defaultConfigValueResolver(config: string): Promise<string | undefined> {
 	const envValue = $envExact(config);
 	return envValue || config;
+}
+
+/** Request identity carried by a stored API key: its workspace id, when one was entered. */
+function apiKeyRequestIdentity(credential: ApiKeyCredential): OAuthRequestIdentity | undefined {
+	return credential.workspaceId ? { workspaceId: credential.workspaceId } : undefined;
 }
 
 /** Runtime (--api-key) and config (models.yml) key overrides plus the config-value resolver. */
@@ -363,6 +369,8 @@ export class KeyCascade implements KeysApi {
 	 * @throws AIError.AccountUnavailableError when a pin names no stored account
 	 * (for a restricted session, only a pin recorded for an allowed account), or
 	 * the pinned account cannot produce a key.
+	 * @throws AIError.MissingApiKeyError when no other source serves the provider
+	 * and every stored account of it is user-disabled.
 	 */
 	async get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		try {
@@ -501,7 +509,9 @@ export class KeyCascade implements KeysApi {
 				? this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id
 				: undefined;
 			const apiKey = await this.#deps.overrides.resolve(loginApiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
+			if (apiKey !== undefined && credentialId !== undefined) {
+				onCredentialId?.(credentialId, apiKeyRequestIdentity(loginApiKeySelection.credential));
+			}
 			return apiKey;
 		}
 
@@ -527,10 +537,18 @@ export class KeyCascade implements KeysApi {
 			}
 			const credentialId = onCredentialId ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
 			const apiKey = await this.#deps.overrides.resolve(apiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
+			if (apiKey !== undefined && credentialId !== undefined) {
+				onCredentialId?.(credentialId, apiKeyRequestIdentity(apiKeySelection.credential));
+			}
 			return apiKey;
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
+		if (this.#deps.pool.entries(provider).length === 0 && this.#deps.pool.listUserDisabled(provider).length > 0) {
+			throw new AIError.MissingApiKeyError(
+				provider,
+				`No API key for provider: ${provider} (every stored account is disabled; enable one with \`omp account enable ${provider}/<account>\`)`,
+			);
+		}
 		return undefined;
 	}
 
@@ -576,7 +594,7 @@ export class KeyCascade implements KeysApi {
 		if (apiKey === undefined) return undefined;
 		this.#deps.affinity.record(provider, sessionId, "api_key", target.index);
 		const credentialId = this.#deps.pool.entries(provider)[target.index]?.id;
-		if (credentialId !== undefined) onCredentialId?.(credentialId);
+		if (credentialId !== undefined) onCredentialId?.(credentialId, apiKeyRequestIdentity(target.credential));
 		return apiKey;
 	}
 

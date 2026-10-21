@@ -35,6 +35,23 @@ async function probeApiKey(provider: Provider): Promise<string | undefined> {
 }
 
 describe("auth-gateway check --strict completion probe", () => {
+	test("passes a Console API key workspace identity and omits it when absent", async () => {
+		const complete = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "pong" }],
+		} as never);
+		for (const workspaceId of ["wrkspc_test123", undefined]) {
+			const result = await createStrictCompletionProbe()({
+				provider: "anthropic",
+				credentialId: 1,
+				credential: { type: "api_key", apiKey: "sk-ant-api03-test", workspaceId },
+				signal: new AbortController().signal,
+			});
+			expect(result.ok).toBe(true);
+			expect(complete.mock.calls.at(-1)?.[2]?.oauthIdentity).toEqual(workspaceId ? { workspaceId } : undefined);
+		}
+	});
+
 	test("sends the structured credential blob for a structured-format OAuth provider", async () => {
 		const apiKey = await probeApiKey("alibaba-coding-plan" as Provider);
 		expect(JSON.parse(apiKey ?? "")).toMatchObject({ token: "access-token", projectId: "project-1" });

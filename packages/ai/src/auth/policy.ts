@@ -15,6 +15,8 @@ import {
 	DRAIN_RETURN_TRIGGERS,
 	DRAIN_SPEND_CLASSES,
 	DRAIN_TRIGGER_SPEND_CLASS,
+	RESET_AUTO_REDEEM_MODES,
+	RESET_ON_WINDOWS,
 } from "./types";
 
 /** Grammar of account names: lowercase only, so names never differ by case alone. */
@@ -22,6 +24,9 @@ export const ACCOUNT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
 /** Longest account name, in characters. */
 export const MAX_ACCOUNT_NAME_LENGTH = 64;
 const KEY_FINGERPRINT = /^[0-9a-f]{16}$/;
+
+/** API-key rejection shared by account-policy validation and account administration. */
+export const RESET_POLICY_OAUTH_ONLY = "Saved resets (resetOn and autoRedeem) apply to OAuth accounts only.";
 
 /**
  * Portable identifier of a stored API key: the first 16 hex digits of the
@@ -288,6 +293,27 @@ export class AccountPolicies {
 					apiKey: policy.account.keyFingerprint !== undefined,
 				});
 				if (issue) throw new AIError.ConfigurationError(`${issue.path} ${issue.message}`);
+			}
+			if (
+				policy.account.keyFingerprint !== undefined &&
+				(policy.resetOn !== undefined || policy.autoRedeem !== undefined)
+			) {
+				throw new AIError.ConfigurationError(`${path}: ${RESET_POLICY_OAUTH_ONLY}`);
+			}
+			if (
+				policy.resetOn !== undefined &&
+				(!Array.isArray(policy.resetOn) ||
+					policy.resetOn.length === 0 ||
+					policy.resetOn.some(window => !RESET_ON_WINDOWS.includes(window)))
+			) {
+				throw new AIError.ConfigurationError(
+					`${path}.resetOn must be a non-empty list of ${RESET_ON_WINDOWS.join(", ")}`,
+				);
+			}
+			if (policy.autoRedeem !== undefined && !RESET_AUTO_REDEEM_MODES.includes(policy.autoRedeem)) {
+				throw new AIError.ConfigurationError(
+					`${path}.autoRedeem must be one of ${RESET_AUTO_REDEEM_MODES.join(", ")}`,
+				);
 			}
 		}
 	}

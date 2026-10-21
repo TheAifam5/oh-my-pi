@@ -103,6 +103,16 @@ export interface CredentialDisableResponse {
 	ok: boolean;
 }
 
+/** POST /v1/credential/:id/enabled request body. */
+export interface CredentialEnabledRequest {
+	enabled: boolean;
+}
+
+/** POST /v1/credential/:id/enabled response body. */
+export interface CredentialEnabledResponse {
+	ok: boolean;
+}
+
 /** GET /v1/credentials/disabled response body — tombstones of auto-disabled rows. */
 export interface DisabledCredentialsResponse {
 	generatedAt: number;
@@ -225,6 +235,13 @@ export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-bloc
  * without the routes answer 404, which clients treat as local-only caching.
  */
 export const AUTH_BROKER_CAPABILITY_SHARED_CACHE = "shared-cache";
+
+/**
+ * Client reads user-disabled credentials: snapshot entries carry
+ * `userDisabledAtMs`. Brokers omit user-disabled rows from clients that do not
+ * announce it, so older clients never select them.
+ */
+export const AUTH_BROKER_CAPABILITY_USER_DISABLED_CREDENTIALS = "user-disabled-credentials";
 
 /**
  * Client reads fleet account totals (`GET /v1/usage/accounts`). Advisory:

@@ -166,6 +166,8 @@ type AuthRow = {
 	data: string;
 	disabled_cause: string | null;
 	identity_key: string | null;
+	/** Epoch ms the user disabled the row; selected by the live-row queries only. */
+	user_disabled_at?: number | null;
 };
 
 /** {@link AuthRow} plus `updated_at` — disabled-tombstone queries surface when the row was torn down. */
@@ -202,7 +204,7 @@ function storesSerializedCredential(row: CredentialStateRow, serialized: Seriali
 	);
 }
 
-const AUTH_SCHEMA_VERSION = 8;
+const AUTH_SCHEMA_VERSION = 9;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 const LEGACY_CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
 const LEGACY_CODEX_BLOCK_SCOPE = "shared";
@@ -236,7 +238,11 @@ function normalizeStoredIdentityKey(identityKey: string | null | undefined): str
 
 export function serializeCredential(provider: string, credential: AuthCredential): SerializedCredentialRecord | null {
 	if (credential.type === "api_key") {
-		const data = credential.source === "login" ? { key: credential.key, source: "login" } : { key: credential.key };
+		const data = {
+			key: credential.key,
+			...(credential.source === "login" ? { source: "login" } : {}),
+			...(credential.workspaceId ? { workspaceId: credential.workspaceId } : {}),
+		};
 		return {
 			credentialType: "api_key",
 			data: JSON.stringify(data),
@@ -267,8 +273,12 @@ function deserializeCredential(row: AuthRow): AuthCredential | null {
 	if (row.credential_type === "api_key") {
 		const data = parsed as Record<string, unknown>;
 		if (typeof data.key === "string") {
-			const source = data.source === "login" ? "login" : undefined;
-			return source ? { type: "api_key", key: data.key, source } : { type: "api_key", key: data.key };
+			return {
+				type: "api_key",
+				key: data.key,
+				...(data.source === "login" ? { source: "login" as const } : {}),
+				...(typeof data.workspaceId === "string" ? { workspaceId: data.workspaceId } : {}),
+			};
 		}
 	}
 	if (row.credential_type === "oauth") {
@@ -283,7 +293,14 @@ function normalizeDisabledCause(disabledCause: string): string {
 }
 
 function toStoredAuthCredential(row: AuthRow, credential: AuthCredential): StoredAuthCredential {
-	return { id: row.id, provider: row.provider, credential, disabledCause: row.disabled_cause };
+	const stored: StoredAuthCredential = {
+		id: row.id,
+		provider: row.provider,
+		credential,
+		disabledCause: row.disabled_cause,
+	};
+	if (typeof row.user_disabled_at === "number") stored.userDisabledAtMs = row.user_disabled_at;
+	return stored;
 }
 
 function resolveProviderCredentialIdentityKey(provider: string, identifiers: string[]): string | null {
@@ -499,6 +516,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#db: Database;
 	#listActiveStmt: Statement;
 	#listActiveByProviderStmt: Statement;
+	#listLiveByProviderStmt: Statement;
+	#listUserDisabledStmt: Statement;
+	#listUserDisabledByProviderStmt: Statement;
+	#enableStmt: Statement;
+	#disableByUserStmt: Statement;
 	#listDisabledStmt: Statement;
 	#listDisabledByProviderStmt: Statement;
 	#insertStmt: Statement;
@@ -554,10 +576,25 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#localAuthRevision = this.#readLocalAuthRevision();
 
 		this.#listActiveStmt = this.#db.prepare(
-			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE disabled_cause IS NULL AND user_disabled_at IS NULL ORDER BY id ASC",
 		);
 		this.#listActiveByProviderStmt = this.#db.prepare(
-			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL AND user_disabled_at IS NULL ORDER BY id ASC",
+		);
+		this.#listLiveByProviderStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, user_disabled_at FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
+		);
+		this.#listUserDisabledStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, user_disabled_at FROM auth_credentials WHERE disabled_cause IS NULL AND user_disabled_at IS NOT NULL ORDER BY id ASC",
+		);
+		this.#listUserDisabledByProviderStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, user_disabled_at FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL AND user_disabled_at IS NOT NULL ORDER BY id ASC",
+		);
+		this.#enableStmt = this.#db.prepare(
+			`UPDATE auth_credentials SET user_disabled_at = NULL, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND disabled_cause IS NULL`,
+		);
+		this.#disableByUserStmt = this.#db.prepare(
+			`UPDATE auth_credentials SET user_disabled_at = COALESCE(user_disabled_at, ?), updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND disabled_cause IS NULL`,
 		);
 		this.#listDisabledStmt = this.#db.prepare(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, updated_at FROM auth_credentials WHERE disabled_cause IS NOT NULL ORDER BY id ASC",
@@ -807,6 +844,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				current: schemaVersion,
 				expected: AUTH_SCHEMA_VERSION,
 			});
+			this.#ensureUserDisabledAtColumn();
 		} else if (schemaVersion < AUTH_SCHEMA_VERSION) {
 			this.#migrateAuthSchema(schemaVersion);
 		}
@@ -886,6 +924,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				credential_type TEXT NOT NULL,
 				data TEXT NOT NULL,
 				disabled_cause TEXT DEFAULT NULL,
+				user_disabled_at INTEGER DEFAULT NULL,
 				identity_key TEXT DEFAULT NULL,
 				created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
 				updated_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH})
@@ -1143,6 +1182,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (fromVersion < 8) {
 			this.#migrateAuthSchemaV7ToV8();
 		}
+		if (fromVersion < 9) {
+			this.#migrateAuthSchemaV8ToV9();
+		}
 	}
 
 	#migrateAuthSchemaV0ToV1(): void {
@@ -1354,6 +1396,29 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		migrate.immediate();
 	}
 
+	#migrateAuthSchemaV8ToV9(): void {
+		const migrate = this.#db.transaction(() => {
+			this.#ensureUserDisabledAtColumn();
+			this.#writeAuthSchemaVersion(9);
+		});
+		migrate.immediate();
+	}
+
+	/** Adds `auth_credentials.user_disabled_at` (epoch ms, NULL = enabled) when the table lacks it. */
+	#ensureUserDisabledAtColumn(): void {
+		const stmt = this.#db.prepare("PRAGMA table_info(auth_credentials)");
+		let hasUserDisabledAt = false;
+		try {
+			const cols = stmt.all() as Array<{ name?: string }>;
+			hasUserDisabledAt = cols.some(column => column.name === "user_disabled_at");
+		} finally {
+			stmt.finalize();
+		}
+		if (!hasUserDisabledAt) {
+			this.#db.run("ALTER TABLE auth_credentials ADD COLUMN user_disabled_at INTEGER DEFAULT NULL");
+		}
+	}
+
 	#backfillCredentialIdentityKeys(): void {
 		const selectRowsStmt = this.#db.prepare(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
@@ -1426,13 +1491,36 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		return results;
 	}
 
+	listUserDisabledCredentials(provider?: string): StoredAuthCredential[] {
+		const rows =
+			(provider
+				? (this.#listUserDisabledByProviderStmt.all(provider) as AuthRow[])
+				: (this.#listUserDisabledStmt.all() as AuthRow[])) ?? [];
+		const results: StoredAuthCredential[] = [];
+		for (const row of rows) {
+			const credential = deserializeCredential(row);
+			if (!credential) continue;
+			results.push(toStoredAuthCredential(row, credential));
+		}
+		return results;
+	}
+
+	/** Sets or clears `user_disabled_at` (epoch ms); a repeated disable keeps the first timestamp. */
+	async setAuthCredentialEnabled(id: number, enabled: boolean): Promise<boolean> {
+		const result = (enabled ? this.#enableStmt.run(id) : this.#disableByUserStmt.run(Date.now(), id)) as {
+			changes: number;
+		};
+		return result.changes > 0;
+	}
+
 	async replaceAuthCredentials(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]> {
 		const replace = this.#db.transaction((providerName: string, items: AuthCredential[]) => {
-			const existingRows = this.#listActiveByProviderStmt.all(providerName) as AuthRow[];
+			const existingRows = this.#listLiveByProviderStmt.all(providerName) as AuthRow[];
 			const existing = existingRows.map(row => ({
 				id: row.id,
 				credential: deserializeCredential(row),
 				identityKey: resolveRowCredentialIdentityKey(providerName, row),
+				userDisabled: typeof row.user_disabled_at === "number",
 			}));
 
 			const result: StoredAuthCredential[] = [];
@@ -1449,7 +1537,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				if (match) {
 					matchedExistingIds.add(match.id);
 					this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, match.id);
-					result.push({ id: match.id, provider: providerName, credential, disabledCause: null });
+					if (!match.userDisabled) {
+						result.push({ id: match.id, provider: providerName, credential, disabledCause: null });
+					}
 				} else {
 					const row = this.#insertStmt.get(
 						providerName,
@@ -1481,7 +1571,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const upsert = this.#db.transaction((providerName: string, item: AuthCredential) => {
 			const serialized = serializeCredential(providerName, item);
 			if (!serialized) return this.listAuthCredentials(providerName);
-			const existingRows = this.#listActiveByProviderStmt.all(providerName) as AuthRow[];
+			const existingRows = this.#listLiveByProviderStmt.all(providerName) as AuthRow[];
 			const existing = existingRows.map(row => ({
 				id: row.id,
 				credential: deserializeCredential(row),
@@ -2391,6 +2481,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#closed = true;
 		this.#listActiveStmt.finalize();
 		this.#listActiveByProviderStmt.finalize();
+		this.#listLiveByProviderStmt.finalize();
+		this.#listUserDisabledStmt.finalize();
+		this.#listUserDisabledByProviderStmt.finalize();
+		this.#enableStmt.finalize();
+		this.#disableByUserStmt.finalize();
 		this.#listDisabledStmt.finalize();
 		this.#listDisabledByProviderStmt.finalize();
 		this.#insertStmt.finalize();

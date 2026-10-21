@@ -33,6 +33,8 @@ export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
 	source?: "login";
+	/** Workspace id entered at login; sent as `anthropic-workspace-id` with this key. */
+	workspaceId?: string;
 };
 
 /** Stored OAuth token and provider account identity. */
@@ -111,7 +113,23 @@ export interface AuthAccountPolicy {
 	 * `extra-usd`; an account over a `skip` limit is not selected. No `id`.
 	 */
 	readonly limits?: readonly AccountLimit[];
+	/**
+	 * Saved-reset windows of this account whose exhaustion permits blocked-account
+	 * recovery: `5h` (the 5-hour window) or `7d` (Claude's 7-day windows, Codex's
+	 * weekly window). Expiry salvage spends a reset only when the window it restores
+	 * is listed. Unset: every window.
+	 */
+	readonly resetOn?: readonly ResetOnWindow[];
+	/** Overrides `claudeResets.autoRedeem` / `codexResets.autoRedeem` for this account. */
+	readonly autoRedeem?: ResetAutoRedeemOverride;
 }
+
+/** Usage windows {@link AuthAccountPolicy.resetOn} accepts. */
+export const RESET_ON_WINDOWS = ["5h", "7d"] as const;
+export type ResetOnWindow = (typeof RESET_ON_WINDOWS)[number];
+/** Values of {@link AuthAccountPolicy.autoRedeem}. */
+export const RESET_AUTO_REDEEM_MODES = ["yes", "no", "unset"] as const;
+export type ResetAutoRedeemOverride = (typeof RESET_AUTO_REDEEM_MODES)[number];
 
 /** Funding classes a drain target may spend ({@link AuthAccountPolicy.spend}). */
 export const DRAIN_SPEND_CLASSES = ["plan", "credits", "money"] as const;
@@ -183,6 +201,8 @@ export interface StoredAuthCredential {
 	provider: string;
 	credential: AuthCredential;
 	disabledCause: string | null;
+	/** Epoch ms the user disabled this account (`omp account disable`); absent while enabled. */
+	userDisabledAtMs?: number;
 }
 
 /** One persisted rate-limit block: credential row id + provider-type key + optional scope. */
@@ -219,6 +239,8 @@ export interface DisabledCredentialSummary {
 	cause: string;
 	/** Epoch ms the row was disabled (SQLite `updated_at`), when known. */
 	disabledAtMs?: number;
+	/** True for an account the user disabled; it stays logged in and `omp account enable` restores it. */
+	userDisabled?: boolean;
 }
 
 /**
@@ -293,7 +315,7 @@ export interface CredentialCompletionResult {
  * forward it verbatim into the structured shape without harm.
  */
 export type CompletionProbeCredential =
-	| { type: "api_key"; apiKey: string }
+	| { type: "api_key"; apiKey: string; workspaceId?: string }
 	| {
 			type: "oauth";
 			accessToken: string;
@@ -378,6 +400,8 @@ export interface AuthCredentialSnapshotEntry {
 	provider: string;
 	credential: SnapshotCredential;
 	identityKey: string | null;
+	/** Epoch ms the user disabled this account; set only for broker clients announcing the capability. */
+	userDisabledAtMs?: number;
 }
 
 /**
@@ -620,11 +644,13 @@ export function oauthAccountKey(identity: {
 	return identity.accountId ?? identity.email ?? identity.projectId;
 }
 
-/** Non-secret identity bound to the OAuth credential selected for one request attempt. */
+/** Non-secret identity bound to the credential selected for one request attempt. */
 export interface OAuthRequestIdentity {
 	orgId?: string;
 	region?: string;
 	inferenceRegion?: "global" | "eu" | "us";
+	/** Workspace id stored with an API key; sent as `anthropic-workspace-id`. */
+	workspaceId?: string;
 }
 
 /**
@@ -1015,14 +1041,28 @@ export interface CredentialsApi {
 	disable(id: number, disabledCause: string): Promise<boolean>;
 	/**
 	 * Disabled credential tombstones for display surfaces (`omp usage`,
-	 * broker `GET /v1/credentials/disabled`). Empty when the backing store
-	 * keeps no tombstones or the remote broker predates the endpoint.
+	 * broker `GET /v1/credentials/disabled`), followed by the accounts the user
+	 * disabled (`userDisabled`). Tombstones are empty when the backing store
+	 * keeps none or the remote broker predates the endpoint.
 	 */
 	listDisabled(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]>;
 	/**
+	 * Stored rows the user disabled, optionally filtered by provider. They are
+	 * absent from {@link list} and every selection path, and stay logged in.
+	 */
+	listUserDisabled(provider?: string): StoredAuthCredential[];
+	/**
+	 * Enable or disable one stored account and persist the state on its row.
+	 * Resolves `false` when no stored row has this ID; throws when the backing
+	 * store cannot persist the state (for example an auth broker without
+	 * `POST /v1/credential/:id/enabled`).
+	 */
+	setEnabled(credentialId: number, enabled: boolean): Promise<boolean>;
+	/**
 	 * Build a redacted snapshot of all loaded credentials for the auth-broker
-	 * wire. OAuth refresh tokens are replaced with {@link REMOTE_REFRESH_SENTINEL}
-	 * so clients never see the actual refresh token.
+	 * wire, user-disabled rows included with `userDisabledAtMs`. OAuth refresh
+	 * tokens are replaced with {@link REMOTE_REFRESH_SENTINEL} so clients never
+	 * see the actual refresh token.
 	 *
 	 * Callers must {@link AuthStorage.credentials.reload} first when serving a stale snapshot
 	 * (the broker server's HTTP handler does this).
@@ -1316,6 +1356,8 @@ export interface AuthAccountSummary {
 	active: boolean;
 	/** True when this credential is the session's exclusive pin (session pin, else project pin). */
 	pinned: boolean;
+	/** True when the user disabled this account; listed only without a session id. */
+	disabled?: boolean;
 }
 
 /** Session credential affinity operations. */
@@ -1357,8 +1399,9 @@ export interface SessionsApi {
 	 * Stored credentials for `provider` in storage order, with names and the
 	 * session's active and pinned marks. A session restricted by {@link restrict}
 	 * lists only the accounts its restriction allows. Without `sessionId`, every
-	 * stored row is listed with no session marks: the owner's view for account
-	 * management, never for a session's own selection.
+	 * stored row is listed with no session marks, followed by the user-disabled
+	 * rows marked `disabled`: the owner's view for account management, never for
+	 * a session's own selection.
 	 */
 	accounts(provider: string, sessionId?: string): AuthAccountSummary[];
 	/**

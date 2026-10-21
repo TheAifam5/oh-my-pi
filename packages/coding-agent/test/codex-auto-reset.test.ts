@@ -21,6 +21,7 @@ import { describe, expect, it } from "bun:test";
 import type { ResetCreditTarget, UsageReport } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	type AccountResetPolicy,
 	ATTEMPT_COOLDOWN_MS,
 	blockedAttemptKey,
 	type CodexResetPlanInput,
@@ -909,5 +910,75 @@ describe("codexResets policy plumbing", () => {
 	it("migrates legacy boolean autoRedeem config to the tri-state policy", () => {
 		expect(cfgCodexResetsAutoRedeem.get(Settings.isolated({ "codexResets.autoRedeem": true }))).toBe("yes");
 		expect(cfgCodexResetsAutoRedeem.get(Settings.isolated({ "codexResets.autoRedeem": false }))).toBe("no");
+	});
+});
+
+describe("planCodexResetRedemptions: per-account policy", () => {
+	const policyFor =
+		(policies: Record<string, AccountResetPolicy>) =>
+		(target: ResetCreditTarget): AccountResetPolicy | undefined =>
+			policies[target.accountId ?? ""];
+
+	it("resetOn [7d] skips an account whose only exhausted window is 5h", () => {
+		const plan = planCodexResetRedemptions(
+			input([report({ primaryUsed: 1, weeklyUsed: 0.8 })], {
+				accountResetPolicy: policyFor({ [ACCOUNT_ID]: { resetOn: ["7d"] } }),
+			}),
+		);
+		expect(plan.actions).toEqual([]);
+		expect(plan.skipped).toContainEqual({
+			accountKey: ACCOUNT_KEY,
+			rule: "blocked-account",
+			reason: "reset-on-excluded",
+		});
+	});
+
+	it("resetOn [7d] redeems when the weekly window is exhausted", () => {
+		const plan = planCodexResetRedemptions(
+			input([report({ primaryUsed: 1, weeklyUsed: 1 })], {
+				accountResetPolicy: policyFor({ [ACCOUNT_ID]: { resetOn: ["7d"] } }),
+			}),
+		);
+		expect(plan.actions).toEqual([
+			expect.objectContaining({ reason: "blocked-account", blockedWindows: ["5h", "weekly"] }),
+		]);
+	});
+
+	it("resetOn [5h] skips salvage that would restore the weekly window", () => {
+		const plan = planCodexResetRedemptions(
+			input([report({ primaryUsed: 0.3, weeklyUsed: 0.6, creditExpiries: [HOUR] })], {
+				trigger: "sweep",
+				accountResetPolicy: policyFor({ [ACCOUNT_ID]: { resetOn: ["5h"] } }),
+			}),
+		);
+		expect(plan.actions).toEqual([]);
+		expect(plan.skipped).toContainEqual({
+			accountKey: ACCOUNT_KEY,
+			rule: "expiring-credit",
+			reason: "reset-on-excluded",
+		});
+	});
+
+	it("autoRedeem no skips one account while another redeems", () => {
+		const plan = planCodexResetRedemptions(
+			input([report(), report({ accountId: "acct-sib", email: "sib@example.com" })], {
+				accountResetPolicy: policyFor({ [ACCOUNT_ID]: { autoRedeem: "no" } }),
+			}),
+		);
+		expect(plan.skipped).toContainEqual({ accountKey: ACCOUNT_KEY, rule: "account", reason: "disabled" });
+		expect(plan.actions).toEqual([
+			expect.objectContaining({ reason: "blocked-account", accountKey: "openai-codex|-|2" }),
+		]);
+	});
+
+	it("autoRedeem yes enables one account while the provider setting is off, and is carried on its action", () => {
+		const plan = planCodexResetRedemptions(
+			input([report(), report({ accountId: "acct-sib", email: "sib@example.com" })], {
+				settings: { enabled: false, minBlockedMinutes: 60, keepCredits: 0, salvageHorizonMs: 12 * HOUR },
+				accountResetPolicy: policyFor({ "acct-sib": { autoRedeem: "yes" } }),
+			}),
+		);
+		expect(plan.skipped).toContainEqual({ accountKey: ACCOUNT_KEY, rule: "account", reason: "disabled" });
+		expect(plan.actions).toEqual([expect.objectContaining({ accountKey: "openai-codex|-|2", autoRedeem: "yes" })]);
 	});
 });

@@ -246,7 +246,123 @@ describe("account administration", () => {
 			await runAccountCommand({ action: "label", target: "nobody@example.com", value: "x" }, context);
 			expect(process.exitCode).toBe(1);
 		} finally {
-			process.exitCode = previousExitCode;
+			process.exitCode = previousExitCode ?? 0;
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("writes, lists, and clears an account's saved-reset policy from the CLI", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const context = { settings, authStorage, cwd: project };
+		const stdout: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout.push(String(chunk));
+			return true;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const previousExitCode = process.exitCode;
+		try {
+			await runAccountCommand({ action: "reset", target: "anthropic/a@example.com", on: "7d", auto: "no" }, context);
+			expect(process.exitCode).toBe(previousExitCode);
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+				{ provider: "anthropic", account: { accountId: "acc-a" }, resetOn: ["7d"], autoRedeem: "no" },
+			]);
+
+			stdout.length = 0;
+			await runAccountCommand({ action: "list", json: true }, context);
+			const rows = JSON.parse(stdout.join("")) as Array<Record<string, unknown>>;
+			expect(rows.map(row => [row.label, row.resetOn, row.autoRedeem])).toEqual([
+				["a@example.com", ["7d"], "no"],
+				["b@example.com", null, null],
+			]);
+
+			await runAccountCommand({ action: "reset", target: "a@example.com", on: "5h,7d" }, context);
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+				{ provider: "anthropic", account: { accountId: "acc-a" }, resetOn: ["5h", "7d"], autoRedeem: "no" },
+			]);
+
+			await runAccountCommand({ action: "reset", target: "a@example.com", on: "any", auto: "inherit" }, context);
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+
+			await runAccountCommand({ action: "reset", target: "a@example.com", on: "weekly" }, context);
+			expect(process.exitCode).toBe(1);
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("rejects API-key reset policies from the CLI with the validator's OAuth-only error", async () => {
+		await authStorage.credentials.set("openai-codex", [{ type: "api_key", key: "sk-test-key" }]);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		const previousExitCode = process.exitCode;
+		try {
+			await runAccountCommand(
+				{
+					action: "reset",
+					target: `openai-codex/${apiKeyFingerprint("sk-test-key")}`,
+					on: "7d",
+					auto: "yes",
+				},
+				{ settings, authStorage, cwd: project },
+			);
+			expect(process.exitCode).toBe(1);
+			expect(stderr.join("")).toContain("Saved resets (resetOn and autoRedeem) apply to OAuth accounts only.");
+			expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("disables and enables an account from the CLI, keeping it stored and listed", async () => {
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+		const context = { settings, authStorage, cwd: project };
+		const stdout: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout.push(String(chunk));
+			return true;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const previousExitCode = process.exitCode;
+		const listed = async (): Promise<unknown[][]> => {
+			stdout.length = 0;
+			await runAccountCommand({ action: "list", json: true }, context);
+			const rows = JSON.parse(stdout.join("")) as Array<Record<string, unknown>>;
+			return rows.map(row => [row.label, row.disabled]);
+		};
+		try {
+			await runAccountCommand({ action: "disable", target: "anthropic/b@example.com" }, context);
+			expect(process.exitCode).toBe(previousExitCode);
+			expect(
+				authStorage.credentials
+					.list("anthropic")
+					.map(row => row.credential.type === "oauth" && row.credential.email),
+			).toEqual(["a@example.com"]);
+			expect(await listed()).toEqual([
+				["a@example.com", false],
+				["b@example.com", true],
+			]);
+
+			stdout.length = 0;
+			await runAccountCommand({ action: "disable", target: "b@example.com" }, context);
+			expect(stdout.join("")).toContain("already disabled");
+
+			await runAccountCommand({ action: "enable", target: "b@example.com" }, context);
+			expect(process.exitCode).toBe(previousExitCode);
+			expect(await listed()).toEqual([
+				["a@example.com", false],
+				["b@example.com", false],
+			]);
+			expect(authStorage.credentials.list("anthropic")).toHaveLength(2);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
 			vi.restoreAllMocks();
 		}
 	});

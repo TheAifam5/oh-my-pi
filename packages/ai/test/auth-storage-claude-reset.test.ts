@@ -175,6 +175,21 @@ describe("Claude saved reset account safety", () => {
 		expect(f.posts.length).toBe(1);
 	});
 
+	it("neither lists nor spends a saved reset on a user-disabled account until it is enabled", async () => {
+		const f = await fixture();
+		expect(await f.storage.credentials.setEnabled(f.target.credentialId, false)).toBe(true);
+		const statuses = await f.storage.resets.list({ provider: "anthropic", baseUrlResolver: f.baseUrlResolver });
+		expect(statuses.map(status => status.credentialId)).not.toContain(f.target.credentialId);
+		const refused = await f.storage.resets.redeem({ target: f.target, baseUrlResolver: f.baseUrlResolver });
+		expect(refused.code).toBe("no_account");
+		expect(f.posts).toEqual([]);
+
+		expect(await f.storage.credentials.setEnabled(f.target.credentialId, true)).toBe(true);
+		const outcome = await f.storage.resets.redeem({ target: f.target, baseUrlResolver: f.baseUrlResolver });
+		expect(outcome.ok).toBe(true);
+		expect(f.posts.map(post => post.path)).toEqual(["/api/organizations/org-b/reset_rate_limits"]);
+	});
+
 	it("lists exact account quota evidence without a second generic usage request", async () => {
 		const f = await fixture();
 		const statuses = await f.storage.resets.list({ provider: "anthropic", baseUrlResolver: f.baseUrlResolver });

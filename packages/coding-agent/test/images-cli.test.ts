@@ -442,6 +442,57 @@ describe("images purge", () => {
 		expect(stderr).toEqual([]);
 	});
 
+	test("--apply purges Anthropic handles in their persisted workspace after the key workspace changes", async () => {
+		const credential = "anthropic-workspace-delete-secret";
+		const contentHash = "a".repeat(64);
+		const cache = new ProviderFileCache(resolvedConfig().providerFileCachePath, { saveDebounceMs: 60_000 });
+		for (const workspace of ["wrkspc_a", "wrkspc_b"]) {
+			cache.set(
+				"anthropic",
+				credential,
+				contentHash,
+				{
+					provider: "anthropic",
+					id: `file_${workspace}`,
+					mimeType: "image/png",
+					bytes: 3,
+					delete: { method: "DELETE", url: `https://api.anthropic.com/v1/files/file_${workspace}` },
+				},
+				workspace,
+			);
+		}
+		cache.save();
+		const remoteDeletes: Array<{ url: string; workspace: string | null }> = [];
+		const result = await runImagesCommand(
+			args("purge", { apply: true, all: true }),
+			dependencies({
+				queryPurge: async () => null,
+				openAuthStorage: async () => {
+					const storage = await AuthStorage.create(":memory:");
+					await storage.credentials.set("anthropic", {
+						type: "api_key",
+						key: credential,
+						workspaceId: "wrkspc_current",
+					});
+					return storage;
+				},
+				fetch: async (input, init) => {
+					remoteDeletes.push({
+						url: String(input),
+						workspace: new Headers(init?.headers).get("anthropic-workspace-id"),
+					});
+					return Response.json({ deleted: true });
+				},
+			}),
+		);
+		expect(result).toMatchObject({ providerFiles: { selected: 2, deleted: 2, skippedAuth: 0 } });
+		expect(remoteDeletes).toEqual([
+			{ url: "https://api.anthropic.com/v1/files/file_wrkspc_a", workspace: "wrkspc_a" },
+			{ url: "https://api.anthropic.com/v1/files/file_wrkspc_b", workspace: "wrkspc_b" },
+		]);
+		expect(new ProviderFileCache(resolvedConfig().providerFileCachePath).status().entries).toBe(0);
+	});
+
 	test("keeps provider-file metadata and fails safely when the matching credential is unavailable", async () => {
 		await writeProviderFile("unavailable-secret");
 		routes.set("/purge", () => ({

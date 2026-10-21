@@ -58,6 +58,7 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AnthropicFallbackCreditHandle,
+	AuthAccountPolicy,
 	AssistantMessage,
 	CodexCompactionContext,
 	Context,
@@ -552,7 +553,7 @@ import type { UsageLimitState } from "./usage-limit";
 import { cfgInterruptMode } from "../modes/settings";
 import { cfgFollowUpMode } from "../modes/settings";
 import { cfgSteeringMode } from "../modes/settings";
-import { cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
+import { cfgAuthAccountPolicies, cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
 import { cfgEvalToolsEnabled } from "../eval/settings";
 import { cfgExtensions, type SkillsSettings } from "../extensibility/settings";
 import {
@@ -14612,8 +14613,10 @@ export class AgentSession implements SettingsScope {
 		if (this.isStreaming) return "streaming";
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.sessions.pin(provider, this.sessionId, credentialId)) {
-			// The auth store refuses a pin for a missing row, an account outside the session's account pool, or an active runtime/config key override.
-			const stored = authStorage.sessions.accounts(provider).some(account => account.credentialId === credentialId);
+			// The auth store refuses a pin for a missing or disabled row, an account outside the session's account pool, or an active runtime/config key override.
+			const stored = authStorage.sessions
+				.accounts(provider)
+				.some(account => account.credentialId === credentialId && account.disabled !== true);
 			if (!stored) return "unavailable";
 			return authStorage.sessions.admits(provider, this.sessionId, credentialId) ? "overridden" : "restricted";
 		}
@@ -14637,7 +14640,9 @@ export class AgentSession implements SettingsScope {
 		if (!provider || this.isStreaming) return "unavailable";
 		const sessions = this.#modelRegistry.authStorage.sessions;
 		if (sessions.drain(provider, this.sessionId, credentialId)) return "drained";
-		const stored = credentialId !== null && sessions.accounts(provider).some(a => a.credentialId === credentialId);
+		const stored =
+			credentialId !== null &&
+			sessions.accounts(provider).some(a => a.credentialId === credentialId && a.disabled !== true);
 		return stored && !sessions.admits(provider, this.sessionId, credentialId) ? "restricted" : "unavailable";
 	}
 
@@ -14702,13 +14707,14 @@ export class AgentSession implements SettingsScope {
 	}
 	/**
 	 * Ask before a provider's first automatic spend and return the approved
-	 * actions. Consent is persisted in that provider's independent settings
-	 * group; a host that cannot prompt (no extension UI, or one whose prompts
-	 * cannot reach a human) spends only credits about to expire and gets a
-	 * one-shot notice for the rest while the mode is unset.
+	 * actions. With `persist`, the answer is saved as that provider's
+	 * `autoRedeem` setting; a host that cannot prompt (no extension UI, or one
+	 * whose prompts cannot reach a human) spends only credits about to expire
+	 * and gets a one-shot notice for the rest.
 	 */
 	async #confirmAutoRedeem(
 		provider: "openai-codex" | "anthropic",
+		persist: boolean,
 		actions: (CodexResetAction | ClaudeResetAction)[],
 		coordinator: CodexAutoRedeemCoordinator,
 	): Promise<readonly (CodexResetAction | ClaudeResetAction)[]> {
@@ -14770,11 +14776,12 @@ export class AgentSession implements SettingsScope {
 				},
 			]);
 			if (choice === "Yes") {
+				if (!persist) return actions;
 				if (provider === "anthropic") cfgClaudeResetsAutoRedeem.set(this.settings, "yes");
 				else cfgCodexResetsAutoRedeem.set(this.settings, "yes");
 				return actions;
 			}
-			if (choice === "No") {
+			if (choice === "No" && persist) {
 				if (provider === "anthropic") cfgClaudeResetsAutoRedeem.set(this.settings, "no");
 				else cfgCodexResetsAutoRedeem.set(this.settings, "no");
 			}
@@ -14784,17 +14791,49 @@ export class AgentSession implements SettingsScope {
 		return [];
 	}
 
-	/** Spend every planned action under `yes`, and only the confirmed ones under `unset`. */
+	/**
+	 * Spend every planned action whose effective mode (its account's `autoRedeem`
+	 * override, else `mode`) is `yes`, and only the confirmed ones under `unset`.
+	 * The answer becomes the provider setting only when `mode` is `unset` and no
+	 * prompted account has its own `autoRedeem`.
+	 */
 	async #redeemConsentedResets(
 		provider: "openai-codex" | "anthropic",
 		mode: ResetAutoRedeemMode,
 		actions: (CodexResetAction | ClaudeResetAction)[],
 		coordinator: CodexAutoRedeemCoordinator,
 	): Promise<{ restoredCredentialIds: number[]; poolLimited: boolean }> {
-		const approved = shouldPromptCodexAutoRedeem(mode)
-			? await this.#confirmAutoRedeem(provider, actions, coordinator)
-			: actions;
+		const prompted = actions.filter(action => shouldPromptCodexAutoRedeem(action.autoRedeem ?? mode));
+		const persist = mode === "unset" && prompted.every(action => action.autoRedeem === undefined);
+		const confirmed =
+			prompted.length > 0 ? await this.#confirmAutoRedeem(provider, persist, prompted, coordinator) : [];
+		const approved = actions.flatMap(action => {
+			if (!shouldPromptCodexAutoRedeem(action.autoRedeem ?? mode)) return [action];
+			return confirmed.filter(spend => spend.attemptKey === action.attemptKey);
+		});
 		return this.#executeResetActions(provider, approved, coordinator);
+	}
+
+	/** The account policy of the stored OAuth credential a saved-reset target names. */
+	#accountResetPolicy(target: ResetCreditTarget): AuthAccountPolicy | undefined {
+		const authStorage = this.#modelRegistry.authStorage;
+		const row = authStorage.credentials.list(target.provider).find(entry => entry.id === target.credentialId);
+		return row?.credential.type === "oauth" ? authStorage.oauth.policy(target.provider, row.credential) : undefined;
+	}
+
+	/** Whether `provider`'s saved resets are checked: its `autoRedeem` setting or an account override allows it. */
+	#resetsEnabled(provider: "openai-codex" | "anthropic", mode: ResetAutoRedeemMode): boolean {
+		return (
+			shouldEvaluateCodexAutoRedeem(mode) ||
+			cfgAuthAccountPolicies
+				.get(this.settings)
+				.some(
+					policy =>
+						policy.provider === provider &&
+						policy.autoRedeem !== undefined &&
+						shouldEvaluateCodexAutoRedeem(policy.autoRedeem),
+				)
+		);
 	}
 
 	#planCodexResets(
@@ -14815,6 +14854,7 @@ export class AgentSession implements SettingsScope {
 			identity,
 			permitsCredential: credentialId =>
 				this.#modelRegistry.authStorage.sessions.permits("openai-codex", this.sessionId, credentialId),
+			accountResetPolicy: target => this.#accountResetPolicy(target),
 			reports,
 			attemptedKeys: coordinator.attemptedKeys,
 			deferredUntilByKey: coordinator.deferredUntilByKey,
@@ -14846,6 +14886,7 @@ export class AgentSession implements SettingsScope {
 			statuses,
 			permitsCredential: credentialId =>
 				this.#modelRegistry.authStorage.sessions.permits("anthropic", this.sessionId, credentialId),
+			accountResetPolicy: target => this.#accountResetPolicy(target),
 			attemptedKeys: coordinator.attemptedKeys,
 			deferredUntilByKey: coordinator.deferredUntilByKey,
 			lastAttemptAtByAccount: coordinator.lastAttemptAtByAccount,
@@ -15064,7 +15105,7 @@ export class AgentSession implements SettingsScope {
 		const provider = this.model?.provider;
 		if (provider !== "anthropic" && provider !== "openai-codex") return { restored: false };
 		const cfg = (provider === "anthropic" ? cfgClaudeResets : cfgCodexResets).get(this.settings);
-		if (!shouldEvaluateCodexAutoRedeem(cfg.autoRedeem)) return { restored: false };
+		if (!this.#resetsEnabled(provider, cfg.autoRedeem)) return { restored: false };
 		const coordinator = this.#resetCoordinator;
 		const authStorage = this.#modelRegistry.authStorage;
 		const identity = authStorage.oauth.identity(provider, this.sessionId);
@@ -15147,10 +15188,11 @@ export class AgentSession implements SettingsScope {
 		const codexCfg = cfgCodexResets.get(this.settings);
 		const claudeCfg = cfgClaudeResets.get(this.settings);
 		const codexEnabled =
-			shouldEvaluateCodexAutoRedeem(codexCfg.autoRedeem) &&
+			this.#resetsEnabled("openai-codex", codexCfg.autoRedeem) &&
 			reports.some(report => report.provider === "openai-codex");
 		const claudeEnabled =
-			shouldEvaluateCodexAutoRedeem(claudeCfg.autoRedeem) && reports.some(report => report.provider === "anthropic");
+			this.#resetsEnabled("anthropic", claudeCfg.autoRedeem) &&
+			reports.some(report => report.provider === "anthropic");
 		if (!codexEnabled && !claudeEnabled) return;
 		if (coordinator.sweepInFlight || coordinator.inFlightByAccount.size > 0) return;
 		const now = Date.now();

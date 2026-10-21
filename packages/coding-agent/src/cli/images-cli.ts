@@ -43,6 +43,7 @@ import {
 } from "../blob-broker/savings";
 import { providerFileCachePath, resolveBlobBrokerConfigs } from "../blob-broker/service";
 import { createConfiguredUploader } from "../blob-broker/uploaders";
+import { getApiKeyWorkspaceId } from "../config/model-provider-discovery";
 import { Settings } from "../config/settings";
 
 import { cfgImagesUrlsBackends, cfgImagesUrlsEnabled } from "../blob-broker/settings";
@@ -94,6 +95,7 @@ export interface ImagesCliDependencies {
 		provider: ProviderFileProvider,
 		credential: string,
 		fetchImpl: FetchImpl,
+		workspaceId?: string,
 	) => ProviderFileClient | null;
 	readonly queryStatus: (projectDir: string) => Promise<BlobBrokerStatus | null>;
 	readonly queryDoctor: (
@@ -220,13 +222,14 @@ function defaultCreateProviderFileClient(
 	provider: ProviderFileProvider,
 	credential: string,
 	fetchImpl: FetchImpl,
+	workspaceId?: string,
 ): ProviderFileClient | null {
 	for (const model of getBundledModels(provider)) {
 		const client =
 			provider === "openai"
 				? createOpenAIFileClient(model, credential, fetchImpl)
 				: provider === "anthropic"
-					? createAnthropicFileClient(model, credential, fetchImpl)
+					? createAnthropicFileClient(model, credential, fetchImpl, workspaceId)
 					: createGeminiProviderFileClient(model, credential, fetchImpl);
 		if (client) return client;
 	}
@@ -250,6 +253,7 @@ function persistedProviderFileEntry(value: unknown): ProviderFileCacheEntry | un
 		!/^[0-9a-f]{64}$/.test(entry.credentialHash) ||
 		typeof entry.contentHash !== "string" ||
 		!/^[0-9a-f]{64}$/.test(entry.contentHash) ||
+		(entry.workspaceId !== undefined && (typeof entry.workspaceId !== "string" || entry.workspaceId.length === 0)) ||
 		!handle ||
 		handle.provider !== entry.provider ||
 		typeof handle.mimeType !== "string" ||
@@ -634,14 +638,19 @@ async function purgeProviderFiles(
 				skippedAuth++;
 				continue;
 			}
-			const client = deps.createProviderFileClient(entry.provider, credential, deps.fetch);
+			const client = deps.createProviderFileClient(
+				entry.provider,
+				credential,
+				deps.fetch,
+				entry.workspaceId ?? getApiKeyWorkspaceId(storage, entry.provider, credential),
+			);
 			if (!client) {
 				skippedAuth++;
 				continue;
 			}
 			try {
 				await client.delete(entry.handle);
-				cache.delete(entry.provider, credential, entry.contentHash);
+				cache.delete(entry.provider, credential, entry.contentHash, entry.workspaceId);
 				deleted++;
 			} catch (error) {
 				errors.push(`${entry.provider}: ${safeDetail(error)}`);

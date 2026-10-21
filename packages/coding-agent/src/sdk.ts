@@ -68,6 +68,7 @@ import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
+import { getApiKeyWorkspaceId } from "./config/model-provider-discovery";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
 	disabledProviderIds,
@@ -1544,7 +1545,12 @@ function createSessionImageUrlService(
 	return new LiveImageUrlService(
 		settings,
 		() => sessionManager.getCwd(),
-		model => modelRegistry.getApiKey(model, providerSessionId),
+		async model => {
+			const apiKey = await modelRegistry.getApiKey(model, providerSessionId);
+			return apiKey
+				? { apiKey, workspaceId: getApiKeyWorkspaceId(modelRegistry.authStorage, model.provider, apiKey) }
+				: undefined;
+		},
 	);
 }
 

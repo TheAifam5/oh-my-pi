@@ -897,17 +897,25 @@ export class SessionAffinity implements SessionsApi {
 		} catch (error) {
 			if (!(error instanceof AIError.AccountUnavailableError)) throw error;
 		}
-		return this.#pool.entries(provider).flatMap((entry, index): AuthAccountSummary[] => {
-			const credential = entry.credential;
+		const rows = [
+			...this.#pool.entries(provider).map((entry, index) => ({ ...entry, index, disabled: false })),
+			// The owner's view also lists the rows the user disabled; a session never selects them.
+			...(sessionId === undefined
+				? this.#pool.listUserDisabled(provider).map(row => ({ ...row, index: -1, disabled: true }))
+				: []),
+		];
+		return rows.flatMap((entry): AuthAccountSummary[] => {
+			const { credential, index } = entry;
 			// A restricted session lists only its allowlist; without a session id every row is listed.
 			if (sessionId !== undefined && !this.allows(provider, sessionId, credential)) return [];
 			const name = this.#policies.forStored(provider, credential)?.name;
 			const summary: AuthAccountSummary = {
 				credentialId: entry.id,
 				type: credential.type,
-				active: session?.index === index && session.type === credential.type,
-				pinned: pinnedIndex === index,
+				active: !entry.disabled && session?.index === index && session.type === credential.type,
+				pinned: !entry.disabled && pinnedIndex === index,
 				...(name !== undefined ? { name } : {}),
+				...(entry.disabled ? { disabled: true } : {}),
 			};
 			if (credential.type === "api_key") return [{ ...summary, keyFingerprint: apiKeyFingerprint(credential.key) }];
 			return [

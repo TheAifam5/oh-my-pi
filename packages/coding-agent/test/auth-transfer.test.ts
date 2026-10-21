@@ -86,4 +86,31 @@ describe("omp auth export/import", () => {
 		expect(() => parseAuthExport(document)).toThrow(AuthTransferError);
 		expect(() => parseAuthExport(document)).toThrow(/credentials\[0\] \(anthropic\).*refresh token/);
 	});
+
+	it("round-trips an API key's workspace ID and rejects an invalid one", async () => {
+		using dir = TempDir.createSync("@omp-auth-transfer-");
+		const laptop = await SqliteAuthCredentialStore.open(path.join(dir.path(), "laptop.db"));
+		const cloud = await SqliteAuthCredentialStore.open(path.join(dir.path(), "cloud.db"));
+		try {
+			const key: AuthCredential = {
+				type: "api_key",
+				key: "sk-ant-usr-x",
+				source: "login",
+				workspaceId: "wrkspc_01Jw",
+			};
+			await laptop.upsertAuthCredential("anthropic", key);
+
+			await importAuthCredentials(cloud, parseAuthExport(JSON.stringify(exportAuthCredentials(laptop))));
+
+			expect(stored(cloud, "anthropic")).toEqual([key]);
+			const invalid = JSON.stringify({
+				version: 1,
+				credentials: [{ provider: "anthropic", credential: { ...key, workspaceId: "wrkspc_01\nJw" } }],
+			});
+			expect(() => parseAuthExport(invalid)).toThrow(/credentials\[0\] \(anthropic\).*workspace ID/);
+		} finally {
+			laptop.close();
+			cloud.close();
+		}
+	});
 });

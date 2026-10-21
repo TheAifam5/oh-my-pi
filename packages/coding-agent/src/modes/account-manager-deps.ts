@@ -31,6 +31,7 @@ import {
 	setAccountPriority,
 	setAccountReserve,
 	setAccountReturn,
+	setAccountEnabled,
 	setPoolMemberAccount,
 	unpinProjectAccount,
 } from "../session/account-admin";
@@ -71,7 +72,8 @@ const MINUTE_MS = 60_000;
 export const STORE_TIMEOUT_MS = 10_000;
 export const STORE_TIMEOUT_MESSAGE = "Timed out reading the credential store";
 /** Actions applied with a target state (`on` or `off`) rather than typed text. */
-const TOGGLES = /^(?:drain|pin-session|pin-project|spend:.*|return:(?:reset|credits-added|money-available)|pool:.*)$/;
+const TOGGLES =
+	/^(?:enabled|drain|pin-session|pin-project|spend:.*|return:(?:reset|credits-added|money-available)|pool:.*)$/;
 
 function accountId(row: Pick<AccountListing, "provider" | "account">): string {
 	return `${row.provider}#${row.account.credentialId}`;
@@ -279,6 +281,13 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				})),
 			},
 			{
+				id: "enabled",
+				label: "enabled",
+				key: "e",
+				value: row.account.disabled ? "off" : "on",
+				on: row.account.disabled !== true,
+			},
+			{
 				id: "limits",
 				label: "limits",
 				key: "l",
@@ -320,6 +329,11 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 			].filter((pin): pin is string => pin !== undefined);
 			const details: AccountManagerAccount["details"] = [
 				{ label: "type", value: row.account.type === "oauth" ? "OAuth" : "API key" },
+				{
+					label: "state",
+					value: row.account.disabled ? "disabled (no request uses it)" : "enabled",
+					tone: row.account.disabled ? "error" : "dim",
+				},
 				{ label: "priority", value: row.priority === undefined ? "default" : String(row.priority) },
 				{ label: "reserve", value: row.reservePct === undefined ? "default" : `${row.reservePct}%` },
 				{
@@ -339,6 +353,17 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					: [{ label: "limits", value: "none", tone: "dim" as const }]),
 			];
 			if (billing !== undefined) details.push({ label: "billing", value: billing });
+			if (row.resetOn !== undefined || row.autoRedeem !== undefined) {
+				details.push({
+					label: "resets",
+					value: [
+						row.resetOn === undefined ? undefined : `on ${row.resetOn.join(", ")}`,
+						row.autoRedeem === undefined ? undefined : `auto-redeem ${row.autoRedeem}`,
+					]
+						.filter(Boolean)
+						.join(" · "),
+				});
+			}
 			const readOnly = accountPolicyWriteBlocker(settings);
 			if (readOnly) details.push({ label: "policy", value: `${readOnly}; shown read-only`, tone: "warning" });
 			return {
@@ -350,6 +375,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					row.priority !== undefined ? `priority ${row.priority}` : undefined,
 					row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
 					row.drain ? "drain" : undefined,
+					row.account.disabled ? "disabled" : undefined,
 					pinnedForSession ? "session pin" : undefined,
 					row.projectPinned ? "project pin" : undefined,
 					poolMembership.length > 0 ? "pool" : undefined,
@@ -542,6 +568,24 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				await withTimeout(authStorage.credentials.reload(), STORE_TIMEOUT_MS, STORE_TIMEOUT_MESSAGE);
 				const row = listAccounts(settings, authStorage, cwd()).find(candidate => accountId(candidate) === id);
 				if (!row) return { error: "That account is no longer stored." };
+				if (actionId === "enabled") {
+					if (value !== "on" && value !== "off") return { error: "A toggle needs its target state (on or off)." };
+					const enabled = value === "on";
+					const label = row.account.name ?? row.label;
+					const outcome = await withTimeout(
+						setAccountEnabled(settings, authStorage, row, enabled),
+						STORE_TIMEOUT_MS,
+						STORE_TIMEOUT_MESSAGE,
+					);
+					if (!outcome.changed) return { message: `${label} is already ${enabled ? "enabled" : "disabled"}.` };
+					const pinned = outcome.pinnedProjects.map(project => shortenPath(project)).join(", ");
+					return {
+						message: enabled ? `${label} is enabled.` : `${label} is disabled; no request uses it.`,
+						...(!enabled && pinned
+							? { warning: `Pinned for ${pinned}; those requests fail until it is enabled.` }
+							: {}),
+					};
+				}
 				result = run(row, actionId, value, expect);
 			} catch (error) {
 				return { error: error instanceof Error ? error.message : String(error) };

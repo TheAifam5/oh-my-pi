@@ -79,6 +79,7 @@ export class OAuthAccounts implements OAuthApi {
 		if (!def?.login) {
 			throw new AIError.ConfigurationError(`Unknown OAuth provider: ${provider}`);
 		}
+		let workspaceId: string | undefined;
 		const result = await def.login({
 			onAuth: ctrl.onAuth,
 			onProgress: ctrl.onProgress,
@@ -87,13 +88,16 @@ export class OAuthAccounts implements OAuthApi {
 			onBrowserSession: ctrl.onBrowserSession,
 			signal: ctrl.signal,
 			fetch: ctrl.fetch,
+			onWorkspaceId: id => {
+				workspaceId = id;
+			},
 		});
 		if (typeof result === "string") {
 			// Some flows (e.g. ollama) return "" to signal that no key was entered.
 			if (!result) {
 				return undefined;
 			}
-			await this.#deps.pool.storeLoginApiKey(def.storeCredentialsAs ?? provider, result);
+			await this.#deps.pool.storeLoginApiKey(def.storeCredentialsAs ?? provider, result, workspaceId);
 			return { type: "api_key" };
 		}
 		// Stamp the interactive-login instant: providers with an absolute grant

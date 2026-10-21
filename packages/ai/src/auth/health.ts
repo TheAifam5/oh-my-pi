@@ -61,9 +61,15 @@ export class CredentialHealth implements HealthApi {
 	 * credential lacks any usable bearer bytes (e.g. an API-key row with an
 	 * empty key, or an OAuth row that never had an `access` token written).
 	 */
-	#buildCompletionProbeCredential(credential: UsageCredential): CompletionProbeCredential | null {
+	#buildCompletionProbeCredential(
+		credential: UsageCredential,
+		workspaceId: string | undefined,
+	): CompletionProbeCredential | null {
 		if (credential.type === "api_key") {
-			return credential.apiKey ? { type: "api_key", apiKey: credential.apiKey } : null;
+			if (!credential.apiKey) return null;
+			return workspaceId
+				? { type: "api_key", apiKey: credential.apiKey, workspaceId }
+				: { type: "api_key", apiKey: credential.apiKey };
 		}
 		if (!credential.accessToken) return null;
 		return {
@@ -405,7 +411,10 @@ export class CredentialHealth implements HealthApi {
 			}
 
 			if (completionProbe) {
-				const probeCred = this.#buildCompletionProbeCredential(params.credential);
+				const probeCred = this.#buildCompletionProbeCredential(
+					params.credential,
+					cred.type === "api_key" ? cred.workspaceId : undefined,
+				);
 				if (!probeCred) {
 					base.completion = {
 						ok: null,

@@ -34,6 +34,8 @@ import type {
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
 	CredentialDisableResponse,
+	CredentialEnabledRequest,
+	CredentialEnabledResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
@@ -106,6 +108,7 @@ export const apiKeyCredentialSchema: FluentType<ApiKeyCredential> = type({
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
 	"source?": "'login'",
+	"workspaceId?": "/^wrkspc_[A-Za-z0-9]+$/",
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */
@@ -124,6 +127,7 @@ export const credentialSnapshotEntrySchema: FluentType<AuthCredentialSnapshotEnt
 	provider: type("string").atLeastLength(1),
 	credential: snapshotCredentialSchema,
 	identityKey: "string | null",
+	"userDisabledAtMs?": "number",
 });
 
 export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> = type({
@@ -140,6 +144,7 @@ export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({
 	provider: type("string").atLeastLength(1),
 	credential: snapshotCredentialSchema,
 	identityKey: "string | null",
+	"userDisabledAtMs?": "number",
 	rotatesInMs: "number | null",
 	"blocks?": credentialBlockSnapshotSchema.array(),
 });
@@ -401,6 +406,16 @@ export const credentialDisableRequestSchema: FluentType<{ cause?: string }> = ty
 });
 
 export const credentialDisableResponseSchema: FluentType<CredentialDisableResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const credentialEnabledRequestSchema: FluentType<CredentialEnabledRequest> = type({
+	"+": "reject",
+	enabled: "boolean",
+});
+
+export const credentialEnabledResponseSchema: FluentType<CredentialEnabledResponse> = type({
 	"+": "reject",
 	ok: "boolean",
 });

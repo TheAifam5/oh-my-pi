@@ -153,7 +153,9 @@ export class AuthStorage {
 	setAccountPolicies(config: { accountPolicies: AuthAccountPolicies; defaultReservePct: number }): void {
 		const pool = this.#modules.pool;
 		const stored = new Map<string, AuthCredential[]>();
-		for (const provider of pool.providers()) stored.set(provider, pool.credentials(provider));
+		for (const row of [...pool.list(), ...pool.listUserDisabled()]) {
+			stored.set(row.provider, [...(stored.get(row.provider) ?? []), row.credential]);
+		}
 		this.#policies.replace(config.accountPolicies, config.defaultReservePct, stored);
 	}
 

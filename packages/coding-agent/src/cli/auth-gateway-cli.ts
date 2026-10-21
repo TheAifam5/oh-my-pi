@@ -784,7 +784,9 @@ export function createStrictCompletionProbe(): CompletionProbe {
 						region: input.credential.region,
 						inferenceRegion: input.credential.inferenceRegion,
 					}
-				: undefined;
+				: input.credential.workspaceId
+					? { workspaceId: input.credential.workspaceId }
+					: undefined;
 		let lastFailure: CredentialCompletionResult | undefined;
 		for (const model of candidates) {
 			if (input.signal.aborted) {

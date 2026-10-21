@@ -21,6 +21,8 @@ import type {
 	CredentialBlocksDeleteResponse,
 	CredentialDisableRequest,
 	CredentialDisableResponse,
+	CredentialEnabledRequest,
+	CredentialEnabledResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
@@ -40,6 +42,7 @@ import {
 	AUTH_BROKER_CAPABILITY_ACCOUNT_USAGE,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AUTH_BROKER_CAPABILITY_SHARED_CACHE,
+	AUTH_BROKER_CAPABILITY_USER_DISABLED_CREDENTIALS,
 	ACCOUNT_USAGE_MAX_ROWS,
 	OBSERVED_USAGE_MAX_ACCOUNT_LENGTH,
 } from "./types";
@@ -52,6 +55,7 @@ import {
 	credentialBlockResponseSchema,
 	credentialBlocksDeleteResponseSchema,
 	credentialDisableResponseSchema,
+	credentialEnabledResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
 	disabledCredentialsResponseSchema,
@@ -73,6 +77,7 @@ const RESPONSE_SCHEMAS = {
 	credentialBlockResponseSchema,
 	credentialBlocksDeleteResponseSchema,
 	credentialDisableResponseSchema,
+	credentialEnabledResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
 	disabledCredentialsResponseSchema,
@@ -133,6 +138,11 @@ export type FetchSnapshotResult =
 	| { status: 304; generation: number };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+/** Capabilities announced on snapshot reads (`GET /v1/snapshot` and its stream). */
+const SNAPSHOT_CAPABILITIES = [
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_USER_DISABLED_CREDENTIALS,
+].join(",");
 const DEFAULT_MAX_RETRIES = 1;
 /** Largest broker response body read by default, in bytes. */
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -211,7 +221,7 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: SNAPSHOT_CAPABILITIES,
 		};
 		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
 		const timeoutMs =
@@ -253,7 +263,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: SNAPSHOT_CAPABILITIES,
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });
@@ -452,6 +462,16 @@ export class AuthBrokerClient {
 		return this.#request<CredentialDisableResponse>("POST", `/v1/credential/${id}/disable`, {
 			body,
 			schema: "credentialDisableResponseSchema",
+			signal,
+		});
+	}
+
+	/** Enable or disable one stored account (`POST /v1/credential/:id/enabled`). */
+	async setCredentialEnabled(id: number, enabled: boolean, signal?: AbortSignal): Promise<CredentialEnabledResponse> {
+		const body: CredentialEnabledRequest = { enabled };
+		return this.#request<CredentialEnabledResponse>("POST", `/v1/credential/${id}/enabled`, {
+			body,
+			schema: "credentialEnabledResponseSchema",
 			signal,
 		});
 	}

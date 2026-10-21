@@ -90,6 +90,8 @@ export interface CredentialPoolOptions {
 export class CredentialPool implements CredentialsApi {
 	/** Provider -> credentials cache, populated from store on reload(). */
 	#data: Map<string, StoredCredential[]> = new Map();
+	/** Provider -> rows the user disabled; listed for account management, never selected. */
+	#userDisabled: Map<string, StoredAuthCredential[]> = new Map();
 	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	/** Fingerprint of the resolved secret of each API-key row whose stored key is a reference; used to attribute usage reports. */
@@ -143,9 +145,11 @@ export class CredentialPool implements CredentialsApi {
 		return rows;
 	}
 
-	/** Persist a login-entered API key. */
-	async storeLoginApiKey(provider: string, key: string): Promise<void> {
-		const credential: ApiKeyCredential = { type: "api_key", key, source: "login" };
+	/** Persist a login-entered API key and the workspace id entered with it. */
+	async storeLoginApiKey(provider: string, key: string, workspaceId?: string): Promise<void> {
+		const credential: ApiKeyCredential = workspaceId
+			? { type: "api_key", key, source: "login", workspaceId }
+			: { type: "api_key", key, source: "login" };
 		const stored = await this.#store.upsertAuthCredential(provider, credential);
 		this.replace(
 			provider,
@@ -281,8 +285,10 @@ export class CredentialPool implements CredentialsApi {
 	 */
 	async reload(): Promise<void> {
 		let records: StoredAuthCredential[];
+		let userDisabled: StoredAuthCredential[];
 		try {
 			records = this.#store.listAuthCredentials();
+			userDisabled = this.#store.listUserDisabledCredentials?.() ?? [];
 		} catch (err) {
 			// Latch + surface repair guidance on corruption, but still fail the
 			// reload: silently continuing with zero credentials would log the
@@ -296,19 +302,31 @@ export class CredentialPool implements CredentialsApi {
 			list.push({ id: record.id, credential: record.credential });
 			grouped.set(record.provider, list);
 		}
+		const disabledGrouped = new Map<string, StoredAuthCredential[]>();
+		for (const record of userDisabled) {
+			const list = disabledGrouped.get(record.provider) ?? [];
+			list.push(record);
+			disabledGrouped.set(record.provider, list);
+		}
 
 		const dedupedGrouped = new Map<string, StoredCredential[]>();
 		for (const [provider, entries] of grouped.entries()) {
 			const deduped = await this.pruneDuplicates(provider, entries);
-			this.#options.policies.validateFor(
-				provider,
-				deduped.map(entry => entry.credential),
-			);
 			if (deduped.length > 0) {
 				dedupedGrouped.set(provider, deduped);
 			}
 		}
+		for (const provider of new Set([...grouped.keys(), ...disabledGrouped.keys()])) {
+			this.#options.policies.validateFor(provider, [
+				...(dedupedGrouped.get(provider) ?? []).map(entry => entry.credential),
+				...(disabledGrouped.get(provider) ?? []).map(entry => entry.credential),
+			]);
+		}
 
+		const previousUserDisabled = this.listUserDisabled().map(row => [row.id, row.userDisabledAtMs]);
+		this.#userDisabled = disabledGrouped;
+		const nextUserDisabled = this.listUserDisabled().map(row => [row.id, row.userDisabledAtMs]);
+		if (JSON.stringify(previousUserDisabled) !== JSON.stringify(nextUserDisabled)) this.bump("credentials");
 		const removedProviders = new Set(this.#data.keys());
 		for (const [provider, entries] of dedupedGrouped) {
 			this.replace(provider, entries);
@@ -661,6 +679,7 @@ export class CredentialPool implements CredentialsApi {
 	 */
 	async remove(provider: string): Promise<void> {
 		await this.#store.deleteAuthCredentials(provider, "deleted by user");
+		if (this.#userDisabled.delete(provider)) this.bump("credentials");
 		this.replace(provider, []);
 		this.reset(provider);
 	}
@@ -671,7 +690,12 @@ export class CredentialPool implements CredentialsApi {
 	async removeById(provider: string, credentialId: number): Promise<boolean> {
 		const entries = this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === credentialId);
-		if (index === -1) return false;
+		if (index === -1) {
+			if (!this.#userDisabled.get(provider)?.some(row => row.id === credentialId)) return false;
+			if (!(await this.#store.deleteAuthCredential(credentialId, "deleted by user"))) return false;
+			this.#dropUserDisabled(credentialId);
+			return true;
+		}
 		const remainingEntries = entries.filter((_entry, entryIndex) => entryIndex !== index);
 		const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
 		if (!deleted) return false;
@@ -721,26 +745,32 @@ export class CredentialPool implements CredentialsApi {
 
 	/**
 	 * Build a redacted snapshot of all loaded credentials for the auth-broker
-	 * wire. OAuth refresh tokens are replaced with {@link REMOTE_REFRESH_SENTINEL}
-	 * so clients never see the actual refresh token.
+	 * wire, user-disabled rows last with `userDisabledAtMs`. OAuth refresh
+	 * tokens are replaced with {@link REMOTE_REFRESH_SENTINEL} so clients never
+	 * see the actual refresh token.
 	 *
 	 * Callers must {@link CredentialPool.reload} first when serving a stale snapshot
 	 * (the broker server's HTTP handler does this).
 	 */
 	snapshot(): AuthCredentialSnapshot {
 		const entries: AuthCredentialSnapshotEntry[] = [];
+		const push = (provider: string, id: number, credential: AuthCredential, userDisabledAtMs?: number): void => {
+			const redacted: SnapshotCredential =
+				credential.type === "api_key" ? credential : { ...credential, refresh: REMOTE_REFRESH_SENTINEL };
+			const entry: AuthCredentialSnapshotEntry = {
+				id,
+				provider,
+				credential: redacted,
+				identityKey: resolveCredentialIdentityKey(provider, credential),
+			};
+			if (userDisabledAtMs !== undefined) entry.userDisabledAtMs = userDisabledAtMs;
+			entries.push(entry);
+		};
 		for (const [provider, stored] of this.#data) {
-			for (const entry of stored) {
-				const credential = entry.credential;
-				const redacted: SnapshotCredential =
-					credential.type === "api_key" ? credential : { ...credential, refresh: REMOTE_REFRESH_SENTINEL };
-				entries.push({
-					id: entry.id,
-					provider,
-					credential: redacted,
-					identityKey: resolveCredentialIdentityKey(provider, credential),
-				});
-			}
+			for (const entry of stored) push(provider, entry.id, entry.credential);
+		}
+		for (const [provider, rows] of this.#userDisabled) {
+			for (const row of rows) push(provider, row.id, row.credential, row.userDisabledAtMs ?? 0);
 		}
 		return {
 			generation: this.#generation,
@@ -751,12 +781,36 @@ export class CredentialPool implements CredentialsApi {
 
 	/**
 	 * Disabled credential tombstones for display surfaces (`omp usage`,
-	 * broker `GET /v1/credentials/disabled`). Empty when the backing store
-	 * keeps no tombstones or the remote broker predates the endpoint.
+	 * broker `GET /v1/credentials/disabled`), followed by the user-disabled
+	 * rows. Tombstones are empty when the backing store keeps none or the
+	 * remote broker predates the endpoint.
 	 */
 	async listDisabled(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]> {
-		if (!this.#store.listDisabledCredentials) return [];
-		return this.#store.listDisabledCredentials(provider, signal);
+		const tombstones = this.#store.listDisabledCredentials
+			? await this.#store.listDisabledCredentials(provider, signal)
+			: [];
+		const listed = new Set(tombstones.map(summary => summary.id));
+		const userDisabled = this.listUserDisabled(provider)
+			.filter(row => !listed.has(row.id))
+			.map((row): DisabledCredentialSummary => {
+				const summary: DisabledCredentialSummary = {
+					id: row.id,
+					provider: row.provider,
+					type: row.credential.type,
+					cause: "disabled by user",
+					userDisabled: true,
+				};
+				if (row.userDisabledAtMs !== undefined) summary.disabledAtMs = row.userDisabledAtMs;
+				if (row.credential.type === "oauth") {
+					const { email, accountId, orgId, orgName } = row.credential;
+					if (email) summary.email = email;
+					if (accountId) summary.accountId = accountId;
+					if (orgId) summary.orgId = orgId;
+					if (orgName) summary.orgName = orgName;
+				}
+				return summary;
+			});
+		return [...tombstones, ...userDisabled];
 	}
 
 	/**
@@ -787,7 +841,49 @@ export class CredentialPool implements CredentialsApi {
 			this.emitDisabled(credentialDisabledEvent(provider, entries[index]!, disabledCause));
 			return true;
 		}
-		return false;
+		const row = this.#findUserDisabled(id);
+		if (!row || !(await this.#store.deleteAuthCredential(id, disabledCause))) return false;
+		this.#dropUserDisabled(id);
+		this.emitDisabled(credentialDisabledEvent(row.provider, row, disabledCause));
+		return true;
+	}
+
+	listUserDisabled(provider?: string): StoredAuthCredential[] {
+		if (provider !== undefined) return [...(this.#userDisabled.get(provider) ?? [])];
+		return [...this.#userDisabled.values()].flat();
+	}
+
+	async setEnabled(credentialId: number, enabled: boolean): Promise<boolean> {
+		const provider =
+			this.#findUserDisabled(credentialId)?.provider ??
+			[...this.#data].find(([, entries]) => entries.some(entry => entry.id === credentialId))?.[0];
+		if (provider === undefined) return false;
+		const setEnabled = this.#store.setAuthCredentialEnabled?.bind(this.#store);
+		if (!setEnabled) throw new Error("This credential store cannot enable or disable accounts.");
+		if (!(await setEnabled(credentialId, enabled))) return false;
+		await this.reload();
+		this.reset(provider);
+		return true;
+	}
+
+	#findUserDisabled(id: number): StoredAuthCredential | undefined {
+		for (const rows of this.#userDisabled.values()) {
+			const row = rows.find(candidate => candidate.id === id);
+			if (row) return row;
+		}
+		return undefined;
+	}
+
+	/** Drop a user-disabled row from memory after its stored row was removed. */
+	#dropUserDisabled(id: number): void {
+		for (const [provider, rows] of this.#userDisabled) {
+			const next = rows.filter(row => row.id !== id);
+			if (next.length === rows.length) continue;
+			if (next.length > 0) this.#userDisabled.set(provider, next);
+			else this.#userDisabled.delete(provider);
+			this.bump("credentials");
+			return;
+		}
 	}
 
 	/**

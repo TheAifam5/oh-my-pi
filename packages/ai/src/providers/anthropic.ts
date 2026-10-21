@@ -2558,7 +2558,9 @@ const streamAnthropicOnce = (
 					extraBetas,
 					stream: true,
 					interleavedThinking: options?.interleavedThinking ?? true,
-					headers: options?.headers,
+					headers: options?.oauthIdentity?.workspaceId
+						? { ...options.headers, "anthropic-workspace-id": options.oauthIdentity.workspaceId }
+						: options?.headers,
 					dynamicHeaders: copilotDynamicHeaders?.headers,
 					isOAuth: options?.isOAuth,
 					hasTools: !!context.tools?.length,

@@ -1,8 +1,14 @@
 /**
  * `login "api-key"` engine: open the provider's key page, prompt for a paste,
- * optionally validate the key against a declared probe, return the key.
+ * optionally prompt for a workspace id, optionally validate the key against a
+ * declared probe, return the key.
  */
-import type { CompiledApiKeyLogin, CompiledAuthValidation, CompiledKeyPrefix } from "@oh-my-pi/pi-catalog/compat/types";
+import type {
+	CompiledApiKeyLogin,
+	CompiledAuthValidation,
+	CompiledKeyPrefix,
+	CompiledWorkspacePrompt,
+} from "@oh-my-pi/pi-catalog/compat/types";
 import { $env } from "@oh-my-pi/pi-utils";
 import * as AIError from "../../error";
 import {
@@ -18,6 +24,7 @@ async function runValidation(
 	label: string,
 	apiKey: string,
 	options: OAuthController,
+	extraHeaders: Record<string, string> | undefined,
 ): Promise<void> {
 	const provider = validate.label ?? label;
 	switch (validate.kind) {
@@ -47,7 +54,8 @@ async function runValidation(
 		case "models-endpoint": {
 			const envBase = validate.baseUrlEnv ? $env[validate.baseUrlEnv]?.trim() : undefined;
 			const modelsUrl = envBase ? `${envBase.replace(/\/+$/, "")}/models` : validate.url;
-			const headers = validate.headersHook ? (await loadHeadersHook(validate.headersHook))() : undefined;
+			const hookHeaders = validate.headersHook ? (await loadHeadersHook(validate.headersHook))() : undefined;
+			const headers = hookHeaders || extraHeaders ? { ...hookHeaders, ...extraHeaders } : undefined;
 			await validateApiKeyAgainstModelsEndpoint({
 				provider,
 				apiKey,
@@ -84,6 +92,25 @@ function checkKeyPrefix(keyPrefix: CompiledKeyPrefix, label: string, apiKey: str
 	}
 }
 
+/**
+ * Asks for the optional workspace id. Returns `undefined` for an empty answer;
+ * refuses an answer outside the rule's pattern with its static message.
+ */
+async function promptWorkspaceId(
+	rule: CompiledWorkspacePrompt,
+	onPrompt: NonNullable<OAuthController["onPrompt"]>,
+	signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+	const answer = await onPrompt({ message: rule.prompt, placeholder: rule.placeholder, allowEmpty: true });
+	if (signal?.aborted) {
+		throw new AIError.LoginCancelledError();
+	}
+	const workspaceId = answer.trim();
+	if (!workspaceId) return undefined;
+	if (!new RegExp(rule.pattern).test(workspaceId)) throw new AIError.ApiKeyRequiredError(rule.message);
+	return workspaceId;
+}
+
 /** Builds the login function for one `login "api-key"` rule; `label` is the provider display name. */
 export function createApiKeyLogin(
 	rule: CompiledApiKeyLogin,
@@ -116,10 +143,15 @@ export function createApiKeyLogin(
 			throw new AIError.ApiKeyRequiredError();
 		}
 		if (rule.keyPrefix) checkKeyPrefix(rule.keyPrefix, label, trimmed);
+		const workspaceId = rule.workspacePrompt
+			? await promptWorkspaceId(rule.workspacePrompt, options.onPrompt, options.signal)
+			: undefined;
+		const workspaceHeaders =
+			workspaceId && rule.workspacePrompt ? { [rule.workspacePrompt.header]: workspaceId } : undefined;
 		if (rule.validate) {
 			options.onProgress?.(rule.validate.optional ? "Validating API key (optional)..." : "Validating API key...");
 			try {
-				await runValidation(rule.validate, label, trimmed, options);
+				await runValidation(rule.validate, label, trimmed, options, workspaceHeaders);
 			} catch (error) {
 				// An optional probe only rejects on a real auth failure (401/403, or
 				// only 401 with `trustForbidden`); any other validation-endpoint
@@ -134,6 +166,7 @@ export function createApiKeyLogin(
 				options.onProgress?.(`Skipping ${label} validation endpoint; continuing with provided API key.`);
 			}
 		}
+		if (workspaceId) options.onWorkspaceId?.(workspaceId);
 		return trimmed;
 	};
 }

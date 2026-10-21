@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ResetCreditAccountStatus, ResetCreditTarget, UsageReport } from "@oh-my-pi/pi-ai";
+import type { AuthAccountPolicies, ResetCreditAccountStatus, ResetCreditTarget, UsageReport } from "@oh-my-pi/pi-ai";
 import * as envApiKey from "@oh-my-pi/pi-ai/env-api-key";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -31,6 +31,7 @@ interface CodexAccount {
 	accountId: string;
 	credentialId: number;
 	weeklyUsed: number;
+	fiveHourUsed?: number;
 	limitReached: boolean;
 	creditExpiresInMs: number;
 }
@@ -47,7 +48,7 @@ function codexReport(account: CodexAccount): UsageReport {
 				label: "5 Hour",
 				scope,
 				window: { id: "5h", label: "5 Hour", resetsAt: now + 2 * HOUR },
-				amount: { usedFraction: 0.1, unit: "percent" },
+				amount: { usedFraction: account.fiveHourUsed ?? 0.1, unit: "percent" },
 			},
 			{
 				id: "openai-codex:secondary",
@@ -116,6 +117,8 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 	function buildSession(options: {
 		accounts: CodexAccount[];
 		streamErrorFirst?: boolean;
+		autoRedeem?: "yes" | "no" | "unset";
+		accountPolicies?: AuthAccountPolicies;
 		/** Builds the session the way ACP does for a client with or without form elicitation. */
 		acpForm?: boolean;
 	}): {
@@ -155,8 +158,9 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 			"retry.baseDelayMs": 5,
 			"retry.maxDelayMs": 100,
 			"retry.maxRetries": 1,
-			"codexResets.autoRedeem": "unset",
+			"codexResets.autoRedeem": options.autoRedeem ?? "unset",
 			"claudeResets.autoRedeem": "no",
+			"auth.accountPolicies": options.accountPolicies ?? [],
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		const sessionManager = SessionManager.inMemory();
@@ -227,6 +231,87 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 			role: "assistant",
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered after reset redemption" }],
+		});
+	});
+
+	describe("per-account blocked recovery", () => {
+		afterEach(async () => {
+			authStorage.setAccountPolicies({ accountPolicies: [], defaultReservePct: 10 });
+			await authStorage.credentials.remove("openai-codex");
+		});
+
+		it.each([
+			{
+				label: "5h-only exhaustion is excluded",
+				fiveHourUsed: 1,
+				weeklyUsed: 0.2,
+				providerMode: "yes",
+				accountMode: "yes",
+				redeemed: false,
+			},
+			{
+				label: "7d exhaustion overrides provider no",
+				fiveHourUsed: 0.1,
+				weeklyUsed: 1,
+				providerMode: "no",
+				accountMode: "yes",
+				redeemed: true,
+			},
+			{
+				label: "account no overrides provider yes",
+				fiveHourUsed: 0.1,
+				weeklyUsed: 1,
+				providerMode: "yes",
+				accountMode: "no",
+				redeemed: false,
+			},
+		] as const)("$label", async ({ fiveHourUsed, weeklyUsed, providerMode, accountMode, redeemed }) => {
+			await authStorage.credentials.set("openai-codex", [
+				{
+					type: "oauth",
+					access: "access-codex",
+					refresh: "refresh-codex",
+					expires: Date.now() + HOUR,
+					accountId: "acct-policy",
+					email: EMAIL,
+				},
+			]);
+			const [stored] = authStorage.credentials.list("openai-codex");
+			if (!stored) throw new Error("expected a stored Codex account");
+			const policies: AuthAccountPolicies = [
+				{
+					provider: "openai-codex",
+					account: { accountId: "acct-policy" },
+					resetOn: ["7d"],
+					autoRedeem: accountMode,
+				},
+			];
+			authStorage.setAccountPolicies({ accountPolicies: policies, defaultReservePct: 10 });
+			const { session, targets } = buildSession({
+				accounts: [
+					{
+						accountId: "acct-policy",
+						credentialId: stored.id,
+						fiveHourUsed,
+						weeklyUsed,
+						limitReached: true,
+						creditExpiresInMs: 6 * HOUR,
+					},
+				],
+				streamErrorFirst: true,
+				autoRedeem: providerMode,
+				accountPolicies: policies,
+			});
+			mockSchedulerWaitWithClock();
+
+			await session.prompt("trigger a codex usage limit");
+			await session.waitForIdle();
+
+			expect(targets.map(target => target.credentialId)).toEqual(redeemed ? [stored.id] : []);
+			expect(session.agent.state.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: redeemed ? "stop" : "error",
+			});
 		});
 	});
 

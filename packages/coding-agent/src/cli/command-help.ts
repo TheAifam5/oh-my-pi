@@ -5,7 +5,7 @@ export const acpHelp = {
 } satisfies CommandMetadata;
 
 export const accountHelp = {
-	description: "List, name, prioritize, pin, and log out stored provider accounts",
+	description: "List, name, prioritize, pin, enable, disable, and log out stored provider accounts",
 } satisfies CommandMetadata;
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;

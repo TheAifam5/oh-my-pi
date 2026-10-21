@@ -12,6 +12,17 @@
 
 - Fixed every OpenAI Codex request failing with HTTP 404 `{"detail":"Not Found"}` on personal ChatGPT accounts whose token is not region-pinned ([#16493](https://github.com/can1357/oh-my-pi/issues/16493))
 
+### Added
+
+- Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries
+- Added user-disabled credentials: `credentials.setEnabled()` stores the state in a new `user_disabled_at` column of `agent.db` (schema 9) or through the auth broker's new `POST /v1/credential/:id/enabled`; a disabled credential stays stored, is listed by `credentials.listUserDisabled()`, `credentials.listDisabled()`, and `sessions.accounts()` without a session, and is never selected
+- Added `workspaceId` to stored API-key credentials (`ApiKeyCredential`, `OAuthRequestIdentity`): `login "api-key"` rules with `workspace-prompt` store the entered ID through `OAuthController.onWorkspaceId`, and the Anthropic provider sends it as `anthropic-workspace-id`
+
+### Fixed
+
+- Reset-only account policies do not enable usage-reserve routing, and API-key policies reject `resetOn` and `autoRedeem`
+- Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
+
 ## [18.12.4] - 2026-10-20
 
 ### Added

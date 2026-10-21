@@ -56,6 +56,8 @@ export interface ProviderFileCacheEntry {
 	readonly credentialHash: string;
 	/** Lowercase SHA-256 of the source bytes. */
 	readonly contentHash: string;
+	/** Provider workspace that owns the remote file; absent for an unscoped credential. */
+	readonly workspaceId?: string;
 	/** Durable remote handle. */
 	readonly handle: ProviderFileHandle;
 }
@@ -126,6 +128,7 @@ const PersistedEntrySchema = type({
 	provider: "'openai' | 'anthropic' | 'google'",
 	credentialHash: "string > 0",
 	contentHash: "string > 0",
+	"workspaceId?": "string > 0",
 	handle: PersistedHandleSchema,
 });
 const PersistedIndexSchema = type({
@@ -153,8 +156,15 @@ export function toProviderFileReference(handle: ProviderFileHandle): ProviderFil
 	};
 }
 
-function cacheKey(provider: ProviderFileProvider, credentialHash: string, contentHash: string): string {
-	return JSON.stringify([provider, credentialHash, contentHash]);
+function cacheKey(
+	provider: ProviderFileProvider,
+	credentialHash: string,
+	contentHash: string,
+	workspaceId?: string,
+): string {
+	return JSON.stringify(
+		workspaceId ? [provider, credentialHash, contentHash, workspaceId] : [provider, credentialHash, contentHash],
+	);
 }
 
 function normalizeContentHash(contentHash: string): string {
@@ -226,8 +236,8 @@ function sanitizeHandle(handle: ProviderFileHandle, credential: string): Provide
 }
 
 /**
- * Durable provider-native file index keyed by provider, credential digest, and
- * content digest. Mutations are persisted atomically after a short debounce.
+ * Durable provider-native file index keyed by provider, credential digest,
+ * content digest, and optional workspace. Mutations are persisted atomically after a short debounce.
  */
 export class ProviderFileCache {
 	readonly #indexPath: string;
@@ -256,10 +266,15 @@ export class ProviderFileCache {
 		}
 	}
 
-	/** Return an unexpired handle for the provider, account credential, and content digest. */
-	get(provider: ProviderFileProvider, credential: string, contentHash: string): ProviderFileHandle | undefined {
+	/** Return an unexpired handle for the provider, account credential, content digest, and workspace. */
+	get(
+		provider: ProviderFileProvider,
+		credential: string,
+		contentHash: string,
+		workspaceId?: string,
+	): ProviderFileHandle | undefined {
 		const credentialHash = hashProviderFileCredential(credential);
-		const key = cacheKey(provider, credentialHash, normalizeContentHash(contentHash));
+		const key = cacheKey(provider, credentialHash, normalizeContentHash(contentHash), workspaceId);
 		const entry = this.#entries.get(key);
 		if (!entry) return undefined;
 		if (this.#expired(entry.handle)) {
@@ -270,12 +285,18 @@ export class ProviderFileCache {
 		return entry.handle;
 	}
 
-	/** Insert or replace a provider handle for one account-scoped content digest. */
-	set(provider: ProviderFileProvider, credential: string, contentHash: string, handle: ProviderFileHandle): void {
+	/** Insert or replace a provider handle for one account- and workspace-scoped content digest. */
+	set(
+		provider: ProviderFileProvider,
+		credential: string,
+		contentHash: string,
+		handle: ProviderFileHandle,
+		workspaceId?: string,
+	): void {
 		const normalizedContentHash = normalizeContentHash(contentHash);
 		if (handle.provider !== provider) throw new Error("Provider file handle does not match its cache provider");
 		const credentialHash = hashProviderFileCredential(credential);
-		const key = cacheKey(provider, credentialHash, normalizedContentHash);
+		const key = cacheKey(provider, credentialHash, normalizedContentHash, workspaceId);
 		if (this.#expired(handle)) {
 			if (this.#entries.delete(key)) this.#changed();
 			return;
@@ -284,16 +305,22 @@ export class ProviderFileCache {
 			provider,
 			credentialHash,
 			contentHash: normalizedContentHash,
+			...(workspaceId ? { workspaceId } : {}),
 			handle: sanitizeHandle(handle, credential),
 		};
 		this.#entries.set(key, entry);
 		this.#changed();
 	}
 
-	/** Remove and return one account-scoped cache record, if present. */
-	delete(provider: ProviderFileProvider, credential: string, contentHash: string): ProviderFileCacheEntry | undefined {
+	/** Remove and return one account- and workspace-scoped cache record, if present. */
+	delete(
+		provider: ProviderFileProvider,
+		credential: string,
+		contentHash: string,
+		workspaceId?: string,
+	): ProviderFileCacheEntry | undefined {
 		const credentialHash = hashProviderFileCredential(credential);
-		const key = cacheKey(provider, credentialHash, normalizeContentHash(contentHash));
+		const key = cacheKey(provider, credentialHash, normalizeContentHash(contentHash), workspaceId);
 		const entry = this.#entries.get(key);
 		if (!entry) return undefined;
 		this.#entries.delete(key);
@@ -320,7 +347,8 @@ export class ProviderFileCache {
 			(left, right) =>
 				left.provider.localeCompare(right.provider) ||
 				left.credentialHash.localeCompare(right.credentialHash) ||
-				left.contentHash.localeCompare(right.contentHash),
+				left.contentHash.localeCompare(right.contentHash) ||
+				(left.workspaceId ?? "").localeCompare(right.workspaceId ?? ""),
 		);
 	}
 
@@ -400,7 +428,7 @@ export class ProviderFileCache {
 				discarded++;
 				continue;
 			}
-			this.#entries.set(cacheKey(entry.provider, entry.credentialHash, entry.contentHash), entry);
+			this.#entries.set(cacheKey(entry.provider, entry.credentialHash, entry.contentHash, entry.workspaceId), entry);
 		}
 		return discarded;
 	}

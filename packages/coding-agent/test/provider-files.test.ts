@@ -3,6 +3,7 @@ import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	hashProviderFileContent,
+	hashProviderFileCredential,
 	ProviderFileCache,
 	type ProviderFileClient,
 	type ProviderFileHandle,
@@ -392,6 +393,132 @@ describe("ProviderFileManager", () => {
 		};
 	}
 
+	test("threads the selected key workspace through Anthropic uploads and omits absent workspace headers", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-workspace-");
+		const originalFetch = globalThis.fetch;
+		const wire = scriptedFetch([
+			Response.json({ id: "file_scoped", mime_type: "image/png", size_bytes: 3 }),
+			Response.json({ id: "file_unscoped", mime_type: "image/png", size_bytes: 3 }),
+		]);
+		globalThis.fetch = wire.fetch as typeof fetch;
+		try {
+			for (const [index, workspaceId] of ["wrkspc_test123", undefined].entries()) {
+				const cache = new ProviderFileCache(tempDir.join(`files-${index}.json`), { saveDebounceMs: 60_000 });
+				const manager = new ProviderFileManager(cache, async () => ({
+					apiKey: "sk-ant-api03-test",
+					workspaceId,
+				}));
+				const result = await manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+				expect(result).not.toBeUndefined();
+				expect(wire.requests).toHaveLength(index + 1);
+				expect(new Headers(wire.requests[index].init.headers).get("anthropic-workspace-id")).toBe(
+					workspaceId ?? null,
+				);
+				cache.save();
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("isolates concurrent Anthropic uploads, cached handles, and invalidation by workspace", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-workspaces-");
+		const cache = new ProviderFileCache(tempDir.join("files.json"), { saveDebounceMs: 60_000 });
+		const release = deferred<void>();
+		const workspaces: Array<string | null> = [];
+		const fetchImpl: FetchImpl = async (_input, init) => {
+			const workspace = new Headers(init?.headers).get("anthropic-workspace-id");
+			workspaces.push(workspace);
+			await release.promise;
+			return Response.json({ id: `file_${workspace}`, mime_type: "image/png", size_bytes: 3 });
+		};
+		let workspaceId = "wrkspc_a";
+		const manager = new ProviderFileManager(cache, async () => ({ apiKey: "same-key", workspaceId }), [
+			(model, credential, workspace) => createAnthropicFileClient(model, credential, fetchImpl, workspace),
+		]);
+		const first = manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+		workspaceId = "wrkspc_b";
+		const second = manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+		release.resolve(undefined);
+		const results = await Promise.all([first, second]);
+		expect(workspaces).toEqual(["wrkspc_a", "wrkspc_b"]);
+		for (const [index, result] of results.entries()) {
+			for (const message of result.messages) {
+				if (!Array.isArray(message.content)) continue;
+				for (const block of message.content) {
+					if (block.type === "image") {
+						expect(block.providerFile).toEqual({
+							provider: "anthropic",
+							id: index === 0 ? "file_wrkspc_a" : "file_wrkspc_b",
+						});
+					}
+				}
+			}
+		}
+		workspaceId = "wrkspc_a";
+		expect(await manager.decorateContext(contextWithRepeatedImage(), anthropicModel)).toEqual(results[0]);
+		await manager.invalidateContext(results[0], anthropicModel);
+		workspaceId = "wrkspc_b";
+		expect(await manager.decorateContext(contextWithRepeatedImage(), anthropicModel)).toEqual(results[1]);
+		expect(workspaces).toHaveLength(2);
+		workspaceId = "wrkspc_a";
+		await manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+		expect(workspaces).toEqual(["wrkspc_a", "wrkspc_b", "wrkspc_a"]);
+		cache.save();
+	});
+
+	test("reuses legacy unscoped rows and persists distinct workspace handles without migration", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-legacy-workspace-");
+		const indexPath = tempDir.join("files.json");
+		const contentHash = hashProviderFileContent(new Uint8Array([1, 2, 3]));
+		const handle: ProviderFileHandle = {
+			provider: "anthropic",
+			id: "file_legacy",
+			mimeType: "image/png",
+			bytes: 3,
+			delete: { method: "DELETE", url: "https://api.anthropic.com/v1/files/file_legacy" },
+		};
+		await Bun.write(
+			indexPath,
+			JSON.stringify({
+				version: 1,
+				entries: [
+					{ provider: "anthropic", credentialHash: hashProviderFileCredential("same-key"), contentHash, handle },
+				],
+			}),
+		);
+		const cache = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000 });
+		cache.set("anthropic", "same-key", contentHash, { ...handle, id: "file_a" }, "wrkspc_a");
+		cache.set("anthropic", "same-key", contentHash, { ...handle, id: "file_b" }, "wrkspc_b");
+		cache.save();
+		const restored = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000 });
+		let workspaceId: string | undefined;
+		const wire = scriptedFetch([]);
+		const manager = new ProviderFileManager(restored, async () => ({ apiKey: "same-key", workspaceId }), [
+			(model, credential, workspace) => createAnthropicFileClient(model, credential, wire.fetch, workspace),
+		]);
+		for (const [workspace, id] of [
+			[undefined, "file_legacy"],
+			["wrkspc_a", "file_a"],
+			["wrkspc_b", "file_b"],
+		] as const) {
+			workspaceId = workspace;
+			const result = await manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+			expect(result.messages[0].content).toContainEqual({
+				type: "image",
+				data: "AQID",
+				mimeType: "image/png",
+				providerFile: { provider: "anthropic", id },
+			});
+		}
+		expect(wire.requests).toHaveLength(0);
+		expect(restored.delete("anthropic", "same-key", contentHash, "wrkspc_a")?.handle.id).toBe("file_a");
+		expect(restored.get("anthropic", "same-key", contentHash)?.id).toBe("file_legacy");
+		expect(restored.get("anthropic", "same-key", contentHash, "wrkspc_b")?.id).toBe("file_b");
+		expect(restored.deleteAll()).toHaveLength(2);
+		restored.save();
+	});
+
 	test("deduplicates concurrent uploads, decorates every image-bearing input transiently, and reuses the cache", async () => {
 		using tempDir = TempDir.createSync("@omp-provider-file-manager-");
 		const cache = new ProviderFileCache(tempDir.join("provider-files.json"), { saveDebounceMs: 60_000 });
@@ -417,7 +544,7 @@ describe("ProviderFileManager", () => {
 			async delete(): Promise<void> {},
 		};
 		const factory: ProviderFileClientFactory = model => (model.provider === "openai" ? client : null);
-		const manager = new ProviderFileManager(cache, async () => "account-a", [factory]);
+		const manager = new ProviderFileManager(cache, async () => ({ apiKey: "account-a" }), [factory]);
 		const original = contextWithRepeatedImage();
 
 		const firstDecoration = manager.decorateContext(original, openAIModel);
@@ -514,7 +641,7 @@ describe("ProviderFileManager", () => {
 			},
 		};
 		const factory: ProviderFileClientFactory = model => (model.provider === "openai" ? client : null);
-		const manager = new ProviderFileManager(cache, async () => "account-a", [factory]);
+		const manager = new ProviderFileManager(cache, async () => ({ apiKey: "account-a" }), [factory]);
 		const context: Context = {
 			messages: [
 				{

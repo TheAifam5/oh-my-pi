@@ -10,6 +10,8 @@ export type ModelManagerConfig = AccountScope & {
 	fetch?: FetchImpl;
 	/** The supplied fetch already applies provider-specific authentication. */
 	authenticated?: boolean;
+	/** Workspace id stored with the API key; Anthropic discovery sends it as `anthropic-workspace-id`. */
+	workspaceId?: string;
 };
 
 /**

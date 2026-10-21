@@ -22,6 +22,7 @@ import type {
 	CompiledOAuthRequest,
 	CompiledRefresh,
 	CompiledUserinfo,
+	CompiledWorkspacePrompt,
 } from "../../src/compat/types";
 import {
 	CompatCompileError,
@@ -365,6 +366,25 @@ function keyPrefix(node: KdlNodeView): CompiledKeyPrefix {
 	return { accept, reject };
 }
 
+/** Reads `workspace-prompt "…" placeholder="…" pattern="…" message="…" header="…"`. */
+function workspacePrompt(node: KdlNodeView): CompiledWorkspacePrompt {
+	leaf(node, ["placeholder", "pattern", "message", "header"]);
+	const prompt = singleString(node);
+	const pattern = requiredProp(node, "pattern");
+	const message = requiredProp(node, "message");
+	const header = requiredProp(node, "header");
+	if (!prompt || !message || !header) malformed(node);
+	try {
+		new RegExp(pattern);
+	} catch {
+		malformed(node, "workspace-prompt pattern");
+	}
+	const result: CompiledWorkspacePrompt = { prompt, pattern, message, header };
+	const placeholder = propString(node, "placeholder");
+	if (placeholder !== undefined) result.placeholder = placeholder;
+	return result;
+}
+
 function apiKeyLogin(node: KdlNodeView): CompiledApiKeyLogin {
 	const login: Partial<CompiledApiKeyLogin> = { kind: "api-key" };
 	const seen = new Set<string>();
@@ -400,6 +420,9 @@ function apiKeyLogin(node: KdlNodeView): CompiledApiKeyLogin {
 			case "key-prefix":
 				login.keyPrefix = keyPrefix(child);
 				break;
+			case "workspace-prompt":
+				login.workspacePrompt = workspacePrompt(child);
+				break;
 			case "validate":
 				login.validate = validation(child);
 				break;
@@ -408,6 +431,9 @@ function apiKeyLogin(node: KdlNodeView): CompiledApiKeyLogin {
 		}
 	}
 	if (!login.prompt) malformed(node, "login api-key prompt");
+	if (login.workspacePrompt && login.validate && login.validate.kind !== "models-endpoint") {
+		malformed(node, "login api-key workspace-prompt with validate");
+	}
 	if ((login.authUrl === undefined) !== (login.instructions === undefined)) malformed(node, "login api-key auth-url");
 	return login as CompiledApiKeyLogin;
 }

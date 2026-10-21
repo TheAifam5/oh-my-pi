@@ -176,6 +176,27 @@ describe("account manager deps", () => {
 		expect(policies()).toEqual({ accountPolicies: [{ ...workPolicy, drain: true }] });
 	});
 
+	it("toggles an account's enabled state with the e field and shows a disabled account", async () => {
+		const { deps, ids } = await open({ auth: { accountPolicies: [workPolicy] } });
+		const field = deps
+			.load()
+			.find(account => account.id === ids.anthropic)
+			?.fields.find(entry => entry.id === "enabled");
+		expect([field?.key, field?.on]).toEqual(["e", true]);
+
+		expect(await deps.apply(ids.anthropic!, "enabled", "off")).toEqual({
+			message: "work is disabled; no request uses it.",
+		});
+		expect(authStorage.credentials.list("anthropic")).toEqual([]);
+		const disabled = deps.load().find(account => account.id === ids.anthropic);
+		expect(disabled?.badges).toContain("disabled");
+		expect(disabled?.fields.find(entry => entry.id === "enabled")?.on).toBe(false);
+		expect((await deps.apply(ids.anthropic!, "enabled", "off")).message).toBe("work is already disabled.");
+
+		expect(await deps.apply(ids.anthropic!, "enabled", "on")).toEqual({ message: "work is enabled." });
+		expect(authStorage.credentials.list("anthropic")).toHaveLength(1);
+	});
+
 	it("attributes billing evidence only to the OAuth account a report names", async () => {
 		const unregister = retryFallbackBillingRegistry.register({
 			id: "acme",

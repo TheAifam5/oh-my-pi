@@ -582,6 +582,59 @@ describe("AuthStorage codex oauth ranking", () => {
 		expectExclusivePreference(counts, "api-acct-protected", "api-acct-default");
 	});
 
+	test("reset-only policies leave reserve routing off while name-only policies still enable it", async () => {
+		if (!store) throw new Error("test setup failed");
+		authStorage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+			rankingStrategyResolver: () => undefined,
+		});
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-low", "low@example.com") },
+			{ type: "oauth", ...createCredential("acct-healthy", "healthy@example.com") },
+		]);
+		for (const [accountId, usedFraction] of [
+			["acct-low", 0.95],
+			["acct-healthy", 0.2],
+		] as const) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction, resetInMs: HOUR_MS },
+					secondary: { usedFraction, resetInMs: WEEK_MS },
+				}),
+			);
+		}
+		for (const resetFields of [
+			{ resetOn: ["7d"] as const },
+			{ autoRedeem: "no" as const },
+			{ resetOn: ["7d"] as const, autoRedeem: "yes" as const },
+		]) {
+			authStorage.setAccountPolicies({
+				accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-low" }, ...resetFields }],
+				defaultReservePct: 10,
+			});
+			const counts = await countApiKeySelections(authStorage, "openai-codex", JSON.stringify(resetFields), 20);
+			expect(countFor(counts, "api-acct-low")).toBeGreaterThan(0);
+			expect(countFor(counts, "api-acct-healthy")).toBeGreaterThan(0);
+		}
+		for (const resetFields of [{}, { resetOn: ["7d"] as const, autoRedeem: "no" as const }]) {
+			authStorage.setAccountPolicies({
+				accountPolicies: [
+					{ provider: "openai-codex", account: { accountId: "acct-low" }, name: "work", ...resetFields },
+				],
+				defaultReservePct: 10,
+			});
+			const counts = await countApiKeySelections(
+				authStorage,
+				"openai-codex",
+				`named-${JSON.stringify(resetFields)}`,
+				20,
+			);
+			expectExclusivePreference(counts, "api-acct-healthy", "api-acct-low");
+		}
+	});
+
 	test("matches account selectors conjunctively and exposes the configured policy", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {

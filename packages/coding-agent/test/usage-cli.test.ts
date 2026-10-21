@@ -1027,6 +1027,23 @@ describe("formatUsageBreakdown", () => {
 		expect(text).toContain("✗ truly-dead@example.test — disabled");
 	});
 
+	it("lists user-disabled accounts, API keys included, with the enable command", () => {
+		const disabled = [
+			{
+				id: 61,
+				provider: "anthropic",
+				type: "oauth" as const,
+				email: "paused@example.test",
+				cause: "disabled by user",
+				userDisabled: true,
+			},
+			{ id: 62, provider: "fireworks", type: "api_key" as const, cause: "disabled by user", userDisabled: true },
+		];
+		const text = stripVTControlCharacters(formatUsageBreakdown([], [], Date.now(), undefined, disabled));
+		expect(text).toContain("✗ paused@example.test — disabled: disabled by user (omp account enable anthropic/#61)");
+		expect(text).toContain("✗ API key #62 — disabled: disabled by user (omp account enable fireworks/#62)");
+	});
+
 	it("renders a tombstone-only provider section even when no active credential remains", () => {
 		const disabled = [
 			{
@@ -1379,6 +1396,21 @@ describe("formatUsageBreakdown", () => {
 		expect(text).toContain("▲ 2 saved resets expire within 24h\n");
 		expect(text).toContain("(codexResets.autoRedeem: yes)");
 		expect(text).toContain("→ not spent automatically  (claudeResets.autoRedeem: no)");
+	});
+
+	it("decides an expiring reset by the account's autoRedeem override", () => {
+		const now = Date.parse("2026-01-01T00:00:00.000Z");
+		const report = codexResetReport({ nowMs: now, accountId: "ws-team", weeklyUsed: 1, expiresInMs: [6 * HOUR] });
+		const options: UsageResetExpiryOptions = {
+			...resetExpiryOptions({ "codexResets.autoRedeem": "yes" }),
+			getAccountPolicy: (provider, identity) =>
+				identity.accountId === "ws-team"
+					? { provider, account: { accountId: "ws-team" }, autoRedeem: "no" }
+					: undefined,
+		};
+		const text = stripVTControlCharacters(formatUsageBreakdown([report], [], now, undefined, [], undefined, options));
+		expect(text).toContain("→ not spent automatically  (auth.accountPolicies autoRedeem: no)");
+		expect(text).toContain("within 24h and will be lost");
 	});
 
 	it.each([

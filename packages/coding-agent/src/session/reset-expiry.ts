@@ -140,14 +140,15 @@ function spendableNow(
 
 /**
  * What an open interactive omp session does with an account's soonest expiring saved
- * reset. `kind` comes from the provider's `autoRedeem` setting alone: `auto`
- * spends it by its last five minutes if the provider still allows it then,
- * `ask` prompts first, `off` leaves it. `eligibleNow` is the salvage planner's
- * answer for this report today; usage can change it before the reset expires.
+ * reset. `kind` comes from the account's `autoRedeem` override, else the provider's
+ * `autoRedeem` setting: `auto` spends it by its last five minutes if the provider
+ * still allows it then, `ask` prompts first, `off` leaves it. `eligibleNow` is the
+ * salvage planner's answer for this report today; usage can change it before the
+ * reset expires.
  */
 export interface ResetSpendVerdict {
 	kind: "auto" | "ask" | "off";
-	setting: "codexResets.autoRedeem" | "claudeResets.autoRedeem";
+	setting: "codexResets.autoRedeem" | "claudeResets.autoRedeem" | "auth.accountPolicies autoRedeem";
 	mode: ResetAutoRedeemMode;
 	eligibleNow: boolean;
 }
@@ -157,15 +158,17 @@ export function resetSpendVerdict(
 	warning: ResetExpiryWarning,
 	settings: Settings,
 	nowMs: number,
+	accountAutoRedeem?: ResetAutoRedeemMode,
 ): ResetSpendVerdict {
 	const autoRedeem = warning.provider === "anthropic" ? cfgClaudeResetsAutoRedeem : cfgCodexResetsAutoRedeem;
-	const mode = autoRedeem.get(settings);
+	const mode = accountAutoRedeem ?? autoRedeem.get(settings);
 	const kind = !shouldEvaluateCodexAutoRedeem(mode) ? "off" : shouldPromptCodexAutoRedeem(mode) ? "ask" : "auto";
 	const plan = planAsLastChance(report, warning, settings, nowMs);
 	// A stale report says nothing about eligibility: the sweep plans only after a fresh fetch.
 	const eligibleNow =
 		plan.actions[0]?.expiresInMs === IMMINENT_RESET_EXPIRY_MS || plan.skipped[0]?.reason === "stale-report";
-	return { kind, setting: autoRedeem.id, mode, eligibleNow };
+	const setting = accountAutoRedeem === undefined ? autoRedeem.id : "auth.accountPolicies autoRedeem";
+	return { kind, setting, mode, eligibleNow };
 }
 
 /**

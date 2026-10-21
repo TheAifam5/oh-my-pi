@@ -95,10 +95,12 @@ export interface UsagePolicyDiagnosticsOptions {
 }
 
 export interface UsageResetExpiryOptions {
-	/** Settings that decide whether an expiring saved reset is spent automatically. */
+	/** Settings whose provider `autoRedeem` decides whether an expiring saved reset is spent automatically. */
 	settings: Settings;
 	/** Stored OAuth accounts, as `/usage reset <provider>/<credential id>` addresses them. */
 	accounts: (provider: string) => readonly OAuthAccountSummary[];
+	/** The account policy whose `autoRedeem` overrides the provider setting for an account. */
+	getAccountPolicy?: (provider: string, identity: OAuthAccountIdentity) => AuthAccountPolicy | undefined;
 }
 
 /**
@@ -589,10 +591,12 @@ function formatReloginDeadline(
 
 /**
  * Tombstones worth a row in `omp usage`: OAuth credentials torn down
- * automatically (refresh failure, upstream invalidation). Rows the user
- * replaced or deleted deliberately are lifecycle noise, not lost capacity.
+ * automatically (refresh failure, upstream invalidation), and every account
+ * the user disabled. Rows the user replaced or deleted deliberately are
+ * lifecycle noise, not lost capacity.
  */
 function isActionableDisable(summary: DisabledCredentialSummary, activeAccounts: UsageAccountIdentity[] = []): boolean {
+	if (summary.userDisabled) return true;
 	if (summary.type !== "oauth") return false;
 	if (/^(replaced by|deleted by user)/i.test(summary.cause)) return false;
 
@@ -633,7 +637,8 @@ function shortDisableCause(cause: string): string {
 
 /** Label for a disabled tombstone, masking each identity part under `--redact`. */
 function disabledIdentityLabel(summary: DisabledCredentialSummary, redaction?: Map<string, string>): string {
-	const base = summary.email ?? summary.accountId ?? "OAuth account";
+	const base =
+		summary.email ?? summary.accountId ?? (summary.type === "api_key" ? `API key #${summary.id}` : "OAuth account");
 	const masked = redaction?.get(base) ?? base;
 	const org = summary.orgName ?? summary.orgId;
 	if (!org || org === base) return masked;
@@ -719,8 +724,9 @@ function formatResetSpendVerdict(verdict: ResetSpendVerdict): string {
 
 /**
  * Saved resets expiring within 24 hours on accounts worth restoring: what the
- * provider's `autoRedeem` setting does with each one, whether it is eligible
- * now, and the `/usage reset` target that spends it now when the provider allows.
+ * account's `autoRedeem` override, else the provider's `autoRedeem` setting, does
+ * with each one, whether it is eligible now, and the `/usage reset` target that
+ * spends it now when the provider allows.
  */
 function formatResetExpiryBanner(
 	expiring: readonly { report: UsageReport; warning: ResetExpiryWarning }[],
@@ -729,7 +735,14 @@ function formatResetExpiryBanner(
 	redaction: Map<string, string> | undefined,
 	options: UsageResetExpiryOptions,
 ): string[] {
-	const verdicts = expiring.map(({ report, warning }) => resetSpendVerdict(report, warning, options.settings, nowMs));
+	const verdicts = expiring.map(({ report, warning }) => {
+		const stored = options
+			.accounts(warning.provider)
+			.filter(account => reportMatchesStatus(report, { ...account, provider: warning.provider }));
+		const identity = stored.length === 1 ? stored[0]! : usageReportIdentity(report);
+		const accountAutoRedeem = options.getAccountPolicy?.(warning.provider, identity)?.autoRedeem;
+		return resetSpendVerdict(report, warning, options.settings, nowMs, accountAutoRedeem);
+	});
 	const count = expiring.reduce((sum, { warning }) => sum + warning.count, 0);
 	const lost = verdicts.every(verdict => verdict.kind === "off");
 	const lines = [
@@ -871,8 +884,11 @@ export function formatUsageBreakdown(
 		for (const summary of disabledByProvider.get(provider) ?? []) {
 			const label = disabledIdentityLabel(summary, redaction);
 			const ago = summary.disabledAtMs !== undefined ? ` ${formatDuration(nowMs - summary.disabledAtMs)} ago` : "";
+			const restore = summary.userDisabled
+				? `(omp account enable ${summary.provider}/#${summary.id})`
+				: "(re-login to restore)";
 			lines.push(
-				`  ${chalk.red(`✗ ${label} — disabled${ago}: ${sanitizeText(shortDisableCause(summary.cause))}`)} ${chalk.dim("(re-login to restore)")}`,
+				`  ${chalk.red(`✗ ${label} — disabled${ago}: ${sanitizeText(shortDisableCause(summary.cause))}`)} ${chalk.dim(restore)}`,
 			);
 		}
 
@@ -1699,6 +1715,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		const resetOptions: UsageResetExpiryOptions = {
 			settings,
 			accounts: provider => authStorage.oauth.accounts(provider),
+			getAccountPolicy: (provider, identity) => authStorage.oauth.policy(provider, identity),
 		};
 		process.stdout.write(
 			`${formatUsageBreakdown(filteredReports, accounts, Date.now(), redaction, disabled, policyOptions, resetOptions)}\n`,

@@ -1,7 +1,7 @@
 /**
  * Account administration shared by `omp account`, the `/account` manager, and
  * the account selector: naming accounts and setting their priority, reserve,
- * drain return thresholds, and limits (`auth.accountPolicies` in the user
+ * drain return thresholds, limits, and saved-reset policy (`auth.accountPolicies` in the user
  * config), pinning a project to an account (`auth.accountPins`), setting a pool
  * member's preferred account, and logging an account out.
  *
@@ -16,8 +16,15 @@ import type {
 	AuthAccountSelector,
 	DrainReturnTrigger,
 	DrainSpendClass,
+	ResetAutoRedeemOverride,
+	ResetOnWindow,
 } from "@oh-my-pi/pi-ai/auth-storage";
-import { AccountPolicies, accountUsageKey, matchesAuthAccountSelector } from "@oh-my-pi/pi-ai/auth/policy";
+import {
+	AccountPolicies,
+	accountUsageKey,
+	matchesAuthAccountSelector,
+	RESET_POLICY_OAUTH_ONLY,
+} from "@oh-my-pi/pi-ai/auth/policy";
 import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
 import {
 	type AccountEvidenceMetric,
@@ -67,6 +74,10 @@ export interface AccountListing extends AccountRef {
 	returnMargin?: number;
 	/** Shortest time a drained account stays behind its siblings, in ms. */
 	returnCooldownMs?: number;
+	/** Saved-reset windows whose exhaustion permits blocked-account recovery, as configured. */
+	resetOn?: readonly ResetOnWindow[];
+	/** The account's saved-reset `autoRedeem` override, as configured. */
+	autoRedeem?: ResetAutoRedeemOverride;
 	/**
 	 * The account policy's limits with their counted usage; a provider-evidence limit
 	 * (`usage`, `credits`, `extra-usd`) carries no `window` or `used`.
@@ -91,7 +102,8 @@ export function accountLabel(account: AuthAccountSummary): string {
 }
 
 function storedProviders(authStorage: AuthStorage): string[] {
-	return [...new Set(authStorage.credentials.list().map(row => row.provider))].sort();
+	const rows = [...authStorage.credentials.list(), ...authStorage.credentials.listUserDisabled()];
+	return [...new Set(rows.map(row => row.provider))].sort();
 }
 
 /**
@@ -203,6 +215,8 @@ type PolicyPatch = Partial<
 		| "returnMargin"
 		| "returnCooldownMs"
 		| "limits"
+		| "resetOn"
+		| "autoRedeem"
 	>
 >;
 
@@ -235,10 +249,10 @@ function commitPolicies(
 ): AccountWriteResult {
 	try {
 		const policies = new AccountPolicies(next, cfgRetryUsageReservePct.get(settings));
-		policies.validateFor(
-			provider,
-			authStorage.credentials.list(provider).map(row => row.credential),
-		);
+		policies.validateFor(provider, [
+			...authStorage.credentials.list(provider).map(row => row.credential),
+			...authStorage.credentials.listUserDisabled(provider).map(row => row.credential),
+		]);
 	} catch (error) {
 		throw new AccountAdminError(error instanceof Error ? error.message : String(error));
 	}
@@ -400,6 +414,21 @@ export function setAccountReturn(
 ): AccountWriteResult {
 	if (ref.account.type !== "oauth") throw new AccountAdminError("Return thresholds apply to OAuth accounts only.");
 	return writePolicy(settings, authStorage, ref, thresholds);
+}
+
+/**
+ * Set an OAuth account's saved-reset policy: `resetOn` (windows whose exhaustion permits
+ * blocked-account recovery) and `autoRedeem` (overrides the provider's `autoRedeem` setting).
+ * A field given as `undefined` is removed; an omitted field is kept.
+ */
+export function setAccountResets(
+	settings: Settings,
+	authStorage: AuthStorage,
+	ref: AccountRef,
+	resets: Pick<AuthAccountPolicy, "resetOn" | "autoRedeem">,
+): AccountWriteResult {
+	if (ref.account.type !== "oauth") throw new AccountAdminError(RESET_POLICY_OAUTH_ONLY);
+	return writePolicy(settings, authStorage, ref, resets);
 }
 
 /**
@@ -808,12 +837,54 @@ export function listAccounts(settings: Settings, authStorage: AuthStorage, cwd: 
 				...(policy?.returnWhen !== undefined ? { returnWhen: [policy.returnWhen].flat() } : {}),
 				...(policy?.returnMargin !== undefined ? { returnMargin: policy.returnMargin } : {}),
 				...(policy?.returnCooldownMs !== undefined ? { returnCooldownMs: policy.returnCooldownMs } : {}),
+				...(policy?.resetOn !== undefined ? { resetOn: policy.resetOn } : {}),
+				...(policy?.autoRedeem !== undefined ? { autoRedeem: policy.autoRedeem } : {}),
 				limits: accountLimitViews(provider, account, policy?.limits, ledger, nowMs),
 				projectPinned: pinnedName !== undefined && account.name === pinnedName,
 			});
 		}
 	}
 	return rows;
+}
+
+/** Result of enabling or disabling an account. */
+export interface AccountEnableResult {
+	/** False when the account was already in the requested state. */
+	changed: boolean;
+	/** User-config project pins naming the account; while it is disabled their requests fail. */
+	pinnedProjects: string[];
+}
+
+/**
+ * Enable or disable a stored account. A disabled account stays logged in and
+ * listed, and no selection path uses it: rotation, session and project pins,
+ * pool member preferences, saved-reset redemption, and usage polling.
+ *
+ * @throws AccountAdminError when the credential is no longer stored or the
+ * credential store cannot persist the state.
+ */
+export async function setAccountEnabled(
+	settings: Settings,
+	authStorage: AuthStorage,
+	ref: AccountRef,
+	enabled: boolean,
+): Promise<AccountEnableResult> {
+	const pinnedProjects: string[] = [];
+	const name = ref.account.name;
+	if (name !== undefined) {
+		for (const location of userPinLocations(settings).values()) {
+			if (location.pins[ref.provider] === name) pinnedProjects.push(location.dir);
+		}
+	}
+	if ((ref.account.disabled !== true) === enabled) return { changed: false, pinnedProjects };
+	let updated: boolean;
+	try {
+		updated = await authStorage.credentials.setEnabled(ref.account.credentialId, enabled);
+	} catch (error) {
+		throw new AccountAdminError(error instanceof Error ? error.message : String(error));
+	}
+	if (!updated) throw new AccountAdminError(`${accountLabel(ref.account)} is no longer stored for ${ref.provider}.`);
+	return { changed: true, pinnedProjects };
 }
 
 /** Result of a logout: project pins that still name the removed account and now fail closed. */

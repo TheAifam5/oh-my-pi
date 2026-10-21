@@ -97,6 +97,8 @@ export interface OAuthController {
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
 	/** Complete browser login and return one matching cookie value privately. Reject on cancellation or failure. */
 	onBrowserSession?(request: OAuthBrowserSessionRequest, signal?: AbortSignal): Promise<string>;
+	/** Receives the workspace id entered with a pasted API key, before the key is returned. */
+	onWorkspaceId?(workspaceId: string): void;
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
 }

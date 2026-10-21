@@ -115,6 +115,49 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote!.snapshot.credentials[0].id).not.toBe(bId);
 	});
 
+	test("another client's account toggle reaches a running session over SSE without restarting", async () => {
+		const provider = "unit-broker-toggle-propagation";
+		await storage!.credentials.upsert(provider, { type: "api_key", key: "sk-toggle-propagation" });
+		const writer = new AuthStorage(
+			new RemoteAuthCredentialStore({
+				client: new AuthBrokerClient({ url: handle!.url, token }),
+			}),
+		);
+		const receiverClient = new AuthBrokerClient({ url: handle!.url, token });
+		const snapshotReads = vi.spyOn(receiverClient, "fetchSnapshot");
+		const streamOpens = vi.spyOn(receiverClient, "openSnapshotStream");
+		remote = new RemoteAuthCredentialStore({ client: receiverClient });
+		const receiver = new AuthStorage(remote);
+		try {
+			await writer.credentials.revalidate();
+			const entry = writer.credentials.list(provider)[0];
+			if (!entry) throw new Error("missing toggle credential");
+			const receiverStore = remote;
+			await waitUntil(() => receiverStore.snapshot.credentials.some(row => row.id === entry.id));
+			await receiver.credentials.reload();
+			const session = "running-toggle-session";
+			expect(await receiver.keys.get(provider, session)).toBe("sk-toggle-propagation");
+
+			expect(await writer.credentials.setEnabled(entry.id, false)).toBe(true);
+			await waitUntil(() =>
+				receiverStore.snapshot.credentials.some(row => row.id === entry.id && row.userDisabledAtMs !== undefined),
+			);
+			await expect(receiver.keys.get(provider, session)).rejects.toThrow(/omp account enable/);
+			expect(receiver.credentials.list(provider).map(row => row.id)).not.toContain(entry.id);
+
+			expect(await writer.credentials.setEnabled(entry.id, true)).toBe(true);
+			await waitUntil(() =>
+				receiverStore.snapshot.credentials.some(row => row.id === entry.id && row.userDisabledAtMs === undefined),
+			);
+			expect(await receiver.keys.get(provider, session)).toBe("sk-toggle-propagation");
+			expect(snapshotReads).not.toHaveBeenCalled();
+			expect(streamOpens).toHaveBeenCalledTimes(1);
+		} finally {
+			receiver.close();
+			writer.close();
+		}
+	});
+
 	test("pollExternalChanges reports broker-side changes so a wrapping AuthStorage reloads", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		// Mirror `auth-gateway serve`'s boot: fetch the initial snapshot so the

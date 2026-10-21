@@ -1,9 +1,15 @@
 /**
- * `omp account` — list stored provider accounts, name them, set their priority
- * and reserve, pin the current project to one, and log one out. Writes go to
- * the user config (`auth.accountPolicies`, `auth.accountPins`); see
+ * `omp account` — list stored provider accounts, name them, set their priority,
+ * reserve, and saved-reset policy, pin the current project to one, and log one out.
+ * Writes go to the user config (`auth.accountPolicies`, `auth.accountPins`); see
  * `session/account-admin.ts` for the shared rules.
  */
+import {
+	RESET_AUTO_REDEEM_MODES,
+	RESET_ON_WINDOWS,
+	type ResetAutoRedeemOverride,
+	type ResetOnWindow,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import { APP_NAME, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
@@ -18,18 +24,34 @@ import {
 	resolveAccount,
 	setAccountPriority,
 	setAccountReserve,
+	setAccountEnabled,
+	setAccountResets,
 	unpinProjectAccount,
 } from "../session/account-admin";
 import type { AuthStorage } from "../session/auth-storage";
 import { formatLimitUsage, localLimitJson } from "../session/local-limits";
 
-export type AccountAction = "list" | "label" | "priority" | "reserve" | "pin" | "unpin" | "logout";
+export type AccountAction =
+	| "list"
+	| "label"
+	| "priority"
+	| "reserve"
+	| "reset"
+	| "pin"
+	| "unpin"
+	| "logout"
+	| "enable"
+	| "disable";
 
 export interface AccountCommandArgs {
 	action: AccountAction;
 	target?: string;
 	value?: string;
 	json?: boolean;
+	/** `reset`: comma-separated {@link RESET_ON_WINDOWS}, or `any` to remove `resetOn`. */
+	on?: string;
+	/** `reset`: {@link RESET_AUTO_REDEEM_MODES} value, or `inherit` to remove `autoRedeem`. */
+	auto?: string;
 }
 
 const USAGE: Record<AccountAction, string> = {
@@ -37,9 +59,12 @@ const USAGE: Record<AccountAction, string> = {
 	label: `${APP_NAME} account label <account> <name>`,
 	priority: `${APP_NAME} account priority <account> <number>`,
 	reserve: `${APP_NAME} account reserve <account> <percent>`,
+	reset: `${APP_NAME} account reset <account> [--on 5h|7d|5h,7d|any] [--auto yes|no|unset|inherit]`,
 	pin: `${APP_NAME} account pin [provider/]<name>`,
 	unpin: `${APP_NAME} account unpin [provider]`,
 	logout: `${APP_NAME} account logout <account>`,
+	enable: `${APP_NAME} account enable <account>`,
+	disable: `${APP_NAME} account disable <account>`,
 };
 
 function required(value: string | undefined, action: AccountAction): string {
@@ -53,6 +78,24 @@ function number(value: string, what: string): number {
 	return parsed;
 }
 
+function resetOnWindows(value: string): readonly ResetOnWindow[] | undefined {
+	if (value.trim() === "any") return undefined;
+	const windows = [...new Set(value.split(",").map(window => window.trim()))];
+	if (windows.some(window => !(RESET_ON_WINDOWS as readonly string[]).includes(window))) {
+		throw new Error(`--on must be any or a comma-separated list of ${RESET_ON_WINDOWS.join(", ")}: ${value}`);
+	}
+	return windows as ResetOnWindow[];
+}
+
+function autoRedeemOverride(value: string): ResetAutoRedeemOverride | undefined {
+	const mode = value.trim();
+	if (mode === "inherit") return undefined;
+	if (!(RESET_AUTO_REDEEM_MODES as readonly string[]).includes(mode)) {
+		throw new Error(`--auto must be one of ${RESET_AUTO_REDEEM_MODES.join(", ")}, or inherit: ${value}`);
+	}
+	return mode as ResetAutoRedeemOverride;
+}
+
 function printListing(rows: readonly AccountListing[], json: boolean | undefined): void {
 	if (json) {
 		const out = rows.map(row => ({
@@ -64,9 +107,12 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 			priority: row.priority ?? null,
 			reservePct: row.reservePct ?? null,
 			drain: row.drain,
+			resetOn: row.resetOn ?? null,
+			autoRedeem: row.autoRedeem ?? null,
 			limits: row.limits.map(localLimitJson),
 			keyFingerprint: row.account.keyFingerprint ?? null,
 			projectPinned: row.projectPinned,
+			disabled: row.account.disabled === true,
 		}));
 		process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
 		return;
@@ -85,10 +131,15 @@ function printListing(rows: readonly AccountListing[], json: boolean | undefined
 			row.priority !== undefined ? `priority ${row.priority}` : undefined,
 			row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
 			row.drain ? "drained first" : undefined,
+			row.resetOn !== undefined ? `resets on ${row.resetOn.join(", ")}` : undefined,
+			row.autoRedeem !== undefined ? `auto-redeem ${row.autoRedeem}` : undefined,
 			...row.limits.map(limit =>
 				"window" in limit ? `limit ${formatLimitUsage(limit, Date.now())}` : `limit ${limit.metric} ${limit.max}`,
 			),
 			row.projectPinned ? chalk.green("pinned for this project") : undefined,
+			row.account.disabled
+				? chalk.red(`disabled (${APP_NAME} account enable ${row.provider}/#${row.account.credentialId})`)
+				: undefined,
 		].filter(Boolean);
 		const name = row.account.name ? chalk.cyan(row.account.name) : chalk.dim("(unnamed)");
 		process.stdout.write(
@@ -137,6 +188,19 @@ async function runAction(
 			);
 			return;
 		}
+		case "reset": {
+			const ref = resolveAccount(authStorage, required(cmd.target, "reset"));
+			if (cmd.on === undefined && cmd.auto === undefined) throw new Error(`Usage: ${USAGE.reset}`);
+			const resets = {
+				...(cmd.on !== undefined ? { resetOn: resetOnWindows(cmd.on) } : {}),
+				...(cmd.auto !== undefined ? { autoRedeem: autoRedeemOverride(cmd.auto) } : {}),
+			};
+			printWarning(setAccountResets(settings, authStorage, ref, resets));
+			process.stdout.write(
+				chalk.green(`Set saved-reset policy for ${ref.provider} account #${ref.account.credentialId}.\n`),
+			);
+			return;
+		}
 		case "pin": {
 			const result = pinProjectAccount(settings, authStorage, cwd, required(cmd.target, "pin"));
 			printWarning(result);
@@ -168,6 +232,28 @@ async function runAction(
 						`${project} is still pinned to "${ref.account.name}"; its ${ref.provider} requests fail until you unpin it.\n`,
 					),
 				);
+			}
+			return;
+		}
+		case "enable":
+		case "disable": {
+			const enabled = cmd.action === "enable";
+			const ref = resolveAccount(authStorage, required(cmd.target, cmd.action));
+			const result = await setAccountEnabled(settings, authStorage, ref, enabled);
+			const account = `${ref.provider} account #${ref.account.credentialId}`;
+			process.stdout.write(
+				result.changed
+					? chalk.green(`${enabled ? "Enabled" : "Disabled"} ${account}.\n`)
+					: `${account} is already ${enabled ? "enabled" : "disabled"}.\n`,
+			);
+			if (!enabled) {
+				for (const project of result.pinnedProjects) {
+					process.stderr.write(
+						chalk.yellow(
+							`${project} is pinned to "${ref.account.name}"; its ${ref.provider} requests fail until you enable it or unpin it.\n`,
+						),
+					);
+				}
 			}
 			return;
 		}

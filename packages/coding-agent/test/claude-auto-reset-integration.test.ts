@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type {
+	AuthAccountPolicies,
 	ResetCreditAccountStatus,
 	ResetCreditTarget,
 	SessionRestrictionLease,
@@ -144,6 +145,7 @@ describe("Claude saved-reset trigger integration", () => {
 		maxDelayMs?: number;
 		quota?: { restored: boolean };
 		autoRedeem?: "unset" | "yes" | "no";
+		accountPolicies?: AuthAccountPolicies;
 		salvageHorizonHours?: number;
 		keepCredits?: number;
 		/** Answers the auto-redeem consent prompt; without it the session has no prompt UI. */
@@ -220,6 +222,7 @@ describe("Claude saved-reset trigger integration", () => {
 			"claudeResets.autoRedeem": options.autoRedeem ?? "yes",
 			"claudeResets.salvageHorizonHours": options.salvageHorizonHours ?? 12,
 			"claudeResets.keepCredits": options.keepCredits ?? 0,
+			...(options.accountPolicies ? { "auth.accountPolicies": options.accountPolicies } : {}),
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		const sessionManager = SessionManager.inMemory();
@@ -939,5 +942,95 @@ describe("Claude saved-reset trigger integration", () => {
 		await coordinator.sweepPromise;
 		expect(questions).toEqual([expect.stringContaining("Spend a saved Claude rate-limit reset?")]);
 		expect(targets).toEqual([]);
+	});
+
+	describe("per-account autoRedeem", () => {
+		/** Stores the account with a project id and applies `policies`; returns its expiring early-use status. */
+		async function storeAccount(policies: AuthAccountPolicies): Promise<ResetCreditAccountStatus> {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access-claude",
+					refresh: "refresh-claude",
+					expires: Date.now() + HOUR,
+					accountId: ACCOUNT_ID,
+					email: EMAIL,
+					orgId: ORG_ID,
+					projectId: "project-claude",
+				},
+			]);
+			authStorage.setAccountPolicies({ accountPolicies: policies, defaultReservePct: 10 });
+			const [stored] = authStorage.credentials.list("anthropic");
+			if (!stored) throw new Error("expected a stored account");
+			return { ...claudeStatus(false), credentialId: stored.id };
+		}
+
+		afterEach(async () => {
+			authStorage.setAccountPolicies({ accountPolicies: [], defaultReservePct: 10 });
+			await authStorage.credentials.remove("anthropic");
+		});
+
+		it("spends for a project-id-selected account with autoRedeem yes while the provider setting is no", async () => {
+			const policies: AuthAccountPolicies = [
+				{ provider: "anthropic", account: { projectId: "project-claude" }, autoRedeem: "yes" },
+			];
+			const status = await storeAccount(policies);
+			const { session, coordinator, targets } = buildSession({
+				report: withInventory(claudeReport(0.5), status),
+				status,
+				autoRedeem: "no",
+				accountPolicies: policies,
+			});
+			vi.spyOn(authStorage.oauth, "accounts").mockReturnValue([
+				{
+					position: 0,
+					credentialId: status.credentialId,
+					accountId: ACCOUNT_ID,
+					email: EMAIL,
+					orgId: ORG_ID,
+					active: true,
+				},
+			]);
+
+			await session.fetchUsageReports();
+			await coordinator.sweepPromise;
+			expect(targets.map(target => target.credentialId)).toEqual([status.credentialId]);
+			expect(cfgClaudeResetsAutoRedeem.get(session.settings)).toBe("no");
+		});
+
+		it("does not save the answer for an account with its own unset autoRedeem as the provider setting", async () => {
+			const policies: AuthAccountPolicies = [
+				{ provider: "anthropic", account: { accountId: ACCOUNT_ID }, autoRedeem: "unset" },
+			];
+			const status = await storeAccount(policies);
+			let prompts = 0;
+			const persisted = vi.spyOn(cfgClaudeResetsAutoRedeem, "set");
+			const { session, coordinator, targets } = buildSession({
+				report: withInventory(claudeReport(0.5), status),
+				status,
+				autoRedeem: "unset",
+				accountPolicies: policies,
+				consent: async () => {
+					prompts++;
+					return "Yes";
+				},
+			});
+			vi.spyOn(authStorage.oauth, "accounts").mockReturnValue([
+				{
+					position: 0,
+					credentialId: status.credentialId,
+					accountId: ACCOUNT_ID,
+					email: EMAIL,
+					orgId: ORG_ID,
+					active: true,
+				},
+			]);
+
+			await session.fetchUsageReports();
+			await coordinator.sweepPromise;
+			expect(prompts).toBe(1);
+			expect(targets.map(target => target.credentialId)).toEqual([status.credentialId]);
+			expect(persisted).not.toHaveBeenCalled();
+		});
 	});
 });

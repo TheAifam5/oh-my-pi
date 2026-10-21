@@ -3,12 +3,15 @@ auth "anthropic-api-key" {
 	login "api-key" {
 		auth-url "https://platform.claude.com/settings/keys"
 		instructions "Create or copy an API key in the Claude Console"
-		prompt "Paste your Anthropic API key" placeholder="sk-ant-api03-..."
+		prompt "Paste your Anthropic API key" placeholder="sk-ant-api03-... or sk-ant-usr-..."
 		normalize "strip-bearer"
-		key-prefix "sk-ant-api" {
+		key-prefix "sk-ant-api" "sk-ant-usr" {
 			reject "sk-ant-oat" message="This is a Claude subscription OAuth token, not an API key. Use the \"Anthropic (Claude Pro/Max)\" login for it."
-			reject "sk-ant-admin" message="Admin API keys manage an organization and cannot run requests. Paste a standard API key (sk-ant-api...)."
+			reject "sk-ant-admin" message="Admin API keys manage an organization and cannot run requests. Paste a standard API key (sk-ant-api... or sk-ant-usr...)."
 		}
+		workspace-prompt "Workspace ID for a key not scoped to one workspace (leave empty otherwise)" placeholder="wrkspc_..." \
+			pattern="^wrkspc_[A-Za-z0-9]+$" message="Not a workspace ID: expected wrkspc_ followed by letters and digits." \
+			header="anthropic-workspace-id"
 		// GET /v1/models authenticates the key without spending tokens. Only a
 		// 401/403 rejects it; an outage or rate limit still saves the key.
 		validate "models-endpoint" label="Anthropic" url="https://api.anthropic.com/v1/models" \

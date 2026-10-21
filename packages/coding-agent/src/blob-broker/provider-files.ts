@@ -16,15 +16,21 @@ import { createGeminiProviderFileClient } from "./provider-files-gemini";
 import { createOpenAIFileClient } from "./provider-files-openai";
 
 /** Resolve the current account credential for a model without retaining it. */
-export type ProviderFileCredentialResolver = (model: Model) => Promise<string | undefined>;
+export type ProviderFileCredentialResolver = (
+	model: Model,
+) => Promise<{ apiKey: string; workspaceId?: string } | undefined>;
 
 /** Select a provider-native file client for a model and resolved credential. */
-export type ProviderFileClientFactory = (model: Model, credential: string) => ProviderFileClient | null;
+export type ProviderFileClientFactory = (
+	model: Model,
+	credential: string,
+	workspaceId?: string,
+) => ProviderFileClient | null;
 
 const DEFAULT_CLIENT_FACTORIES: readonly ProviderFileClientFactory[] = [
-	createGeminiProviderFileClient,
-	createAnthropicFileClient,
-	createOpenAIFileClient,
+	(model, credential) => createGeminiProviderFileClient(model, credential),
+	(model, credential, workspaceId) => createAnthropicFileClient(model, credential, undefined, workspaceId),
+	(model, credential) => createOpenAIFileClient(model, credential),
 ];
 
 function imageBlocks(context: Context): ImageContent[] {
@@ -103,9 +109,9 @@ export class ProviderFileManager {
 		const images = imageBlocks(context);
 		if (!images.some(block => !block.url && block.data.length > 0)) return context;
 
-		let credential: string | undefined;
+		let resolved: { apiKey: string; workspaceId?: string } | undefined;
 		try {
-			credential = await this.#resolveCredential(model);
+			resolved = await this.#resolveCredential(model);
 		} catch (error) {
 			logger.warn("blob-broker: provider-file credential resolution failed; trying next image backend", {
 				provider: model.provider,
@@ -113,10 +119,11 @@ export class ProviderFileManager {
 			});
 			return context;
 		}
-		if (!credential) return context;
+		if (!resolved?.apiKey) return context;
+		const credential = resolved.apiKey;
 		let client: ProviderFileClient | null;
 		try {
-			client = this.#clientFor(model, credential);
+			client = this.#clientFor(model, credential, resolved.workspaceId);
 		} catch (error) {
 			logger.warn("blob-broker: provider-file client unavailable; trying next image backend", {
 				provider: model.provider,
@@ -154,6 +161,7 @@ export class ProviderFileManager {
 						hash,
 						() => (group.bytes ??= Buffer.from(group.blocks[0].data, "base64")),
 						group.blocks[0].mimeType,
+						client.provider === "anthropic" ? resolved.workspaceId : undefined,
 					);
 					const reference = toProviderFileReference(handle);
 					for (const block of group.blocks) referenceByBlock.set(block, reference);
@@ -174,18 +182,23 @@ export class ProviderFileManager {
 	async invalidateContext(context: Context, model: Model): Promise<void> {
 		const blocks = imageBlocks(context).filter(block => block.providerFile !== undefined && block.data.length > 0);
 		if (blocks.length === 0) return;
-		let credential: string | undefined;
+		let resolved: { apiKey: string; workspaceId?: string } | undefined;
 		try {
-			credential = await this.#resolveCredential(model);
+			resolved = await this.#resolveCredential(model);
 		} catch {
 			return;
 		}
-		if (!credential) return;
+		if (!resolved?.apiKey) return;
 		for (const block of blocks) {
 			if (!block.providerFile) continue;
 			const digest = blockFileHash(block);
 			if (!digest) continue;
-			this.#cache.delete(block.providerFile.provider, credential, digest.hash);
+			this.#cache.delete(
+				block.providerFile.provider,
+				resolved.apiKey,
+				digest.hash,
+				block.providerFile.provider === "anthropic" ? resolved.workspaceId : undefined,
+			);
 		}
 	}
 
@@ -201,9 +214,9 @@ export class ProviderFileManager {
 		this.#cache.save();
 	}
 
-	#clientFor(model: Model, credential: string): ProviderFileClient | null {
+	#clientFor(model: Model, credential: string, workspaceId?: string): ProviderFileClient | null {
 		for (const factory of this.#factories) {
-			const client = factory(model, credential);
+			const client = factory(model, credential, workspaceId);
 			if (client) return client;
 		}
 		return null;
@@ -215,14 +228,15 @@ export class ProviderFileManager {
 		contentHash: string,
 		getBytes: () => Uint8Array,
 		mimeType: string,
+		workspaceId?: string,
 	): Promise<ProviderFileHandle> {
-		const cached = this.#cache.get(client.provider, credential, contentHash);
+		const cached = this.#cache.get(client.provider, credential, contentHash, workspaceId);
 		if (cached) return Promise.resolve(cached);
-		const key = JSON.stringify([client.provider, hashProviderFileCredential(credential), contentHash]);
+		const key = JSON.stringify([client.provider, hashProviderFileCredential(credential), contentHash, workspaceId]);
 		let pending = this.#uploads.get(key);
 		if (!pending) {
 			pending = client.upload({ bytes: getBytes(), mimeType }).then(handle => {
-				this.#cache.set(client.provider, credential, contentHash, handle);
+				this.#cache.set(client.provider, credential, contentHash, handle, workspaceId);
 				return handle;
 			});
 			this.#uploads.set(key, pending);

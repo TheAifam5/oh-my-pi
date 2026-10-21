@@ -420,6 +420,65 @@ describe("auth grammar", () => {
 		).toThrow(/auth\/x\.kdl:6/);
 	});
 
+	test("api-key workspace-prompt compiles with models-endpoint validation and rejects other validation kinds", () => {
+		const workspaceAuth = (prompt: string, validate: string) =>
+			[
+				'auth "x" {',
+				'\tname "X"',
+				'\tlogin "api-key" {',
+				'\t\tprompt "Paste"',
+				`\t\t${prompt}`,
+				`\t\t${validate}`,
+				"\t}",
+				"}",
+			].join("\n");
+		const prompt =
+			'workspace-prompt "Workspace" placeholder="ws_..." pattern="^ws_[a-z]+$" message="Bad id." header="x-ws"';
+		const compiled = compileAuth([
+			{ file: "auth/x.kdl", text: workspaceAuth(prompt, 'validate "models-endpoint" url="https://m"') },
+			order("x"),
+		]);
+		expect(compiled.providers[0]?.login).toMatchObject({
+			workspacePrompt: {
+				prompt: "Workspace",
+				placeholder: "ws_...",
+				pattern: "^ws_[a-z]+$",
+				message: "Bad id.",
+				header: "x-ws",
+			},
+		});
+		expect(() =>
+			compileAuth([
+				{
+					file: "auth/x.kdl",
+					text: workspaceAuth(prompt, 'validate "anthropic-messages" base-url="https://m" model="m"'),
+				},
+				order("x"),
+			]),
+		).toThrow(/auth\/x\.kdl:3/);
+		expect(() =>
+			compileAuth([
+				{
+					file: "auth/x.kdl",
+					text: workspaceAuth(
+						'workspace-prompt "Workspace" pattern="(" message="Bad id." header="x-ws"',
+						'validate "models-endpoint" url="https://m"',
+					),
+				},
+				order("x"),
+			]),
+		).toThrow(/auth\/x\.kdl:5/);
+		expect(() =>
+			compileAuth([
+				{
+					file: "auth/x.kdl",
+					text: workspaceAuth('workspace-prompt "Workspace" pattern="^a$" message="Bad id."', ""),
+				},
+				order("x"),
+			]),
+		).toThrow(/auth\/x\.kdl:5/);
+	});
+
 	test("oauth-code derives callback-port and paste-code; refresh inherits the login token request", () => {
 		const compiled = compileAuth([
 			{

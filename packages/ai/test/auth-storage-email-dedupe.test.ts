@@ -463,7 +463,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const migratedStore = new SqliteAuthCredentialStore(legacyDb);
 		try {
-			expect(readAuthSchemaVersion(legacyDb)).toBe(8);
+			expect(readAuthSchemaVersion(legacyDb)).toBe(9);
 			const readKeys = (provider: string): string[] => {
 				// Rows were inserted by this test above; the cast names their shape.
 				const rows = legacyDb
@@ -504,7 +504,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		const freshDb = new Database(":memory:");
 		const freshStore = new SqliteAuthCredentialStore(freshDb);
 		try {
-			expect(readAuthSchemaVersion(freshDb)).toBe(8);
+			expect(readAuthSchemaVersion(freshDb)).toBe(9);
 			expect(readTableSql(freshDb, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(freshDb, "auth_credentials")).toContain("strftime('%s','now')");
 		} finally {
@@ -519,7 +519,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
 			);
-			INSERT INTO auth_schema_version(id, version) VALUES (1, 9);
+			INSERT INTO auth_schema_version(id, version) VALUES (1, 10);
 			CREATE TABLE auth_credentials (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				provider TEXT NOT NULL,
@@ -534,7 +534,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const reopenedStore = new SqliteAuthCredentialStore(futureDb);
 		try {
-			expect(readAuthSchemaVersion(futureDb)).toBe(9);
+			expect(readAuthSchemaVersion(futureDb)).toBe(10);
 		} finally {
 			reopenedStore.close();
 		}
@@ -560,7 +560,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 				const reopened = await SqliteAuthCredentialStore.open(reopenDbPath);
 				try {
 					expect(reopened.listAuthCredentials("openai")).toHaveLength(1);
-					expect(readAuthSchemaVersion(observer)).toBe(8);
+					expect(readAuthSchemaVersion(observer)).toBe(9);
 				} finally {
 					reopened.close();
 				}
@@ -613,7 +613,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const migratedStore = new SqliteAuthCredentialStore(legacyDb);
 		try {
-			expect(readAuthSchemaVersion(legacyDb)).toBe(8);
+			expect(readAuthSchemaVersion(legacyDb)).toBe(9);
 			expect(readTableSql(legacyDb, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(legacyDb, "auth_credentials")).toContain("strftime('%s','now')");
 			expect(readStoredIdentityRows(legacyDb, "openai-codex")).toEqual([

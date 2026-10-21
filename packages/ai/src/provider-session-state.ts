@@ -30,6 +30,8 @@
  *   bearer (`getCodexWebSocketSessionKey`), so a switch naturally lands on a
  *   fresh transport session while the old one stays reachable for teardown.
  *   Resetting from the outside would close a socket a retry may still be on.
+ *   The native-lane steering refusal is keyed by routing session and model,
+ *   not account, and stays across a switch.
  * - **Antigravity** — `lastGoodEndpoint` is endpoint-scoped; the agent /
  *   conversation ids are conversation-scoped. Neither depends on the account.
  * - **GitLab Duo** — the active workflow is account-bound, but it is a live

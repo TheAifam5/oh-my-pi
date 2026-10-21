@@ -1110,9 +1110,15 @@ export class CredentialSelector {
 				const accountKey = oauthAccountKey(credential);
 				return accountKey !== undefined && accountIds.has(accountKey);
 			});
-		const hasAccountPolicy = credentials.some(
-			({ credential }) => this.#deps.policies.forCredential(provider, credential) !== undefined,
-		);
+		const hasAccountPolicy = credentials.some(({ credential }) => {
+			const policy = this.#deps.policies.forCredential(provider, credential);
+			if (!policy) return false;
+			if (policy.resetOn === undefined && policy.autoRedeem === undefined) return true;
+			return Object.entries(policy).some(
+				([field, value]) =>
+					value !== undefined && !["provider", "account", "resetOn", "autoRedeem"].includes(field),
+			);
+		});
 		const hasPriorityPolicy = credentials.some(
 			({ credential }) => this.#deps.policies.forCredential(provider, credential)?.priority !== undefined,
 		);

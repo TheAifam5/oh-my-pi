@@ -902,6 +902,7 @@ export class UsageService implements UsageApi {
 		options?: UsageReportsOptions,
 		providerFilter?: ReadonlySet<Provider>,
 	): Promise<UsageReport[] | null> {
+		await this.#deps.pool.adoptExternalChanges();
 		const requests = await this.#collectUsageRequests(options, providerFilter);
 		if (requests.length === 0) return [];
 

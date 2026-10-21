@@ -41,6 +41,21 @@
 - Fixed the `ts-set-map` rule stalling tool-call streaming for seconds on a long single-line `Map` literal, and missing `Map` entries written `["key", value] as const` ([#16242](https://github.com/can1357/oh-my-pi/pull/16242))
 - Fixed the `ts-import-type` rule missing inline type imports whose member name is non-ASCII, such as `import("./units").温度` ([#16242](https://github.com/can1357/oh-my-pi/pull/16242))
 
+### Added
+
+- `auth.accountPolicies` entries take `resetOn` (`5h`, `7d`) and `autoRedeem` (`yes`, `no`, `unset`) for per-account Claude and Codex saved-reset redemption, set with `omp account reset <account> --on <windows> --auto <mode>` and shown by `omp account list` and `/account`
+- `omp account disable <account>` and `omp account enable <account>` (and `e` in `/account`) stop and resume using a stored account without logging it out; a disabled account is listed as disabled by `omp account list`, `/account`, and `omp usage`, and requests to a provider whose accounts are all disabled fail naming `omp account enable`
+
+### Changed
+
+- `omp login anthropic-api-key` accepts Claude Console personal API keys (`sk-ant-usr…`) besides `sk-ant-api…` keys
+- `omp login anthropic-api-key` asks for an optional workspace ID (`wrkspc_…`) and sends it as `anthropic-workspace-id` with that key's requests, so keys not scoped to one workspace work
+
+### Fixed
+
+- `omp account reset` rejects API-key accounts with the same OAuth-only error as account-policy validation
+- Anthropic Files API handles and concurrent uploads are isolated by workspace; existing unscoped cache entries remain reusable, and purge deletes files in their recorded workspace
+
 ## [18.12.4] - 2026-10-20
 
 ### Added
