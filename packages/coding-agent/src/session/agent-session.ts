@@ -117,7 +117,7 @@ import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
-import { loadAdvisorTranscriptCosts } from "../advisor";
+import { type AdvisorCategory, type AdvisorFinding, loadAdvisorTranscriptCosts } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { classifyAutoPrewalk } from "../auto-prewalk/classifier";
 import { reset as resetCapabilities } from "../capability";
@@ -445,6 +445,7 @@ import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } fro
 import type { ServingModel } from "./retry-fallback-chains";
 import {
 	type AdvisorCatchupOptions,
+	type AdvisorFindingCommandResult,
 	type AdvisorStats,
 	type AdvisorStatusOverviewEntry,
 	SessionAdvisors,
@@ -492,7 +493,12 @@ import { YieldQueue } from "./yield-queue";
 
 export * from "./agent-session-events";
 export * from "./agent-session-types";
-export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
+export type {
+	AdvisorFindingCommandResult,
+	AdvisorStats,
+	AdvisorStatusOverviewEntry,
+	PerAdvisorStat,
+} from "./session-advisors";
 
 const SESSION_STOP_CONTINUATION_CAP = 8;
 /** Assistant thinking+reply words a deferred auto-title waits for before retitling from context. */
@@ -2592,6 +2598,7 @@ export class AgentSession implements SettingsScope {
 			contextPrompt: config.advisorContextPrompt,
 			memoryPrompt: config.advisorMemoryPrompt,
 			configs: config.advisorConfigs,
+			categories: config.advisorCategories,
 			configWarnings: config.advisorConfigWarnings,
 			streamFn: config.advisorStreamFn,
 			transformProviderContext: config.transformProviderContext,
@@ -15608,9 +15615,10 @@ export class AgentSession implements SettingsScope {
 
 	/**
 	 * Replace the live advisor roster from an edited `WATCHDOG.yml` (the `/advisor
-	 * configure` save path). Swaps the configs + shared baseline, then rebuilds the
-	 * runtimes in place so the change applies without a restart. When the advisor is
-	 * disabled the new configs are simply stored for the next enable.
+	 * configure` save path). Swaps the configs, shared baseline, and finding
+	 * taxonomy (omitted resolves the defaults against `advisors`), then rebuilds
+	 * the runtimes in place so the change applies without a restart. When the
+	 * advisor is disabled the new configs are simply stored for the next enable.
 	 *
 	 * @returns the number of advisors active after the rebuild.
 	 */
@@ -15618,8 +15626,34 @@ export class AgentSession implements SettingsScope {
 		advisors: AdvisorConfig[],
 		sharedInstructions: string | undefined,
 		sharedMaxNotesPerUpdate?: number,
+		categories?: readonly AdvisorCategory[],
 	): number {
-		return this.#advisors.applyAdvisorConfigs(advisors, sharedInstructions, sharedMaxNotesPerUpdate);
+		return this.#advisors.applyAdvisorConfigs(advisors, sharedInstructions, sharedMaxNotesPerUpdate, categories);
+	}
+
+	/** The active advisor finding taxonomy. */
+	getAdvisorCategories(): readonly AdvisorCategory[] {
+		return this.#advisors.getAdvisorCategories();
+	}
+
+	/** Whether category `id` has a live owner: its owner advisor is built and `running`. */
+	advisorCategoryHasLiveOwner(id: string): boolean {
+		return this.#advisors.advisorCategoryHasLiveOwner(id);
+	}
+
+	/** The session advisor findings ledger's findings, oldest first. */
+	getAdvisorFindings(): readonly AdvisorFinding[] {
+		return this.#advisors.getAdvisorFindings();
+	}
+
+	/** Resolve advisor finding `id` for the user; persists to the session. */
+	resolveAdvisorFinding(id: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
+		return this.#advisors.resolveAdvisorFinding(id);
+	}
+
+	/** Reopen a resolved or expired advisor finding; persists to the session. */
+	reopenAdvisorFinding(id: string): AdvisorFindingCommandResult<"reopened" | "open" | "missing" | "superseded"> {
+		return this.#advisors.reopenAdvisorFinding(id);
 	}
 
 	/**
@@ -15677,6 +15711,11 @@ export class AgentSession implements SettingsScope {
 	 */
 	getAdvisorAgent(): Agent | undefined {
 		return this.#advisors.getAdvisorAgent();
+	}
+
+	/** Every live advisor's agent, in roster order. */
+	getAdvisorAgents(): Agent[] {
+		return this.#advisors.getAdvisorAgents();
 	}
 
 	/** WATCHDOG.yml problems from startup discovery; shown by the UI once it is ready. */

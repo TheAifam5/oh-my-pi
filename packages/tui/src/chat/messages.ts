@@ -307,6 +307,16 @@ export interface AdvisorNote {
 	turn?: number;
 	/** Primary turns elapsed before merged-batch delivery. */
 	turnsAgo?: number;
+	/** Ledger finding id (`F<n>`); absent in transcripts written before the findings ledger. */
+	finding?: string;
+	/** The finding's category id. */
+	category?: string;
+	/** The finding category's owner advisor. */
+	owner?: string;
+	/** Advisors that reported the finding at delivery time, owner first. */
+	reporters?: string[];
+	/** How this report relates to its finding (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`). */
+	relation?: string;
 }
 
 /** Details payload on the batched `advisor` custom message rendered in the transcript. */

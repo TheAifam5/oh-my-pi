@@ -323,7 +323,7 @@ describe("formatSessionHistoryMarkdown", () => {
 						arguments: {
 							kind: "defect",
 							severity: "blocker",
-							where: { type: "file", ref: "src/retry.ts:42" },
+							where: { type: "file", path: "src/retry.ts", line: 42 },
 							defect: "budget never decrements",
 							impact: "loops forever",
 							fix: "decrement before sleeping",

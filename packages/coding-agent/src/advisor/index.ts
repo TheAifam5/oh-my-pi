@@ -1,7 +1,11 @@
 export * from "./advise-tool";
+export * from "./anchor-identity";
 export type { AdvisorConfig, AdvisorConfigScope, WatchdogConfigDoc } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 export * from "./config";
 export * from "./emission-guard";
+export * from "./findings-digest";
+export * from "./findings-judge";
+export * from "./findings-ledger";
 export * from "./loop-guard";
 export * from "./runtime";
 export * from "./transcript-recorder";

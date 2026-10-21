@@ -9,6 +9,7 @@ An advisor does not approve actions or mutate primary session state directly. It
 - [`src/advisor/runtime.ts`](../packages/coding-agent/src/advisor/runtime.ts)
 - [`src/advisor/advise-tool.ts`](../packages/coding-agent/src/advisor/advise-tool.ts)
 - [`src/advisor/emission-guard.ts`](../packages/coding-agent/src/advisor/emission-guard.ts)
+- [`src/advisor/findings-ledger.ts`](../packages/coding-agent/src/advisor/findings-ledger.ts)
 - [`src/advisor/watchdog.ts`](../packages/coding-agent/src/advisor/watchdog.ts)
 - [`src/advisor/config.ts`](../packages/coding-agent/src/advisor/config.ts)
 - [`src/advisor/transcript-recorder.ts`](../packages/coding-agent/src/advisor/transcript-recorder.ts)
@@ -107,6 +108,9 @@ Slash commands:
 | `/advisor dump`      | In the TUI, copy the compact transcript (all active advisors when a roster is present) to the clipboard; other hosts return the text. |
 | `/advisor dump raw`  | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                      |
 | `/advisor configure` | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only. |
+| `/advisor findings [open\|all]` | List the session's open (default) or all advisor findings. See [Findings command](#findings-command). |
+| `/advisor findings resolve F<n>` | Close an open finding as `resolved`; persisted to the session. |
+| `/advisor findings reopen F<n>` | Reopen a resolved or expired finding; persisted to the session. |
 
 If the subsystem is enabled but no legacy/default or roster model resolves, status reports the configured advisors as inactive/`no_model`.
 
@@ -148,16 +152,62 @@ Advisor tools are built against the isolated advisor `ToolSession` and wrapped w
 
 The `advise` tool accepts one structured finding:
 
-| Field      | Required                                                               | Meaning                                                                                                                                                     |
-| ---------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`     | yes                                                                    | `defect` (wrong now), `concern` (likely wrong), `unverified` (claim or result nobody checked), `suggestion` (better approach).                              |
-| `severity` | no (omitted = `nit`)                                                   | `nit`, `concern`, or `blocker`; drives delivery, budget, and dedupe escalation as below.                                                                    |
-| `where`    | yes                                                                    | `{ type, ref }`: `type` is `file`, `command`, `tool-call`, `instruction`, `claim`, or `approach` (plan, strategy, verification); `ref` is the anchor.       |
-| `defect`   | yes                                                                    | What is wrong; for a `suggestion`, the advice itself.                                                                                                       |
-| `impact`   | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | What breaks if left as is.                                                                                                                                  |
-| `fix`      | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | The concrete correction.                                                                                                                                    |
+| Field      | Required                                                               | Meaning                                                                                                                        |
+| ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `kind`     | yes                                                                    | `defect` (wrong now), `concern` (likely wrong), `unverified` (claim or result nobody checked), `suggestion` (better approach). |
+| `severity` | no (omitted = `nit`)                                                   | `nit`, `concern`, or `blocker`; drives delivery, budget, and dedupe escalation as below.                                       |
+| `category` | when the active taxonomy is non-empty                                  | One id of the [active taxonomy](#finding-categories). A category the advisor does not own is allowed.                          |
+| `where`    | yes                                                                    | Typed anchor; see [Anchors](#anchors).                                                                                         |
+| `defect`   | yes                                                                    | What is wrong; for a `suggestion`, the advice itself.                                                                          |
+| `impact`   | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | What breaks if left as is.                                                                                                     |
+| `fix`      | for `defect`/`concern`/`unverified` at severity `concern` or `blocker` | The concrete correction.                                                                                                       |
 
 Validation is shape-only: enums, and required strings that are non-empty after trimming. A call that fails validation returns a tool error naming the failing fields and stating that a review with nothing to report ends without calling `advise`. The advisor may retry once per update; a second rejected call in the same update is dropped and acknowledged as dropped.
+
+### Anchors
+
+`where` is a tagged union on `type`:
+
+| `type`        | Fields                                                       | Display                          |
+| ------------- | ------------------------------------------------------------ | -------------------------------- |
+| `file`        | `path`, optional `line`, `endLine`, `symbol`                 | `path[:line[-endLine]] (symbol)` |
+| `command`     | `text`                                                       | the command                      |
+| `tool-call`   | `id`                                                         | the tool call id                 |
+| `instruction` | `source` (`user`, `agents-md`, `watchdog`, `other`), `quote` | the quote                        |
+| `claim`       | `quote`                                                      | the quote                        |
+| `approach`    | `topic` (plan step, strategy, or verification approach)      | the topic                        |
+
+A `file` path may embed `:line`, `:line-endLine`, or `:line:column` and trailing label text (`auth-broker/server.ts:1043 reversed-auth probe`); explicit `line`/`endLine` fields take precedence. Surrounding backticks and quotes are stripped.
+
+The host also computes an anchor identity that is never shown to advisors or the primary agent:
+
+- `file`: the path is resolved against the session cwd (`~` expands to the home directory). The anchored line is read only when the anchor has a line, the path's real path (symlinks resolved) lies inside a workspace root — the session cwd or any worktree of its Git repository — and the reporting advisor's `read` tool is allowed without a prompt for both the given and the real path under the same approval evaluation the tool call itself gets (`tools.approvalMode`, `tools.approval`, and `always-ask-cached` grants). A `deny`, a policy that would prompt, or no available approval context means no read. The identity is then the root-relative real path, the SHA-256 of the whitespace-normalized line, and the line's index among earlier identical lines, so it survives line shifts. Otherwise nothing is read and the identity is the normalized path (root-relative inside a root, absolute outside) plus the line.
+- `command`: the whitespace-normalized text; `tool-call`: the id; `instruction`: the source plus the SHA-256 of the quote; `claim`: the SHA-256 of the quote; `approach`: the topic in lower-kebab case.
+
+Anchors are never rejected for being outside the workspace or unreadable, and the `advise` result is identical whether or not the line was read.
+
+### Finding categories
+
+Each session has an active finding taxonomy. When it is non-empty, `advise` requires `category` and enumerates the taxonomy's ids; the tool description lists each id with its description and marks the categories the advisor owns. The taxonomy is fixed per session and rebuilt when the roster is reapplied (`/advisor configure`).
+
+Without a `categories` key in any discovered `WATCHDOG.yml`, the bundled taxonomy applies. A default owner applies only when the roster has an advisor of that name (compared by slug):
+
+| Id             | Default owner               |
+| -------------- | --------------------------- |
+| `logic`        | Correctness                 |
+| `security`     | Security (precedence `1`)   |
+| `concurrency`  | Performance and concurrency |
+| `verification` | Verification                |
+| `docs`         | Documentation               |
+| `delivery`     | Dependencies and delivery   |
+| `migration`    | Migration and recovery      |
+| `ui`           | UI and accessibility        |
+| `style`        | Code style                  |
+| `architecture` | Architecture                |
+
+`categories: {}` declares an empty taxonomy, which removes `category` from `advise`. A category has a live owner when its owner advisor is built and its status is `running`.
+
+### Delivery
 
 Severity routing:
 
@@ -167,15 +217,19 @@ Severity routing:
 | `concern`       | Interrupting steering when delivery constraints permit it. After a terminal answer it requests a continuation at the default `advisor.continueSeverity`; set the threshold to `blocker` to leave a visible card instead. | Material risk, likely wrong direction, missing constraint, hallucinated API. |
 | `blocker`       | Interrupting steering message when the delivery constraints below permit it. A terminal answer never prevents it from triggering a turn.                            | Continuing would clearly waste work or produce broken output.                |
 
-Accepted notes are rendered into the primary transcript as `<advisory>` elements whose body is `<where.ref> — <defect>`, followed by ` → <impact>` and ` → <fix>` when present, XML-escaped. `kind` is an attribute; named roster advisors add an `advisor` attribute:
+Accepted notes are rendered into the primary transcript as `<advisory>` elements whose body is `<anchor display> — <defect>`, followed by ` → <impact>` and ` → <fix>` when present, XML-escaped. A note belonging to a [finding](#findings-ledger) leads with `finding`, `category`, and `owner` (the category's live owner, when it has one), then `severity` and `kind`, then `reporters` (every advisor that reported the finding, owner first), the report's [`relation`](#relations) when it named the finding, and the reporting `advisor`:
 
 ```text
-<advisory advisor="Architecture" severity="concern" kind="defect" guidance="weigh, don't blindly obey">
+<advisory finding="F7" category="security" owner="Security" severity="concern" kind="defect" reporters="Security,Correctness" advisor="Correctness" guidance="weigh, don't blindly obey">
 src/retry.ts:42 — the retry budget is never decremented → the loop never terminates on a persistent 503 → decrement before the backoff sleep
 </advisory>
 ```
 
-`advise` tool-result details store the rendered body as `note` alongside the structured fields; primary advisor cards store `note` and `kind`. Transcripts written before structured advice carry only `note` and render unchanged.
+`advise` tool-result details store the rendered body as `note` alongside the structured fields, including `category`, `relatesTo`, and `relation`; primary advisor cards store `note`, `kind`, `finding`, `category`, `owner`, `reporters`, and `relation`. The TUI card groups notes by finding and labels each with its finding id, category, and reporter count. Transcripts written before structured advice or the ledger carry only `note` (and `kind`) and render unchanged.
+
+One interrupt per finding: the first report on a finding that the routing below would steer interrupts the primary; every later report on the same finding — including the owner's report after a non-owner already interrupted — is routed as a non-interrupting aside under the finding, unless it raises the finding's severity (`concern` → `blocker`), which interrupts again. Within one terminal-boundary batch, reports on one finding merge into one note: the owner's report leads, and each other report adds a `<advisor>: …` line with its defect, impact, and fix where they differ from the lead's. No report is dropped except a failed validation, a no-finding `defect`, a budget rejection, an exact repeat of a report already on the finding, or an attached aside past the per-update aside cap; the last two are still recorded on the finding.
+
+One interrupt per anchor: within one primary turn, once a report on one finding interrupted the primary, a report on another finding with the same anchor identity (another category) is delivered as an aside, unless its severity is strictly higher than the interrupting one; that may interrupt once more. A terminal-boundary batch is a single delivery that continues the run at most once; within it the findings on one anchor stay together, led by the finding of the highest-precedence category.
 
 When you deliberately interrupt the agent (Esc, or a cancel from collab, ACP, RPC, the SDK, or an extension), the advisor stops auto-resuming it. An interrupting `concern`/`blocker` raised while the run is stopped is recorded as a visible advisor card instead of restarting the turn, and a concern already in flight when you interrupt is preserved the same way rather than driving a surprise resume. The advice re-enters context the next time you resume — a new message, the `.`/`c` continue shortcut, or a steer/follow-up.
 
@@ -195,20 +249,79 @@ So the advisor can steer and resume a run the agent ended on its own **while it 
 
 `advisor.immuneTurns` limits concern interruption frequency independently of review cadence. After the advisor successfully delivers a `concern` or `blocker` through the steering channel, later concerns are routed as non-interrupting asides until the configured number of primary turns has completed. Tool-loop continuations count toward that cooldown even for an `agent-end` reviewer. The default is `3`. Blockers are exempt from this cooldown, but still obey preservation constraints such as deliberate interrupts and plan mode. `nit` notes are unchanged.
 
-While an advisor update reviews work still in progress, `AdviseTool` defers `nit` and `concern` calls until a final boundary; only a `blocker` may interrupt partial work. Deferred notes pass the emission guard before reservation. A higher-severity note may displace a pending lower-severity note from the same review, but cannot displace notes from earlier reviews or retract routed advice. A final boundary flushes pending notes even when cadence skips a new review, without resetting the current review's budget.
+While an advisor update reviews work still in progress, `AdviseTool` defers `nit` and `concern` calls until a final boundary; only a `blocker` may interrupt partial work. Deferred notes pass the emission guard and are recorded in the findings ledger before reservation. A higher-severity new finding may displace a pending lower-severity one from the same review (its report is withdrawn from the ledger), but cannot displace notes from earlier reviews or retract routed advice. A final boundary flushes pending notes even when cadence skips a new review, without resetting the current review's budget.
+
+### Findings ledger
+
+`SessionAdvisors` owns one `AdvisorFindingsLedger` (`src/advisor/findings-ledger.ts`) shared by every advisor; it survives advisor rebuilds (`/advisor configure`, `applyAdvisorConfigs`). It is the single owner of report dedupe and of which reports open a new finding.
+
+- A finding (`F<n>`) is identified by its category plus its [anchor identity](#anchors). The same anchor in another category is a separate finding until the [findings judge](#findings-judge) merges them; a merged finding's id and category then alias the lead. A finding records its anchor display, its first report's file anchor (file anchors only), its category's live owner when it was opened, its status (`open`, `resolved`, `expired`), its highest severity, its reports (advisor, kind, severity, defect, impact, fix, relation, turn, owner flag, and `category` when it differs from the finding's), the findings merged into it (`merged`), the turns it was created and last touched, and the [`possiblyFixed`](#lifecycle) mark.
+- A report on an open finding attaches to it; one that repeats a report already on the finding (normalized defect, impact, and fix) at no higher severity is a duplicate: its advisor is recorded as a reporter, nothing is delivered, and the advisor is told `Already raised; recorded, not delivered again.` Anything else opens a new finding. The prompt is stricter: it permits re-raising prior non-blocker advice only as a `blocker`, once new transcript evidence meets `blocker` criteria.
+- Attached reports delivered as asides (same-category attachments that do not raise the severity, accepted `duplicate` reports with new text, `adds`, `disputes`, `resolved`, and non-raising `escalates`) are capped per advisor per update at that advisor's per-update budget. Past the cap the report is recorded on the finding but not delivered, and the advisor is told `Recorded under F<n>; this update's aside budget is spent, not delivered.`
+- Bounds: open findings untouched for 50 primary turns expire; compaction keeps only open findings at severity `concern` or `blocker`; at most 256 findings are kept, evicting resolved/expired ones first, then the oldest; a finding keeps at most 16 reports per report category, dropping the oldest of that category that is neither its first nor an owner's, so reports merged in from another category never count against the lead's. Expiry, compaction, and eviction trim only the ledger, never transcript messages.
+- Persistence: every change synchronously appends an `advisor_findings` custom session entry `{ v: 1, turn, findings }` to the session it happened in; a duplicate that adds no reporter in an already-touched turn writes nothing. Session start and every conversation boundary (`/new`, `/branch`, `/tree`, session switch, resume) load the latest entry on the current branch without writing; a session without one starts with an empty ledger, malformed findings are skipped, and an entry with another `v` is ignored with a warning.
+
+### Relations
+
+`advise` takes optional `relatesTo` (an open finding id, `F<n>`) and `relation`, given together; one without the other is rejected as an invalid call.
+
+| `relation`  | Effect                                                                                                                                                                                                                                                                                                                                                           |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `duplicate` | Accepted only when the report's host anchor identity equals the finding's; otherwise the report is handled as if it named no finding. An accepted duplicate joins the finding and is delivered as an aside under it when its defect, impact, or fix differ from the lead report (the first owner report, else the first report); otherwise nothing is delivered. |
+| `adds`      | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                               |
+| `disputes`  | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                               |
+| `escalates` | Joins the finding; interrupts per the severity routing when its severity is strictly higher than the finding's, otherwise an aside.                                                                                                                                                                                                                              |
+| `resolved`  | From the finding's owner: joins the finding, closes it as `resolved`, and is delivered as an aside. From any other advisor it is handled as `disputes`.                                                                                                                                                                                                          |
+
+A `relatesTo` id that is unknown, resolved, or expired is ignored: the report is handled as if it named no finding. A related report joins the named finding whatever its `category`. The finding's severity is the highest across its reports.
+
+### Findings digest
+
+With `advisor.findingsDigest` (default `true`), every advisor review ends with an `<open-findings>` block (`src/prompts/advisor/findings-digest.md`) listing open findings, one line each: `F<n> <category> <severity> owner=<name> reporters=<count>`. Open blockers come first, then concerns, then nits, newest first; at most 12 entries, then `and N more`. A missing category or owner renders as `-`.
+
+The digest never carries report text (defect, impact, fix) or the text of command, tool-call, instruction, claim, or approach anchors. A file anchor's `path:line[-endLine]` follows as `at <path:line>` only when that advisor's `read` tool is allowed without a prompt for the file's path and, when it exists, its real path; an advisor without `read`, or whose approval policy would prompt, sees the entry without it.
+
+### Lifecycle
+
+A finding is `open` until its owner reports `resolved`, the user resolves it with `/advisor findings resolve F<n>`, it expires after 50 untouched primary turns, or compaction drops it. While `advisor.findingsDigest` is on, before each review of an advisor, every open file-anchored finding it owns whose identity was formed by reading the line is re-checked through that advisor's read gate: when no line with the same normalized-content hash at the same occurrence index remains in the file, or the file no longer exists, the finding is marked `possiblyFixed`, shown as `possibly-fixed` in that owner's digest entry; when the line reappears the mark is cleared. The mark never resolves a finding, and a gate that would not allow the read leaves it unchanged. A digest that fails to build is skipped; the review runs without it.
+
+### Findings judge
+
+`advisor.aggregation.judge` controls a pass (`src/advisor/findings-judge.ts`, prompt `src/prompts/advisor/findings-judge.md`) that runs when an advisor update ends:
+
+| Setting                                        | Default  | Effect                                                                              |
+| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------- |
+| `advisor.aggregation.judge.enabled`            | `true`   | Run the pass.                                                                       |
+| `advisor.aggregation.judge.model`              | `@judge` | Judge model; `@judge` is the `judge` model role chain. Other values skip the pass.  |
+| `advisor.aggregation.judge.timeoutMs`          | `10000`  | Deadline of one group's judgment, fallback candidates included.                     |
+| `advisor.aggregation.judge.allowCrossProvider` | `false`  | Send report text to a judge candidate whose provider differs from the advisors'.    |
+
+Only anchor groups are judged: open findings sharing one [anchor identity](#anchors), in at least two categories, one of which gained a report during the update. Each group is one judgment holding every judged finding's id, category, anchor display, and reports (kind, severity, defect, impact, fix), with one choice question per pair that includes a finding touched by the update; each answer must be `same` or `distinct`, and any other answer fails the group. Findings judged `same` merge into the one whose category has the highest precedence (the oldest on a tie): every report of the merged finding joins the lead (none is dropped by the report cap), the lead keeps the higher severity, and the merged finding's id and category become aliases, so `/advisor findings resolve` on the old id and later reports in its category on that anchor reach the lead. Merges persist in the `advisor_findings` entry (`merged`). Delivery already routed during the update is unchanged.
+
+A failed, timed-out, or malformed judgment leaves the group as recorded. When the `judge` role has no usable candidate, the pass does nothing. Passes from advisors that finish together run one at a time, each on the ledger the previous one left, and the advisor's update completes only after its pass.
+
+### Findings command
+
+`/advisor findings [open|all]` lists the session's open (default) or all findings, one per finding: id, status, severity, category, anchor display, owner, reporters, `possibly-fixed`, ids merged into it, then the lead report's defect. `/advisor findings resolve F<n>` closes an open finding as `resolved`; `/advisor findings reopen F<n>` reopens a resolved or expired one unless an open finding already holds its category and anchor. Both persist through the `advisor_findings` session entry, so a resumed session keeps them. The command works in the TUI and in ACP/text hosts; ids are case-insensitive.
+
+### Findings privacy
+
+- Anchor identities, line hashes, and read-gate results stay in the host; models never see them.
+- The digest shows other advisors' findings as metadata only (see [Findings digest](#findings-digest)).
+- Report text reaches the findings judge only when the provider of the judge candidate about to be called equals the provider of every advisor that reported a judged finding (an advisor no longer in the roster has no known provider). The check runs before each candidate call, because the `judge` role chain may fall back to another provider; a candidate that fails the check ends the group's judgment without sending anything, and the group is not judged. `allowCrossProvider: true` disables the check.
 
 ### Emission guard
 
-Each advisor has its own `AdvisorEmissionGuard` (`src/advisor/emission-guard.ts`) on the route from `AdviseTool` to the YieldQueue/steer channel. It enforces the system prompt's per-update non-blocker advice budget and no-repeat rules:
+Each advisor has its own `AdvisorEmissionGuard` (`src/advisor/emission-guard.ts`) on the route from `AdviseTool` to the ledger. It performs per-call screening and rate limiting only:
 
 1. **Normalization.** Lowercase, NFKC, collapse every run of non-alphanumeric characters to one space, then trim. `"Stop."`, `"*Stop*"`, and `"  stop  "` all key to `stop`.
 2. **Content-free filter.** A `defect` consisting only of a short phrase with no concrete reason — `stop`, `done`, `complete`, `no issue continue`, `lgtm`, `nothing to add`, and similar — is suppressed. Whatever the anchor, a short `defect` (at most 200 characters) is also suppressed when its own text cites no code, number, path, or flag, carries no finding cue (`but`, `missing`, `fails`, `should`, …), and every clause only states no finding, silence, being out of lane, or the agent's progress ("Nothing in verification scope; no advice.", "Silent.", "Out of my lane; no owned finding.").
-3. **Severity-aware dedupe.** Findings key on the trimmed `where.ref` plus the normalized `defect`. A repeated finding is dropped at equal or lower severity. A higher-severity re-raise (`nit` → `concern` → `blocker`) remains eligible even after the earlier note was delivered. The prompt is stricter: it permits re-raising prior non-blocker advice only as a `blocker`, once new transcript evidence meets `blocker` criteria. The FIFO history holds at most 4096 entries.
-4. **Per-update rank budget.** Up to N non-blocker notes per advisor model `prompt()` cycle (default 4, configurable from 1–32). At capacity, a higher-severity note may replace the lowest-rank still-pending note from the same update. Routed notes retain their slots; earlier updates' pending notes remain reserved. Blockers are exempt, and suppressed noise consumes no budget. Precedence: per-advisor config > shared `WATCHDOG.yml` top-level > `advisor.maxNotesPerUpdate` setting > default 4. There is no additional aggregate backlog budget.
+3. **Per-update rank budget.** Up to N new non-blocker findings per advisor model `prompt()` cycle (default 4, configurable from 1–32). Reports attached to an existing finding consume no budget. At capacity, a higher-severity new finding may replace the lowest-rank still-pending one from the same update. Routed notes retain their slots; earlier updates' pending notes remain reserved. Blockers are exempt, and suppressed noise consumes no budget. Precedence: per-advisor config > shared `WATCHDOG.yml` top-level > `advisor.maxNotesPerUpdate` setting > default 4. There is no additional aggregate backlog budget.
+4. **Invalid-call retry.** The first malformed call in an update is a tool error naming the failing fields; later ones are acknowledged as `Dropped: invalid call`.
 
-Acknowledgments distinguish acceptance, conditional deferral, duplicates, noise, budget suppression, and invalid calls: the first malformed call in an update is a tool error naming the failing fields; later ones are acknowledged as `Dropped: invalid call`. Acceptance means the host accepted the note for primary delivery, not that the primary model consumed it. Deferred acceptance warns that a higher-severity finding from the same review may displace the note. A rejected note receives no delivery promise; the advisor should not rephrase rejected findings to evade the guard.
+Acknowledgments distinguish acceptance, conditional deferral, duplicates, noise, budget suppression, and invalid calls. Acceptance means the host accepted the note for primary delivery, not that the primary model consumed it. A rejected note receives no delivery promise; the advisor should not rephrase rejected findings to evade the guard.
 
-The guard's full state — dedupe history, per-update gate, and the per-update invalid-call retry — clears on every advisor reset (compaction, session switch, `/new`), so a re-primed reviewer can re-raise issues it already raised against the rewritten transcript. The per-update budget and invalid-call retry also reset at the start of every advisor update.
+The guard's per-update gate and invalid-call retry clear at the start of every advisor update and on every advisor reset (compaction, session switch, `/new`).
 
 ## Catch-up with `advisor.syncBacklog`
 
@@ -385,6 +498,8 @@ Fields:
 - `advisors[].syncBacklog`: optional `off`, `1`, `3`, `5`, or `strict`. Numeric thresholds may be unquoted YAML numbers. Omitted → inherit the current global `advisor.syncBacklog`; explicit `off` always disables waiting for this advisor. The editor shows the effective policy and offers `inherit` to remove an override.
 - `maxNotesPerUpdate` (top level or per advisor): accepted non-blocker notes per prompt update, default `4`. A per-advisor value overrides the top-level value, which overrides the `advisor.maxNotesPerUpdate` setting.
 - `advisors[].instructions`: this advisor's specialization, appended after the shared baseline. Both instruction fields expand `@path` imports like `WATCHDOG.md`.
+- `categories` (top level): mapping of category id → `{ description, owner?, precedence? }` defining the [finding taxonomy](#finding-categories). `owner` names an advisor; `precedence` ranks categories competing for one finding (higher leads). Entries layer like advisors: a more-specific file replaces an entry with the same id. Malformed entries are dropped with a warning; an `owner` that names no configured advisor is warned and kept.
+- `advisors[].owns`: optional list of category ids this advisor owns. It claims categories without an `owner`; when the category already names a different owner, the category's `owner` wins and a warning is reported. Unknown ids are warned and ignored.
 
 A continuation an advisor delivery itself starts — a steer while the primary is idle or past its final boundary — neither schedules reviews nor advances interval counters through its own final boundary, so advisor deliveries cannot re-wake reviewers into an advisor→primary→advisor cascade. Its updates are still captured and reach the next scheduled review. Continuations started by anything else (todo reminders, async job wakes, live delegations, user input) are reviewed under the normal cadence, so an `agent-end` reviewer also reviews the run a todo reminder resumes. Delivery itself never pauses: advice already produced still steers, flushes, or rides asides to the primary.
 

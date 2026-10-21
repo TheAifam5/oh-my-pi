@@ -31,6 +31,20 @@
 
 - Changed `/account` to show each account's remaining quota, reset countdowns, balances and spending projections instead of billing classes; older numbers keep their fetched age
 - Changed the advisor `advise` tool to take one structured finding (`kind`, `where` anchor, `defect`, plus `impact`/`fix` for concern and blocker findings) instead of a free-form note; malformed calls get one retry per update, advisories carry a `kind` attribute, and a `defect` that only states no finding, silence, or being out of lane is dropped whatever its anchor
+- Changed the advisor `advise` anchor `where` to a typed union (`file` with `path`/`line`/`endLine`/`symbol`, `command`, `tool-call`, `instruction` with a `source`, `claim`, `approach`) replacing the free `where.ref`; duplicate findings are recognized by a host-side anchor identity that reads the anchored line only for files inside the workspace that the advisor's `read` tool may open without a prompt, so a shifted line still matches
+- Changed advisor dedupe and budgeting to a session findings ledger: a finding is a category plus anchor identity, reports from any advisor on an open finding attach to it without spending that advisor's budget for new findings, an exact repeat is recorded as a reporter instead of delivered, and the emission guard keeps only per-call screening, the invalid-call retry and the per-update limit on new findings
+- Changed advisor delivery to interrupt once per finding: later reports on the same finding, including the owner's, arrive as asides unless they raise its severity; `<advisory>` elements carry `finding`, `category`, `owner` and `reporters`, and terminal-boundary batches merge a finding's reports owner first
+- Changed advisor delivery to interrupt once per anchor per primary turn: a report on another category's finding at an already-interrupted anchor arrives as an aside unless its severity is strictly higher (once); terminal-boundary batches lead each anchor with its highest-precedence category
+- Changed advisor attachment delivery to a per-advisor, per-update cap equal to that advisor's budget: further reports on existing findings are recorded on the finding but not delivered
+
+### Added
+
+- Added finding categories: `WATCHDOG.yml` `categories` (`description`, `owner`, `precedence`) and per-advisor `owns`, layered user then project, with a bundled default taxonomy; `advise` requires a `category` from the session's taxonomy
+- Added the `advisor_findings` session entry persisting the findings ledger across advisor rebuilds and resume; findings expire after 50 untouched primary turns, compaction keeps open concern/blocker findings, and the ledger holds at most 256 findings
+- Added `advise` `relatesTo` + `relation` (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`) to relate a report to an open finding; a duplicate needs a matching anchor identity, only the finding's owner can resolve it (others count as `disputes`), and unknown ids are ignored
+- Added the `advisor.findingsDigest` setting (default on): each advisor review ends with an `<open-findings>` digest of up to 12 open findings (id, category, severity, owner, reporter count), showing a file anchor only when that advisor may read the file without a prompt, and marking the owner's findings whose anchored line changed as `possibly-fixed`
+- Added the advisor findings judge (`advisor.aggregation.judge`: `enabled` default on, `model` `@judge`, `timeoutMs` 10000, `allowCrossProvider` off): after an advisor update, open findings of different categories on one anchor that gained reports are judged `same`/`distinct` by the `judge` role, and `same` findings merge under the highest-precedence category keeping every report; report text reaches a judge candidate only when its provider matches every reporting advisor's, re-checked per fallback candidate, and a failed or timed-out judgment leaves the findings unchanged
+- Added `/advisor findings [open|all]`, `/advisor findings resolve F<n>` and `/advisor findings reopen F<n>` in the TUI and ACP/text hosts; resolve and reopen persist in the `advisor_findings` session entry
 
 ## [18.12.5] - 2026-10-21
 

@@ -503,8 +503,12 @@ export class ChainJudge implements Judge {
 		return this.#resolveCandidates()[0]?.model;
 	}
 
-	async withCandidate<T>(run: (judge: Judge, kind: JudgeKind) => Promise<T>, options: JudgeOptions = {}): Promise<T> {
-		return this.#withCandidate((judge, kind) => run(judge, kind), options);
+	/** Run `run` against each candidate in chain order until one succeeds; `model` is the candidate's catalog model. */
+	async withCandidate<T>(
+		run: (judge: Judge, kind: JudgeKind, model: Model) => Promise<T>,
+		options: JudgeOptions = {},
+	): Promise<T> {
+		return this.#withCandidate(run, options);
 	}
 
 	/** Run `run` against each candidate able to answer `request` (any candidate when omitted) until one succeeds. */

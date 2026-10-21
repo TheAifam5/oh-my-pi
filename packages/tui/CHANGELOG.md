@@ -15,6 +15,8 @@
 ### Added
 
 - Usage dashboard details show credit-balance spending rates and projected run-out countdowns
+- `AdvisorConfig` takes `owns` and `WatchdogConfigDoc` takes `categories` (`AdvisorCategoryConfig`) for advisor finding categories
+- `AdvisorNote` takes optional `finding`, `category`, `owner`, `reporters` and `relation`; advisor cards group notes by finding and label each with its finding, category and reporter count
 
 ## [18.12.4] - 2026-10-20
 

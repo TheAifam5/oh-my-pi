@@ -19,6 +19,7 @@ import { copyToClipboard } from "../utils/clipboard";
 import { refreshStatusLine } from "./builtin-modes";
 import { CollabQrCodeComponent, collabBrowserLink } from "@oh-my-pi/pi-tui/chrome/collab-qrcode";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
+import { runAdvisorFindingsCommand } from "./helpers/advisor-findings";
 import { formatDumpArchiveReport } from "../session/session-dump-format";
 import type { SlashCommandSpec } from "./types";
 
@@ -64,13 +65,18 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		icon: "advisor",
 		description: "Toggle the advisor (a second model that reviews each turn and injects notes)",
 		acpDescription: "Toggle advisor",
-		acpInputHint: "[on|off|status|dump [raw]|configure]",
+		acpInputHint: "[on|off|status|dump [raw]|configure|findings [open|all|resolve F<n>|reopen F<n>]]",
 		subcommands: [
 			{ name: "on", description: "Enable the advisor" },
 			{ name: "off", description: "Disable the advisor" },
 			{ name: "status", description: "Show advisor status" },
 			{ name: "dump", description: "Copy the advisor's transcript to clipboard", usage: "[raw]" },
 			{ name: "configure", description: "Open the advisor configuration editor (TUI)" },
+			{
+				name: "findings",
+				description: "List advisor findings, or resolve/reopen one",
+				usage: "[open|all] | resolve F<n> | reopen F<n>",
+			},
 		],
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
@@ -116,13 +122,20 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				await runtime.output(text ?? "Advisor is not active for this session.");
 				return commandConsumed();
 			}
+			if (verb === "findings") {
+				await runtime.output(runAdvisorFindingsCommand(runtime.session, rest));
+				return commandConsumed();
+			}
 			if (verb === "configure") {
 				await runtime.output(
 					"/advisor configure opens an interactive editor and is only available in the interactive TUI.",
 				);
 				return commandConsumed();
 			}
-			return usage("Usage: /advisor [on|off|status|dump [raw]|configure]", runtime);
+			return usage(
+				"Usage: /advisor [on|off|status|dump [raw]|configure|findings [open|all|resolve F<n>|reopen F<n>]]",
+				runtime,
+			);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -167,12 +180,19 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				clearSubmittedText(runtime);
 				return;
 			}
+			if (verb === "findings") {
+				runtime.ctx.showStatus(runAdvisorFindingsCommand(runtime.ctx.session, rest), { dim: false, toast: false });
+				clearSubmittedText(runtime);
+				return;
+			}
 			if (verb === "configure") {
 				runtime.ctx.showAdvisorConfigure();
 				clearSubmittedText(runtime);
 				return;
 			}
-			runtime.ctx.showStatus("Usage: /advisor [on|off|status|dump [raw]|configure]");
+			runtime.ctx.showStatus(
+				"Usage: /advisor [on|off|status|dump [raw]|configure|findings [open|all|resolve F<n>|reopen F<n>]]",
+			);
 			clearSubmittedText(runtime);
 		},
 	},

@@ -115,7 +115,13 @@ describe("advisor tool-call loop guard", () => {
 			const repeating = advising || turn < maxRepeatedTurns;
 			turn++;
 			const { note, severity } = queued ?? { note: advice, severity: adviceSeverity };
-			const adviceArgs = { kind: "suggestion", where: { type: "approach", ref: "review" }, defect: note, severity };
+			const adviceArgs = {
+				kind: "suggestion",
+				category: "logic",
+				where: { type: "approach", topic: "review" },
+				defect: note,
+				severity,
+			};
 			const message: AssistantMessage = repeating
 				? {
 						role: "assistant",
@@ -525,7 +531,8 @@ describe("advisor tool-call loop guard", () => {
 		try {
 			await advise.execute("first-note", {
 				kind: "suggestion",
-				where: { type: "approach", ref: "review" },
+				category: "logic",
+				where: { type: "approach", topic: "review" },
 				defect: "The first operation loses the selected file.",
 				severity: "concern",
 			});
@@ -565,7 +572,8 @@ describe("advisor tool-call loop guard", () => {
 		try {
 			await advise.execute("next-note", {
 				kind: "suggestion",
-				where: { type: "approach", ref: "review" },
+				category: "logic",
+				where: { type: "approach", topic: "next operation" },
 				defect: "The next operation overwrites the destination file.",
 				severity: "concern",
 			});
@@ -599,7 +607,8 @@ describe("advisor tool-call loop guard", () => {
 		try {
 			await advise.execute("arm-immune", {
 				kind: "suggestion",
-				where: { type: "approach", ref: "review" },
+				category: "logic",
+				where: { type: "approach", topic: "review" },
 				defect: "The running step loses the selected file.",
 				severity: "concern",
 			});
@@ -673,7 +682,8 @@ describe("advisor tool-call loop guard", () => {
 							name: "advise",
 							arguments: {
 								kind: "suggestion",
-								where: { type: "approach", ref: "review" },
+								category: "logic",
+								where: { type: "approach", topic: "review" },
 								defect: "final review found a stale fixture",
 								severity: "nit",
 							},

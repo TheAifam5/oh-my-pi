@@ -1739,6 +1739,40 @@
           "description": "Before each review, replace the advisor's read/grep/glob output from older reviews with a short placeholder. The latest review is kept.",
           "type": "boolean",
           "default": true
+        },
+        "findingsDigest": {
+          "description": "Before each review, show each advisor the open advisor findings (id, category, severity, owner, reporter count) so it can relate new reports to them.",
+          "type": "boolean",
+          "default": true
+        },
+        "aggregation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "judge": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "description": "After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its provider matches every reporting advisor's.",
+                  "type": "boolean",
+                  "default": true
+                },
+                "model": {
+                  "type": "string",
+                  "default": "@judge"
+                },
+                "timeoutMs": {
+                  "type": "number",
+                  "default": 10000
+                },
+                "allowCrossProvider": {
+                  "type": "boolean",
+                  "default": false
+                }
+              }
+            }
+          }
         }
       }
     },

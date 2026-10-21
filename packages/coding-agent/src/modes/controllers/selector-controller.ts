@@ -561,6 +561,7 @@ export class SelectorController {
 						discovered.advisors,
 						discovered.sharedInstructions,
 						discovered.sharedMaxNotesPerUpdate,
+						discovered.categories,
 					);
 					this.ctx.statusLine.invalidate();
 					if (discovered.warnings.length > 0) {

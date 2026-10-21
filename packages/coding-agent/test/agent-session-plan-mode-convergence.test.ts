@@ -249,7 +249,8 @@ describe("AgentSession plan-mode convergence", () => {
 							name: "advise",
 							arguments: {
 								kind: "suggestion",
-								where: { type: "approach", ref: "review" },
+								category: "logic",
+								where: { type: "approach", topic: "review" },
 								defect: "tighten the plan",
 								severity: "concern",
 							},

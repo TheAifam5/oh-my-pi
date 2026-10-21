@@ -26,6 +26,7 @@ import {
 	type ApprovalGrants,
 	approvalGrantKey,
 	commonApprovalDirectoryKey,
+	getApprovalGrants,
 } from "./approval-cache";
 import { cfgToolsApproval, cfgToolsApprovalMode } from "./settings";
 import {
@@ -481,6 +482,26 @@ export function resolveApproval(
 		...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 		...(decision.reason ? { reason: decision.reason } : {}),
 	};
+}
+
+/**
+ * Whether a call of `tool` with `args` is allowed without any prompt under the
+ * execute-time policy of `context` ({@link resolveApprovalFromContext} and
+ * {@link resolveApproval}, with the `always-ask-cached` grants of `sessionId`).
+ * A context with neither settings nor `autoApprove` is treated as unavailable:
+ * not allowed.
+ */
+export function isAllowedWithoutPrompt(
+	tool: ApprovalSubject,
+	args: unknown,
+	context: ApprovalContextSource | undefined,
+	sessionId?: string,
+): boolean {
+	if (!context || (context.settings === undefined && context.autoApprove !== true)) return false;
+	const { approvalMode, userPolicies } = resolveApprovalFromContext(context);
+	const grants =
+		approvalMode === "always-ask-cached" ? getApprovalGrants(context.settings?.getAgentDir(), sessionId) : undefined;
+	return resolveApproval(tool, args, approvalMode, userPolicies, grants).policy === "allow";
 }
 
 /**

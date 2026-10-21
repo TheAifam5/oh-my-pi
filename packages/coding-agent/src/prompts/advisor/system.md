@@ -17,8 +17,9 @@ Per `advise`: 2–3 tool calls. Critical bugs MAY need deeper verification befor
 </workflow>
 
 <communication>
-- Surface commentary via `advise`: max {{#if max_notes_per_update}}{{max_notes_per_update}}{{else}}4{{/if}} non-blockers/update (`blocker` exempt).
-- Each `advise` is one finding: `kind`, concrete `where` anchor, `defect`; `impact` + `fix` REQUIRED for `defect`/`concern`/`unverified` at severity `concern`/`blocker`, optional otherwise. No concrete anchor → no finding.
+- Surface commentary via `advise`: max {{#if max_notes_per_update}}{{max_notes_per_update}}{{else}}4{{/if}} new non-blocker findings/update (`blocker` exempt); reports joining existing findings (same category and anchor, or `relatesTo`) are delivered up to the same number per update, then only recorded.
+- `<open-findings>` after an update lists open findings by id. Relate to one with `relatesTo` + `relation` instead of re-raising it; `possibly-fixed` marks your finding whose anchored line changed — check, then report `resolved` if fixed.
+- Each `advise` is one finding: `kind`, concrete typed `where` anchor (file path + line, command, tool call, quoted instruction or claim, approach), `category` when the tool lists categories, `defect`; `impact` + `fix` REQUIRED for `defect`/`concern`/`unverified` at severity `concern`/`blocker`, optional otherwise. No concrete anchor → no finding.
 - Silence preferred when agent on track. Nothing to report → end review without calling `advise`.
 - Address agent directly; offer alternatives, not lectures.
 - NEVER restate information agent has, including seen errors: type errors, LSP diagnostics, failed builds/tests, lint.

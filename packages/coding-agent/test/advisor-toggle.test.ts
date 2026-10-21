@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -243,7 +244,9 @@ describe("AgentSession advisor toggle", () => {
 
 		cfgAdvisorMaxNotesPerUpdate.set(session.settings, 3);
 		await Promise.resolve();
-		expect(session.getAdvisorAgent()?.state.systemPrompt.join("\n")).toContain("max 3 non-blockers/update");
+		expect(session.getAdvisorAgent()?.state.systemPrompt.join("\n")).toContain(
+			"max 3 new non-blocker findings/update",
+		);
 
 		// `/advisor` off is session-only: a later budget edit must not bring it back.
 		session.setAdvisorEnabled(false);
@@ -1179,7 +1182,8 @@ describe("AgentSession advisor toggle", () => {
 			adviseTool.beginUpdate(true);
 			const deferred = await adviseTool.execute("deferred-before-quota", {
 				kind: "suggestion",
-				where: { type: "approach", ref: "review" },
+				category: "logic",
+				where: { type: "approach", topic: "review" },
 				defect: "The final result still needs a regression test.",
 				severity: "nit",
 			});
@@ -1227,14 +1231,18 @@ describe("AgentSession advisor toggle", () => {
 		session.applyAdvisorConfigs([{ name: "Strict", maxNotesPerUpdate: 1 }], undefined);
 		let advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent");
-		expect(advisor.state.systemPrompt.join("\n")).toContain("max 1 non-blockers/update (`blocker` exempt)");
+		expect(advisor.state.systemPrompt.join("\n")).toContain(
+			"max 1 new non-blocker findings/update (`blocker` exempt",
+		);
 
 		cfgAdvisorMaxNotesPerUpdate.set(session.settings, 3);
 		session.applyAdvisorConfigs([{ name: "Lenient" }], undefined, undefined);
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent");
-		expect(advisor.state.systemPrompt.join("\n")).toContain("max 3 non-blockers/update (`blocker` exempt)");
+		expect(advisor.state.systemPrompt.join("\n")).toContain(
+			"max 3 new non-blocker findings/update (`blocker` exempt",
+		);
 	});
 
 	it("enforces budget precedence through advisor calls: per-advisor > shared WATCHDOG.yml > settings > default", async () => {
@@ -1248,7 +1256,8 @@ describe("AgentSession advisor toggle", () => {
 			for (let i = 1; i <= budget; i++) {
 				const result = await tool.execute(`${prefix}-${i}`, {
 					kind: "suggestion",
-					where: { type: "approach", ref: "review" },
+					category: "logic",
+					where: { type: "approach", topic: `review ${prefix} ${i}` },
 					defect: `${prefix} note ${i}`,
 					severity: "concern",
 				});
@@ -1256,7 +1265,8 @@ describe("AgentSession advisor toggle", () => {
 			}
 			const rejected = await tool.execute(`${prefix}-${budget + 1}`, {
 				kind: "suggestion",
-				where: { type: "approach", ref: "review" },
+				category: "logic",
+				where: { type: "approach", topic: `review ${prefix} ${budget + 1}` },
 				defect: `${prefix} note ${budget + 1}`,
 				severity: "concern",
 			});
@@ -1278,4 +1288,85 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.applyAdvisorConfigs([{ name: "SettingsOnly" }], undefined, undefined)).toBe(1);
 		await exerciseBudget("settings", 2);
 	});
+
+	it("builds each advisor's category enum from the session taxonomy and reports live owners", () => {
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Paused", enabled: false }], undefined, undefined, [
+			{ id: "security", description: "Trust boundaries.", owner: "Security" },
+			{ id: "perf", description: "Hot paths.", owner: "Paused" },
+			{ id: "misc", description: "Everything else." },
+		]);
+		const advisor = session.getAdvisorAgent();
+		const tool = advisor?.state.tools?.find(candidate => candidate.name === "advise");
+		if (!(tool instanceof advisorModule.AdviseTool)) throw new Error("Expected advise tool");
+		const base = { kind: "defect", where: { type: "approach", topic: "review" }, defect: "x" };
+		expect(tool.parameters({ ...base, category: "perf" }) instanceof type.errors).toBe(false);
+		expect(tool.parameters({ ...base, category: "logic" }) instanceof type.errors).toBe(true);
+		expect(tool.parameters(base) instanceof type.errors).toBe(true);
+		expect(tool.description).toContain("`security` (yours): Trust boundaries.");
+		expect(tool.description).not.toContain("`perf` (yours)");
+
+		expect(session.advisorCategoryHasLiveOwner("security")).toBe(true);
+		expect(session.advisorCategoryHasLiveOwner("perf")).toBe(false);
+		expect(session.advisorCategoryHasLiveOwner("misc")).toBe(false);
+		expect(session.advisorCategoryHasLiveOwner("nope")).toBe(false);
+
+		// Without a declared taxonomy the bundled defaults apply, owned only by configured advisors.
+		session.applyAdvisorConfigs([{ name: "Security" }], undefined);
+		const categories = session.getAdvisorCategories();
+		expect(categories.find(category => category.id === "security")?.owner).toBe("Security");
+		expect(categories.find(category => category.id === "logic")?.owner).toBeUndefined();
+		expect(session.advisorCategoryHasLiveOwner("security")).toBe(true);
+		expect(session.advisorCategoryHasLiveOwner("logic")).toBe(false);
+
+		expect(session.setAdvisorEnabled(false)).toBe(false);
+		expect(session.advisorCategoryHasLiveOwner("security")).toBe(false);
+	});
+
+	for (const [status, failure] of [
+		["quota_exhausted", () => new AIError.ProviderHttpError("quota", 429, { code: "insufficient_quota" })],
+		["error", () => new Error("advisor backend unavailable")],
+	] as const) {
+		it(`does not count an owner in ${status} status as a live owner`, async () => {
+			const mock = createMockModel({ responses: [{ content: ["primary complete"] }] });
+			const primaryAgent = new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			});
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+			const failingSession = new AgentSession({
+				agent: primaryAgent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+				advisorTools: [],
+			});
+			try {
+				expect(failingSession.setAdvisorEnabled(true)).toBe(true);
+				failingSession.applyAdvisorConfigs([{ name: "Security" }], undefined, undefined, [
+					{ id: "security", description: "Trust boundaries.", owner: "Security" },
+				]);
+				expect(failingSession.advisorCategoryHasLiveOwner("security")).toBe(true);
+				const advisorAgent = failingSession.getAdvisorAgent();
+				if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+				vi.spyOn(advisorAgent, "prompt").mockImplementation(() => Promise.reject(failure()));
+				vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false });
+				const reachedStatus = Promise.withResolvers<void>();
+				const unsubscribe = failingSession.subscribe(() => {
+					if (failingSession.getAdvisorStatusOverview().advisors[0]?.status === status) reachedStatus.resolve();
+				});
+
+				await failingSession.prompt("Trigger advisor");
+				await failingSession.waitForIdle();
+				await reachedStatus.promise;
+				unsubscribe();
+				expect(failingSession.getAdvisorStatusOverview().advisors[0]?.status).toBe(status);
+				expect(failingSession.advisorCategoryHasLiveOwner("security")).toBe(false);
+			} finally {
+				await failingSession.dispose();
+				vi.restoreAllMocks();
+			}
+		});
+	}
 });

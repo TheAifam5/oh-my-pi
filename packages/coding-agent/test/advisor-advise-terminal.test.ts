@@ -21,7 +21,8 @@ const ADVISE_CALL = {
 	name: "advise",
 	arguments: {
 		kind: "suggestion",
-		where: { type: "approach", ref: "review" },
+		category: "logic",
+		where: { type: "approach", topic: "review" },
 		defect: "Check the null path before the retry.",
 		severity: "concern",
 	},
@@ -149,7 +150,8 @@ describe("advisor advise-only turn terminates the review", () => {
 						name: "advise",
 						arguments: {
 							kind: "suggestion",
-							where: { type: "approach", ref: "review" },
+							category: "logic",
+							where: { type: "approach", topic: "review" },
 							defect: "The retry budget is never decremented.",
 							severity: "concern",
 						},

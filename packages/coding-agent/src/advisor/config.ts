@@ -10,6 +10,7 @@ import { registerDerivedSessionId } from "../session/request-session-ids";
 
 import {
 	ADVISOR_SYNC_BACKLOG_MODES,
+	type AdvisorCategoryConfig,
 	type AdvisorConfig,
 	type AdvisorConfigScope,
 	type AdvisorSyncBacklog,
@@ -17,7 +18,11 @@ import {
 } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
 export { ADVISOR_REVIEW_MODES, ADVISOR_SYNC_BACKLOG_MODES } from "@oh-my-pi/pi-tui/overlays/advisor-config";
-export type { AdvisorReviewMode, AdvisorSyncBacklog } from "@oh-my-pi/pi-tui/overlays/advisor-config";
+export type {
+	AdvisorCategoryConfig,
+	AdvisorReviewMode,
+	AdvisorSyncBacklog,
+} from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
 /**
  * Runtime health of a single advisor, surfaced in stats and the status line.
@@ -31,6 +36,61 @@ export type { AdvisorReviewMode, AdvisorSyncBacklog } from "@oh-my-pi/pi-tui/ove
 export type AdvisorRuntimeStatus = "running" | "paused" | "quota_exhausted" | "error" | "no_model";
 
 /**
+ * One category of the active finding taxonomy, with its owner resolved
+ * against the roster.
+ */
+export interface AdvisorCategory {
+	id: string;
+	description: string;
+	/** Owning advisor's configured name. */
+	owner?: string;
+	/** Rank among categories competing for one finding; higher leads. */
+	precedence?: number;
+}
+
+/**
+ * Taxonomy used when no discovered `WATCHDOG.yml` declares `categories`. An
+ * `owner` applies only when the roster has an advisor of that name.
+ */
+export const DEFAULT_ADVISOR_CATEGORIES: readonly Readonly<AdvisorCategory>[] = [
+	{ id: "logic", description: "Wrong behavior, logic errors, unhandled edge cases.", owner: "Correctness" },
+	{
+		id: "security",
+		description: "Trust boundaries, injection, secrets, permissions.",
+		owner: "Security",
+		precedence: 1,
+	},
+	{
+		id: "concurrency",
+		description: "Races, ordering, cancellation, resource lifetimes, performance.",
+		owner: "Performance and concurrency",
+	},
+	{
+		id: "verification",
+		description: "Missing, thin, or unexercised tests and checks; unverified claims.",
+		owner: "Verification",
+	},
+	{ id: "docs", description: "Comments, docs, and changelogs out of step with behavior.", owner: "Documentation" },
+	{
+		id: "delivery",
+		description: "Dependencies, versions, builds, CI, and release.",
+		owner: "Dependencies and delivery",
+	},
+	{
+		id: "migration",
+		description: "Data and schema migrations, upgrades, rollback, and recovery.",
+		owner: "Migration and recovery",
+	},
+	{ id: "ui", description: "Interface behavior, layout, and accessibility.", owner: "UI and accessibility" },
+	{ id: "style", description: "Conventions, naming, formatting, and idioms.", owner: "Code style" },
+	{
+		id: "architecture",
+		description: "Module boundaries, coupling, abstractions, and public APIs.",
+		owner: "Architecture",
+	},
+];
+
+/**
  * The result of walking the `WATCHDOG.yml`/`WATCHDOG.yaml` search path: the
  * deduped advisor roster plus the concatenated top-level `instructions` baseline
  * that is prepended (alongside `WATCHDOG.md`) to every advisor.
@@ -39,6 +99,8 @@ export interface DiscoveredAdvisors {
 	advisors: AdvisorConfig[];
 	sharedInstructions: string | undefined;
 	sharedMaxNotesPerUpdate?: number;
+	/** Active finding taxonomy (see {@link resolveAdvisorCategories}). */
+	categories: AdvisorCategory[];
 	/**
 	 * Human-readable config problems collected during the walk: unparseable
 	 * files and dropped entries. Surfaced as one aggregated session warning so
@@ -69,15 +131,66 @@ const advisorEntrySchema = type({
 	"instructions?": "string",
 	"enabled?": "boolean",
 	"maxNotesPerUpdate?": "number",
+	"owns?": "string[]",
 });
 
 type AdvisorYamlEntry = typeof advisorEntrySchema.infer;
 
+const categoryEntrySchema = type({
+	description: "string",
+	"owner?": "string",
+	"precedence?": "number",
+});
+
+/** Trimmed, non-empty, deduplicated `owns` ids; `undefined` stays `undefined`. */
+function normalizeOwns(owns: readonly string[] | undefined): string[] | undefined {
+	if (owns === undefined) return undefined;
+	return [...new Set(owns.map(id => id.trim()).filter(id => id.length > 0))];
+}
+
+/**
+ * Validate a document's `categories` mapping per entry. Returns `undefined`
+ * when the key is absent or not a mapping; otherwise the valid entries
+ * (possibly none), with trimmed descriptions and owners.
+ */
+function parseCategories(
+	raw: unknown,
+	path: string,
+	warnings: string[],
+): Map<string, AdvisorCategoryConfig> | undefined {
+	if (raw === undefined) return undefined;
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		warnings.push(`${path}: categories must be a mapping — ignored`);
+		return undefined;
+	}
+	const categories = new Map<string, AdvisorCategoryConfig>();
+	for (const [rawId, rawEntry] of Object.entries(raw)) {
+		const id = rawId.trim();
+		const result = categoryEntrySchema(rawEntry);
+		if (result instanceof type.errors) {
+			warnings.push(`${path}: category "${rawId}" dropped — ${result.summary}`);
+			continue;
+		}
+		if (!id || !result.description.trim()) {
+			warnings.push(`${path}: category "${rawId}" dropped — empty id or description`);
+			continue;
+		}
+		const category: AdvisorCategoryConfig = { description: result.description };
+		const owner = result.owner?.trim();
+		if (owner) category.owner = owner;
+		if (result.precedence !== undefined && Number.isFinite(result.precedence)) {
+			category.precedence = result.precedence;
+		}
+		categories.set(id, category);
+	}
+	return categories;
+}
+
 /**
  * Validate one parsed `WATCHDOG.yml` document per entry instead of as a whole:
- * a single malformed advisor drops out with a warning naming it, while the
- * healthy entries still load. Also reports non-string `instructions` and a
- * non-list `advisors` key — both previously failed the whole file silently.
+ * a single malformed advisor or category drops out with a warning naming it,
+ * while the healthy entries still load. Also reports non-string
+ * `instructions`, a non-list `advisors` key, and a non-mapping `categories` key.
  */
 function parseWatchdogDoc(
 	doc: Record<string, unknown>,
@@ -86,6 +199,7 @@ function parseWatchdogDoc(
 	instructions: string | undefined;
 	entries: AdvisorYamlEntry[];
 	sharedMaxNotesPerUpdate: number | undefined;
+	categories: Map<string, AdvisorCategoryConfig> | undefined;
 	warnings: string[];
 } {
 	const warnings: string[] = [];
@@ -99,6 +213,7 @@ function parseWatchdogDoc(
 		typeof rawMaxNotes === "number" && Number.isFinite(rawMaxNotes) && rawMaxNotes >= 1
 			? Math.trunc(rawMaxNotes)
 			: undefined;
+	const categories = parseCategories(doc.categories, path, warnings);
 	const rawAdvisors = doc.advisors;
 	if (rawAdvisors !== undefined && !Array.isArray(rawAdvisors)) {
 		warnings.push(`${path}: advisors must be a list — ignored`);
@@ -115,7 +230,64 @@ function parseWatchdogDoc(
 		}
 		entries.push(result);
 	}
-	return { instructions, entries, sharedMaxNotesPerUpdate, warnings };
+	return { instructions, entries, sharedMaxNotesPerUpdate, categories, warnings };
+}
+
+/**
+ * Resolve the active finding taxonomy for a roster.
+ *
+ * `declared` is the merged `categories` of every discovered file, or
+ * `undefined` when none declares the key; then {@link DEFAULT_ADVISOR_CATEGORIES}
+ * apply, each default owner only when the roster has an advisor of that name.
+ * A declared description is whitespace-collapsed; a declared `owner` resolves
+ * to the roster advisor with the same slug (an unknown owner is warned and
+ * kept). Each advisor's `owns` then claims ownerless categories in roster
+ * order; claiming an unknown category, or one another advisor already owns, is
+ * warned and ignored, so a category's own `owner` wins.
+ */
+export function resolveAdvisorCategories(
+	declared: ReadonlyMap<string, AdvisorCategoryConfig> | undefined,
+	advisors: readonly AdvisorConfig[],
+): { categories: AdvisorCategory[]; warnings: string[] } {
+	const warnings: string[] = [];
+	const rosterNames = new Map(advisors.map(advisor => [slugifyAdvisorName(advisor.name), advisor.name]));
+	const categories = new Map<string, AdvisorCategory>();
+	if (declared === undefined) {
+		for (const { owner, ...category } of DEFAULT_ADVISOR_CATEGORIES) {
+			const rosterOwner = owner === undefined ? undefined : rosterNames.get(slugifyAdvisorName(owner));
+			categories.set(category.id, rosterOwner === undefined ? { ...category } : { ...category, owner: rosterOwner });
+		}
+	} else {
+		for (const [id, config] of declared) {
+			const category: AdvisorCategory = { id, description: config.description.trim().replace(/\s+/g, " ") };
+			if (config.owner !== undefined) {
+				const rosterOwner = rosterNames.get(slugifyAdvisorName(config.owner));
+				if (rosterOwner === undefined) {
+					warnings.push(`category "${id}": owner "${config.owner}" is not a configured advisor`);
+				}
+				category.owner = rosterOwner ?? config.owner;
+			}
+			if (config.precedence !== undefined) category.precedence = config.precedence;
+			categories.set(id, category);
+		}
+	}
+	for (const advisor of advisors) {
+		for (const id of advisor.owns ?? []) {
+			const category = categories.get(id);
+			if (!category) {
+				warnings.push(`advisor "${advisor.name}": owns unknown category "${id}" — ignored`);
+				continue;
+			}
+			if (category.owner === undefined) {
+				category.owner = advisor.name;
+			} else if (slugifyAdvisorName(category.owner) !== slugifyAdvisorName(advisor.name)) {
+				warnings.push(
+					`advisor "${advisor.name}": category "${id}" is owned by "${category.owner}" — ownership kept`,
+				);
+			}
+		}
+	}
+	return { categories: [...categories.values()], warnings };
 }
 
 /**
@@ -183,15 +355,19 @@ function filterAdvisorTools(tools: string[] | undefined, sourcePath: string): st
  * Discover advisor configs from `WATCHDOG.yml`/`WATCHDOG.yaml` files on the same
  * user + project search path as `WATCHDOG.md`. Advisors are keyed by slug; a
  * more-specific file (project leaf > project ancestor > user) replaces an earlier
- * entry with the same slug. Top-level `instructions` across all files concatenate
- * into the shared baseline. A malformed file is logged and skipped — never
- * thrown — so a bad project config can't kill the session.
+ * entry with the same slug, and a more-specific `categories` entry replaces an
+ * earlier one with the same id; the taxonomy resolves against the merged roster
+ * via {@link resolveAdvisorCategories}. Top-level `instructions` across all
+ * files concatenate into the shared baseline. A malformed file is logged and
+ * skipped — never thrown — so a bad project config can't kill the session.
  */
 export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Promise<DiscoveredAdvisors> {
 	const items = await collectConfigCandidates(cwd, agentDir, ["WATCHDOG.yml", "WATCHDOG.yaml"]);
 	const advisors = new Map<string, AdvisorConfig>();
 	const sharedParts: string[] = [];
 	let sharedMaxNotesPerUpdate: number | undefined;
+	/** Merged `categories` by id, deeper files winning; undefined while no file declares the key. */
+	let declaredCategories: Map<string, AdvisorCategoryConfig> | undefined;
 	const warnings: string[] = [];
 	const warn = (message: string, context?: Record<string, unknown>): void => {
 		warnings.push(message);
@@ -214,6 +390,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 			instructions,
 			entries,
 			sharedMaxNotesPerUpdate: docSharedMaxNotes,
+			categories: docCategories,
 			warnings: docWarnings,
 		} = parseWatchdogDoc(parsed as Record<string, unknown>, item.path);
 		for (const message of docWarnings) warn(message, { path: item.path });
@@ -224,6 +401,11 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 		}
 
 		if (docSharedMaxNotes !== undefined) sharedMaxNotesPerUpdate = docSharedMaxNotes;
+
+		if (docCategories !== undefined) {
+			declaredCategories ??= new Map();
+			for (const [id, category] of docCategories) declaredCategories.set(id, category);
+		}
 
 		for (const entry of entries) {
 			const slug = slugifyAdvisorName(entry.name);
@@ -245,14 +427,19 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 						: undefined,
 				enabled: entry.enabled,
 				instructions: entryInstructions,
+				owns: normalizeOwns(entry.owns),
 			});
 		}
 	}
 
+	const roster = [...advisors.values()];
+	const { categories, warnings: categoryWarnings } = resolveAdvisorCategories(declaredCategories, roster);
+	for (const message of categoryWarnings) warn(message);
 	return {
-		advisors: [...advisors.values()],
+		advisors: roster,
 		sharedInstructions: sharedParts.length > 0 ? sharedParts.join("\n\n") : undefined,
 		sharedMaxNotesPerUpdate,
+		categories,
 		warnings,
 	};
 }
@@ -315,7 +502,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		logger.warn("Advisor config", { path: filePath, error: message });
 		return { advisors: [], warnings: [message] };
 	}
-	const { instructions, entries, sharedMaxNotesPerUpdate, warnings } = parseWatchdogDoc(
+	const { instructions, entries, sharedMaxNotesPerUpdate, categories, warnings } = parseWatchdogDoc(
 		parsed as Record<string, unknown>,
 		filePath,
 	);
@@ -332,11 +519,14 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		if (typeof a.maxNotesPerUpdate === "number" && Number.isFinite(a.maxNotesPerUpdate) && a.maxNotesPerUpdate >= 1) {
 			advisor.maxNotesPerUpdate = Math.trunc(a.maxNotesPerUpdate);
 		}
+		const owns = normalizeOwns(a.owns);
+		if (owns !== undefined) advisor.owns = owns;
 		return advisor;
 	});
 	const doc: WatchdogConfigDoc = { advisors };
 	if (instructions?.trim()) doc.instructions = instructions;
 	if (sharedMaxNotesPerUpdate !== undefined) doc.maxNotesPerUpdate = sharedMaxNotesPerUpdate;
+	if (categories !== undefined) doc.categories = Object.fromEntries(categories);
 	if (warnings.length > 0) doc.warnings = warnings;
 	return doc;
 }
@@ -380,6 +570,19 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 	) {
 		lines.push(`maxNotesPerUpdate: ${Math.trunc(doc.maxNotesPerUpdate)}`);
 	}
+	if (doc.categories !== undefined) {
+		const entries = Object.entries(doc.categories);
+		if (entries.length === 0) lines.push("categories: {}");
+		else lines.push("categories:");
+		for (const [id, category] of entries) {
+			lines.push(`  ${YAML.stringify(id)}:`);
+			appendYamlString(lines, "    ", "description", category.description);
+			if (category.owner?.trim()) lines.push(`    owner: ${YAML.stringify(category.owner)}`);
+			if (category.precedence !== undefined && Number.isFinite(category.precedence)) {
+				lines.push(`    precedence: ${category.precedence}`);
+			}
+		}
+	}
 	if (doc.advisors.length > 0) {
 		lines.push("advisors:");
 		for (const advisor of doc.advisors) {
@@ -392,6 +595,16 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 					lines.push("    tools:");
 					for (const tool of advisor.tools) {
 						lines.push(`      - ${YAML.stringify(tool)}`);
+					}
+				}
+			}
+			if (advisor.owns !== undefined) {
+				if (advisor.owns.length === 0) {
+					lines.push("    owns: []");
+				} else {
+					lines.push("    owns:");
+					for (const id of advisor.owns) {
+						lines.push(`      - ${YAML.stringify(id)}`);
 					}
 				}
 			}

@@ -12,14 +12,15 @@
  * 114× `Stop.`, 52× `No issue; continue.`, 41× `Done.` — flooding the primary
  * transcript with `<advisory severity="blocker">Stop.</advisory>` after the
  * task was already complete. The fix is to make the rules load-bearing in code
- * instead of prose: drop duplicates, content-free self-talk, and over-budget
- * calls at the `AdviseTool` admission boundary so the primary stays clean even when
- * the advisor misbehaves.
+ * instead of prose: drop content-free self-talk and over-budget calls at the
+ * `AdviseTool` admission boundary so the primary stays clean even when the
+ * advisor misbehaves. Cross-report dedupe belongs to the session findings
+ * ledger, which also decides which reports open a new finding and so consume
+ * the budget.
  *
- * The guard is the single admission authority: every decision carries a
- * truthful {@link AdvisorSuppressionReason} that `AdviseTool` surfaces
- * verbatim in its acknowledgment — a rejected note is never described as
- * recorded, and a rate-limited note is never mislabeled a duplicate.
+ * Every rejection carries a truthful {@link AdvisorSuppressionReason} that
+ * `AdviseTool` surfaces verbatim in its acknowledgment — a rejected note is
+ * never described as recorded, and a rate-limited note is never mislabeled.
  */
 
 /**
@@ -39,15 +40,15 @@ export function normalizeAdvisorNote(note: string): string {
 }
 
 /**
- * Dedupe key for one finding: the trimmed `where.ref` anchor plus the
+ * Dedupe key for one finding: the trimmed anchor identity plus the
  * {@link normalizeAdvisorNote normalized} defect; the normalized defect alone
- * without a ref. Empty when the defect normalizes to nothing.
+ * without an anchor. Empty when the defect normalizes to nothing.
  */
-export function advisorDedupeKey(defect: string, ref?: string): string {
+export function advisorDedupeKey(defect: string, anchor?: string): string {
 	const normalized = normalizeAdvisorNote(defect);
 	if (!normalized) return "";
-	const anchor = ref?.trim();
-	return anchor ? `${anchor}\n${normalized}` : normalized;
+	const trimmedAnchor = anchor?.trim();
+	return trimmedAnchor ? `${trimmedAnchor}\n${normalized}` : normalized;
 }
 
 /**
@@ -191,82 +192,51 @@ export function isNoFindingNote(note: string): boolean {
 	return marked;
 }
 
-/**
- * Bounds the dedupe history. Sessions with very long advisor activity could
- * otherwise grow the set without bound. The reporter's pathological session
- * had 92 unique notes; 4096 leaves headroom while staying tiny (≤ ~256 KB of
- * normalized strings even at long max).
- */
-const DEFAULT_HISTORY_CAPACITY = 4096;
-
-/** Maximum non-blocker advise notes allowed per update cycle across all configurations. */
+/** Maximum non-blocker new findings allowed per update cycle across all configurations. */
 export const ADVISOR_MAX_BUDGET_PER_UPDATE = 32;
 
-/** Default non-blocker advise notes allowed per update cycle when unspecified. */
+/** Default non-blocker new findings allowed per update cycle when unspecified. */
 export const ADVISOR_DEFAULT_BUDGET_PER_UPDATE = 4;
 
 /** Why the guard suppressed a note. Surfaced verbatim in the tool acknowledgment. */
-export type AdvisorSuppressionReason = "empty" | "noise" | "duplicate" | "rate-limit";
+export type AdvisorSuppressionReason = "empty" | "noise" | "rate-limit";
 
-/**
- * The guard's admission decision for one `advise()` call — the single source
- * of truth `AdviseTool` acts on; the tool never re-infers eviction or
- * suppression policy from its own state.
- */
+/** The guard's admission decision for one `advise()` call. */
 export interface AdvisorAdmission {
 	/** Whether the note may reach the primary (routed now or held for a deferred flush). */
 	accepted: boolean;
 	/** Why a suppressed note was rejected. Set only when `accepted` is false. */
 	reason?: AdvisorSuppressionReason;
 	/**
-	 * Normalized key of a still-pending note from the SAME update that this
-	 * admission displaced (budget full, strictly higher severity). The caller
-	 * MUST drop it from its pending backlog. Only pending notes are ever
-	 * displaced — a note already routed to the primary keeps its budget slot,
-	 * because a delivery cannot be retracted.
+	 * Key of a still-pending note from the SAME update that this admission
+	 * displaced (budget full, strictly higher severity). The caller MUST drop
+	 * it from its pending backlog. Only pending notes are ever displaced — a
+	 * note already routed to the primary keeps its budget slot, because a
+	 * delivery cannot be retracted.
 	 */
 	displacedKey?: string;
 }
 
 /**
- * Decides whether an advisor `advise()` call should reach the primary agent.
+ * Per-advisor validation backstop and rate limit for `advise()` calls.
  *
- * Enforces — in this order — the noise filter, session-scoped rank-aware
- * dedupe (FIFO-evicted at {@link DEFAULT_HISTORY_CAPACITY}), and a per-update
- * budget of admitted non-blocker notes. Suppressed calls never consume the
- * budget — a noise call doesn't burn the slot for a real concern that follows
- * in the same update. A `blocker` is exempt from the budget: it must always
- * interrupt, so a lower-severity note emitted earlier in the same update can
- * never rate-limit it out.
+ * Enforces — in this order — the empty/no-finding filter and a per-update
+ * budget of new non-blocker findings. Reports attached to an existing finding
+ * and suppressed calls never consume the budget. A `blocker` is exempt: it
+ * must always interrupt, so a lower-severity finding emitted earlier in the
+ * same update can never rate-limit it out.
  *
- * Dedupe is rank-aware: re-raising the same text at a strictly higher
- * severity is a real escalation (nit → concern → blocker), not a repeat, and
- * is admitted — an already-delivered nit re-raised as a blocker still
- * interrupts. Equal or lower severity re-raises stay suppressed, so an
- * advisor cannot bypass dedupe by retagging the same text sideways.
+ * When the budget is full, a strictly-higher-severity finding displaces the
+ * lowest-rank STILL-PENDING slot (a queued concern kicks out a queued nit) and
+ * the decision names the displaced note via
+ * {@link AdvisorAdmission.displacedKey}. Routed notes remain charged and
+ * cannot be displaced — delivery cannot be retracted to free a slot.
  *
- * The budget is rank-aware within a single update: when it is full, a
- * strictly-higher-severity note displaces the lowest-rank STILL-PENDING slot
- * (a queued concern kicks out a queued nit) and the decision names the
- * displaced note via {@link AdvisorAdmission.displacedKey}. Routed notes
- * remain charged and cannot be displaced — delivery cannot be retracted to
- * free a slot. With a budget of 1 this collapses to one non-blocker per
- * update with concern-evicts-pending-nit; with the default budget 4, up to 4
- * non-blockers are admitted before displacement applies.
- *
- * Reset on advisor reset (compaction, session switch, `/new`) via
- * {@link reset}. Per-update budget is cleared at the start of every advisor
- * `agent.prompt()` cycle via {@link beginUpdate} (driven by
- * `AdviseTool.beginUpdate`).
+ * Also counts malformed calls so each update allows a single corrected retry.
+ * Per-update state is cleared at the start of every advisor `agent.prompt()`
+ * cycle via {@link beginUpdate} and on advisor reset via {@link reset}.
  */
 export class AdvisorEmissionGuard {
-	/** Normalized key → highest admitted severity rank this session. A new call
-	 *  passes only when its rank strictly exceeds the recorded one (a real
-	 *  escalation), so equal/lower retags of the same text stay suppressed. */
-	#seen = new Map<string, number>();
-	/** Insertion-order log to drive FIFO eviction without a second Map. Keys are
-	 *  pushed on first admission only; escalations update the rank in place. */
-	#seenOrder: string[] = [];
 	/** Budget slots charged this update, in admission order. Length ≤
 	 *  #budgetPerUpdate. `pending` marks notes withheld behind an in-progress
 	 *  primary turn: only those may be displaced by a strictly-higher-rank
@@ -274,11 +244,11 @@ export class AdvisorEmissionGuard {
 	#slots: { key: string; rank: number; pending: boolean }[] = [];
 	/** Malformed `advise` calls rejected this update. */
 	#invalidCalls = 0;
-	readonly #capacity: number;
+	/** Reports on existing findings admitted for delivery as asides this update. */
+	#attachedAsides = 0;
 	readonly #budgetPerUpdate: number;
 
-	constructor(opts: { capacity?: number; budgetPerUpdate?: number } = {}) {
-		this.#capacity = opts.capacity ?? DEFAULT_HISTORY_CAPACITY;
+	constructor(opts: { budgetPerUpdate?: number } = {}) {
 		const budget = opts.budgetPerUpdate;
 		this.#budgetPerUpdate =
 			typeof budget === "number" && Number.isFinite(budget)
@@ -286,29 +256,33 @@ export class AdvisorEmissionGuard {
 				: ADVISOR_DEFAULT_BUDGET_PER_UPDATE;
 	}
 
-	/**
-	 * Drop all dedupe and per-update state. Called when the advisor runtime is
-	 * reset — same boundary as `yieldQueue.clear("advisor")`, so a re-primed
-	 * advisor can re-raise old issues (the primary transcript was rewritten).
-	 * Driven by `AdviseTool.resetDeliveredNotes()`.
-	 */
+	/** Drop all per-update state. Driven by `AdviseTool.resetDeliveredNotes()`. */
 	reset(): void {
-		this.#seen.clear();
-		this.#seenOrder.length = 0;
 		this.#slots = [];
 		this.#invalidCalls = 0;
+		this.#attachedAsides = 0;
 	}
 
 	/**
-	 * Clear the per-update budget. Called at the start of every advisor
-	 * `agent.prompt()` cycle (via `AdviseTool.beginUpdate`) so the next advisor
-	 * model cycle starts with a fresh budget. Notes still pending from earlier
-	 * updates keep their reservations — they hold no slot here and cannot be
-	 * displaced by the new update's admissions.
+	 * Clear the per-update budget, attached-aside count, and invalid-call
+	 * count. Notes still pending from earlier updates hold no slot here and
+	 * cannot be displaced by the new update's admissions.
 	 */
 	beginUpdate(): void {
 		this.#slots = [];
 		this.#invalidCalls = 0;
+		this.#attachedAsides = 0;
+	}
+
+	/**
+	 * Charge one aside report on an existing finding against this update.
+	 * Returns `false` once the update has delivered as many such asides as the
+	 * per-update budget; the report is then recorded but not delivered.
+	 */
+	admitAttachedAside(): boolean {
+		if (this.#attachedAsides >= this.#budgetPerUpdate) return false;
+		this.#attachedAsides++;
+		return true;
 	}
 
 	/**
@@ -322,118 +296,68 @@ export class AdvisorEmissionGuard {
 	}
 
 	/**
-	 * Record that a still-pending note was re-raised at a strictly higher
-	 * severity and is being escalated in place — no new admission, no extra
-	 * budget. Keeps the dedupe rank and any current-update slot coherent, so a
-	 * later equal/lower repeat of the finding stays suppressed and displacement
-	 * compares the note's real rank. The finding is identified by `defect` and
-	 * `ref` as in {@link admit}. No-op when `rank` does not exceed the recorded
-	 * rank.
+	 * Raise the rank of a still-pending note's current-update slot after it
+	 * was re-raised at a strictly higher severity and escalated in place.
 	 */
-	escalatePending(defect: string, rank: number, ref?: string): void {
-		const key = advisorDedupeKey(defect, ref);
-		if (!key) return;
-		const seenRank = this.#seen.get(key) ?? 0;
-		if (rank <= seenRank) return;
-		// Shares admit's bounded recording: a key that aged out of the FIFO
-		// history and is re-tracked here MUST re-enter the eviction queue,
-		// otherwise it becomes a permanent, unevictable entry.
-		this.#recordRank(key, rank);
+	escalatePending(key: string, rank: number): void {
 		const slot = this.#slots.find(s => s.key === key);
 		if (slot && slot.rank < rank) slot.rank = rank;
 	}
 
 	/**
-	 * Record the highest admitted rank for a key, FIFO-bounding the history:
-	 * first-seen keys enter the eviction queue and the oldest entry is dropped
-	 * beyond {@link #capacity}. The single recording path shared by {@link
-	 * admit} and {@link escalatePending}.
+	 * Mark a previously admitted pending note as routed to the primary. Its
+	 * budget slot — when still within the originating update — becomes
+	 * non-displaceable. No-op once the update boundary has cleared the slot.
 	 */
-	#recordRank(key: string, rank: number): void {
-		const isNew = !this.#seen.has(key);
-		this.#seen.set(key, rank);
-		if (!isNew) return;
-		this.#seenOrder.push(key);
-		if (this.#seenOrder.length > this.#capacity) {
-			const stale = this.#seenOrder.shift();
-			if (stale !== undefined) this.#seen.delete(stale);
-		}
-	}
-
-	/**
-	 * Mark a previously admitted pending finding (`defect` and `ref` as in
-	 * {@link admit}) as routed to the primary (a deferred flush delivered it).
-	 * Its budget slot — when still within the originating update — becomes
-	 * non-displaceable: a routed note cannot be retracted to free budget. No-op
-	 * once the update boundary has cleared the slot.
-	 */
-	markRouted(defect: string, ref?: string): void {
-		const key = advisorDedupeKey(defect, ref);
+	markRouted(key: string): void {
 		const slot = this.#slots.find(s => s.key === key);
 		if (slot) slot.pending = false;
 	}
 
 	/**
-	 * Decide whether the proposed finding may reach the primary. The decision
-	 * is the single admission authority: on `accepted` the guard has recorded
-	 * the note (consumed budget where due, updated the dedupe rank) and names
-	 * any displaced pending note; on rejection the `reason` is the truthful
-	 * classification for the advisor-facing acknowledgment.
-	 *
-	 * `defect` is filtered against the content-free phrase list and
-	 * {@link isNoFindingNote}, independent of the anchor. Dedupe keys on
-	 * {@link advisorDedupeKey}(`defect`, `ref`). `pending` declares the caller's
-	 * routing intent: withheld behind an in-progress primary turn (displaceable
-	 * by a later strictly-higher-rank admission this update) versus routed
-	 * immediately (charged, never displaceable). A note that fails the
-	 * noise/empty/dedupe filter never consumes the budget, so a suppressed
-	 * phrase cannot burn the update's slot ahead of a substantive concern.
+	 * Decide whether a report may reach the primary. `defect` is filtered
+	 * against the content-free phrase list and {@link isNoFindingNote}. A
+	 * report opening a new finding (`newFinding`) then takes a budget slot keyed
+	 * by `key`; `pending` declares the caller's routing intent: withheld behind
+	 * an in-progress primary turn (displaceable by a later strictly-higher-rank
+	 * admission this update) versus routed immediately (charged, never
+	 * displaceable).
 	 */
-	admit(defect: string, opts: { rank: number; pending: boolean; ref?: string }): AdvisorAdmission {
+	admit(defect: string, opts: { rank: number; pending: boolean; key: string; newFinding: boolean }): AdvisorAdmission {
 		const normalized = normalizeAdvisorNote(defect);
 		if (!normalized) return { accepted: false, reason: "empty" };
 		if (SUPPRESSED_NORMALIZED_PHRASES[normalized] || isNoFindingNote(defect)) {
 			return { accepted: false, reason: "noise" };
 		}
-		const key = advisorDedupeKey(defect, opts.ref);
-		const rank = opts.rank;
-		const seenRank = this.#seen.get(key) ?? 0;
-		if (rank <= seenRank) return { accepted: false, reason: "duplicate" };
-		// Admitted: a fresh note, or a strictly-higher-rank re-raise of an
-		// already-admitted note (a real escalation).
-		let displacedKey: string | undefined;
+		if (!opts.newFinding) return { accepted: true };
+		const { key, rank } = opts;
 		const ownSlot = this.#slots.find(s => s.key === key);
 		if (rank >= 3) {
-			// Blockers: unlimited per update — never dropped to the budget. A
-			// blocker escalation of a still-pending note releases its slot: the
-			// note now routes live, so the reservation will never flush. A
-			// routed slot stays charged — delivery cannot be retracted.
+			// A blocker escalation of a still-pending note releases its slot: the
+			// note now routes live, so the reservation will never flush.
 			if (ownSlot?.pending) this.#slots.splice(this.#slots.indexOf(ownSlot), 1);
-		} else if (ownSlot) {
-			// Same-update severity escalation of an already-admitted note (e.g. a
-			// routed nit re-raised as a concern): upgrade the slot's rank instead
-			// of charging a second slot for the same text.
-			ownSlot.rank = rank;
-		} else if (this.#slots.length < this.#budgetPerUpdate) {
-			this.#slots.push({ key, rank, pending: opts.pending });
-		} else {
-			// Budget full: a strictly-higher-rank note displaces the lowest-rank
-			// still-pending slot (concern kicks out a queued nit). Same or lower
-			// rank — or a budget spent entirely on routed notes — is rate-limited.
-			let minIndex = -1;
-			for (let i = 0; i < this.#slots.length; i++) {
-				const slot = this.#slots[i]!;
-				if (!slot.pending) continue;
-				if (minIndex === -1 || slot.rank < this.#slots[minIndex]!.rank) minIndex = i;
-			}
-			if (minIndex !== -1 && rank > this.#slots[minIndex]!.rank) {
-				displacedKey = this.#slots[minIndex]!.key;
-				this.#slots[minIndex] = { key, rank, pending: opts.pending };
-			} else {
-				return { accepted: false, reason: "rate-limit" };
-			}
+			return { accepted: true };
 		}
-		this.#recordRank(key, rank);
-		return displacedKey === undefined ? { accepted: true } : { accepted: true, displacedKey };
+		if (ownSlot) {
+			if (ownSlot.rank < rank) ownSlot.rank = rank;
+			return { accepted: true };
+		}
+		if (this.#slots.length < this.#budgetPerUpdate) {
+			this.#slots.push({ key, rank, pending: opts.pending });
+			return { accepted: true };
+		}
+		// Budget full: a strictly-higher-rank note displaces the lowest-rank
+		// still-pending slot. Same or lower rank — or a budget spent entirely on
+		// routed notes — is rate-limited.
+		let minIndex = -1;
+		for (let i = 0; i < this.#slots.length; i++) {
+			const slot = this.#slots[i]!;
+			if (!slot.pending) continue;
+			if (minIndex === -1 || slot.rank < this.#slots[minIndex]!.rank) minIndex = i;
+		}
+		if (minIndex === -1 || rank <= this.#slots[minIndex]!.rank) return { accepted: false, reason: "rate-limit" };
+		const displacedKey = this.#slots[minIndex]!.key;
+		this.#slots[minIndex] = { key, rank, pending: opts.pending };
+		return { accepted: true, displacedKey };
 	}
 }

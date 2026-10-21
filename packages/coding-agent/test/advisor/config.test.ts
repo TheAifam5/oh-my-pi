@@ -157,6 +157,93 @@ describe("discoverAdvisorConfigs", () => {
 		expect(result.advisors).toEqual([]);
 		expect(result.sharedInstructions).toBeUndefined();
 	});
+
+	it("uses the bundled taxonomy without declared categories, with default owners only for configured advisors", async () => {
+		await Bun.write(
+			path.join(tmp, "WATCHDOG.yml"),
+			["advisors:", "  - name: security", "  - name: Reviewer"].join("\n"),
+		);
+		const { categories, warnings } = await discoverAdvisorConfigs(tmp, agentDir);
+		expect(categories.map(category => category.id)).toEqual([
+			"logic",
+			"security",
+			"concurrency",
+			"verification",
+			"docs",
+			"delivery",
+			"migration",
+			"ui",
+			"style",
+			"architecture",
+		]);
+		expect(categories.find(category => category.id === "security")).toMatchObject({
+			owner: "security",
+			precedence: 1,
+		});
+		expect(categories.filter(category => category.owner !== undefined).map(category => category.id)).toEqual([
+			"security",
+		]);
+		expect(warnings).toEqual([]);
+	});
+
+	it("layers declared categories user then project and merges advisor `owns`, the category owner winning", async () => {
+		await Bun.write(
+			path.join(agentDir, "WATCHDOG.yml"),
+			[
+				"categories:",
+				"  perf:",
+				"    description: User-level performance.",
+				"  api:",
+				"    description: Public API shape.",
+				"    owner: Architecture",
+			].join("\n"),
+		);
+		await Bun.write(
+			path.join(tmp, "WATCHDOG.yml"),
+			[
+				"categories:",
+				"  perf:",
+				"    description: Hot paths and allocations.",
+				"    precedence: 2",
+				"  broken: not-a-mapping",
+				"advisors:",
+				"  - name: Architecture",
+				"  - name: Speed",
+				"    owns: [perf, api, ' nope ', perf]",
+			].join("\n"),
+		);
+		const { advisors, categories, warnings } = await discoverAdvisorConfigs(tmp, agentDir);
+		expect(advisors.find(advisor => advisor.name === "Speed")?.owns).toEqual(["perf", "api", "nope"]);
+		expect(categories).toEqual([
+			{ id: "perf", description: "Hot paths and allocations.", precedence: 2, owner: "Speed" },
+			{ id: "api", description: "Public API shape.", owner: "Architecture" },
+		]);
+		expect(warnings).toHaveLength(3);
+		expect(warnings[0]).toContain('category "broken" dropped');
+		expect(warnings[1]).toContain('"api" is owned by "Architecture"');
+		expect(warnings[2]).toContain('unknown category "nope"');
+	});
+
+	it("keeps an explicitly empty taxonomy empty", async () => {
+		await Bun.write(path.join(tmp, "WATCHDOG.yml"), ["categories: {}", "advisors:", "  - name: Security"].join("\n"));
+		expect((await discoverAdvisorConfigs(tmp, agentDir)).categories).toEqual([]);
+	});
+
+	it("round-trips categories and `owns` through the editor file", async () => {
+		const file = path.join(tmp, "WATCHDOG.yml");
+		const doc: WatchdogConfigDoc = {
+			categories: {
+				perf: { description: "Hot paths.", owner: "Speed", precedence: 2 },
+				"api-shape": { description: "Line one.\nLine two.\n" },
+			},
+			advisors: [
+				{ name: "Speed", owns: ["perf"] },
+				{ name: "Quiet", owns: [] },
+			],
+		};
+		await saveWatchdogConfigFile(file, doc);
+		expect(await loadWatchdogConfigFile(file)).toEqual(doc);
+	});
 });
 
 describe("slugifyAdvisorName", () => {

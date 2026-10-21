@@ -44,15 +44,20 @@ import { extractHttpStatusFromError, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import {
 	ADVISOR_DEFAULT_BUDGET_PER_UPDATE,
+	ADVISOR_FINDINGS_ENTRY_TYPE,
 	ADVISOR_DEFAULT_TOOL_NAMES,
 	ADVISOR_MAX_BUDGET_PER_UPDATE,
 	ADVISOR_SYNC_BACKLOG_MODES,
 	AdviseTool,
+	type AdvisorAdvice,
 	type AdvisorAgent,
+	type AdvisorCategory,
 	type AdvisorReviewMode,
 	AdvisorEmissionGuard,
+	type AdvisorFinding,
+	AdvisorFindingsLedger,
+	type AdvisorReport,
 	type AdvisorHeldUpdates,
-	type AdvisorKind,
 	AdvisorLoopGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
@@ -62,16 +67,29 @@ import {
 	type AdvisorSeverity,
 	type AdvisorSyncBacklog,
 	AdvisorTranscriptRecorder,
+	type AnchorIdentityContext,
+	advisorSeverityRank,
 	advisorTranscriptFilename,
 	buildAdvisorQuarantineSourceText,
+	canReadFileAnchor,
 	compareAdvisorNotes,
+	type FindingsJudgeCandidates,
+	type FindingsJudgeSettings,
+	discoverWorkspaceRoots,
+	fileAnchorLinePresent,
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
 	isAdvisorInterruptImmuneTurnActive,
 	isClassifierRefusal,
+	isInterruptingSeverity,
+	judgeFindingGroups,
 	meetsAdvisorSeverity,
+	normalizeAdvisorNote,
 	quarantineAdvisorUnsafeOutput,
+	renderFindingsDigest,
+	resolveAdvisorCategories,
 	resolveAdvisorDeliveryChannel,
+	resolveAnchorIdentity,
 	slugifyAdvisorName,
 } from "../advisor";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
@@ -85,6 +103,7 @@ import {
 import { MODEL_ROLES } from "../config/model-roles";
 import { serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/service-tier";
 import type { Settings } from "../config/settings";
+import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "../cursor";
 import { bridgeToolMap } from "../cursor-bridge-tools";
 import { estimateContextToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -92,6 +111,7 @@ import type { PlanModeState } from "../plan-mode/state";
 import advisorBoundaryGuidance from "../prompts/advisor/boundary-guidance.md" with { type: "text" };
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { isAllowedWithoutPrompt } from "../tools/approval";
 import {
 	AUTO_THINKING,
 	concreteThinkingLevel,
@@ -125,7 +145,12 @@ import type { YieldQueue } from "./yield-queue";
 
 import {
 	cfgAdvisorContinueSeverity,
+	cfgAdvisorAggregationJudgeAllowCrossProvider,
+	cfgAdvisorAggregationJudgeEnabled,
+	cfgAdvisorAggregationJudgeModel,
+	cfgAdvisorAggregationJudgeTimeoutMs,
 	cfgAdvisorEvictStaleResults,
+	cfgAdvisorFindingsDigest,
 	cfgAdvisorImmuneTurns,
 	cfgAdvisorMaxNotesPerUpdate,
 	cfgAdvisorReviewInterval,
@@ -250,6 +275,27 @@ export function planAdvisorUsageLimitWait(args: {
  */
 const ADVISOR_BOUNDARY_GUIDANCE = advisorBoundaryGuidance.trim();
 const ADVISOR_BOUNDARY_GUIDANCE_TURNS = 50;
+
+/** One report buffered during a terminal-boundary window. */
+interface BoundaryReport {
+	note: AdvisorNote;
+	advice: AdvisorAdvice;
+}
+
+/**
+ * The line a corroborating report adds under its finding's lead note: its
+ * advisor, then its defect, impact, and fix where they differ from the lead's.
+ * Empty when nothing differs.
+ */
+function corroborationLine(lead: AdvisorAdvice, report: BoundaryReport): string {
+	const parts: string[] = [];
+	for (const field of ["defect", "impact", "fix"] as const) {
+		const value = report.advice[field]?.trim();
+		if (!value || normalizeAdvisorNote(value) === normalizeAdvisorNote(lead[field] ?? "")) continue;
+		parts.push(field === "defect" ? value : `→ ${value}`);
+	}
+	return parts.length === 0 ? "" : `\n${report.note.advisor ?? "default"}: ${parts.join(" ")}`;
+}
 
 /**
  * Last genuine user-turn initiator in the transcript. Agent-attributed
@@ -449,6 +495,8 @@ export interface SessionAdvisorsOptions {
 	/** Active memory backend's developer instructions, wrapped for advisors. */
 	memoryPrompt?: string;
 	configs?: AdvisorConfig[];
+	/** Active finding taxonomy; omitted resolves the defaults against `configs`. */
+	categories?: readonly AdvisorCategory[];
 	/** WATCHDOG.yml problems found during discovery; surfaced once as a warning. */
 	configWarnings?: string[];
 	streamFn?: StreamFn;
@@ -541,6 +589,12 @@ export interface SessionAdvisorsHost {
 	restrictOAuthAccounts(providerSessionId: string): void;
 }
 
+/** Outcome of a user `/advisor findings` change and the finding it acted on (absent when `missing`). */
+export interface AdvisorFindingCommandResult<R extends string> {
+	result: R;
+	finding?: AdvisorFinding;
+}
+
 /**
  * One advisor's status-line slice: runtime status plus whether it has
  * finished reviewing the current yield — i.e. it is not going to add any
@@ -570,6 +624,14 @@ export class SessionAdvisors {
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
+	/** Active finding taxonomy; every advisor's `advise` enumerates its ids. */
+	#advisorCategories: readonly AdvisorCategory[];
+	/** Session findings ledger shared by every advisor; survives runtime rebuilds. */
+	readonly #findings: AdvisorFindingsLedger;
+	/** Whether the unsupported `advisor.aggregation.judge.model` warning was logged. */
+	#findingsJudgeModelWarned = false;
+	/** Tail of the serialized findings judge passes; never rejects. */
+	#findingsJudgePass: Promise<void> = Promise.resolve();
 	#advisorConfigWarnings: string[];
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
 	#advisorProviderSessionIds = new Map<string, string>();
@@ -617,7 +679,13 @@ export class SessionAdvisors {
 	 * merged message when the window closes (#flushAdvisorBoundaryNotes), so N
 	 * simultaneous notes never force N separate cards or continuation turns.
 	 */
-	#advisorBoundaryNotes: AdvisorNote[] = [];
+	#advisorBoundaryNotes: BoundaryReport[] = [];
+	/**
+	 * Anchor identities whose findings interrupted the primary this primary
+	 * turn: those findings, the highest interrupting rank, and whether the
+	 * one strictly-higher re-interrupt was spent. Cleared at each turn end.
+	 */
+	#anchorInterrupts = new Map<string, { findings: Set<string>; rank: number; raised: boolean }>();
 	/** Primary-turn count when the staleness header last shipped; `undefined`
 	 *  until the first merged delivery. Gates {@link ADVISOR_BOUNDARY_GUIDANCE}
 	 *  to at most once per {@link ADVISOR_BOUNDARY_GUIDANCE_TURNS} turns. */
@@ -640,9 +708,16 @@ export class SessionAdvisors {
 		this.#advisorContextPrompt = options.contextPrompt;
 		this.#advisorMemoryPrompt = options.memoryPrompt;
 		this.#advisorConfigs = options.configs;
+		this.#advisorCategories =
+			options.categories ?? resolveAdvisorCategories(undefined, options.configs ?? []).categories;
 		this.#advisorConfigWarnings = options.configWarnings ?? [];
 		this.#advisorStreamFn = options.streamFn;
 		this.#transformProviderContext = options.transformProviderContext;
+		this.#findings = new AdvisorFindingsLedger({
+			ownerOf: category => this.#liveCategoryOwner(category),
+			onChange: () => this.#persistFindings(),
+		});
+		this.#loadFindingsFromBranch();
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
@@ -657,6 +732,8 @@ export class SessionAdvisors {
 		// Delivery state follows primary boundaries even when review cadence skips a callback.
 		this.#advisorPrimaryWillContinue = willContinue === true;
 		this.#advisorPrimaryTurnsCompleted++;
+		this.#findings.advanceTurn();
+		this.#anchorInterrupts.clear();
 		// Marks the terminal-boundary window (flush + catch-up wait) for
 		// #routeAdvice: the loop still reports isStreaming here, but the turn IS
 		// final, so non-blocker notes must preserve instead of steering a fresh
@@ -1097,6 +1174,7 @@ export class SessionAdvisors {
 		this.#advisorAutoResumeSuppressed = false;
 		this.#advisorBoundaryNotes = [];
 		this.#advisorBoundaryGuidanceLastTurn = undefined;
+		this.#loadFindingsFromBranch();
 		this.#host.yieldQueue.clear("advisor");
 		this.#host.extractQueuedAdvisorCards();
 		this.#host.dropPendingAdvisorCards();
@@ -1330,10 +1408,6 @@ export class SessionAdvisors {
 			// suppression reason, and pending-note displacement; the tool routes
 			// accepted notes and acknowledges truthfully. No separate accept wrapper.
 			const emissionGuard = new AdvisorEmissionGuard({ budgetPerUpdate });
-			const adviseTool = new AdviseTool(
-				(note, severity, turn, kind) => this.#routeAdvice(advisorRef, note, severity, turn, kind),
-				emissionGuard,
-			);
 
 			// `#advisorWatchdogPrompt` already carries WATCHDOG.md + YAML shared
 			// instructions; `config.instructions` adds this advisor's specialization.
@@ -1352,6 +1426,29 @@ export class SessionAdvisors {
 			const names =
 				config.tools === undefined ? new Set([...ADVISOR_DEFAULT_TOOL_NAMES, "recall"]) : new Set(config.tools);
 			const tools = (this.#advisorTools ?? []).filter(t => names.has(t.name));
+			const readTool = tools.find(tool => tool.name === "read");
+			const anchorContext = async (): Promise<AnchorIdentityContext> => {
+				const cwd = this.#host.sessionManager.getCwd();
+				const toolContext = this.#advisorGetToolContext?.();
+				const sessionId = this.#host.sessionManager.getSessionId();
+				return {
+					cwd,
+					roots: await discoverWorkspaceRoots(cwd),
+					canRead: absolutePath =>
+						readTool !== undefined &&
+						isAllowedWithoutPrompt(readTool, { path: absolutePath }, toolContext, sessionId),
+				};
+			};
+			const adviseTool = new AdviseTool(advice => this.#routeAdvice(advisorRef, advice), emissionGuard, {
+				ledger: this.#findings,
+				advisor: advisorName,
+				categories: this.#advisorCategories.map(category => ({
+					id: category.id,
+					description: category.description,
+					owned: category.owner !== undefined && slugifyAdvisorName(category.owner) === slug,
+				})),
+				resolveAnchorIdentity: async where => resolveAnchorIdentity(where, await anchorContext()),
+			});
 			const advisorLoopTools: AgentTool<any>[] = [adviseTool, ...tools];
 			const advisorToolMap = new Map<string, AgentTool<any>>();
 			for (const tool of advisorLoopTools) {
@@ -1526,12 +1623,23 @@ export class SessionAdvisors {
 			});
 
 			const advisorAgentFacade: AdvisorAgent = {
-				prompt: async input => {
+				prompt: async update => {
 					let quarantined: string | undefined;
 					advisorLoopGuard.reset();
 					advisorLoopGuardStopped = false;
+					const reportsBefore = new Set(this.#findings.list().flatMap(finding => finding.reports));
 					try {
 						quarantinedAdvisorOutput = undefined;
+						const digest = await this.#findingsDigest(advisorName, anchorContext).catch(err => {
+							logger.debug("advisor findings digest skipped", { error: String(err) });
+							return undefined;
+						});
+						const input =
+							digest === undefined
+								? update
+								: Array.isArray(update)
+									? [...update, { role: "user" as const, content: digest, timestamp: Date.now() }]
+									: `${update}\n\n${digest}`;
 						// Multi-message input (candidate 4) must serialize deterministically
 						// for quarantine source text; reuse the session history formatter
 						// rather than ad-hoc joins so all message kinds (text/tool/
@@ -1555,6 +1663,7 @@ export class SessionAdvisors {
 						currentAdvisorInput = "";
 					}
 					if (quarantined) throw new AdvisorOutputQuarantinedError(quarantined);
+					await this.#judgeUpdateFindings(reportsBefore);
 				},
 				abort: reason => advisorAgent.abort(reason),
 				reset: () => {
@@ -1730,17 +1839,15 @@ export class SessionAdvisors {
 	 * on resume); a live-streaming turn is steered in directly. Never re-runs
 	 * admission — the note cleared the emission guard inside AdviseTool when it was
 	 * emitted, so a deferred flush replays the backlog without re-filtering.
+	 * `advice` carries the structured finding, its category, and its anchor.
 	 */
-	#routeAdvice(
-		advisor: ActiveAdvisor,
-		note: string,
-		severity: AdvisorSeverity | undefined,
-		turn: number | undefined,
-		kind: AdvisorKind,
-	): void {
+	#routeAdvice(advisor: ActiveAdvisor, advice: AdvisorAdvice): void {
+		const { turn } = advice;
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
+		const finding = advice.finding === undefined ? undefined : this.#findings.get(advice.finding);
+		const entry = this.#findingNote(advice, source, finding);
 		// Inside a terminal-boundary callback (deferred flush + catch-up wait) the
 		// loop still reports streaming, so a delivered note would steer a fresh turn
 		// — waking the primary to act on advice produced against work that already
@@ -1751,16 +1858,12 @@ export class SessionAdvisors {
 		// one merged continuation, otherwise one preserved card re-enters context on
 		// the next user turn.
 		if (this.#advisorTerminalBoundaryOpen) {
-			this.#advisorBoundaryNotes.push({
-				note,
-				severity,
-				kind,
-				advisor: source,
-				turn: turn ?? this.#advisorPrimaryTurnsCompleted,
-			});
+			entry.turn = turn ?? this.#advisorPrimaryTurnsCompleted;
+			this.#advisorBoundaryNotes.push({ note: entry, advice });
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, kind, advisor: source }];
+		const severity = this.#routingSeverity(advice, finding);
+		const notes: AdvisorNote[] = [entry];
 		const terminalAnswerNoQueuedWork = this.#hasTerminalTextAnswerWithoutQueuedWork();
 		// A note that lands after the boundary window closed (catch-up off, or a
 		// review slower than its wait) gets exactly what the merged boundary flush
@@ -1784,31 +1887,125 @@ export class SessionAdvisors {
 			interruptImmuneTurnActive: this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, kind, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", entry);
 			return;
 		}
 		this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), channel === "steer");
 	}
 
 	/**
+	 * The severity a report routes at; undefined routes it as an aside. A
+	 * relation report other than a severity-raising `escalates` is an aside.
+	 * One interrupt per finding: once a report on the finding interrupted the
+	 * primary, later reports are asides unless they raised the finding's
+	 * severity. One interrupt per anchor per primary turn: once a finding on
+	 * the same anchor identity interrupted, a report on another finding there
+	 * interrupts only at a strictly higher severity, and only once.
+	 */
+	#routingSeverity(advice: AdvisorAdvice, finding: AdvisorFinding | undefined): AdvisorSeverity | undefined {
+		if (advice.aside) return undefined;
+		if (finding?.interrupted && !advice.escalated) return undefined;
+		if (!finding || !isInterruptingSeverity(advice.severity)) return advice.severity;
+		const window = this.#anchorInterrupts.get(finding.identity);
+		if (!window || window.findings.has(finding.id)) return advice.severity;
+		return !window.raised && advisorSeverityRank(advice.severity) > window.rank ? advice.severity : undefined;
+	}
+
+	/** Record that a report on finding `id` interrupted the primary at `severity` in this primary turn. */
+	#recordAnchorInterrupt(id: string, severity: AdvisorSeverity | undefined): void {
+		const finding = this.#findings.get(id);
+		if (!finding) return;
+		const rank = advisorSeverityRank(severity);
+		const window = this.#anchorInterrupts.get(finding.identity);
+		if (!window) {
+			this.#anchorInterrupts.set(finding.identity, { findings: new Set([id]), rank, raised: false });
+			return;
+		}
+		if (!window.findings.has(id) && rank > window.rank) window.raised = true;
+		window.findings.add(id);
+		window.rank = Math.max(window.rank, rank);
+	}
+
+	/** The primary-facing note for one report, carrying its finding's id, category, owner, and reporters. */
+	#findingNote(advice: AdvisorAdvice, source: string | undefined, finding: AdvisorFinding | undefined): AdvisorNote {
+		const note: AdvisorNote = { note: advice.note, severity: advice.severity, kind: advice.kind, advisor: source };
+		if (advice.relation) note.relation = advice.relation;
+		if (!finding) return note;
+		note.finding = finding.id;
+		if (finding.category) note.category = finding.category;
+		if (finding.owner) note.owner = finding.owner;
+		note.reporters = this.#findings.reporters(finding);
+		return note;
+	}
+
+	/**
 	 * Merged delivery of everything routed during a terminal-boundary window.
 	 * One message per boundary, carrying every note with per-advisor and
 	 * per-severity attribution, headed by {@link ADVISOR_BOUNDARY_GUIDANCE} so
-	 * the primary reads stale review output critically. Steering is decided per
-	 * note by the same {@link resolveAdvisorDeliveryChannel} policy live routing
-	 * uses — user-stop suppression, headless/terminal-yield preservation, and
-	 * the post-interrupt cooldown all gate a final-review continuation exactly
-	 * as they gate a live steer. The batch steers at most ONE continuation, only
+	 * the primary reads stale review output critically. Reports on one finding
+	 * merge into one note: the owner's report leads, and every other report
+	 * adds its differing impact/fix as a line. Steering is decided per note by
+	 * the same {@link resolveAdvisorDeliveryChannel} policy live routing uses —
+	 * user-stop suppression, headless/terminal-yield preservation, and the
+	 * post-interrupt cooldown all gate a final-review continuation exactly as
+	 * they gate a live steer. The batch steers at most ONE continuation, only
 	 * when a note qualifies on its own merits: its severity meets
 	 * `advisor.continueSeverity` (the advisor continuation latch prevents a
 	 * cascade). Otherwise preserves as a single visible card.
 	 */
 	#flushAdvisorBoundaryNotes(): void {
 		if (this.#advisorBoundaryNotes.length === 0) return;
-		// Newest turn first, then severity: the latest notes describe the current
-		// state of the work; older ones may already be resolved by it.
-		const notes = [...this.#advisorBoundaryNotes].sort(compareAdvisorNotes);
+		const reports = this.#advisorBoundaryNotes;
 		this.#advisorBoundaryNotes = [];
+		const merged: (BoundaryReport & { severity: AdvisorSeverity | undefined })[] = [];
+		const byFinding = new Map<string, (typeof merged)[number]>();
+		for (const report of this.#ownerReportsFirst(reports)) {
+			const finding = report.note.finding === undefined ? undefined : this.#findings.get(report.note.finding);
+			const severity = this.#routingSeverity(report.advice, finding);
+			const lead = finding ? byFinding.get(finding.id) : undefined;
+			if (!lead) {
+				const item = { note: { ...report.note }, advice: report.advice, severity };
+				merged.push(item);
+				if (finding) {
+					byFinding.set(finding.id, item);
+					item.note.reporters = this.#findings.reporters(finding);
+				}
+				continue;
+			}
+			lead.note.note += corroborationLine(lead.advice, report);
+			if (report.note.severity && !meetsAdvisorSeverity(lead.note.severity, report.note.severity)) {
+				lead.note.severity = report.note.severity;
+			}
+			if (severity && !meetsAdvisorSeverity(lead.severity, severity)) lead.severity = severity;
+			if (report.note.turn !== undefined && (lead.note.turn === undefined || report.note.turn > lead.note.turn)) {
+				lead.note.turn = report.note.turn;
+			}
+		}
+		// One interrupt per anchor: the batch is one delivery, and each anchor's
+		// findings stay together, led by the highest-precedence category.
+		const groups = new Map<string, (typeof merged)[number][]>();
+		for (const item of merged) {
+			const finding = item.note.finding === undefined ? undefined : this.#findings.get(item.note.finding);
+			const anchor = finding?.identity ?? item.advice.anchorIdentity;
+			const group = groups.get(anchor);
+			if (group) group.push(item);
+			else groups.set(anchor, [item]);
+		}
+		// Categories without a precedence rank 0.
+		const precedence = (id: string | undefined): number =>
+			this.#advisorCategories.find(category => category.id === id)?.precedence ?? 0;
+		for (const group of groups.values()) {
+			group.sort((a, b) => precedence(b.note.category) - precedence(a.note.category));
+		}
+		// Newest turn first, then severity: the latest notes describe the current
+		// state of the work; older ones may already be resolved by it. An anchor
+		// group stays together behind its lead.
+		merged.splice(
+			0,
+			merged.length,
+			...[...groups.values()].sort((a, b) => compareAdvisorNotes(a[0]!.note, b[0]!.note)).flat(),
+		);
+		const notes = merged.map(item => item.note);
 		for (const n of notes) {
 			if (n.turn !== undefined && this.#advisorPrimaryTurnsCompleted > n.turn) {
 				n.turnsAgo = this.#advisorPrimaryTurnsCompleted - n.turn;
@@ -1823,8 +2020,21 @@ export class SessionAdvisors {
 		this.#deliverAdvisorBatch(
 			notes,
 			content,
-			notes.some(n => this.#continuesFinishedRun(n.severity)),
+			merged.some(item => this.#continuesFinishedRun(item.severity)),
 		);
+	}
+
+	/** Boundary reports in arrival order, except each finding's owner report moves ahead of the others on it. */
+	#ownerReportsFirst(reports: readonly BoundaryReport[]): BoundaryReport[] {
+		const ordered = [...reports];
+		for (const report of reports) {
+			const { finding, owner, advisor } = report.note;
+			if (finding === undefined || owner === undefined || advisor !== owner) continue;
+			const first = ordered.findIndex(other => other.note.finding === finding);
+			const index = ordered.indexOf(report);
+			if (first < index) ordered.splice(first, 0, ...ordered.splice(index, 1));
+		}
+		return ordered;
 	}
 
 	/**
@@ -1878,6 +2088,12 @@ export class SessionAdvisors {
 				// arming earlier would downgrade the next `advisor.immuneTurns` worth of
 				// real concerns/blockers to skip-idle-flush asides (#5628 review).
 				this.#recordAdvisorInterruptDelivered();
+				for (const note of notes) {
+					if (note.finding !== undefined && isInterruptingSeverity(note.severity)) {
+						this.#findings.markInterrupted(note.finding);
+						this.#recordAnchorInterrupt(note.finding, note.severity);
+					}
+				}
 				// A steer into a run still working only redirects it; one delivered
 				// while idle or past a terminal boundary starts the continuation
 				// that must not schedule another review.
@@ -1913,6 +2129,7 @@ export class SessionAdvisors {
 			a.usageLimitRetries = 0;
 			if (compacted) this.#releaseRefusalPin(a);
 		}
+		if (compacted) this.#findings.compact();
 	}
 
 	#stopAdvisorRuntime(): void {
@@ -2769,9 +2986,10 @@ export class SessionAdvisors {
 
 	/**
 	 * Replace the live advisor roster from an edited `WATCHDOG.yml` (the `/advisor
-	 * configure` save path). Swaps the configs + shared baseline, then rebuilds the
-	 * runtimes in place so the change applies without a restart. When the advisor is
-	 * disabled the new configs are simply stored for the next enable.
+	 * configure` save path). Swaps the configs, shared baseline, and finding
+	 * taxonomy (omitted resolves the defaults against `advisors`), then rebuilds
+	 * the runtimes in place so the change applies without a restart. When the
+	 * advisor is disabled the new configs are simply stored for the next enable.
 	 *
 	 * @returns the number of advisors active after the rebuild.
 	 */
@@ -2779,12 +2997,191 @@ export class SessionAdvisors {
 		advisors: AdvisorConfig[],
 		sharedInstructions: string | undefined,
 		sharedMaxNotesPerUpdate?: number,
+		categories?: readonly AdvisorCategory[],
 	): number {
 		this.#advisorConfigs = advisors;
 		this.#advisorSharedInstructions = sharedInstructions;
 		this.#advisorSharedMaxNotesPerUpdate = sharedMaxNotesPerUpdate;
+		this.#advisorCategories = categories ?? resolveAdvisorCategories(undefined, advisors).categories;
 		this.#rebuildAdvisorRuntime();
 		return this.#advisors.length;
+	}
+
+	/** The active finding taxonomy. */
+	getAdvisorCategories(): readonly AdvisorCategory[] {
+		return this.#advisorCategories;
+	}
+
+	/**
+	 * Whether category `id` has a live owner: its owner advisor has a built
+	 * runtime whose status is `running`.
+	 */
+	advisorCategoryHasLiveOwner(id: string): boolean {
+		const owner = this.#advisorCategories.find(category => category.id === id)?.owner;
+		if (owner === undefined) return false;
+		const slug = slugifyAdvisorName(owner);
+		return (
+			this.#advisors.some(advisor => advisor.slug === slug) && this.#advisorStatuses.get(slug)?.status === "running"
+		);
+	}
+
+	/** The session findings ledger's findings, oldest first. */
+	getAdvisorFindings(): readonly AdvisorFinding[] {
+		return this.#findings.list();
+	}
+
+	/**
+	 * Resolve finding `id` for the user (`/advisor findings resolve`). `id`
+	 * may name a finding merged into another one; the result names the
+	 * finding acted on. The change persists to the session.
+	 */
+	resolveAdvisorFinding(id: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
+		const finding = this.#findings.get(id);
+		if (!finding) return { result: "missing" };
+		return { result: this.#findings.resolve(finding.id) ? "resolved" : "closed", finding };
+	}
+
+	/**
+	 * Reopen a resolved or expired finding (`/advisor findings reopen`).
+	 * `superseded` when an open finding already holds its category and
+	 * anchor. The change persists to the session.
+	 */
+	reopenAdvisorFinding(id: string): AdvisorFindingCommandResult<"reopened" | "open" | "missing" | "superseded"> {
+		const finding = this.#findings.get(id);
+		if (!finding) return { result: "missing" };
+		return { result: this.#findings.reopen(finding.id), finding };
+	}
+
+	/**
+	 * End-of-update judge pass ({@link judgeFindingGroups}) over the open
+	 * findings that gained a report not in `reportsBefore`, under
+	 * `advisor.aggregation.judge`. Passes of parallel advisors run one at a
+	 * time, each on the ledger the previous one left. Errors leave the ledger
+	 * unchanged.
+	 */
+	#judgeUpdateFindings(reportsBefore: ReadonlySet<AdvisorReport>): Promise<void> {
+		const pass = this.#findingsJudgePass.then(() => this.#runFindingsJudgePass(reportsBefore));
+		this.#findingsJudgePass = pass.catch(error => {
+			logger.warn("advisor findings judge pass failed", { error: String(error) });
+		});
+		return this.#findingsJudgePass;
+	}
+
+	async #runFindingsJudgePass(reportsBefore: ReadonlySet<AdvisorReport>): Promise<void> {
+		const settings = this.#host.settings;
+		const judgeSettings: FindingsJudgeSettings = {
+			enabled: cfgAdvisorAggregationJudgeEnabled.get(settings),
+			model: cfgAdvisorAggregationJudgeModel.get(settings),
+			timeoutMs: cfgAdvisorAggregationJudgeTimeoutMs.get(settings),
+			allowCrossProvider: cfgAdvisorAggregationJudgeAllowCrossProvider.get(settings),
+		};
+		if (!judgeSettings.enabled) return;
+		const touched = this.#findings
+			.list()
+			.filter(finding => finding.status === "open" && finding.reports.some(report => !reportsBefore.has(report)));
+		if (touched.length === 0) return;
+		const judge = this.#findingsJudge(judgeSettings.model);
+		if (!judge) return;
+		try {
+			const outcome = await judgeFindingGroups({
+				ledger: this.#findings,
+				touched,
+				categories: this.#advisorCategories,
+				settings: judgeSettings,
+				judge,
+				providerOf: name =>
+					this.#advisors.find(advisor => advisor.name.trim().toLowerCase() === name.trim().toLowerCase())?.agent
+						.state.model?.provider,
+			});
+			if (outcome.judged + outcome.blocked + outcome.failed > 0)
+				logger.debug("advisor findings judged", { ...outcome });
+		} catch (error) {
+			logger.warn("advisor findings judge pass failed", { error: String(error) });
+		}
+	}
+
+	/** The judge candidates for `advisor.aggregation.judge.model`; `@judge` is the `judge` model role chain. */
+	#findingsJudge(model: string): FindingsJudgeCandidates | undefined {
+		if (model.trim() !== "@judge") {
+			if (!this.#findingsJudgeModelWarned) {
+				this.#findingsJudgeModelWarned = true;
+				logger.warn("advisor.aggregation.judge.model supports only @judge; skipping the findings judge", { model });
+			}
+			return undefined;
+		}
+		const host = this.#host;
+		return resolveJudge({
+			settings: host.settings,
+			registry: host.modelRegistry,
+			sessionModel: host.agent.state.model,
+			sessionId: host.sessionId(),
+			metadataResolver: provider => host.agent.metadataForProvider(provider),
+			purpose: "advisor-findings",
+			onUsage: journalJudgmentUsage(host.sessionManager),
+			telemetry: host.agent.telemetry,
+			cache: sharedJudgmentCache(),
+		});
+	}
+
+	/**
+	 * The open-findings digest for `advisor`'s next review, or undefined when
+	 * `advisor.findingsDigest` is off or nothing is open. First re-checks the
+	 * anchored line of every open file finding `advisor` owns through the read
+	 * gate of `anchorContext` and updates its changed-line hint; a file anchor
+	 * is shown only when the gate allows `advisor` to read the file.
+	 * `anchorContext` is resolved only when an open finding has a file anchor.
+	 */
+	async #findingsDigest(
+		advisor: string,
+		anchorContext: () => Promise<AnchorIdentityContext>,
+	): Promise<string | undefined> {
+		if (!cfgAdvisorFindingsDigest.get(this.#host.settings)) return undefined;
+		const open = this.#findings.list().filter(finding => finding.status === "open");
+		const readable = new Set<AdvisorFinding>();
+		let ctx: AnchorIdentityContext | undefined;
+		for (const finding of open) {
+			if (!finding.where) continue;
+			ctx ??= await anchorContext();
+			if (this.#findings.isOwner(finding, advisor)) {
+				const present = await fileAnchorLinePresent(finding.where, finding.identity, ctx);
+				if (present !== undefined) this.#findings.setPossiblyFixed(finding, !present);
+			}
+			if (await canReadFileAnchor(finding.where, ctx)) readable.add(finding);
+		}
+		return renderFindingsDigest(open, {
+			owns: finding => this.#findings.isOwner(finding, advisor),
+			canReadAnchor: finding => readable.has(finding),
+		});
+	}
+
+	/** Name of category `id`'s live owner advisor; undefined without one. */
+	#liveCategoryOwner(id: string): string | undefined {
+		if (!this.advisorCategoryHasLiveOwner(id)) return undefined;
+		const owner = this.#advisorCategories.find(category => category.id === id)?.owner;
+		const slug = owner === undefined ? undefined : slugifyAdvisorName(owner);
+		return this.#advisors.find(advisor => advisor.slug === slug)?.name;
+	}
+
+	/** Replace the ledger with the latest `advisor_findings` snapshot on the current branch; none leaves it empty. */
+	#loadFindingsFromBranch(): void {
+		const branch = this.#host.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index]!;
+			if (entry.type === "reset_boundary") break;
+			if (entry.type !== "custom" || entry.customType !== ADVISOR_FINDINGS_ENTRY_TYPE) continue;
+			this.#findings.load(entry.data);
+			return;
+		}
+		this.#findings.clear();
+	}
+
+	/** Append the ledger snapshot to the session the change happened in. */
+	#persistFindings(): void {
+		if (this.#host.isDisposed()) return;
+		this.#host.sessionManager.appendCustomEntry(
+			ADVISOR_FINDINGS_ENTRY_TYPE,
+			structuredClone(this.#findings.toEntry()),
+		);
 	}
 
 	/**
@@ -2849,6 +3246,11 @@ export class SessionAdvisors {
 	 */
 	getAdvisorAgent(): Agent | undefined {
 		return this.#advisors[0]?.agent;
+	}
+
+	/** Every live advisor's agent, in roster order. */
+	getAdvisorAgents(): Agent[] {
+		return this.#advisors.map(advisor => advisor.agent);
 	}
 
 	/**

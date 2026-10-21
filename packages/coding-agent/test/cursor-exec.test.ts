@@ -1631,7 +1631,7 @@ describe("CursorExecHandlers advise routing (issue #5680)", () => {
 							providerIdentifier: "pi-agent",
 							args: {
 								kind: encode("suggestion"),
-								where: encode({ type: "approach", ref: "input parsing" }),
+								where: encode({ type: "approach", topic: "input parsing" }),
 								defect: encode(defect),
 							},
 						}),
@@ -1651,7 +1651,7 @@ describe("CursorExecHandlers advise routing (issue #5680)", () => {
 
 	it("executes the advise MCP call through the bridge and routes the note", async () => {
 		const advised: Array<{ note: string; severity?: string }> = [];
-		const adviseTool = new AdviseTool((note, severity) => advised.push({ note, severity }));
+		const adviseTool = new AdviseTool(({ note, severity }) => advised.push({ note, severity }));
 		const handlers = new CursorExecHandlers({
 			cwd: ".",
 			tools: new Map([["advise", adviseTool as unknown as AgentTool]]),

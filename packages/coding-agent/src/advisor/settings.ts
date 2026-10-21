@@ -161,3 +161,54 @@ export const cfgAdvisorEvictStaleResults = register({
 		condition: "advisorEnabled",
 	},
 });
+
+export const cfgAdvisorFindingsDigest = register({
+	id: "advisor.findingsDigest",
+	protocolDefault: ["rpc", "acp"],
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Findings Digest",
+		description:
+			"Before each review, show each advisor the open advisor findings (id, category, severity, owner, reporter count) so it can relate new reports to them.",
+		condition: "advisorEnabled",
+	},
+});
+
+export const cfgAdvisorAggregationJudgeEnabled = register({
+	id: "advisor.aggregation.judge.enabled",
+	protocolDefault: ["rpc", "acp"],
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Findings Judge",
+		description:
+			"After an advisor update, ask the judge model whether open findings of different categories on one anchor are the same defect, and merge those that are. Report text reaches the judge only when its provider matches every reporting advisor's.",
+		condition: "advisorEnabled",
+	},
+});
+
+export const cfgAdvisorAggregationJudgeModel = register({
+	id: "advisor.aggregation.judge.model",
+	protocolDefault: ["rpc", "acp"],
+	type: "string",
+	default: "@judge",
+});
+
+export const cfgAdvisorAggregationJudgeTimeoutMs = register({
+	id: "advisor.aggregation.judge.timeoutMs",
+	protocolDefault: ["rpc", "acp"],
+	type: "number",
+	default: 10_000,
+});
+
+export const cfgAdvisorAggregationJudgeAllowCrossProvider = register({
+	id: "advisor.aggregation.judge.allowCrossProvider",
+	protocolDefault: ["rpc", "acp"],
+	type: "boolean",
+	default: false,
+});

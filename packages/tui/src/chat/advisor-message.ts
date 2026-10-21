@@ -116,18 +116,40 @@ function sourceOf(entry: AdvisorNote): string | undefined {
 	return entry.advisor && entry.advisor !== "default" ? entry.advisor : undefined;
 }
 
+/** `F7 security · 2 reporters` for a ledger note; undefined for a note without a finding. */
+function findingLabel(entry: AdvisorNote): string | undefined {
+	if (!entry.finding) return undefined;
+	const parts = [entry.category ? `${entry.finding} ${entry.category}` : entry.finding];
+	const reporters = entry.reporters?.length ?? 0;
+	if (reporters > 0) parts.push(`${reporters} ${reporters === 1 ? "reporter" : "reporters"}`);
+	return parts.join(" · ");
+}
+
+/** Notes in arrival order, with every note on one finding moved up behind that finding's first note. */
+function groupByFinding(notes: readonly AdvisorNote[]): AdvisorNote[] {
+	const grouped: AdvisorNote[] = [];
+	for (const note of notes) {
+		const last = note.finding ? grouped.findLastIndex(other => other.finding === note.finding) : -1;
+		if (last === -1) grouped.push(note);
+		else grouped.splice(last + 1, 0, note);
+	}
+	return grouped;
+}
+
 /** Wrapped, truncated rail rows for a single note; shared by both branches. */
 function renderAdvisorNote(entry: AdvisorNote, width: number, uiTheme: Theme): string[] {
 	const badge = entry.severity ? `${formatBadge(entry.severity, severityColor(entry.severity), uiTheme)} ` : "";
 	const source = sourceOf(entry);
 	const who = source ? `${uiTheme.fg("dim", `[${replaceTabs(source)}]`)} ` : "";
+	const label = findingLabel(entry);
+	const finding = label ? `${uiTheme.fg("dim", replaceTabs(label))} ` : "";
 	const age = entry.turnsAgo !== undefined ? `${uiTheme.fg("dim", `T-${entry.turnsAgo}`)} ` : "";
 	const railGlyph = uiTheme.symbol("advisor.rail");
 	const rail = uiTheme.fg(severityColor(entry.severity), railGlyph);
 	const quoteWidth = visibleWidth(`  ${railGlyph} `);
 	const badgeWidth = visibleWidth(badge);
 	const ageWidth = visibleWidth(age);
-	const whoWidth = visibleWidth(who);
+	const whoWidth = visibleWidth(who) + visibleWidth(finding);
 	const w1 = Math.max(10, Math.min(NOTE_LINE_WIDTH, width) - quoteWidth - badgeWidth - ageWidth - whoWidth);
 	const w2 = Math.max(10, Math.min(NOTE_LINE_WIDTH, width) - quoteWidth);
 
@@ -144,7 +166,7 @@ function renderAdvisorNote(entry: AdvisorNote, width: number, uiTheme: Theme): s
 
 	return bodyLines.map(
 		(line, index) =>
-			`  ${rail} ${index === 0 ? `${badge}${age}${who}` : ""}${uiTheme.fg("customMessageText", replaceTabs(line))}`,
+			`  ${rail} ${index === 0 ? `${badge}${age}${finding}${who}` : ""}${uiTheme.fg("customMessageText", replaceTabs(line))}`,
 	);
 }
 
@@ -182,11 +204,15 @@ function tallySpans(notes: readonly AdvisorNote[]): TspSpan[] {
 	return spans;
 }
 
-/** Native spans for one note: its advisor when the callout mixes several, then the text. */
+/** Native spans for one note: its finding label, its advisor when the callout mixes several, then the text. */
 function noteSpans(entry: AdvisorNote, attribute: boolean): TspSpan[] {
 	const who = attribute ? sourceOf(entry) : undefined;
-	const body = span(plainText(entry.note));
-	return who ? [span(`${who} · `, "dim"), body] : [body];
+	const label = findingLabel(entry);
+	const spans: TspSpan[] = [];
+	if (label) spans.push(span(`${label} · `, "dim"));
+	if (who) spans.push(span(`${who} · `, "dim"));
+	spans.push(span(plainText(entry.note)));
+	return spans;
 }
 
 /** The advisor card: shared by the controlled expansion getter and native toggles. */
@@ -214,7 +240,7 @@ export function createAdvisorMessageCard(
 	getExpanded: () => boolean,
 	uiTheme: Theme,
 ): AdvisorMessageCard {
-	const notes = details?.notes ?? [];
+	const notes = groupByFinding(details?.notes ?? []);
 	const blockers = notes.filter(note => note.severity === "blocker").length;
 	const meta: string[] = [`${notes.length} ${notes.length === 1 ? "note" : "notes"}`];
 	if (blockers > 0) meta.push(uiTheme.fg("error", `${blockers} blocker${blockers === 1 ? "" : "s"}`));

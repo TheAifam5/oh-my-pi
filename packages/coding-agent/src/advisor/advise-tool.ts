@@ -1,4 +1,4 @@
-import { type } from "@oh-my-pi/omptype";
+import { type Type, type } from "@oh-my-pi/omptype";
 import { type AdvisorKind, type AdvisorNote, type AdvisorSeverity } from "@oh-my-pi/pi-tui/chat/messages";
 export {
 	type AdvisorKind,
@@ -14,23 +14,31 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
-import { escapeXmlAttribute, escapeXmlText, logger } from "@oh-my-pi/pi-utils";
+import { escapeXmlAttribute, escapeXmlText, logger, prompt } from "@oh-my-pi/pi-utils";
 import adviseDescription from "../prompts/advisor/advise-tool.md" with { type: "text" };
+import {
+	type AdviseWhere,
+	adviseWhereSchema,
+	emptyAnchorFields,
+	formatAnchorDisplay,
+	resolveAnchorIdentity,
+} from "./anchor-identity";
 import { AdvisorEmissionGuard, type AdvisorSuppressionReason, advisorDedupeKey } from "./emission-guard";
+import {
+	ADVISOR_RELATIONS,
+	type AdvisorFinding,
+	AdvisorFindingsLedger,
+	type AdvisorRelation,
+	type AdvisorReport,
+	type AdvisorReportInput,
+} from "./findings-ledger";
 
-const adviseSchema = type({
+const adviseShape = {
 	kind: type("'defect' | 'concern' | 'unverified' | 'suggestion'").describe(
 		"defect: wrong now; concern: likely wrong; unverified: a claim or result nobody checked; suggestion: a better approach.",
 	),
 	"severity?": type("'nit' | 'concern' | 'blocker'").describe("How strongly to weigh this. Omit for a plain nit."),
-	where: type({
-		type: type("'file' | 'command' | 'tool-call' | 'instruction' | 'claim' | 'approach'").describe(
-			"What the finding is anchored to; `approach` anchors a plan, strategy, or verification approach.",
-		),
-		ref: type("string").describe(
-			"The concrete anchor: path[:line], command, tool call, quoted instruction or claim, or the plan step.",
-		),
-	}).describe("Where the finding is."),
+	where: adviseWhereSchema,
 	defect: type("string").describe("What is wrong, in one line. For `suggestion`, the advice itself."),
 	"impact?": type("string").describe(
 		"What breaks if left as is. Required for defect/concern/unverified at severity concern or blocker.",
@@ -38,38 +46,100 @@ const adviseSchema = type({
 	"fix?": type("string").describe(
 		"The concrete correction. Required for defect/concern/unverified at severity concern or blocker.",
 	),
-});
+	"relatesTo?": type(/^F\d+$/).describe("Id of an open finding from the digest this report relates to."),
+	"relation?": type
+		.enumerated(...ADVISOR_RELATIONS)
+		.describe(
+			"How the report relates to `relatesTo`: duplicate (same anchor), adds, escalates (higher severity), disputes, resolved (owner only).",
+		),
+};
 
-export type AdviseParams = typeof adviseSchema.infer;
+/** `advise` parameters without a category taxonomy. */
+const uncategorizedAdviseSchema = type(adviseShape);
 
-/** Anchor of a structured advisor finding. */
-export type AdviseWhere = AdviseParams["where"];
+export type AdviseParams = typeof uncategorizedAdviseSchema.infer & {
+	/** Active-taxonomy category id; present when the session has a taxonomy. */
+	category?: string;
+};
+
+/** One category of the active taxonomy as offered to one advisor. */
+export interface AdviseCategory {
+	id: string;
+	description: string;
+	/** Whether the reporting advisor owns this category. */
+	owned?: boolean;
+}
+
+/**
+ * The `advise` parameter schema for a taxonomy: without categories, no
+ * `category` field; otherwise `category` is required and enumerates the ids.
+ */
+export function buildAdviseSchema(categories: readonly AdviseCategory[]): Type<AdviseParams> {
+	if (categories.length === 0) return uncategorizedAdviseSchema;
+	return type({
+		...adviseShape,
+		category: type
+			.enumerated(...categories.map(category => category.id))
+			.describe("The finding's category; ids and meanings are listed in the tool description."),
+	});
+}
 
 export interface AdviseDetails {
 	/** Rendered note body (see {@link formatAdviseNote}); the only field in transcripts written before structured advice. */
 	note: string;
 	severity?: AdvisorSeverity;
 	kind?: AdvisorKind;
+	category?: string;
 	where?: AdviseWhere;
 	defect?: string;
 	impact?: string;
 	fix?: string;
+	relatesTo?: string;
+	relation?: AdvisorRelation;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
 }
 
+/** One admitted finding as routed to the primary. */
+export interface AdvisorAdvice {
+	/** Rendered note body (see {@link formatAdviseNote}). */
+	note: string;
+	severity: AdvisorSeverity | undefined;
+	kind: AdvisorKind;
+	/** Primary-turn count the emitting review covered. */
+	turn: number | undefined;
+	/** Active-taxonomy category id; undefined without a taxonomy. */
+	category: string | undefined;
+	where: AdviseWhere;
+	/** Display string of `where` (see {@link formatAnchorDisplay}). */
+	anchor: string;
+	/** Host-side anchor identity (see {@link resolveAnchorIdentity}); never shown to models. */
+	anchorIdentity: string;
+	defect: string;
+	impact: string | undefined;
+	fix: string | undefined;
+	/** Ledger finding the report belongs to. */
+	finding?: string;
+	/** Whether the report raised its finding's severity. */
+	escalated?: boolean;
+	/** How the report relates to its finding, when it named one. */
+	relation?: AdvisorRelation;
+	/** Whether the report must not interrupt the primary. */
+	aside?: boolean;
+}
+
 /**
  * Render the note body of a structured finding:
- * `<where.ref> — <defect>`, then ` → <impact>` and ` → <fix>` when present.
+ * `<anchor display> — <defect>`, then ` → <impact>` and ` → <fix>` when present.
  * Fields are trimmed; the result is plain text (escape before embedding in XML).
  */
 export function formatAdviseNote(advice: {
-	where: { ref: string };
+	where: AdviseWhere;
 	defect: string;
 	impact?: string;
 	fix?: string;
 }): string {
-	let note = `${advice.where.ref.trim()} — ${advice.defect.trim()}`;
+	let note = `${formatAnchorDisplay(advice.where)} — ${advice.defect.trim()}`;
 	const impact = advice.impact?.trim();
 	if (impact) note += ` → ${impact}`;
 	const fix = advice.fix?.trim();
@@ -77,15 +147,27 @@ export function formatAdviseNote(advice: {
 	return note;
 }
 
+/** Free-text `where` fields, in display order. */
+const WHERE_TEXT_FIELDS = ["path", "symbol", "text", "id", "quote", "topic", "ref"] as const;
+
 /**
- * Free-text strings of an `advise` tool call's raw arguments — `where.ref`,
- * `defect`, `impact`, `fix`, and the legacy `note` — for content screening
- * and summaries. Non-string values are skipped.
+ * Free-text strings of an `advise` tool call's raw arguments — the `where`
+ * anchor (its display string when it is a valid anchor, else its string
+ * fields), `defect`, `impact`, `fix`, and the legacy `note` — for content
+ * screening and summaries. Non-string values are skipped.
  */
 export function adviseArgumentTexts(args: Record<string, unknown>): string[] {
 	const texts: string[] = [];
 	const where = args.where;
-	if (where && typeof where === "object" && "ref" in where && typeof where.ref === "string") texts.push(where.ref);
+	const anchor = adviseWhereSchema(where);
+	if (!(anchor instanceof type.errors)) {
+		texts.push(formatAnchorDisplay(anchor));
+	} else if (where && typeof where === "object") {
+		for (const field of WHERE_TEXT_FIELDS) {
+			const value = (where as Record<string, unknown>)[field];
+			if (typeof value === "string") texts.push(value);
+		}
+	}
 	for (const field of ["defect", "impact", "fix", "note"] as const) {
 		const value = args[field];
 		if (typeof value === "string") texts.push(value);
@@ -96,16 +178,22 @@ export function adviseArgumentTexts(args: Record<string, unknown>): string[] {
 const ADVISE_SILENCE_RULE = "A review with nothing to report ends without calling `advise`.";
 
 /**
- * Validate raw `advise` arguments: the schema shape and enums, non-empty
- * `where.ref` and `defect`, and non-empty `impact`/`fix` for a
- * defect/concern/unverified finding at severity concern or blocker. Returns
- * the parsed params, or the rejection text naming every failing field.
+ * Validate raw `advise` arguments against `schema` (default: no taxonomy):
+ * the shape and enums, non-empty anchor text and `defect`, non-empty
+ * `impact`/`fix` for a defect/concern/unverified finding at severity concern
+ * or blocker, and `relatesTo` and `relation` given together. Returns the
+ * parsed params, or the rejection text naming every failing field.
  */
-export function validateAdviseArgs(raw: unknown): AdviseParams | string {
-	const parsed = adviseSchema(raw);
+export function validateAdviseArgs(
+	raw: unknown,
+	schema: Type<AdviseParams> = uncategorizedAdviseSchema,
+): AdviseParams | string {
+	const parsed = schema(raw);
 	if (parsed instanceof type.errors) return `Rejected: ${parsed.summary}\n${ADVISE_SILENCE_RULE}`;
-	const missing: string[] = [];
-	if (!parsed.where.ref.trim()) missing.push("where.ref");
+	if ((parsed.relatesTo === undefined) !== (parsed.relation === undefined)) {
+		return `Rejected: \`relatesTo\` and \`relation\` go together; give both or neither.\n${ADVISE_SILENCE_RULE}`;
+	}
+	const missing = emptyAnchorFields(parsed.where);
 	if (!parsed.defect.trim()) missing.push("defect");
 	if (parsed.kind !== "suggestion" && (parsed.severity === "concern" || parsed.severity === "blocker")) {
 		if (!parsed.impact?.trim()) missing.push("impact");
@@ -125,10 +213,11 @@ const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 
 /**
  * Render a batch of advisor notes as the agent-facing message body: one
- * `<advisory>` element per note, severity and kind as attributes, the
- * XML-escaped note body as text. Shared by the non-interrupting YieldQueue
- * dispatcher and the interrupting steer path so both build byte-identical
- * content.
+ * `<advisory>` element per note, the XML-escaped note body as text. A ledger
+ * note leads with `finding`, `category`, and `owner`, then severity and kind,
+ * then `reporters` and `relation`; a note without a finding keeps the pre-ledger attribute
+ * order. Shared by the non-interrupting YieldQueue dispatcher and the
+ * interrupting steer path so both build byte-identical content.
  */
 export function formatAdvisorBatchContent(notes: readonly AdvisorNote[], opts?: { currentTurn?: number }): string {
 	return notes
@@ -140,7 +229,15 @@ export function formatAdvisorBatchContent(notes: readonly AdvisorNote[], opts?: 
 				opts?.currentTurn !== undefined && n.turn !== undefined && opts.currentTurn > n.turn
 					? ` turns_ago="${opts.currentTurn - n.turn}"`
 					: "";
-			return `<advisory${who}${severity}${kind}${age} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
+			let attributes = `${who}${severity}${kind}`;
+			if (n.finding) {
+				const category = n.category ? ` category="${escapeXmlAttribute(n.category)}"` : "";
+				const owner = n.owner ? ` owner="${escapeXmlAttribute(n.owner)}"` : "";
+				const reporters = n.reporters?.length ? ` reporters="${escapeXmlAttribute(n.reporters.join(","))}"` : "";
+				const relation = n.relation ? ` relation="${escapeXmlAttribute(n.relation)}"` : "";
+				attributes = ` finding="${escapeXmlAttribute(n.finding)}"${category}${owner}${severity}${kind}${reporters}${relation}${who}`;
+			}
+			return `<advisory${attributes}${age} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
 		})
 		.join("\n");
 }
@@ -256,7 +353,8 @@ export const ADVISOR_DEFAULT_TOOL_NAMES: ReadonlySet<string> = new Set(["read", 
  *  (nit → concern → blocker) versus a verbatim repeat. `undefined` defers to
  *  `nit` because the schema treats an omitted severity as a plain nit. */
 const ADVISOR_SEVERITY_RANK: Record<AdvisorSeverity, number> = { nit: 1, concern: 2, blocker: 3 };
-function advisorSeverityRank(severity: AdvisorSeverity | undefined): number {
+/** Rank of a severity: nit (or none) 1, concern 2, blocker 3. */
+export function advisorSeverityRank(severity: AdvisorSeverity | undefined): number {
 	return ADVISOR_SEVERITY_RANK[severity ?? "nit"];
 }
 
@@ -280,29 +378,58 @@ const ADVISOR_ACK_DEFERRED = "Queued for the end of the turn. Do not re-raise.";
 const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
 	empty: "Dropped: empty note.",
 	noise: "Dropped: nothing actionable.",
-	duplicate: "Dropped: already raised.",
 	"rate-limit": "Dropped: this update's advice budget is spent.",
 };
+/** An exact repeat of a report already on the finding: recorded, not delivered again. */
+const ADVISOR_ACK_DUPLICATE = "Already raised; recorded, not delivered again.";
 /** A malformed call after this update's single retry was spent. */
 const ADVISOR_ACK_INVALID_DROPPED = "Dropped: invalid call; this update's retry is spent.";
 
-export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
+/** Host wiring of one advisor's `advise` tool beyond routing and admission. */
+export interface AdviseToolOptions {
+	/** Active taxonomy as offered to this advisor; empty or omitted means no `category` field. */
+	categories?: readonly AdviseCategory[];
+	/**
+	 * Host-side anchor identity; defaults to {@link resolveAnchorIdentity}
+	 * without a workspace context (no file is read).
+	 */
+	resolveAnchorIdentity?: (where: AdviseWhere) => Promise<string>;
+	/** Session findings ledger; defaults to a ledger private to this tool. */
+	ledger?: AdvisorFindingsLedger;
+	/** Reporter name recorded in the ledger; defaults to `default`. */
+	advisor?: string;
+}
+
+/** A report withheld behind an in-progress primary turn. */
+interface DeferredReport {
+	/** {@link advisorDedupeKey} of the defect and finding key: matches re-raises. */
+	key: string;
+	/** Category plus anchor identity: the guard's budget slot key. */
+	findingKey: string;
+	advice: AdvisorAdvice;
+	finding: AdvisorFinding;
+	report: AdvisorReport;
+}
+
+export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> {
 	readonly name = "advise";
 	/** Consults an advisor model over the network. */
 	readonly replay = "unsafe" as const;
 	readonly label = "Advise";
-	readonly description = adviseDescription;
-	readonly parameters = adviseSchema;
+	readonly description: string;
+	readonly parameters: Type<AdviseParams>;
 	readonly intent = "omit" as const;
 	/** Malformed calls reach {@link execute}, which owns rejection and the per-update retry limit. */
 	readonly lenientArgValidation = true;
-	/**
-	 * Single admission authority for every emission. The tool owns no parallel
-	 * dedupe/budget state: the guard's {@link AdvisorAdmission} decides whether
-	 * a note routes, holds pending, or is suppressed — and names any displaced
-	 * pending note.
-	 */
+	readonly #onAdvice: (advice: AdvisorAdvice) => void;
+	readonly #resolveAnchorIdentity: (where: AdviseWhere) => Promise<string>;
+	/** Per-call backstop and rate limit; the ledger decides what is a new finding. */
 	readonly #guard: AdvisorEmissionGuard;
+	/** Dedupe owner: classifies each report as a new finding, an attachment, or a duplicate. */
+	readonly #ledger: AdvisorFindingsLedger;
+	/** Whether {@link #ledger} is private to this tool (cleared on reset). */
+	readonly #ownsLedger: boolean;
+	readonly #advisor: string;
 	#inProgressUpdate = false;
 	/** Primary-turn count the in-flight update reviews (stamped on emitted notes
 	 *  so merged batches can report how stale each review was at delivery). */
@@ -313,35 +440,33 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *  advisor model choosing to re-raise (it may not — the deferred
 	 *  acknowledgment tells it the note is queued). Only these still-pending
 	 *  notes can be displaced by the guard; routed notes are never retracted. */
-	#deferredNotes: {
-		key: string;
-		defect: string;
-		ref: string;
-		note: string;
-		severity?: AdviseDetails["severity"];
-		kind: AdvisorKind;
-		turn?: number;
-	}[] = [];
+	#deferredNotes: DeferredReport[] = [];
+	/** Settles after the latest call's admission; admissions run in call order. */
+	#admissionChain: Promise<unknown> = Promise.resolve();
 
 	/**
-	 * @param onAdvice Route an admitted note to the primary (channel selection +
-	 *   delivery). Never re-filters — the note already cleared the guard.
-	 * @param guard The admission authority: noise/empty/dedupe filter, rank-aware
-	 *   escalation, and the per-update non-blocker budget, decided the moment a
-	 *   note is emitted (live or deferred). Defaults to a stock
+	 * @param onAdvice Route an admitted report to the primary (channel
+	 *   selection + delivery). Never re-filters — the report already cleared admission.
+	 * @param guard Per-call noise/empty backstop, invalid-call retry, and the
+	 *   per-update budget of new findings. Defaults to a stock
 	 *   {@link AdvisorEmissionGuard} (default budget
 	 *   {@link ADVISOR_DEFAULT_BUDGET_PER_UPDATE}).
+	 * @param options Category taxonomy, anchor identity resolution, and the findings ledger.
 	 */
 	constructor(
-		private readonly onAdvice: (
-			note: string,
-			severity: AdviseDetails["severity"] | undefined,
-			turn: number | undefined,
-			kind: AdvisorKind,
-		) => void,
+		onAdvice: (advice: AdvisorAdvice) => void,
 		guard?: AdvisorEmissionGuard,
+		options: AdviseToolOptions = {},
 	) {
+		this.#onAdvice = onAdvice;
 		this.#guard = guard ?? new AdvisorEmissionGuard();
+		this.#ownsLedger = options.ledger === undefined;
+		this.#ledger = options.ledger ?? new AdvisorFindingsLedger();
+		this.#advisor = options.advisor ?? "default";
+		const categories = options.categories ?? [];
+		this.parameters = buildAdviseSchema(categories);
+		this.description = prompt.render(adviseDescription, { categories });
+		this.#resolveAnchorIdentity = options.resolveAnchorIdentity ?? (where => resolveAnchorIdentity(where));
 	}
 
 	/**
@@ -373,13 +498,14 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		this.#flushDeferred();
 	}
 
-	/** Clear all note state when the advisor starts a fresh conversation: the
-	 *  guard's dedupe/budget memory and this tool's pending backlog reset
-	 *  together, so a re-primed advisor can re-raise old issues. */
+	/** Clear per-advisor note state when the advisor starts a fresh
+	 *  conversation: the guard's budget and this tool's pending backlog, plus
+	 *  a tool-private ledger, so a re-primed advisor can re-raise old issues. */
 	resetDeliveredNotes(): void {
 		this.#guard.reset();
 		this.#inProgressUpdate = false;
 		this.#deferredNotes = [];
+		if (this.#ownsLedger) this.#ledger.clear();
 	}
 
 	async execute(
@@ -389,64 +515,174 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		_onUpdate?: AgentToolUpdateCallback<AdviseDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<AdviseDetails>> {
-		const args = validateAdviseArgs(rawArgs);
+		const args = validateAdviseArgs(rawArgs, this.parameters);
 		if (typeof args === "string") return this.#rejected(args);
+		const identity = this.#resolveAnchorIdentity(args.where).catch(err => {
+			logger.debug("advisor anchor identity fell back to the unread form", { error: String(err) });
+			return resolveAnchorIdentity(args.where);
+		});
+		// Identities resolve concurrently; admission stays in call order.
+		const admitted = this.#admissionChain.then(async () => this.#admit(args, await identity));
+		this.#admissionChain = admitted.catch(() => undefined);
+		return admitted;
+	}
+
+	#admit(args: AdviseParams, anchorIdentity: string): AgentToolResult<AdviseDetails> {
 		const note = formatAdviseNote(args);
+		const advice: AdvisorAdvice = {
+			note,
+			severity: args.severity,
+			kind: args.kind,
+			turn: this.#coveredTurn,
+			category: args.category,
+			where: args.where,
+			anchor: formatAnchorDisplay(args.where),
+			anchorIdentity,
+			defect: args.defect,
+			impact: args.impact,
+			fix: args.fix,
+		};
 		const rank = advisorSeverityRank(args.severity);
-		const key = advisorDedupeKey(args.defect, args.where.ref);
-		if (this.#inProgressUpdate && args.severity !== "blocker") {
-			// Withheld, not delivered: reserve for the deterministic flush at the
-			// completed-update transition / terminal boundary.
-			const pending = this.#deferredNotes.find(item => item.key === key);
-			if (pending) {
-				// Re-raise of a still-queued note is not a new admission: escalate
-				// severity in place (never a second slot) and keep the dedupe rank
-				// coherent so equal/lower repeats of the finding stay suppressed.
-				if (rank > advisorSeverityRank(pending.severity)) {
-					pending.severity = args.severity;
-					this.#guard.escalatePending(args.defect, rank, args.where.ref);
-				}
-				return this.#result(ADVISOR_ACK_DEFERRED, args, note);
+		const related = this.#relatedFinding(args, anchorIdentity);
+		const findingKey = related ? related.finding.id : `${args.category ?? ""}\n${anchorIdentity}`;
+		const key = advisorDedupeKey(args.defect, findingKey);
+		const pending = this.#inProgressUpdate && args.severity !== "blocker";
+		const reservedIndex = this.#deferredNotes.findIndex(item => item.key === key);
+		if (pending && reservedIndex !== -1) {
+			// Re-raise of a still-queued note is not a new report: escalate
+			// severity in place (never a second slot or report).
+			const reserved = this.#deferredNotes[reservedIndex]!;
+			if (rank > advisorSeverityRank(reserved.advice.severity)) {
+				reserved.advice.severity = args.severity;
+				this.#ledger.raiseReport(reserved.finding, reserved.report, args.severity);
+				this.#guard.escalatePending(findingKey, rank);
 			}
-			const decision = this.#guard.admit(args.defect, {
-				rank,
-				pending: true,
-				ref: args.where.ref,
-			});
-			if (!decision.accepted) return this.#suppressed(args, note, decision.reason);
-			// The guard centrally names the still-pending note displaced by this
-			// strictly-higher-severity admission; only same-update pending notes
-			// can be displaced, so the backlog lookup is a drop, not a policy.
-			if (decision.displacedKey !== undefined) {
-				const displacedIndex = this.#deferredNotes.findIndex(item => item.key === decision.displacedKey);
-				if (displacedIndex !== -1) this.#deferredNotes.splice(displacedIndex, 1);
-			}
-			this.#deferredNotes.push({
-				key,
-				defect: args.defect,
-				ref: args.where.ref,
-				note,
-				severity: args.severity,
-				kind: args.kind,
-				turn: this.#coveredTurn,
-			});
 			return this.#result(ADVISOR_ACK_DEFERRED, args, note);
 		}
-		// Live path (completed update, or a blocker that must interrupt now). A
-		// blocker re-raise of a still-queued note pulls the reservation first:
-		// the guard admits it as a rank escalation (nit/concern → blocker), so
-		// it interrupts at blocker severity now instead of arriving late at the
-		// lower deferred severity.
-		const reservedIndex = this.#deferredNotes.findIndex(item => item.key === key);
-		if (reservedIndex !== -1) this.#deferredNotes.splice(reservedIndex, 1);
-		const decision = this.#guard.admit(args.defect, {
-			rank,
-			pending: false,
-			ref: args.where.ref,
-		});
+		if (reservedIndex !== -1) {
+			// A blocker re-raise of a still-queued note replaces the reservation
+			// so it interrupts at blocker severity now.
+			const [reserved] = this.#deferredNotes.splice(reservedIndex, 1);
+			this.#ledger.withdraw(reserved!.finding, reserved!.report);
+		}
+		if (related) return this.#admitRelated(args, advice, related, { rank, pending, key, findingKey });
+		const existing = this.#ledger.findOpen(args.category, anchorIdentity);
+		const decision = this.#guard.admit(args.defect, { rank, pending, key: findingKey, newFinding: !existing });
 		if (!decision.accepted) return this.#suppressed(args, note, decision.reason);
-		this.onAdvice(note, args.severity, this.#coveredTurn, args.kind);
-		return this.#result(ADVISOR_ACK_SENT, args, note);
+		if (decision.displacedKey !== undefined) {
+			// Only same-update pending reports can be displaced; they were never delivered.
+			for (const item of this.#deferredNotes.filter(item => item.findingKey === decision.displacedKey)) {
+				this.#deferredNotes.splice(this.#deferredNotes.indexOf(item), 1);
+				this.#ledger.withdraw(item.finding, item.report);
+			}
+		}
+		const outcome = this.#ledger.record(this.#reportInput(args, advice));
+		if (outcome.type === "duplicate") {
+			logger.debug("advisor advice recorded as a duplicate report", { finding: outcome.finding.id });
+			return this.#result(ADVISOR_ACK_DUPLICATE, args, note);
+		}
+		advice.finding = outcome.finding.id;
+		if (outcome.type === "attached") {
+			if (outcome.escalated) advice.escalated = true;
+			else if (!this.#guard.admitAttachedAside()) return this.#asideCapped(args, note, outcome.finding);
+		}
+		return this.#route(args, advice, { key, findingKey, finding: outcome.finding, report: outcome.report, pending });
+	}
+
+	/**
+	 * The open finding a report names through `relatesTo`, with the relation
+	 * it takes effect as: `duplicate` only when the report's anchor identity
+	 * matches the finding's, `resolved` only from the finding's owner (else
+	 * `disputes`). Undefined for an unknown or closed id or an unmatched
+	 * duplicate: the report then counts as unrelated.
+	 */
+	#relatedFinding(
+		args: AdviseParams,
+		anchorIdentity: string,
+	): { finding: AdvisorFinding; relation: AdvisorRelation } | undefined {
+		if (args.relatesTo === undefined || args.relation === undefined) return undefined;
+		const finding = this.#ledger.get(args.relatesTo);
+		if (!finding || finding.status !== "open") return undefined;
+		if (args.relation === "duplicate" && finding.identity !== anchorIdentity) return undefined;
+		if (args.relation === "resolved" && !this.#ledger.isOwner(finding, this.#advisor)) {
+			return { finding, relation: "disputes" };
+		}
+		return { finding, relation: args.relation };
+	}
+
+	/**
+	 * Admit a report on a finding it names. It joins the finding; `resolved`
+	 * closes it. Only `escalates` raising the finding's severity may
+	 * interrupt; every other relation is an aside charged against
+	 * {@link AdvisorEmissionGuard.admitAttachedAside}. A `duplicate` repeating
+	 * the lead report is recorded without delivery.
+	 */
+	#admitRelated(
+		args: AdviseParams,
+		advice: AdvisorAdvice,
+		related: { finding: AdvisorFinding; relation: AdvisorRelation },
+		opts: { rank: number; pending: boolean; key: string; findingKey: string },
+	): AgentToolResult<AdviseDetails> {
+		const { finding, relation } = related;
+		const decision = this.#guard.admit(args.defect, {
+			rank: opts.rank,
+			pending: opts.pending,
+			key: opts.findingKey,
+			newFinding: false,
+		});
+		if (!decision.accepted) return this.#suppressed(args, advice.note, decision.reason);
+		const outcome = this.#ledger.recordRelated(finding, { ...this.#reportInput(args, advice), relation });
+		if (relation === "resolved") this.#ledger.resolve(finding.id);
+		if (outcome.type !== "attached") return this.#result(ADVISOR_ACK_DUPLICATE, args, advice.note);
+		advice.finding = finding.id;
+		advice.relation = relation;
+		if (relation === "escalates" && outcome.escalated) {
+			advice.escalated = true;
+		} else {
+			advice.aside = true;
+			if (!this.#guard.admitAttachedAside()) return this.#asideCapped(args, advice.note, finding);
+		}
+		return this.#route(args, advice, { ...opts, finding, report: outcome.report });
+	}
+
+	#reportInput(args: AdviseParams, advice: AdvisorAdvice): AdvisorReportInput {
+		return {
+			advisor: this.#advisor,
+			category: args.category,
+			identity: advice.anchorIdentity,
+			anchor: advice.anchor,
+			where: args.where,
+			kind: args.kind,
+			severity: args.severity,
+			defect: args.defect,
+			impact: args.impact,
+			fix: args.fix,
+		};
+	}
+
+	/** Deliver an admitted report now, or withhold it behind the in-progress primary turn. */
+	#route(
+		args: AdviseParams,
+		advice: AdvisorAdvice,
+		reserved: Omit<DeferredReport, "advice"> & { pending: boolean },
+	): AgentToolResult<AdviseDetails> {
+		if (reserved.pending) {
+			const { key, findingKey, finding, report } = reserved;
+			this.#deferredNotes.push({ key, findingKey, advice, finding, report });
+			return this.#result(ADVISOR_ACK_DEFERRED, args, advice.note);
+		}
+		this.#onAdvice(advice);
+		return this.#result(ADVISOR_ACK_SENT, args, advice.note);
+	}
+
+	/** An aside on an existing finding past this update's aside budget: recorded, not delivered. */
+	#asideCapped(args: AdviseParams, note: string, finding: AdvisorFinding): AgentToolResult<AdviseDetails> {
+		logger.debug("advisor aside recorded without delivery", { finding: finding.id });
+		return this.#result(
+			`Recorded under ${finding.id}; this update's aside budget is spent, not delivered.`,
+			args,
+			note,
+		);
 	}
 
 	/** Route every withheld note, oldest first, without re-admission — each was
@@ -456,9 +692,9 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (this.#deferredNotes.length === 0) return;
 		const pending = this.#deferredNotes;
 		this.#deferredNotes = [];
-		for (const { defect, ref, note, severity, kind, turn } of pending) {
-			this.#guard.markRouted(defect, ref);
-			this.onAdvice(note, severity, turn ?? this.#coveredTurn, kind);
+		for (const { advice, findingKey } of pending) {
+			this.#guard.markRouted(findingKey);
+			this.#onAdvice({ ...advice, turn: advice.turn ?? this.#coveredTurn });
 		}
 	}
 
@@ -484,7 +720,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		reason: AdvisorSuppressionReason | undefined,
 	): AgentToolResult<AdviseDetails> {
 		logger.debug("advisor advice suppressed by emission guard", { reason, severity: args.severity });
-		return this.#result(ADVISOR_ACK_SUPPRESSED[reason ?? "duplicate"], args, note);
+		return this.#result(ADVISOR_ACK_SUPPRESSED[reason ?? "noise"], args, note);
 	}
 
 	#result(text: string, args: AdviseParams, note: string): AgentToolResult<AdviseDetails> {
@@ -494,10 +730,13 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				note,
 				severity: args.severity,
 				kind: args.kind,
+				category: args.category,
 				where: args.where,
 				defect: args.defect,
 				impact: args.impact,
 				fix: args.fix,
+				relatesTo: args.relatesTo,
+				relation: args.relation,
 			},
 			useless: true,
 		};

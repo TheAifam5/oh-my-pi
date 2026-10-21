@@ -193,7 +193,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 							name: "advise",
 							arguments: {
 								kind: "suggestion",
-								where: { type: "approach", ref: "review" },
+								category: "logic",
+								where: { type: "approach", topic: "review" },
 								defect: "Fixture verdict confirmed",
 								severity,
 							},
@@ -288,7 +289,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 							name: "advise",
 							arguments: {
 								kind: "suggestion",
-								where: { type: "approach", ref: "review" },
+								category: "logic",
+								where: { type: "approach", topic: "review" },
 								defect: "Final yield needs correction",
 								severity: "blocker",
 							},
@@ -706,7 +708,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 							name: "advise",
 							arguments: {
 								kind: "suggestion",
-								where: { type: "approach", ref: "review" },
+								category: "logic",
+								where: { type: "approach", topic: "review" },
 								defect: "shipped code deletes the audit table",
 								severity: "blocker",
 							},

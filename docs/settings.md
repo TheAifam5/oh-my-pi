@@ -500,6 +500,11 @@ Advisors review primary turns on a configurable cadence and can inject advice. E
 | `advisor.reviewInterval` | number | `1` | Default advisor only: review every Nth eligible update. Skipped updates are sent with the next scheduled review; pending advice delivery never depends on cadence. Applies live. |
 | `advisor.maxNotesPerUpdate` | number | `4` | Non-blocker notes accepted per advisor review, from 1–32. Higher-severity notes can replace only pending notes from the same review. `WATCHDOG.yml` top-level or per-advisor values override this default. |
 | `advisor.evictStaleResults` | boolean | `true` | Before each review, replace the advisor's `read`/`grep`/`glob` output from older reviews with a short placeholder. The latest review is kept. |
+| `advisor.findingsDigest` | boolean | `true` | Before each review, show each advisor the open advisor findings (id, category, severity, owner, reporter count). |
+| `advisor.aggregation.judge.enabled` | boolean | `true` | After an advisor update, judge whether open findings of different categories on one anchor are the same defect and merge those that are. |
+| `advisor.aggregation.judge.model` | string | `@judge` | Findings judge model; only `@judge` (the `judge` role chain) is supported, other values skip the judge. |
+| `advisor.aggregation.judge.timeoutMs` | number | `10000` | Deadline of one anchor group's judgment; on timeout the findings stay as recorded. |
+| `advisor.aggregation.judge.allowCrossProvider` | boolean | `false` | Let report text reach a judge candidate whose provider differs from the reporting advisors'. |
 
 ### Thinking
 

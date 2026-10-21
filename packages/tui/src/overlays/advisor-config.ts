@@ -83,6 +83,17 @@ export interface AdvisorConfig {
 	reviewMode?: AdvisorReviewMode;
 	reviewInterval?: number;
 	syncBacklog?: AdvisorSyncBacklog;
+	/** Category ids this advisor owns. */
+	owns?: string[];
+}
+
+/** One `WATCHDOG.yml` finding category. */
+export interface AdvisorCategoryConfig {
+	description: string;
+	/** Owning advisor name; when set it wins over a conflicting advisor `owns`. */
+	owner?: string;
+	/** Rank among categories competing for one finding; higher leads. */
+	precedence?: number;
 }
 
 /** Which level a `WATCHDOG.yml` lives at: the project root or the user agent dir. */
@@ -92,6 +103,8 @@ export type AdvisorConfigScope = "project" | "user";
 export interface WatchdogConfigDoc {
 	instructions?: string;
 	maxNotesPerUpdate?: number;
+	/** Finding categories by id; present (even empty) when the file declares `categories`. */
+	categories?: Record<string, AdvisorCategoryConfig>;
 	advisors: AdvisorConfig[];
 	/** Per-entry problems found while loading (dropped entries). Shown when the file becomes active in the editor. */
 	warnings?: string[];
@@ -1202,7 +1215,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 			advisor.syncBacklog === undefined &&
 			!advisor.instructions?.trim() &&
 			advisor.enabled !== false &&
-			advisor.maxNotesPerUpdate === undefined
+			advisor.maxNotesPerUpdate === undefined &&
+			advisor.owns === undefined
 		);
 	}
 
