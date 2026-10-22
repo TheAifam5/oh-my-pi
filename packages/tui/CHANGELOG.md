@@ -2,16 +2,6 @@
 
 ## [Unreleased]
 
-## [18.12.6] - 2026-10-21
-
-### Changed
-
-- In Tern, centered sheets (`/context`, reports, keyboard shortcuts, BTW history, session info, the pause screen) fill the pane when it is narrower than 100 columns instead of floating with margins ([#16676](https://github.com/can1357/oh-my-pi/pull/16676) by [@H4vC](https://github.com/H4vC))
-
-### Fixed
-
-- Fixed the `/agents` and `/models` hubs in Tern squeezing the left sidebar as long lines (such as a streaming new-agent draft) widen the body pane
-
 ### Added
 
 - Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and keys to turn a selector role into a pool, add, replace, remove, and reorder members, and cycle the strategy (including `quota`) and funding order; an invalid pool shows its validation problem and can be removed or replaced
@@ -36,6 +26,16 @@
 
 - Fixed the status line's usage timeout cancelling the host's background usage fetch; it now bounds only its own wait
 - Advisor category and owns descriptions truncate with an ellipsis
+
+## [18.12.6] - 2026-10-21
+
+### Changed
+
+- In Tern, centered sheets (`/context`, reports, keyboard shortcuts, BTW history, session info, the pause screen) fill the pane when it is narrower than 100 columns instead of floating with margins ([#16676](https://github.com/can1357/oh-my-pi/pull/16676) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed the `/agents` and `/models` hubs in Tern squeezing the left sidebar as long lines (such as a streaming new-agent draft) widen the body pane
 
 ## [18.12.4] - 2026-10-20
 
