@@ -94,7 +94,7 @@ export function createSettingsHost(session?: SettingsHostSession): SettingsHost 
 	};
 	const targets: SettingsTarget[] = [{ id: "global", label: "Global" }];
 	let target = "global";
-	const ready = settings.listDirectoryLayerTargets().then(layers => {
+	const ready = Promise.try(() => settings.listDirectoryLayerTargets()).then(layers => {
 		for (const [index, layer] of layers.entries()) {
 			const label =
 				index === 0
