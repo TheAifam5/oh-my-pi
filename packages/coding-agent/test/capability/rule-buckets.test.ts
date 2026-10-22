@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { BUILTIN_DEFAULTS_PROVIDER_ID, type Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { bucketRules } from "@oh-my-pi/pi-coding-agent/capability/rule-buckets";
+import type { RuleScopeModel } from "@oh-my-pi/pi-coding-agent/capability/rule-model-scope";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 
 function source(provider: string): Rule["_source"] {
@@ -20,6 +22,10 @@ function makeRule(partial: Partial<Rule>): Rule {
 		question: partial.question,
 		scope: partial.scope,
 		agents: partial.agents,
+		models: partial.models,
+		providers: partial.providers,
+		class: partial.class,
+		family: partial.family,
 		interruptMode: partial.interruptMode,
 		_source: partial._source ?? source("native"),
 	};
@@ -282,5 +288,65 @@ describe("bucketRules agent scoping", () => {
 		const mgr = new TtsrManager();
 		bucketRules([rule], mgr, { agentName: " Scout " });
 		expect(mgr.checkDelta("contains FORBIDDEN token", { source: "text" }).map(r => r.name)).toEqual(["scout-only"]);
+	});
+});
+
+function scopeModel(provider: string, id: string): RuleScopeModel {
+	return { provider, id, identity: classifyModel(provider, id, { lenient: true }) };
+}
+
+describe("bucketRules model scoping", () => {
+	const opus = scopeModel("anthropic", "claude-opus-5");
+	const gpt = scopeModel("openai", "gpt-5.5");
+
+	it("keeps only the always-apply variant whose models glob admits the session model", () => {
+		const claudeStyle = makeRule({ name: "style.claude", alwaysApply: true, models: ["claude-*"] });
+		const gptStyle = makeRule({ name: "style.gpt", alwaysApply: true, models: ["gpt-*"] });
+
+		const onOpus = bucketRules([claudeStyle, gptStyle], new TtsrManager(), { model: opus });
+		expect(onOpus.alwaysApplyRules.map(r => r.name)).toEqual(["style.claude"]);
+
+		const onGpt = bucketRules([claudeStyle, gptStyle], new TtsrManager(), { model: gpt });
+		expect(onGpt.alwaysApplyRules.map(r => r.name)).toEqual(["style.gpt"]);
+	});
+
+	it("leaves a TTSR rule scoped to another model unregistered, so its trigger never fires", () => {
+		const rule = makeRule({ name: "no-foo", condition: ["FORBIDDEN"], description: "blocks foo", models: ["gpt-*"] });
+
+		const opusMgr = new TtsrManager();
+		const onOpus = bucketRules([rule], opusMgr, { model: opus });
+		expect(opusMgr.hasRules()).toBe(false);
+		expect(opusMgr.checkDelta("contains FORBIDDEN token", { source: "text" })).toEqual([]);
+		// rule:// resolves from rulebook + always + registered TTSR rules; none carries it.
+		expect([...onOpus.rulebookRules, ...onOpus.alwaysApplyRules, ...opusMgr.getRules()]).toEqual([]);
+
+		const gptMgr = new TtsrManager();
+		bucketRules([rule], gptMgr, { model: gpt });
+		expect(gptMgr.checkDelta("contains FORBIDDEN token", { source: "text" }).map(r => r.name)).toEqual(["no-foo"]);
+	});
+
+	it("drops a TTSR registration when a replacing re-bucket runs on a non-matching model", () => {
+		const rule = makeRule({ name: "gpt-guard", condition: ["FORBIDDEN"], models: ["gpt-*"] });
+		const mgr = new TtsrManager();
+		bucketRules([rule], mgr, { model: gpt });
+		expect(mgr.hasRules()).toBe(true);
+
+		bucketRules([rule], mgr, { model: opus, replaceTtsrRules: true });
+		expect(mgr.hasRules()).toBe(false);
+		expect(mgr.checkDelta("contains FORBIDDEN token", { source: "text" })).toEqual([]);
+	});
+
+	it("ANDs model selectors with agents", () => {
+		const rule = makeRule({ name: "scout-claude", alwaysApply: true, agents: ["scout"], providers: ["anthropic"] });
+		expect(bucketRules([rule], new TtsrManager(), { agentName: "scout", model: opus }).alwaysApplyRules).toEqual([
+			rule,
+		]);
+		expect(bucketRules([rule], new TtsrManager(), { agentName: "main", model: opus }).alwaysApplyRules).toEqual([]);
+		expect(bucketRules([rule], new TtsrManager(), { agentName: "scout", model: gpt }).alwaysApplyRules).toEqual([]);
+	});
+
+	it("an undefined model disables model scoping", () => {
+		const rule = makeRule({ name: "gpt-only", alwaysApply: true, models: ["gpt-*"] });
+		expect(bucketRules([rule], new TtsrManager()).alwaysApplyRules).toEqual([rule]);
 	});
 });

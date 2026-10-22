@@ -735,6 +735,27 @@ describe("rule inspector", () => {
 		expect(text).toContain("agents");
 		expect(text).not.toContain("no apply conditions");
 	});
+
+	test("lists model selectors and does not show '(no apply conditions)' for a model-scoped rule", () => {
+		const panel = new InspectorPanel();
+		panel.setExtension({
+			...ruleExtension(),
+			trigger: "manual",
+			description: "Opus-only guidance.",
+			raw: {
+				name: "claude-opus-5",
+				description: "Opus-only guidance.",
+				models: ["*/claude-opus-5"],
+				family: ["opus"],
+				content: "opus body",
+			},
+		});
+		const text = render(panel);
+		expect(text).toContain("models");
+		expect(text).toContain("*/claude-opus-5");
+		expect(text).toContain("family");
+		expect(text).not.toContain("no apply conditions");
+	});
 });
 
 describe("command inspector", () => {

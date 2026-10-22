@@ -21,6 +21,7 @@ import {
 	MAIN_AGENT_RULE_NAME,
 	parseRuleAgents,
 	parseRuleConditionAndScope,
+	parseRuleModelScope,
 	type Rule,
 	type RuleFrontmatter,
 	SUB_AGENT_RULE_NAME,
@@ -248,6 +249,7 @@ function buildRule(
 		question,
 		scope,
 		agents: parseRuleAgents(frontmatter.agents),
+		...parseRuleModelScope(frontmatter),
 		interruptMode,
 		_source: source,
 	};

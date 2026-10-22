@@ -77,6 +77,10 @@ export interface ExtensionInspectorSource {
 		astCondition?: string[];
 		scope?: string[];
 		agents?: string[];
+		models?: string[];
+		providers?: string[];
+		class?: string[];
+		family?: string[];
 	};
 }
 
@@ -350,6 +354,10 @@ export function ruleInspectorData(
 	astCondition?: string[];
 	scope?: string[];
 	agents?: string[];
+	models?: string[];
+	providers?: string[];
+	class?: string[];
+	family?: string[];
 	interruptMode?: string;
 	content: string;
 	runtimeDetail?: string;
@@ -368,6 +376,10 @@ export function ruleInspectorData(
 		astCondition: stringArray(parsed.astCondition),
 		scope: stringArray(parsed.scope),
 		agents: stringArray(parsed.agents),
+		models: stringArray(parsed.models),
+		providers: stringArray(parsed.providers),
+		class: stringArray(parsed.class),
+		family: stringArray(parsed.family),
 		interruptMode,
 		content,
 		runtimeDetail: ext.trigger,

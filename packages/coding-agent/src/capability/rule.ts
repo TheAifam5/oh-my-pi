@@ -36,6 +36,14 @@ export interface RuleFrontmatter {
 	scope?: string | string[];
 	/** Agent-name globs this rule applies to; absent = every agent. `main` targets the top-level session. */
 	agents?: string[] | string;
+	/** Model globs matched against `provider/id` or the bare model id; absent = every model. */
+	models?: string[] | string;
+	/** Provider globs matched against `Model.provider`; absent = every provider. */
+	providers?: string[] | string;
+	/** Globs matched against the model's classified vendor lineage (`model.identity.class`). */
+	class?: string[] | string;
+	/** Globs matched against the model's classified product family (`model.identity.family`). */
+	family?: string[] | string;
 	/** Per-rule TTSR interrupt mode override. */
 	interruptMode?: "never" | "prose-only" | "tool-only" | "always";
 	[key: string]: unknown;
@@ -71,6 +79,14 @@ export interface Rule {
 	scope?: string[];
 	/** Lowercased agent-name globs this rule applies to (absent = every agent). */
 	agents?: string[];
+	/** Lowercased model globs (see `rule-model-scope.ts`); absent = every model. */
+	models?: string[];
+	/** Lowercased provider globs; absent = every provider. */
+	providers?: string[];
+	/** Lowercased model-class globs; absent = every class. */
+	class?: string[];
+	/** Lowercased model-family globs; absent = every family. */
+	family?: string[];
 	/** Per-rule TTSR interrupt mode override (falls back to global ttsr.interruptMode). */
 	interruptMode?: "never" | "prose-only" | "tool-only" | "always";
 	/** Source metadata */
@@ -200,6 +216,19 @@ export function parseRuleAgents(value: unknown): string[] | undefined {
 		return undefined;
 	}
 	return Array.from(new Set(tokens.map(token => token.replace(/\s*,\s*/g, ",").toLowerCase())));
+}
+
+/** Normalized model selectors of a rule (matched in `rule-model-scope.ts`). */
+export type RuleModelScope = Pick<Rule, "models" | "providers" | "class" | "family">;
+
+/** Parse the `models`, `providers`, `class`, and `family` frontmatter fields with the `agents` tokenizer. */
+export function parseRuleModelScope(frontmatter: Record<string, unknown>): RuleModelScope {
+	return {
+		models: parseRuleAgents(frontmatter.models),
+		providers: parseRuleAgents(frontmatter.providers),
+		class: parseRuleAgents(frontmatter.class),
+		family: parseRuleAgents(frontmatter.family),
+	};
 }
 
 /** Agent name used for the top-level (non-sub) session when evaluating `agents`. */

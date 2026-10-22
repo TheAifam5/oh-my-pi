@@ -334,6 +334,10 @@ export class InspectorPanel implements Component {
 					["ast", this.#nativeList(data.astCondition)],
 					["scope", this.#nativeList(data.scope)],
 					["agents", this.#nativeList(data.agents)],
+					["models", this.#nativeList(data.models)],
+					["providers", this.#nativeList(data.providers)],
+					["class", this.#nativeList(data.class)],
+					["family", this.#nativeList(data.family)],
 					["interrupt", data.interruptMode ? [span(data.interruptMode, "dim")] : undefined],
 				]);
 				return {
@@ -701,8 +705,13 @@ export class InspectorPanel implements Component {
 		if (data.astCondition) this.#pushLabeledList(appliesBody, "ast", data.astCondition, width);
 		if (data.scope) this.#pushLabeledList(appliesBody, "scope", data.scope, width);
 		if (data.agents) this.#pushLabeledList(appliesBody, "agents", data.agents, width);
+		if (data.models) this.#pushLabeledList(appliesBody, "models", data.models, width);
+		if (data.providers) this.#pushLabeledList(appliesBody, "providers", data.providers, width);
+		if (data.class) this.#pushLabeledList(appliesBody, "class", data.class, width);
+		if (data.family) this.#pushLabeledList(appliesBody, "family", data.family, width);
 		if (data.interruptMode) this.#pushLabeled(appliesBody, "interrupt", data.interruptMode, width, "dim");
-		if (!data.alwaysApply && !data.globs && !data.condition && !data.astCondition && !data.agents) {
+		const modelScoped = data.models || data.providers || data.class || data.family;
+		if (!data.alwaysApply && !data.globs && !data.condition && !data.astCondition && !data.agents && !modelScoped) {
 			appliesBody.push(theme.fg("dim", "  (no apply conditions)"));
 		}
 		appliesBody.push("");

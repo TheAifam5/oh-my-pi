@@ -134,12 +134,22 @@ export interface ScopedModel {
 	explicitThinkingLevel: boolean;
 }
 
+function globMatchesModel(glob: Bun.Glob, model: Pick<Model, "provider" | "id">): boolean {
+	const fullId = `${model.provider}/${model.id}`;
+	return glob.match(fullId.toLowerCase()) || glob.match(model.id.toLowerCase());
+}
+
+/**
+ * Whether a model glob (the `enabledModels` grammar) matches `model`: the lowercased
+ * pattern is tested against lowercased `provider/id` and the bare `id`.
+ */
+export function modelMatchesGlob(pattern: string, model: Pick<Model, "provider" | "id">): boolean {
+	return globMatchesModel(new Bun.Glob(pattern.toLowerCase()), model);
+}
+
 function matchingGlobModels(pattern: string, availableModels: readonly Model<Api>[]): Model<Api>[] {
 	const glob = new Bun.Glob(pattern.toLowerCase());
-	return availableModels.filter(model => {
-		const fullId = `${model.provider}/${model.id}`;
-		return glob.match(fullId.toLowerCase()) || glob.match(model.id.toLowerCase());
-	});
+	return availableModels.filter(model => globMatchesModel(glob, model));
 }
 
 function resolveGlobScopePattern(

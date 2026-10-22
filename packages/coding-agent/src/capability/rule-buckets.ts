@@ -9,12 +9,14 @@
  *   1. disabledRules  — dropped before any bucket assignment
  *   2. builtin drop   — `builtinRules === false` drops `builtin-defaults` rules
  *   3. agents scope   — rules whose `agents` globs do not match `options.agentName` are dropped
+ *   3b. model scope   — rules whose model selectors do not admit `options.model` are dropped
  *   4. TTSR           — non-empty `condition`/`astCondition`/`question` the manager already tracks or newly accepts
  *   5. always         — `alwaysApply === true`
  *   6. rulebook       — has a `description`
  */
 import type { TtsrManager } from "../export/ttsr";
 import { BUILTIN_DEFAULTS_PROVIDER_ID, type Rule, ruleAppliesToAgent } from "./rule";
+import { type RuleScopeModel, ruleAppliesToModel } from "./rule-model-scope";
 
 export interface RuleBuckets {
 	rulebookRules: Rule[];
@@ -32,6 +34,11 @@ export interface BucketRulesOptions {
 	 * from every bucket. Omit to disable agent scoping (CLI inventory listings).
 	 */
 	agentName?: string;
+	/**
+	 * Resolved model of this session. Rules whose `models`/`providers`/`class`/`family`
+	 * selectors do not admit it are dropped from every bucket. Omit to disable model scoping.
+	 */
+	model?: RuleScopeModel;
 	/** Replace existing TTSR registrations before bucketing this complete rule snapshot. */
 	replaceTtsrRules?: boolean;
 }
@@ -58,6 +65,7 @@ export function bucketRules(
 		if (disabled.has(rule.name)) continue;
 		if (!includeBuiltin && rule._source?.provider === BUILTIN_DEFAULTS_PROVIDER_ID) continue;
 		if (!ruleAppliesToAgent(rule, options.agentName)) continue;
+		if (!ruleAppliesToModel(rule, options.model)) continue;
 		includedRules.push(rule);
 	}
 

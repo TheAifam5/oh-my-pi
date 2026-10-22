@@ -47,6 +47,10 @@ interface Rule {
   question?: string;
   scope?: string[];
   agents?: string[];
+  models?: string[];
+  providers?: string[];
+  class?: string[];
+  family?: string[];
   interruptMode?: "never" | "prose-only" | "tool-only" | "always";
   _source: SourceMeta;
 }
@@ -85,7 +89,7 @@ Normalization:
 - `name` = filename without `.md`/`.mdc`
 - frontmatter parsed via `parseFrontmatter`
 - `content` = body (frontmatter stripped)
-- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, and `interruptMode` are parsed by `buildRuleFromMarkdown`
+- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, the model selectors (`models`, `providers`, `class`, `family`), and `interruptMode` are parsed by `buildRuleFromMarkdown`
 - user sticky `RULES.md` is named `RULES`; project sticky `RULES.md` is named `RULES@project`; both are forced to `alwaysApply: true`
 
 The distinct sticky names allow user and project content to coexist. Native items are appended as project rules, user rules, user sticky `RULES.md`, then project sticky `RULES.md`; an earlier regular rule with either sticky name can still shadow that sticky file.
@@ -99,7 +103,7 @@ Loads from both `.agent` and `.agents` directories:
 - project: walk upward from `cwd` to repo root, loading `<ancestor>/.agent/rules/*.{md,mdc}` and `<ancestor>/.agents/rules/*.{md,mdc}`
 - user: `~/.agent/rules/*.{md,mdc}` and `~/.agents/rules/*.{md,mdc}`
 
-Normalization uses the shared `buildRuleFromMarkdown` path: filename-derived name, stripped frontmatter body, and parsed `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, and `interruptMode`.
+Normalization uses the shared `buildRuleFromMarkdown` path: filename-derived name, stripped frontmatter body, and parsed `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, model selectors, and `interruptMode`.
 
 ### Cursor provider (`cursor.ts`)
 
@@ -113,7 +117,7 @@ Normalization (`transformMDCRule`):
 - `description`: kept only if string
 - `alwaysApply`: normalized to a boolean — `true` only when frontmatter has `alwaysApply: true` (anything else becomes `false`)
 - `globs`: accepts array (string elements only) or single string
-- `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, and `interruptMode` are parsed by shared rule helpers
+- `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, model selectors, and `interruptMode` are parsed by shared rule helpers
 - `name` from filename without extension
 
 ### Windsurf provider (`windsurf.ts`)
@@ -126,7 +130,7 @@ Loads from:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, model selectors, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `global_rules` for the user global file and derived from filename for project rules
 
 ### Cline provider (`cline.ts`)
@@ -139,7 +143,7 @@ Searches upward from `cwd` for nearest `.clinerules`:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `question`, `scope`, `agents`, model selectors, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `clinerules` for a `.clinerules` file and derived from filename for `.clinerules/*.md`
 
 ### GitHub provider (`github.ts`)
@@ -219,9 +223,10 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
 1. Drop rules listed in `ttsr.disabledRules`.
 2. Drop rules from the `builtin-defaults` provider when `ttsr.builtinRules === false`.
 3. Drop rules whose `agents` globs do not match the session's agent name (`main` for a top-level session, otherwise the agent definition name); rules without `agents` apply to every agent.
-4. Register rules with a non-empty `condition`, `astCondition`, or `question` into `TtsrManager`; if registration succeeds, the rule is TTSR-only.
-5. Put remaining `alwaysApply === true` rules into `alwaysApplyRules`.
-6. Put remaining rules with `description` into `rulebookRules`.
+4. Drop rules whose model selectors (`models`, `providers`, `class`, `family`) do not admit the session's resolved model; rules without selectors apply to every model. Callers that pass no model (CLI inventory listings) skip this step.
+5. Register rules with a non-empty `condition`, `astCondition`, or `question` into `TtsrManager`; if registration succeeds, the rule is TTSR-only.
+6. Put remaining `alwaysApply === true` rules into `alwaysApplyRules`.
+7. Put remaining rules with `description` into `rulebookRules`.
 
 ### Bucket behavior
 
@@ -270,6 +275,32 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
   ```yaml
   # Main agent only; every subagent ignores this rule:
   agents: main
+  ```
+
+### `models`, `providers`, `class`, and `family`
+
+- Restrict a rule to the session's resolved model. Each selector accepts a YAML sequence, a single string, or a comma-separated string; patterns are lowercased globs (`Bun.Glob`) matched case-insensitively.
+  - `models`: matched against `provider/id` **or** the bare model `id`, the same grammar as `enabledModels`. `*` does not cross `/`: `*/claude-opus-5` matches `anthropic/claude-opus-5` and, through the bare id `anthropic/claude-opus-5`, `openrouter/anthropic/claude-opus-5`, but not `claude-opus-5-5`. Use `**/claude-*` to reach any routed id.
+  - `providers`: matched against the model's provider id (`anthropic`, `openai-codex`, `openrouter`).
+  - `class` / `family`: matched against the catalog's classified identity (`model.identity.class`, for example `anthropic` or `openai`; `model.identity.family`, for example `opus` or `gpt`). These follow the lineage across providers, routed ids, and new revisions; bundled rules should prefer them over id globs.
+- Patterns within one selector are OR'd. Selectors are AND'd with each other and with `agents`.
+- Filtering happens in `bucketRules(...)` exactly like `agents`: a non-matching rule joins no bucket, is never registered with `TtsrManager`, and is not addressable via `rule://`.
+- The match uses the resolved concrete model. The first system prompt is bucketed against the session's final model (including restored and fallback-resolved models), and every model switch (`/model`, temporary and role switches, retry fallback, context promotion) re-buckets the rules and rebuilds the prompt. When any discovered rule carries a model selector, the prompt refresh key includes `provider/id` even with `includeModelInPrompt: false`.
+- Subagents re-evaluate selectors against their own model.
+- Rule identity stays name-based (§1). Variants of one logical rule need distinct file names, for example `style.claude.md` and `style.gpt.md`.
+- `omp ttsr test --model <provider/id>` evaluates TTSR rules against that model; without `--model`, model selectors are ignored.
+
+  ```yaml
+  # ~/.omp/agent/rules/claude-opus-5.md
+  alwaysApply: true
+  models: ["*/claude-opus-5"]
+  ```
+
+  ```yaml
+  # Every Anthropic Opus model on any provider:
+  alwaysApply: true
+  class: anthropic
+  family: opus
   ```
 
 ### `condition`, `astCondition`, `question`, `scope`, and `interruptMode`

@@ -69,7 +69,7 @@ async function run(args: TtsrCommandArgs): Promise<void> {
 async function writeTempRule(
 	condition: string,
 	scope: string[],
-	options: { astCondition?: string; agents?: string[] } = {},
+	options: { astCondition?: string; agents?: string[]; models?: string[] } = {},
 ): Promise<string> {
 	// Stable basename "test-rule.md" so buildRuleFromMarkdown derives name
 	// "test-rule" — assertions rely on it. Each call uses a unique parent dir
@@ -81,6 +81,7 @@ async function writeTempRule(
 	if (options.astCondition) fm.push(`astCondition: "${options.astCondition.replace(/"/g, '\\"')}"`);
 	fm.push(`scope: [${scope.map(s => `"${s}"`).join(", ")}]`);
 	if (options.agents) fm.push(`agents: [${options.agents.map(a => `"${a}"`).join(", ")}]`);
+	if (options.models) fm.push(`models: [${options.models.map(m => `"${m}"`).join(", ")}]`);
 	await Bun.write(tmp, `---\n${fm.join("\n")}\n---\nbody\n`);
 	return tmp;
 }
@@ -236,6 +237,36 @@ describe("omp ttsr", () => {
 			await run({ action: "test", test: { ...test, agent: "main" }, json: true });
 			const report = JSON.parse(stdout);
 			expect(report.error).toMatch(/scoped to agents/);
+		});
+
+		it("evaluates model selectors against --model and ignores them without it", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule(": any", ["tool:edit(*.ts)"], { models: ["*/claude-opus-5"] });
+			const test: TtsrTestArgs = {
+				rule: rulePath,
+				source: "tool",
+				filePath: "src/foo.ts",
+				snippet: "const x: any = 1",
+			};
+			await run({ action: "test", test: { ...test, model: "openrouter/anthropic/claude-opus-5" }, json: true });
+			const matching = JSON.parse(stdout);
+			expect(matching.model).toBe("openrouter/anthropic/claude-opus-5");
+			expect(matching.triggered.map((r: { name: string }) => r.name)).toEqual(["test-rule"]);
+
+			captureStreams();
+			await run({ action: "test", test: { ...test, model: "anthropic/claude-opus-5-5" }, json: true });
+			expect(JSON.parse(stdout).error).toMatch(/model-scoped/);
+
+			captureStreams();
+			await run({ action: "test", test, json: true });
+			expect(JSON.parse(stdout).triggered.map((r: { name: string }) => r.name)).toEqual(["test-rule"]);
+		});
+
+		it("rejects a --model without a provider", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule(": any", ["tool:edit(*.ts)"]);
+			await run({ action: "test", test: { rule: rulePath, snippet: "x", model: "claude-opus-5" }, json: true });
+			expect(JSON.parse(stdout).error).toMatch(/Invalid --model/);
 		});
 	});
 
