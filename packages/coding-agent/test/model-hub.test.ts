@@ -104,8 +104,8 @@ interface RegistryOverrides {
 function makeRegistry(models: () => Model[], overrides: RegistryOverrides = {}): ModelRegistry {
 	const getAll = overrides.getAll ?? models;
 	return {
-		refresh: overrides.refresh ?? (async () => { }),
-		refreshProvider: overrides.refreshProvider ?? (async () => { }),
+		refresh: overrides.refresh ?? (async () => {}),
+		refreshProvider: overrides.refreshProvider ?? (async () => {}),
 		getError: () => undefined,
 		getAvailable: overrides.getAvailable ?? models,
 		getAll,
@@ -2830,7 +2830,7 @@ describe("ModelHub", () => {
 		test("wheel over the sidebar never changes the active scope or schedules refreshes", () => {
 			vi.useFakeTimers();
 			try {
-				const refreshProvider = vi.fn(async () => { });
+				const refreshProvider = vi.fn(async () => {});
 				const { hub } = createHub({
 					models: [makeModel("prov-a", "model-a"), makeModel("prov-b", "model-b")],
 					registry: { refreshProvider },
@@ -2981,7 +2981,7 @@ describe("ModelHub", () => {
 	describe("provider refresh lifecycle", () => {
 		test("auto-refreshes a provider once per process; F5 forces a re-fetch", async () => {
 			const model = makeModel("prov-a", "model-a");
-			const refreshProvider = vi.fn<ModelRegistry["refreshProvider"]>(async () => { });
+			const refreshProvider = vi.fn<ModelRegistry["refreshProvider"]>(async () => {});
 			const { hub } = createHub({
 				models: [model],
 				registry: { refreshProvider },
@@ -3011,7 +3011,7 @@ describe("ModelHub", () => {
 
 		test("F5 during the hover debounce upgrades the pending catalog refresh", async () => {
 			const model = makeModel("prov-a", "model-a");
-			const refreshProvider = vi.fn(async () => { });
+			const refreshProvider = vi.fn(async () => {});
 			const { hub } = createHub({
 				models: [model],
 				registry: { refreshProvider },
