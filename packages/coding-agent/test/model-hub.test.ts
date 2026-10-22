@@ -104,8 +104,8 @@ interface RegistryOverrides {
 function makeRegistry(models: () => Model[], overrides: RegistryOverrides = {}): ModelRegistry {
 	const getAll = overrides.getAll ?? models;
 	return {
-		refresh: overrides.refresh ?? (async () => {}),
-		refreshProvider: overrides.refreshProvider ?? (async () => {}),
+		refresh: overrides.refresh ?? (async () => { }),
+		refreshProvider: overrides.refreshProvider ?? (async () => { }),
 		getError: () => undefined,
 		getAvailable: overrides.getAvailable ?? models,
 		getAll,
@@ -1693,6 +1693,47 @@ describe("ModelHub", () => {
 					tmp.removeSync();
 				}
 			});
+
+			test(`the ${kind} pool writer keeps stored unknown account names on unrelated edits`, async () => {
+				const tmp = TempDir.createSync("@pi-model-hub-account-stale-");
+				try {
+					const section =
+						kind === "role"
+							? "modelRoles:\n  smol:\n"
+							: kind === "chain"
+								? "retry:\n  fallbackChains:\n    smol:\n"
+								: "modelGroups:\n  smol:\n";
+					const indent = kind === "chain" ? "      " : "    ";
+					const storedPool = [
+						"strategy: random",
+						"models:",
+						"  a: { model: test/model-a }",
+						"routing:",
+						"  accounts: { order: [gone], drain: gone }",
+					]
+						.map(line => `${indent}${line}\n`)
+						.join("");
+					const settings = await fileSettings(
+						tmp,
+						`auth:\n  accountPolicies:\n    - provider: test\n      name: work\n      account: { email: w@example.com }\n${section}${storedPool}`,
+					);
+					const target = { kind, key: "smol" };
+					const edited = {
+						strategy: "cheapest",
+						models: { a: { model: "test/model-a" } },
+						routing: { accounts: { order: ["gone"], drain: "gone" } },
+					};
+					expect(writeModelHubPool(settings, target, edited)).toBeUndefined();
+					const refused = writeModelHubPool(settings, target, {
+						...edited,
+						routing: { accounts: { order: ["gone", "other"], drain: "gone" } },
+					});
+					expect(refused).toContain("other");
+				} finally {
+					AgentStorage.close();
+					tmp.removeSync();
+				}
+			});
 		}
 
 		test("the drain editor surfaces a writer refusal when a name loses trust before submission", () => {
@@ -2789,7 +2830,7 @@ describe("ModelHub", () => {
 		test("wheel over the sidebar never changes the active scope or schedules refreshes", () => {
 			vi.useFakeTimers();
 			try {
-				const refreshProvider = vi.fn(async () => {});
+				const refreshProvider = vi.fn(async () => { });
 				const { hub } = createHub({
 					models: [makeModel("prov-a", "model-a"), makeModel("prov-b", "model-b")],
 					registry: { refreshProvider },
@@ -2940,7 +2981,7 @@ describe("ModelHub", () => {
 	describe("provider refresh lifecycle", () => {
 		test("auto-refreshes a provider once per process; F5 forces a re-fetch", async () => {
 			const model = makeModel("prov-a", "model-a");
-			const refreshProvider = vi.fn<ModelRegistry["refreshProvider"]>(async () => {});
+			const refreshProvider = vi.fn<ModelRegistry["refreshProvider"]>(async () => { });
 			const { hub } = createHub({
 				models: [model],
 				registry: { refreshProvider },
@@ -2970,7 +3011,7 @@ describe("ModelHub", () => {
 
 		test("F5 during the hover debounce upgrades the pending catalog refresh", async () => {
 			const model = makeModel("prov-a", "model-a");
-			const refreshProvider = vi.fn(async () => {});
+			const refreshProvider = vi.fn(async () => { });
 			const { hub } = createHub({
 				models: [model],
 				registry: { refreshProvider },

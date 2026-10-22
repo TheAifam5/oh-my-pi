@@ -191,9 +191,10 @@ function trustedAccountNames(settings: Settings): string[] {
 /**
  * Persist a pool edit from the model hub to the global config: `value` replaces the role's
  * `modelRoles` entry, the `retry.fallbackChains` entry, or the `modelGroups` entry; `undefined`
- * removes it. Account order and drain names must belong to the trusted account-policy layer.
+ * removes it. Account order and drain names the edit adds must belong to the trusted account-policy
+ * layer; names already stored in the pool are kept.
  *
- * @returns the refusal message for an invalid value or untrusted account name; nothing is written then.
+ * @returns the refusal message for an invalid value or newly added untrusted account name; nothing is written then.
  */
 export function writeModelHubPool(
 	settings: Settings,
@@ -201,16 +202,13 @@ export function writeModelHubPool(
 	value: Readonly<Record<string, unknown>> | undefined,
 ): string | undefined {
 	try {
-		const routing = value?.routing;
-		const accounts = isRecord(routing) ? routing.accounts : undefined;
-		if (isRecord(accounts)) {
+		const added = routingAccountNames(value);
+		if (added.length > 0) {
+			const stored = new Set(routingAccountNames(storedGlobalPool(settings, target)).map(entry => entry.name));
 			const trustedNames = trustedAccountNames(settings);
-			for (const field of ["order", "drain"] as const) {
-				const names = field === "order" && Array.isArray(accounts.order) ? accounts.order : [accounts[field]];
-				for (const name of names) {
-					if (typeof name === "string" && !trustedNames.includes(name)) {
-						return `routing.accounts.${field}: account ${JSON.stringify(name)} is not defined in trusted auth.accountPolicies`;
-					}
+			for (const { field, name } of added) {
+				if (!stored.has(name) && !trustedNames.includes(name)) {
+					return `routing.accounts.${field}: account ${JSON.stringify(name)} is not defined in trusted auth.accountPolicies`;
 				}
 			}
 		}
@@ -222,6 +220,33 @@ export function writeModelHubPool(
 		if (error instanceof ModelGroupConfigError) return error.message;
 		throw error;
 	}
+}
+
+/** The raw pool `target` names in the global config, the layer {@link writeModelHubPool} replaces. */
+function storedGlobalPool(settings: Settings, target: ModelHubWriteTarget): unknown {
+	const global = settings.getGlobalSettings();
+	const section =
+		target.kind === "role"
+			? global.modelRoles
+			: target.kind === "chain"
+				? isRecord(global.retry)
+					? global.retry.fallbackChains
+					: undefined
+				: global.modelGroups;
+	return isRecord(section) ? section[target.key] : undefined;
+}
+
+/** Account names in a pool's `routing.accounts.order` and `routing.accounts.drain`. */
+function routingAccountNames(pool: unknown): { field: "order" | "drain"; name: string }[] {
+	const routing = isRecord(pool) ? pool.routing : undefined;
+	const accounts = isRecord(routing) ? routing.accounts : undefined;
+	if (!isRecord(accounts)) return [];
+	const names: { field: "order" | "drain"; name: string }[] = [];
+	if (Array.isArray(accounts.order)) {
+		for (const name of accounts.order) if (typeof name === "string") names.push({ field: "order", name });
+	}
+	if (typeof accounts.drain === "string") names.push({ field: "drain", name: accounts.drain });
+	return names;
 }
 
 /** A pool limit from the `/account` limit syntax; values are checked when the pool is written. */
