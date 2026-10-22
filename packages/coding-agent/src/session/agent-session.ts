@@ -8275,9 +8275,20 @@ export class AgentSession implements SettingsScope {
 	 */
 	resolveRoleModelAsync(
 		role: string,
-		options?: { signal?: AbortSignal; availableModels?: Model[] },
+		options?: {
+			signal?: AbortSignal;
+			availableModels?: Model[];
+			memberSelector?: string;
+			advance?: boolean;
+			thinkingLevel?: ConfiguredThinkingLevel;
+		},
 	): Promise<ResolvedModelRoleValue> {
 		return this.#models.resolveRoleModelAsync(role, options);
+	}
+
+	/** Whether the active model is the kept pool pick of the last selected role. */
+	isRolePoolPickActive(role: string): boolean {
+		return this.#models.isRolePoolPickActive(role);
 	}
 
 	/**

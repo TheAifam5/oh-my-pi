@@ -525,8 +525,8 @@ export interface InteractiveModeContext {
 	/** Open the fullscreen git UI, optionally pinned to a revision (`/git <rev>`). */
 	showGitUi(revision?: string): void;
 	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void;
-	/** Session-only switch to an already-resolved model (`/switch <selector>`); compacts first when over context. */
-	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void>;
+	/** Session-only switch, compacting first when over context; `poolRole` retains that role's pick and reports `@role → provider/id`. */
+	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, poolRole?: string): Promise<void>;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
 	showCopySelector(): void;

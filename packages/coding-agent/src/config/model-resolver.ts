@@ -23,6 +23,7 @@ import {
  */
 
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { sanitizeNoticeLine } from "../utils/notice-text";
 import type { ModelRoleLookup } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import type { Api, Effort, KnownProvider, Model, ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -57,6 +58,7 @@ import {
 	type ModelRole,
 } from "./model-roles";
 import type { Settings } from "./settings";
+import { groupMemberSelectors, type GroupMemberSelector } from "./model-groups";
 
 import { cfgDisabledProviders, cfgEnabledModels, cfgModelProviderOrder } from "./model-settings";
 import {
@@ -1058,6 +1060,47 @@ export function parseModelPattern(
 const DEFAULT_MODEL_ROLE = "default";
 const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
 
+export interface PoolMemberSelection {
+	role?: string;
+	group?: string;
+	member: string;
+	selector: string;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** Resolves a named pool member and rejects unknown pool or member names. */
+export function resolvePoolMemberSelector(value: string, settings: Settings): PoolMemberSelection | undefined {
+	const { base, level } = splitRoleAliasThinkingSuffix(value.trim());
+	const match = /^([@+])([^/]+)\/(.+)$/.exec(base);
+	if (!match) return undefined;
+	const [, prefix, name, member] = match;
+	let members: GroupMemberSelector[] | undefined;
+	if (prefix === "+") {
+		const group = settings.getModelGroup(name);
+		if (group) members = groupMemberSelectors(group);
+	} else {
+		const spec = settings.getModelRoleSpec(name);
+		const group =
+			spec?.kind === "group" ? spec.group : spec?.kind === "ref" ? settings.getModelGroup(spec.ref.use) : undefined;
+		if (group) members = groupMemberSelectors(group, spec?.kind === "ref" ? spec.ref.profile : group.profile);
+	}
+	const selected =
+		prefix === "@" && member === "next" ? members?.[0] : members?.find(entry => entry.member.alias === member);
+	if (!selected) {
+		throw new Error(
+			sanitizeNoticeLine(
+				`Unknown ${prefix === "@" ? "role pool" : "group"} member "${base}". Valid members: ${members?.map(entry => entry.member.alias).join(", ") || "(none)"}`,
+			),
+		);
+	}
+	return {
+		...(prefix === "@" ? { role: name } : { group: name }),
+		member,
+		selector: selected.selector,
+		...(level !== undefined ? { thinkingLevel: level } : {}),
+	};
+}
+
 function isModelRole(role: string): role is ModelRole {
 	return (MODEL_ROLE_IDS as string[]).includes(role);
 }
@@ -1104,6 +1147,8 @@ export function resolveExplicitModelRole(
 	settings?: ModelRoleLookup,
 ): string | undefined {
 	for (const pattern of normalizeModelPatternList(value)) {
+		const memberRole = /^@([^/:]+)\/[^:]+(?::[^:]+)?$/.exec(pattern)?.[1];
+		if (memberRole && settings?.getModelRole(memberRole) !== undefined) return memberRole;
 		const prefixLength = modelRoleAliasPrefixLength(pattern);
 		if (prefixLength === undefined) continue;
 		const { base } = splitThinkingSuffix(pattern, prefixLength, MAX_THINKING_SUFFIX_OPTIONS);
@@ -1500,6 +1545,15 @@ export function resolveModelRoleValue(
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
 
+	const member = options?.settings ? resolvePoolMemberSelector(normalized, options.settings) : undefined;
+	if (member) {
+		const resolved = resolveModelRoleValue(member.selector, availableModels, { ...options, exact: true });
+		if (member.thinkingLevel !== undefined) {
+			resolved.thinkingLevel = member.thinkingLevel;
+			resolved.explicitThinkingLevel = true;
+		}
+		return resolved;
+	}
 	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.roleLookup ?? options?.settings);
 	if (!effectivePatterns || effectivePatterns.length === 0) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -2265,6 +2319,29 @@ function resolveCliModelInScope(
 	}
 
 	const trimmedModel = cliModel.trim();
+	if (!cliProvider && settings) {
+		try {
+			const member = resolvePoolMemberSelector(trimmedModel, settings);
+			if (member) {
+				const resolved = resolveModelRoleValue(trimmedModel, availableModels, { settings, exact: true });
+				return {
+					model: resolved.model,
+					selector: resolved.model ? formatModelString(resolved.model) : undefined,
+					configuredRole: member.role,
+					thinkingLevel: resolved.thinkingLevel,
+					warning: resolved.warning,
+					error: resolved.model ? undefined : sanitizeNoticeLine(`Pool member "${trimmedModel}" is unavailable`),
+				};
+			}
+		} catch (error) {
+			return {
+				model: undefined,
+				selector: undefined,
+				warning: undefined,
+				error: String(error instanceof Error ? error.message : error),
+			};
+		}
+	}
 	if (!provider) {
 		const exact = findExactCliModel(trimmedModel, allModels, availableModels, preferences, {
 			catalogFallback: false,

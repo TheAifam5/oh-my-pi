@@ -42,6 +42,7 @@ import {
 	validateRetryFallbackChains,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
+import { resolveSessionModelSelector } from "@oh-my-pi/pi-coding-agent/session/model-selector";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -339,6 +340,43 @@ describe("AgentSession retry fallback", () => {
 			session = undefined;
 		}
 		vi.restoreAllMocks();
+	});
+
+	it("keeps a named role member's later fallback inside its pool", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("google", "gemini-2.5-flash");
+		const outside = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback || !outside) throw new Error("Expected bundled pool models");
+		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
+			"retry.baseDelayMs": 1,
+			"compaction.enabled": false,
+			modelRoles: {
+				default: "openai/gpt-4o-mini",
+				security: {
+					strategy: "priority",
+					strategyOptions: { order: ["mythos", "flash"] },
+					models: {
+						mythos: { model: "anthropic/claude-sonnet-4-5" },
+						flash: { model: "google/gemini-2.5-flash" },
+					},
+				},
+			},
+		});
+		const requested: string[] = [];
+		session = new AgentSession({
+			agent: createFallbackAgent(primary, requested),
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const selected = await resolveSessionModelSelector("@security/mythos", session, settings);
+		if (!selected.model) throw new Error(selected.error);
+		await session.setModelTemporary(selected.model, selected.thinkingLevel, { poolRole: selected.poolRole });
+		await session.prompt("Recover inside the selected role pool");
+		await session.waitForIdle();
+		expect(requested).toEqual(["anthropic/claude-sonnet-4-5", "google/gemini-2.5-flash"]);
+		expect(session.model?.id).toBe(fallback.id);
 	});
 
 	it("advances through a role-keyed fallback chain across retries", async () => {

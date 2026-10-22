@@ -21,6 +21,8 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { resolveSessionModelSelector, listSessionPoolMembers } from "@oh-my-pi/pi-coding-agent/session/model-selector";
+import { resolvePoolMemberSelector, resolveCliModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import {
 	notePoolPickApplied,
 	ordersEveryCandidate,
@@ -177,6 +179,9 @@ describe("model role pools", () => {
 			expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
 			expect(notices).toHaveLength(1);
 			expect(notices[0]).toContain(selectorOf(OPENAI));
+			await expect(
+				resolveRolePool("engineer", deps(settings), { memberSelector: selectorOf(OPENAI) }),
+			).rejects.toThrow("funding exhausted");
 		});
 
 		it("ranks a member without billing evidence after a funded one and still excludes an exhausted one", async () => {
@@ -277,6 +282,9 @@ describe("model role pools", () => {
 				expect(resolution?.kind).toBe("picked");
 				if (resolution?.kind !== "picked") return;
 				expect(selectorOf(resolution.pick.model)).toBe(selectorOf(GOOGLE));
+				await expect(
+					resolveRolePool("engineer", deps(settings), { memberSelector: selectorOf(OPENAI) }),
+				).rejects.toThrow("local limit reached");
 			} finally {
 				AgentStorage.close();
 			}
@@ -1489,6 +1497,242 @@ describe("model role pools", () => {
 				toolNames: ["read"],
 			};
 		}
+
+		function memberSettings(): Settings {
+			return Settings.isolated({
+				modelRoles: {
+					default: selectorOf(OPENAI),
+					security: {
+						strategy: "priority",
+						strategyOptions: { order: ["mythos", "flash", "next"] },
+						models: {
+							mythos: { model: selectorOf(ANTHROPIC), defaultEffort: "low" },
+							flash: { model: selectorOf(GOOGLE) },
+							next: { model: selectorOf(OPENAI) },
+						},
+					},
+				},
+				modelGroups: {
+					grp: {
+						strategy: "priority",
+						strategyOptions: { order: ["x"] },
+						models: { x: { model: selectorOf(GOOGLE), defaultEffort: "low" } },
+					},
+				},
+			});
+		}
+
+		it("selects a named role member and retains its pool pick and fallback members", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				const keys = vi.spyOn(modelRegistry, "getApiKey");
+				const selected = await resolveSessionModelSelector("@security/mythos", session, settings);
+				expect(selected.error).toBeUndefined();
+				expect(selected.model && selectorOf(selected.model)).toBe(selectorOf(ANTHROPIC));
+				expect(selected.thinkingLevel).toBe(Effort.Low);
+				expect(keys.mock.calls.map(([model]) => selectorOf(model))).toEqual([selectorOf(ANTHROPIC)]);
+				await session.setModelTemporary(selected.model!, selected.thinkingLevel, { poolRole: selected.poolRole });
+				expect(session.sessionManager.getLastModelChangeRole()).toBe("security");
+				expect((await session.resolveRoleModelAsync("security")).model).toBe(selected.model);
+				const cycle = session.getRoleModelCycle(["default", "security"]);
+				expect(cycle?.models.find(entry => entry.role === "security")?.model).toBe(selected.model);
+				const pick = await resolveRolePool("security", deps(settings), {
+					memberSelector: `${selectorOf(ANTHROPIC)}:low`,
+				});
+				expect(pick?.kind).toBe("picked");
+				if (pick?.kind === "picked")
+					expect(pick.pick.rest.map(member => member.raw)).toEqual([selectorOf(GOOGLE), selectorOf(OPENAI)]);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("switches a group member as a plain model and overrides member effort", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				const selected = await resolveSessionModelSelector("+grp/x:high", session, settings);
+				expect(selected.model && selectorOf(selected.model)).toBe(selectorOf(GOOGLE));
+				expect(selected.poolRole).toBeUndefined();
+				expect(selected.thinkingLevel).toBe(Effort.High);
+				await session.setModelTemporary(selected.model!, selected.thinkingLevel);
+				expect(session.sessionManager.getLastModelChangeRole()).toBe("temporary");
+				const role = await resolveSessionModelSelector("@security/mythos:high", session, settings);
+				expect(role.thinkingLevel).toBe(Effort.High);
+				modelRegistry.suppressSelector(selectorOf(GOOGLE), Date.now() + 60_000);
+				const blocked = await resolveSessionModelSelector("+grp/x", session, settings);
+				expect(blocked.model).toBeUndefined();
+				expect(blocked.error).toContain("cooling down");
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("lists valid names for unknown members and refuses blocked members without switching", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				const before = session.model;
+				const missing = await resolveSessionModelSelector("@security/missing", session, settings);
+				expect(missing.error).toContain("mythos, flash, next");
+				expect((await resolveSessionModelSelector("+grp/missing", session, settings)).error).toContain("x");
+				modelRegistry.suppressSelector(selectorOf(ANTHROPIC), Date.now() + 60_000);
+				const blocked = await resolveSessionModelSelector("@security/mythos", session, settings);
+				expect(blocked.error).toContain("cooling down");
+				expect(blocked.model).toBeUndefined();
+				expect(session.model).toBe(before);
+				const rows = await listSessionPoolMembers(session, settings);
+				expect(rows.find(row => row.selector === "@security/mythos")?.state).toMatch(/^blocked until /);
+				expect(rows.find(row => row.selector === "@security/flash")?.state).toBe("usable");
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["exhausted", "no-entitled-account"])(
+			"refuses and displays a member with %s health without switching",
+			async reason => {
+				const settings = memberSettings();
+				const { session } = await createAgentSession(startupOptions(settings));
+				try {
+					const before = session.model;
+					vi.spyOn(authStorage.health, "model").mockImplementation(async provider =>
+						provider === ANTHROPIC.provider
+							? reason === "exhausted"
+								? { state: "depleted", accounts: [] }
+								: { state: "unknown", accounts: [], unavailableReason: "no-entitled-account" }
+							: { state: "unknown", accounts: [] },
+					);
+					const selected = await resolveSessionModelSelector("@security/mythos", session, settings);
+					expect(selected.model).toBeUndefined();
+					expect(selected.error).toContain(reason === "exhausted" ? "exhausted" : "no entitled account");
+					expect(session.model).toBe(before);
+					const rows = await listSessionPoolMembers(session, settings);
+					expect(rows.find(row => row.selector === "@security/mythos")?.state).toContain(
+						reason === "exhausted" ? "exhausted" : "no entitled account",
+					);
+				} finally {
+					await session.dispose();
+				}
+			},
+		);
+
+		it("advances an active role, wraps, skips blocked members, and keeps quick-role picks", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				async function select(selector: string) {
+					const selected = await resolveSessionModelSelector(selector, session, settings, {
+						advanceActiveRole: true,
+					});
+					if (!selected.model) throw new Error(selected.error);
+					await session.setModelTemporary(selected.model, selected.thinkingLevel, { poolRole: selected.poolRole });
+					return selectorOf(selected.model);
+				}
+				expect(await select("@security/mythos")).toBe(selectorOf(ANTHROPIC));
+				expect(await select("@security")).toBe(selectorOf(GOOGLE));
+				await session.applyRoleModel({ role: "security", model: ANTHROPIC, explicitThinkingLevel: false });
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(GOOGLE));
+				modelRegistry.suppressSelector(selectorOf(OPENAI), Date.now() + 60_000);
+				expect(await select("@security")).toBe(selectorOf(ANTHROPIC));
+				expect(await select("@security/next")).toBe(selectorOf(GOOGLE));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("advances from a non-first named member and wraps in strategy order", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				for (const [selector, expected] of [
+					["@security/flash", selectorOf(GOOGLE)],
+					["@security", selectorOf(OPENAI)],
+					["@security", selectorOf(ANTHROPIC)],
+					["@security/flash", selectorOf(GOOGLE)],
+					["@security/next", selectorOf(OPENAI)],
+					["@security/next", selectorOf(ANTHROPIC)],
+				]) {
+					const selected = await resolveSessionModelSelector(selector!, session, settings, {
+						advanceActiveRole: true,
+					});
+					if (!selected.model) throw new Error(selected.error);
+					expect(selectorOf(selected.model)).toBe(expected!);
+					await session.setModelTemporary(selected.model, selected.thinkingLevel, { poolRole: selected.poolRole });
+				}
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("sanitizes invalid pool member selectors before displaying them", () => {
+			const settings = memberSettings();
+			try {
+				resolvePoolMemberSelector("+grp/missing\x1b[31m", settings);
+				throw new Error("Expected unknown member");
+			} catch (error) {
+				expect(String(error)).toContain("Unknown group member");
+				expect(String(error)).not.toContain("\x1b");
+			}
+		});
+
+		it("does not advance a recorded role without a kept pool pick", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				await session.setModelTemporary(ANTHROPIC);
+				session.sessionManager.appendModelChange(selectorOf(ANTHROPIC), "security");
+				expect(session.isRolePoolPickActive("security")).toBe(false);
+				const selected = await resolveSessionModelSelector("@security", session, settings, {
+					advanceActiveRole: true,
+				});
+				expect(selected.model && selectorOf(selected.model)).toBe(selectorOf(ANTHROPIC));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("advances an inactive role instead of selecting a literal next member", async () => {
+			const settings = memberSettings();
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				const selected = await resolveSessionModelSelector("@security/next", session, settings);
+				expect(selected.model && selectorOf(selected.model)).toBe(selectorOf(GOOGLE));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["@security/mythos:high", "+grp/x:high"])("resolves %s through the CLI model resolver", selector => {
+			const settings = memberSettings();
+			const selected = resolveCliModel({ cliModel: selector, modelRegistry, settings });
+			expect(selected.error).toBeUndefined();
+			expect(selected.thinkingLevel).toBe(Effort.High);
+			expect(selected.model).toBeDefined();
+			expect(resolvePoolMemberSelector(selector, settings)?.member).toBe(selector.startsWith("@") ? "mythos" : "x");
+		});
+
+		it.each(["@security/mythos:high", "+grp/x:high"])("starts --model %s on the selected member", async selector => {
+			const settings = memberSettings();
+			const built = await buildSessionOptions(
+				parseArgs(["--model", selector]),
+				[],
+				SessionManager.inMemory(),
+				modelRegistry,
+				settings,
+			);
+			const { session } = await createAgentSession({ ...startupOptions(settings), ...built, cwd: tempDir.path() });
+			try {
+				expect(session.model && selectorOf(session.model)).toBe(
+					selector.startsWith("@") ? selectorOf(ANTHROPIC) : selectorOf(GOOGLE),
+				);
+				expect(session.thinkingLevel).toBe(Effort.High);
+			} finally {
+				await session.dispose();
+			}
+		});
 
 		it("fails with the role and skip reasons when every default pool member is unfunded", async () => {
 			const settings = Settings.isolated({

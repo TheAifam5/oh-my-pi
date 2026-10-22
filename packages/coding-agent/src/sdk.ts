@@ -3284,7 +3284,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						rolePoolCall,
 					);
 					if (!pick) continue;
-					deferredRolePoolPicks.push(pick);
+					if (!target.group) deferredRolePoolPicks.push(pick);
 					const pickPattern =
 						target.thinkingLevel === undefined
 							? pick.selector.raw

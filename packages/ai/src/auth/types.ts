@@ -586,6 +586,8 @@ export interface ModelUsageAccountHealth {
 export interface ModelUsageHealth {
 	state: ModelUsageHealthState;
 	accounts: ModelUsageAccountHealth[];
+	/** No stored account of the active credential type may serve this model for the session. */
+	unavailableReason?: "no-entitled-account";
 }
 
 /** Requested model, session, and reserve threshold for usage health. */

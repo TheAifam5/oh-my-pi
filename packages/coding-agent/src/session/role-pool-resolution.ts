@@ -133,6 +133,7 @@ export async function pickRolePoolTarget(
 ): Promise<RolePoolPick | undefined> {
 	const { modelRegistry, sessionId, signal } = context;
 	const unusable = new Set<string>();
+	let afterSelector = target.afterSelector;
 	for (;;) {
 		const resolution = await resolveRolePool(
 			target.role,
@@ -146,7 +147,13 @@ export async function pickRolePoolTarget(
 					!unusable.has(formatModelStringWithRouting(model)) && modelRegistry.hasConfiguredAuth(model),
 				selection: call.selection,
 			},
-			{ signal },
+			{
+				signal,
+				memberSelector: target.memberSelector,
+				afterSelector,
+				afterOrder: target.afterOrder,
+				policy: target.policy,
+			},
 		);
 		if (resolution === undefined) return undefined;
 		switch (resolution.kind) {
@@ -154,12 +161,16 @@ export async function pickRolePoolTarget(
 				signal?.throwIfAborted();
 				return undefined;
 			case "none":
-				if (rolePoolPolicyBlocked(resolution.skipped)) {
+				if (target.memberSelector || target.advance || rolePoolPolicyBlocked(resolution.skipped)) {
 					throw new RolePoolUnavailableError(target.role, resolution.skipped);
 				}
 				return undefined;
 			case "picked": {
 				const { pick } = resolution;
+				if (target.advance && afterSelector === undefined) {
+					afterSelector = pick.selector.raw;
+					continue;
+				}
 				let key: string | undefined;
 				try {
 					key = await untilAborted(signal, modelRegistry.getApiKey(pick.model, sessionId, { signal }));

@@ -1,6 +1,11 @@
 import type { Model, ModelUsageHealth, UsageReport } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
-import { type BillingClass, DEFAULT_LEAST_USED_WINDOW_MS, isKeyGroupStrategy } from "../config/model-groups";
+import {
+	type BillingClass,
+	DEFAULT_LEAST_USED_WINDOW_MS,
+	groupMemberSelectors,
+	isKeyGroupStrategy,
+} from "../config/model-groups";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelStringWithRouting,
@@ -8,6 +13,7 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
 	resolveModelRoleValue,
+	resolvePoolMemberSelector,
 	splitRoleAliasThinkingSuffix,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -635,7 +641,7 @@ export interface RolePoolPick {
  * was passed over), or `aborted` when the caller's signal aborted before a pick.
  */
 export type RolePoolResolution =
-	| { kind: "picked"; pick: RolePoolPick; notice?: string }
+	| { kind: "picked"; pick: RolePoolPick; skipped?: RolePoolSkip[]; notice?: string }
 	| { kind: "none"; role: string; skipped: RolePoolSkip[]; notice?: string }
 	| { kind: "aborted"; role: string };
 
@@ -674,7 +680,7 @@ export function describeRolePoolSkip(reason: RolePoolSkipReason): string {
 		case "unavailable":
 			return "model unavailable";
 		case "no-auth":
-			return "no credentials";
+			return "no entitled account or credentials";
 		case "cooldown":
 			return "cooling down";
 		case "quota-unknown":
@@ -724,9 +730,16 @@ export class RolePoolUnavailableError extends Error {
 export async function resolveRolePool(
 	role: string,
 	deps: RolePoolDeps,
-	options: { signal?: AbortSignal } = {},
+	options: {
+		signal?: AbortSignal;
+		policy?: GroupFallbackChain;
+		memberSelector?: string;
+		afterSelector?: string;
+		afterOrder?: readonly string[];
+		checkHealth?: boolean;
+	} = {},
 ): Promise<RolePoolResolution | undefined> {
-	const policy = resolveRolePoolGroup(deps.settings, role);
+	const policy = options.policy ?? resolveRolePoolGroup(deps.settings, role);
 	if (!policy) return undefined;
 	const { signal } = options;
 	const aborted: RolePoolResolution = { kind: "aborted", role };
@@ -776,6 +789,34 @@ export async function resolveRolePool(
 		if (!usable) {
 			skipped.push({ selector: member.raw, reason: { kind: "no-auth" } });
 			continue;
+		}
+		if (options.checkHealth || options.memberSelector || options.afterSelector) {
+			try {
+				const healthSignal = signal
+					? AbortSignal.any([signal, AbortSignal.timeout(QUOTA_ORDERING_DEADLINE_MS)])
+					: AbortSignal.timeout(QUOTA_ORDERING_DEADLINE_MS);
+				const health = await untilAborted(
+					healthSignal,
+					deps.modelRegistry.authStorage.health.model(model.provider, {
+						modelId: model.id,
+						sessionId: deps.sessionId(),
+						accountIds: model.accountAccess && Object.keys(model.accountAccess),
+						reserveFraction: 0,
+						signal: healthSignal,
+					}),
+				);
+				if (health.unavailableReason === "no-entitled-account") {
+					skipped.push({ selector: member.raw, reason: { kind: "no-auth" } });
+					continue;
+				}
+				if (health.state === "depleted") {
+					skipped.push({ selector: member.raw, reason: { kind: "exhausted" } });
+					continue;
+				}
+			} catch (error) {
+				if (signal?.aborted) return aborted;
+				logger.debug("Model pool member health unavailable", { selector: member.raw, error: String(error) });
+			}
 		}
 		callable.push(member);
 	}
@@ -842,6 +883,32 @@ export async function resolveRolePool(
 		skipped.push({ selector: candidate.raw, reason: { kind: "cooldown" } });
 	}
 	eligible = eligible.filter(candidate => !isSuppressed(candidate));
+	if (options.afterOrder) {
+		const ranks = new Map(options.afterOrder.map((selector, index) => [selector, index]));
+		eligible.sort((left, right) => (ranks.get(left.raw) ?? ranks.size) - (ranks.get(right.raw) ?? ranks.size));
+	} else if (options.afterSelector) {
+		const orderedMembers = ordered.candidates.some(candidate => candidate.raw === options.afterSelector)
+			? ordered.candidates
+			: members;
+		const index = orderedMembers.findIndex(candidate => candidate.raw === options.afterSelector);
+		if (index >= 0) {
+			const rotated = [...orderedMembers.slice(index + 1), ...orderedMembers.slice(0, index + 1)];
+			eligible.sort((left, right) => rotated.indexOf(left) - rotated.indexOf(right));
+		}
+	}
+	if (options.memberSelector) {
+		const chosen = eligible.find(candidate => candidate.raw === options.memberSelector);
+		if (!chosen) {
+			const skip = skipped.find(entry => entry.selector === options.memberSelector);
+			throw new Error(
+				sanitizeNoticeLine(
+					`Pool member "${options.memberSelector}" is unusable: ${skip ? describeRolePoolSkip(skip.reason) : "model unavailable"}`,
+				),
+			);
+		}
+		const index = eligible.indexOf(chosen);
+		eligible = [...eligible.slice(index), ...eligible.slice(0, index)];
+	}
 	const [first, ...rest] = eligible;
 	const match = first ? resolve(first) : undefined;
 	if (first && match?.model) {
@@ -856,7 +923,7 @@ export async function resolveRolePool(
 			members,
 		};
 		if (match.thinkingLevel !== undefined) pick.thinkingLevel = match.thinkingLevel;
-		return { kind: "picked", pick, ...(notice !== undefined ? { notice } : {}) };
+		return { kind: "picked", pick, skipped, ...(notice !== undefined ? { notice } : {}) };
 	}
 	logger.warn("Model role pool has no eligible member", {
 		role,
@@ -877,6 +944,12 @@ export function notePoolPickApplied(pick: RolePoolPick): void {
 /** The pool role a selection resolves through, and the effort a role-alias suffix asks for. */
 export interface RolePoolTarget {
 	role: string;
+	memberSelector?: string;
+	advance?: boolean;
+	afterSelector?: string;
+	afterOrder?: readonly string[];
+	group?: string;
+	policy?: GroupFallbackChain;
 	/** Effort of a `:level` suffix on the alias; it replaces the picked member's effort. */
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
@@ -889,6 +962,29 @@ export interface RolePoolTarget {
  */
 export function rolePoolAliasTarget(selector: string, settings: Settings): RolePoolTarget | undefined {
 	const { base, level } = splitRoleAliasThinkingSuffix(selector.trim());
+	const next = /^@([^/]+)\/next$/.exec(base);
+	if (next && resolveRolePoolGroup(settings, next[1])) {
+		return { role: next[1], advance: true, ...(level !== undefined ? { thinkingLevel: level } : {}) };
+	}
+	const member = resolvePoolMemberSelector(selector, settings);
+	if (member?.group) {
+		const group = settings.getModelGroup(member.group);
+		if (!group) return undefined;
+		return {
+			role: `+${member.group}`,
+			group: member.group,
+			memberSelector: member.selector,
+			policy: { group, members: groupMemberSelectors(group), poolId: `group:${member.group}` },
+			...(member.thinkingLevel !== undefined ? { thinkingLevel: member.thinkingLevel } : {}),
+		};
+	}
+	if (member?.role) {
+		return {
+			role: member.role,
+			memberSelector: member.selector,
+			...(member.thinkingLevel !== undefined ? { thinkingLevel: member.thinkingLevel } : {}),
+		};
+	}
 	const role = resolveExplicitModelRole(base, settings);
 	if (role === undefined || (level !== undefined && role === "default")) return undefined;
 	if (!resolveRolePoolGroup(settings, role)) return undefined;

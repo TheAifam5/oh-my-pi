@@ -1974,7 +1974,7 @@ export class ModelBrowser implements Component {
 			};
 		});
 		// Quick-role rows (`@role`) name the role and trail the model they apply.
-		const quickRole = item.provider === "" && item.id.startsWith("@");
+		const quickRole = item.provider === "" && (item.id.startsWith("@") || item.id.startsWith("+"));
 		const value: TspPickerItem = {
 			id: item.selector,
 			label: quickRole ? item.id : item.selector,

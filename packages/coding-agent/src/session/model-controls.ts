@@ -56,6 +56,7 @@ import {
 	warnRolePoolProjection,
 } from "./pool-selection";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
+import { createRolePoolCall, pickRolePoolTarget } from "./role-pool-resolution";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -245,6 +246,19 @@ export class ModelControls {
 		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model);
 	}
 
+	/** Whether the active model and last model-change role still match this session's kept pool pick. */
+	isRolePoolPickActive(role: string): boolean {
+		const cached = this.#rolePoolPicks.get(role);
+		const model = this.#model;
+		return (
+			cached !== undefined &&
+			cached.revision === this.#host.settings.revision &&
+			this.#host.sessionManager.getLastModelChangeRole() === role &&
+			model !== undefined &&
+			modelsAreEqual(cached.pick.model, model)
+		);
+	}
+
 	/**
 	 * {@link resolveRoleModelWithThinking} that applies a pool role's strategy and funding policy
 	 * ({@link resolveRolePool}), also for a role whose value is an alias of a pool role
@@ -261,7 +275,13 @@ export class ModelControls {
 	 */
 	async resolveRoleModelAsync(
 		role: string,
-		options: { signal?: AbortSignal; availableModels?: Model[] } = {},
+		options: {
+			signal?: AbortSignal;
+			availableModels?: Model[];
+			memberSelector?: string;
+			advance?: boolean;
+			thinkingLevel?: ConfiguredThinkingLevel;
+		} = {},
 	): Promise<ResolvedModelRoleValue> {
 		const settings = this.#host.settings;
 		const scope = options.availableModels;
@@ -270,15 +290,47 @@ export class ModelControls {
 		const cached = this.#rolePoolPicks.get(role);
 		if (
 			cached &&
+			!options.memberSelector &&
+			!options.advance &&
 			cached.revision === settings.revision &&
 			(!scope || scope.some(model => modelsAreEqual(model, cached.pick.model)))
 		) {
 			return rolePickResolution(cached.pick);
 		}
-		this.#rolePoolPicks.delete(role);
+		const previousPick = cached?.revision === settings.revision ? cached.pick : undefined;
 		const revision = settings.revision;
 		const target = rolePoolTarget(settings, role);
 		if (!target) return legacy();
+		const memberSelector = options.memberSelector ?? target.memberSelector;
+		if (memberSelector || options.advance) {
+			const context = {
+				modelRegistry: this.#host.modelRegistry,
+				sessionId: this.#host.sessionId(),
+				signal: options.signal,
+				emitNotice: async (message: string) => this.#host.emitNotice("warning", message, "model-role"),
+			};
+			const call = createRolePoolCall(settings, context);
+			const pick = await pickRolePoolTarget(
+				{
+					...target,
+					memberSelector,
+					advance: options.advance,
+					thinkingLevel: options.thinkingLevel ?? target.thinkingLevel,
+					afterSelector: options.advance ? previousPick?.selector.raw : undefined,
+					afterOrder:
+						options.advance && previousPick
+							? [...previousPick.rest.map(member => member.raw), previousPick.selector.raw]
+							: undefined,
+				},
+				settings,
+				scope ?? this.#host.modelRegistry.getAvailable(),
+				context,
+				{ ...call, selection: this.#poolSelection },
+			);
+			if (!pick) throw new RolePoolUnavailableError(target.role, []);
+			if (settings.revision === revision) this.#rolePoolPicks.set(role, { revision, pick, recorded: false });
+			return rolePickResolution(pick);
+		}
 		const resolution = await resolveRolePool(
 			target.role,
 			{
@@ -297,9 +349,13 @@ export class ModelControls {
 		}
 		if (resolution?.kind !== "picked") return legacy();
 		const pick =
-			target.thinkingLevel === undefined
+			(options.thinkingLevel ?? target.thinkingLevel) === undefined
 				? resolution.pick
-				: { ...resolution.pick, thinkingLevel: target.thinkingLevel, explicitThinkingLevel: true };
+				: {
+						...resolution.pick,
+						thinkingLevel: options.thinkingLevel ?? target.thinkingLevel,
+						explicitThinkingLevel: true,
+					};
 		if (settings.revision === revision) this.#rolePoolPicks.set(role, { revision, pick, recorded: false });
 		return rolePickResolution(pick);
 	}
@@ -433,7 +489,7 @@ export class ModelControls {
 		this.#noteModelSwitch(targetModel, options?.poolRole);
 		this.#host.sessionManager.appendModelChange(
 			`${targetModel.provider}/${targetModel.id}`,
-			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
+			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : (options?.poolRole ?? "temporary"),
 		);
 		this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
 

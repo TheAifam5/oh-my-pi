@@ -101,7 +101,7 @@ or `--fork`.
 
 | Flag | Description |
 | --- | --- |
-| `--model <id-or-role>` | Model or configured role to use (role: `slow` or `@slow`; fuzzy model match: `opus`, `gpt-5.2`, or `openai/gpt-5.2`). |
+| `--model <id-or-role>` | Model or configured role to use (`slow`, `@slow`, fuzzy `opus`, or exact `openai/gpt-5.2`); `@role/member[:level]` keeps a named pool pick, `@role/next[:level]` advances the pool, and `+group/member[:level]` selects a group member as a plain model. |
 | `--smol <id>` | Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`). |
 | `--slow <id>` | Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`). |
 | `--plan <id>` | Plan model for architectural planning (or `PI_PLAN_MODEL`). |
@@ -113,6 +113,13 @@ or `--fork`.
 | `--service-tier <tier>` | OpenAI service tier: `none`, `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast` (`none` omits `service_tier`). |
 
 See [providers](./providers.md) and [models](./models.md) for model resolution.
+
+In an interactive session, `/switch @role/member[:level]` and `/switch +group/member[:level]`
+use the same member syntax without saving a model assignment. Repeating `/switch @role` advances
+its active kept pool pick; `/switch @role/next` advances explicitly, including from an inactive role.
+`next` is reserved for that operation, not a literal role-pool member name. `/switch` argument
+completion lists roles after `@`, groups after `+`, and members after the pool's `/`.
+With no argument, `/switch` opens the Alt+P session picker; `/model` still opens the model hub.
 
 #### Thinking and reasoning
 

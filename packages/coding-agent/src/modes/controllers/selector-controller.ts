@@ -76,6 +76,7 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
 import { previewModelCompactionPoint, setModelCompactionPoint } from "../../session/model-compaction-threshold";
 import { rolePoolTarget } from "../../session/pool-selection";
+import { listSessionPoolMembers, resolveSessionModelSelector } from "../../session/model-selector";
 import { isTranscriptEntry, type TranscriptEntry } from "../../session/session-context";
 import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
@@ -773,14 +774,14 @@ export class SelectorController {
 	 * transcript exceeds the target's context window, mirroring an over-context
 	 * pick in the alt+p picker. Failures surface as status errors.
 	 */
-	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void> {
+	async switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, poolRole?: string): Promise<void> {
 		const contextTokens = this.ctx.viewSession.getContextUsage()?.tokens ?? 0;
 		const contextWindow = model.contextWindow ?? 0;
 		const overContext = contextWindow > 0 && contextTokens > contextWindow;
 		try {
-			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext);
+			await this.#applySessionModel(model, `${model.provider}/${model.id}`, thinkingLevel, overContext, poolRole);
 		} catch (error) {
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			this.ctx.showError(sanitizeErrorLine(error));
 		}
 	}
 
@@ -800,14 +801,19 @@ export class SelectorController {
 		selector: string,
 		thinkingLevel: ConfiguredThinkingLevel | undefined,
 		compactFirst: boolean,
+		poolRole?: string,
 	): Promise<void> {
 		const target = this.ctx.viewSession;
 		const focusedAgentId = this.ctx.focusedAgentId;
 		const apply = async () => {
 			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
-			await target.setModelTemporary(model, level);
+			await target.setModelTemporary(model, level, { poolRole });
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+			if (poolRole) {
+				this.ctx.showStatus(`@${poolRole} → ${model.provider}/${model.id}`);
+				return;
+			}
 			if (focusedAgentId) {
 				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
 				return;
@@ -865,8 +871,10 @@ export class SelectorController {
 		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
 		const menu = this.#claimMenu(menuKind);
+		const memberLoad = new AbortController();
 		const done = () => {
 			if (this.#openMenus.get(menuKind) !== menu) return;
+			memberLoad.abort();
 			menu.handle?.hide();
 			this.#releaseMenu(menuKind, menu);
 			this.focusActiveEditorArea();
@@ -891,13 +899,26 @@ export class SelectorController {
 						return;
 					}
 					try {
-						// Over-context pick: close the picker first so the compaction
-						// loader is visible.
-						if (overContext) done();
-						await this.#applySessionModel(model, selector, undefined, overContext);
-						if (!overContext) done();
+						const resolved =
+							selector.startsWith("@") || selector.startsWith("+")
+								? await resolveSessionModelSelector(selector, viewed, this.ctx.settings)
+								: undefined;
+						if (resolved && !resolved.model) throw new Error(resolved.error ?? `Unknown model: ${selector}`);
+						const targetModel = resolved?.model ?? model;
+						const contextWindow = targetModel.contextWindow ?? 0;
+						const compactFirst =
+							overContext || (contextWindow > 0 && (viewed.getContextUsage()?.tokens ?? 0) > contextWindow);
+						if (compactFirst) done();
+						await this.#applySessionModel(
+							targetModel,
+							selector,
+							resolved?.thinkingLevel,
+							compactFirst,
+							resolved?.poolRole,
+						);
+						if (!compactFirst) done();
 					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						this.ctx.showError(sanitizeErrorLine(error));
 					}
 				},
 				onPickRole: async entry => {
@@ -912,7 +933,7 @@ export class SelectorController {
 						);
 						done();
 					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						this.ctx.showError(sanitizeErrorLine(error));
 					}
 				},
 				onPickTask: (_model, selector) => {
@@ -939,6 +960,16 @@ export class SelectorController {
 				selectOnly: selectOnly !== undefined,
 			},
 		);
+		if (!selectOnly) {
+			void listSessionPoolMembers(viewed, this.ctx.settings, memberLoad.signal)
+				.then(members => {
+					if (isCurrent()) picker.setPoolMembers(members);
+				})
+				.catch(error => {
+					if (!memberLoad.signal.aborted)
+						logger.warn("Could not load pool selector members", { error: String(error) });
+				});
+		}
 		this.#mountMenu(menu, picker, () => {
 			const handle = this.ctx.ui.showOverlay(picker, {
 				anchor: "bottom-center",

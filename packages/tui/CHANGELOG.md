@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added expandable role-pool and model-group members to the session model picker, with concrete model ids and current availability
 - Added rule model selectors to the extensions inspector and `fallback` to the advisor configuration type
 - Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and keys to turn a selector role into a pool, add, replace, remove, and reorder members, and cycle the strategy (including `quota`) and funding order; an invalid pool shows its validation problem and can be removed or replaced
 - Added routing editors to model hub pools: `a`/`h` toggle cache affinity and pricing, `u`/`r` cycle quota unknown handling and reserve, and `e` edits account order, drain target, drain spend, return triggers, metered funding with its spending policy or local budget, local limits, strategy lists, and quota tolerance; pool summaries show quota, accounts, and cache routing

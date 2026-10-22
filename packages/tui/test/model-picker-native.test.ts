@@ -594,3 +594,52 @@ describe("model hub billing", () => {
 		expect(gptLookups()).toBe(3);
 	});
 });
+
+test("session pool entries expand to named members with models and availability, then collapse", () => {
+	const picked: string[] = [];
+	const picker = new ModelPickerComponent(
+		ui,
+		source({}, []),
+		{ ...registry(MODELS), refreshIfStale: async () => false },
+		MODELS.map(entry => ({ model: entry })),
+		{ onPick: (_model, selector) => picked.push(selector), onCancel: () => {} },
+	);
+	picker.setPoolMembers([
+		{ parent: "@security", selector: "@security/mythos", model: MODELS[0]!, state: "usable" },
+		{ parent: "@security", selector: "@security/blocked", model: MODELS[1]!, state: "blocked until 12:00:00" },
+		{ parent: "@security", selector: "@security/spent", model: MODELS[2]!, state: "exhausted" },
+		{ parent: "@security", selector: "@security/denied", model: MODELS[3]!, state: "no entitled account" },
+		{ parent: "+grp", selector: "+grp/x", model: MODELS[0]!, state: "usable" },
+	]);
+	picker.handleInput("@");
+	picker.handleInput("\x1b[C");
+	const expanded = props(picker.describe(withPicker));
+	expect(expanded.order).toEqual(["@security/mythos", "@security/blocked", "@security/spent", "@security/denied"]);
+	const rendered = Bun.stripANSI(picker.render(220).join("\n"));
+	expect(rendered).toContain("@security/mythos");
+	expect(rendered).toContain("anthropic/claude-sonnet-5-5");
+	expect(rendered).toContain("usable");
+	expect(rendered).toContain("blocked until 12:00:00");
+	expect(rendered).toContain("exhausted");
+	expect(rendered).toContain("no entitled account");
+	picker.handleNativeEvent({ type: "activate", key: "", item: "@security/mythos" });
+	expect(picked).toEqual(["@security/mythos"]);
+	picker.handleInput("\x1b[D");
+	expect(props(picker.describe(withPicker)).order).toEqual(["@security"]);
+});
+
+test("a group/member search exposes group availability in the native picker", () => {
+	const picker = new ModelPickerComponent(
+		ui,
+		source({}, []),
+		{ ...registry(MODELS), refreshIfStale: async () => false },
+		MODELS.map(entry => ({ model: entry })),
+		{ onPick: () => {}, onCancel: () => {} },
+	);
+	picker.setPoolMembers([{ parent: "+grp", selector: "+grp/x", model: MODELS[0]!, state: "exhausted" }]);
+	for (const char of "+grp/") picker.handleInput(char);
+	const p = props(picker.describe(withPicker));
+	expect(p.order).toEqual(["+grp/x"]);
+	expect(JSON.stringify(p.items)).toContain("exhausted");
+	for (const line of picker.render(40)) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40);
+});

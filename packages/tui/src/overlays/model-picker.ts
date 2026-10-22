@@ -1,8 +1,8 @@
 /**
  * Compact session-model picker (alt+p / `/switch`): a bottom-anchored
  * floating overlay hosting just a {@link ModelBrowser} — no provider sidebar.
- * Model entries switch the current session only; a search beginning with `@`
- * exposes the configured ctrl+p quick roles.
+ * Model entries switch the current session only. Searches beginning with `@`
+ * show quick roles; `+` shows groups. Right expands pool members; Left returns.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import { addKeyAliases, canonicalKeyId } from "../keybindings";
@@ -35,6 +35,14 @@ export interface ResolvedRoleModel {
 	model: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
+}
+
+/** A `parent/member` selector under `@role` or `+group`, with current availability display text. */
+export interface PoolPickerMember {
+	parent: string;
+	selector: string;
+	model: Model;
+	state: string;
 }
 
 /** Catalog refresh capability used by the session picker. */
@@ -101,7 +109,7 @@ function footerHint(mode: "session" | "role" | "task" | "selection"): string {
 	const close = `${editorKey("tui.select.cancel")} close`;
 	switch (mode) {
 		case "role":
-			return `${upDown} roles · ${enter} apply role model · type to search · ${close}`;
+			return `${upDown} roles · ${formatKeyHint("right")} members · ${formatKeyHint("left")} back · ${enter} apply · ${close}`;
 		case "task":
 			return `${upDown} models · ${enter} use for Task subagents · type to search · ${close}`;
 		case "selection":
@@ -127,6 +135,8 @@ export class ModelPickerComponent implements Component {
 	#currentQuickRoleSelector: string | undefined;
 	#modelItems: ModelBrowserItem[] = [];
 	#quickRoleItems: ModelBrowserItem[] = [];
+	#displayItems: ModelBrowserItem[] = [];
+	#poolMembers: readonly PoolPickerMember[] = [];
 	#quickRoles = new Map<string, ResolvedRoleModel>();
 	#roleMode = false;
 	#taskMode = false;
@@ -179,6 +189,10 @@ export class ModelPickerComponent implements Component {
 					: undefined,
 		});
 		this.#browser.onActivate = item => {
+			if (item.selector.startsWith("+") && this.#poolMembers.some(member => member.parent === item.selector)) {
+				this.#expandPool(true);
+				return;
+			}
 			const quickRole = this.#quickRoles.get(item.selector);
 			if (quickRole) {
 				callbacks.onPickRole?.(quickRole);
@@ -255,11 +269,44 @@ export class ModelPickerComponent implements Component {
 		});
 	}
 
+	/** Supplies pool member rows and their current availability to the session picker. */
+	setPoolMembers(members: readonly PoolPickerMember[]): void {
+		this.#poolMembers = members;
+		for (const member of members) {
+			const existing = this.#quickRoleItems.find(item => item.selector === member.parent);
+			if (existing) {
+				existing.id = `${member.parent} ▸`;
+				continue;
+			}
+			this.#quickRoleItems.push({
+				provider: "",
+				id: `${member.parent} ▸`,
+				selector: member.parent,
+				model: member.model,
+			});
+		}
+		this.#syncItemsForQuery(this.#browser.query, true);
+		this.#tui.requestRender();
+	}
+
+	#poolItems(query: string): ModelBrowserItem[] | undefined {
+		const parent = /^([@+][^/]+)\//.exec(query)?.[1];
+		if (!parent) return undefined;
+		return this.#poolMembers
+			.filter(member => member.parent === parent)
+			.map(member => ({
+				provider: "",
+				id: `${member.selector}  ${member.model.provider}/${member.model.id}  ${member.state}`,
+				selector: member.selector,
+				model: member.model,
+			}));
+	}
 	/** Switch browser content only when a leading `@` changes the search mode. */
 	#syncItemsForQuery(query: string, refresh = false): void {
-		const roleMode = !this.#selectOnly && query.startsWith("@") && !this.#taskMode;
+		const roleMode = !this.#selectOnly && (query.startsWith("@") || query.startsWith("+")) && !this.#taskMode;
 		const modeChanged = roleMode !== this.#roleMode;
-		if (!modeChanged && !refresh) return;
+		const poolItems = roleMode ? this.#poolItems(query) : undefined;
+		if (!modeChanged && !refresh && !roleMode) return;
 
 		this.#roleMode = roleMode;
 		this.#browser.setShowProvider(!roleMode);
@@ -271,16 +318,28 @@ export class ModelPickerComponent implements Component {
 				? this.#taskSelector
 				: this.#currentSelector;
 		this.#browser.setCurrentSelector(currentSelector);
-		this.#browser.setItems(roleMode ? this.#quickRoleItems : this.#modelItems);
+		this.#displayItems = roleMode
+			? (poolItems ?? this.#quickRoleItems.filter(item => item.selector.startsWith(query[0])))
+			: this.#modelItems;
+		this.#browser.setItems(this.#displayItems);
 		if (modeChanged && currentSelector) {
 			this.#browser.selectSelector(currentSelector);
 		}
+	}
+
+	#expandPool(expand: boolean): boolean {
+		const parent = expand ? this.#browser.getSelected()?.selector : /^([@+][^/]+)\//.exec(this.#browser.query)?.[1];
+		if (!parent || !this.#poolMembers.some(member => member.parent === parent)) return false;
+		this.#browser.setQuery(expand ? `${parent}/` : parent);
+		this.#syncItemsForQuery(this.#browser.query, true);
+		return true;
 	}
 
 	handleInput(data: string): void {
 		// Mouse tracking is off outside fullscreen overlays; drop any stray SGR
 		// reports instead of feeding them to the search input.
 		if (data.startsWith("\x1b[<")) return;
+		if (this.#roleMode && (data === "\x1b[C" || data === "\x1b[D") && this.#expandPool(data === "\x1b[C")) return;
 		if (this.#taskMatchKeys.size > 0) {
 			const parsed = parseKey(data);
 			const canonical = parsed !== undefined ? canonicalKeyId(parsed) : undefined;
@@ -355,6 +414,12 @@ export class ModelPickerComponent implements Component {
 			return;
 		}
 		switch (picked.act) {
+			case "members":
+				this.#expandPool(true);
+				return;
+			case "back":
+				this.#expandPool(false);
+				return;
 			case CLOSE_ACTION.id:
 				this.#browser.handleCancel();
 				return;
@@ -384,7 +449,7 @@ export class ModelPickerComponent implements Component {
 			providers: false,
 			rest: mode === "role" ? null : query.trim() ? "Matches" : "All",
 		});
-		const catalogue = this.#browser.pickerItems(this.#roleMode ? this.#quickRoleItems : this.#modelItems);
+		const catalogue = this.#browser.pickerItems(this.#displayItems);
 		const current =
 			mode === "role"
 				? this.#currentQuickRoleSelector
@@ -449,6 +514,8 @@ export class ModelPickerComponent implements Component {
 						"enter",
 						{ primary: true },
 					),
+					mode === "role" ? pickerAction("members", "Members", "right") : undefined,
+					mode === "role" && query.includes("/") ? pickerAction("back", "Back", "left") : undefined,
 					this.#taskModeKey !== undefined && mode !== "role" && mode !== "selection"
 						? pickerAction("task", "Task model", this.#taskModeKey, { on: mode === "task" })
 						: undefined,

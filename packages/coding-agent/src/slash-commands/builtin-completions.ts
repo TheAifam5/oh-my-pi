@@ -4,7 +4,9 @@ import * as path from "node:path";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { getMCPConfigPath, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import { formatModelRoleAlias, getKnownRoleIds } from "../config/model-roles";
-import { cfgCycleOrder } from "../config/model-settings";
+import { cfgCycleOrder, cfgModelGroups } from "../config/model-settings";
+import { groupMemberSelectors } from "../config/model-groups";
+import { resolveRolePoolGroup } from "../session/retry-fallback-groups";
 import { readMCPConfigFile } from "../mcp/config-writer";
 import { collectMcpServerNames } from "../modes/controllers/mcp-command-controller";
 import { createModelBrowserSource } from "../modes/model-browser-source";
@@ -12,7 +14,7 @@ import {
 	createModelMentionSource,
 	type ModelMentionCandidateSource,
 } from "@oh-my-pi/pi-tui/prompt/model-mention-autocomplete";
-import { getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
+import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { expandTilde } from "../tools/path-utils";
 import type { SubcommandDef, TuiSlashCommandRuntime } from "./types";
 
@@ -287,7 +289,36 @@ export function buildModelSelectorCompletions(
 		const suffix = suffixIndex === -1 ? "" : argumentPrefix.slice(suffixIndex);
 		const query = suffixIndex === -1 ? argumentPrefix : argumentPrefix.slice(0, suffixIndex);
 		const matches: AutocompleteItem[] = [];
-		if (query.startsWith("@")) {
+		const poolQuery = /^([@+])([^/]+)\/(.*)$/.exec(query);
+		if (poolQuery) {
+			const [, prefix, name, memberPrefix] = poolQuery;
+			const settings = runtime.ctx.settings;
+			const group = prefix === "+" ? settings.getModelGroup(name) : undefined;
+			const members =
+				prefix === "@"
+					? resolveRolePoolGroup(settings, name)?.members
+					: group
+						? groupMemberSelectors(group)
+						: undefined;
+			for (const entry of members ?? []) {
+				if (prefix === "@" && entry.member.alias === "next") continue;
+				if (!entry.member.alias.toLowerCase().startsWith(memberPrefix.toLowerCase())) continue;
+				const alias = `${prefix}${name}/${entry.member.alias}`;
+				matches.push({ value: `${alias}${suffix} `, label: alias, description: entry.selector });
+			}
+			if (prefix === "@" && members && "next".startsWith(memberPrefix.toLowerCase())) {
+				matches.push({
+					value: `@${name}/next${suffix} `,
+					label: `@${name}/next`,
+					description: "Next eligible pool member",
+				});
+			}
+		} else if (query.startsWith("+")) {
+			for (const name of Object.keys(cfgModelGroups.get(runtime.ctx.settings))) {
+				if (!`+${name}`.toLowerCase().startsWith(query.toLowerCase())) continue;
+				matches.push({ value: `+${name}/`, label: `+${name}`, description: "Model group members" });
+			}
+		} else if (query.startsWith("@")) {
 			const { settings } = runtime.ctx;
 			const lower = query.toLowerCase();
 			for (const role of new Set([...cfgCycleOrder.get(settings), ...getKnownRoleIds(settings)])) {
@@ -308,6 +339,14 @@ export function buildModelSelectorCompletions(
 			for (const { selector, model } of rankModels(query)) {
 				matches.push({ value: `${selector}${suffix} `, label: selector, description: model.name });
 			}
+		}
+		if (suffixIndex !== -1 && matches.some(item => item.label === query)) {
+			const levels = CLI_THINKING_LEVELS.filter(level => level.startsWith(suffix.slice(1))).map(level => ({
+				value: `${query}:${level} `,
+				label: `${query}:${level}`,
+				description: getConfiguredThinkingLevelMetadata(level).description,
+			}));
+			if (levels.length > 0) return levels;
 		}
 		return matches.length > 0 ? matches : null;
 	};

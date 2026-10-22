@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added named pool picks (`@role/member[:level]`, `+group/member[:level]`) to `/switch` and `--model`, active-role advancement and explicit `@role/next`, and role/group/member/effort argument completion; named role picks retain pool fallback and routing policies
 - Added model-scoped rules (`models`, `providers`, `class`, `family`) with model-switch re-evaluation and `omp ttsr test --model`; advisors support per-advisor `fallback` chains, role-specific fallback, configurable capacity backoff and concurrency limits, and masked account failure logs
 - Added `omp config schema` (`-o, --out <file>`), which prints the JSON Schema of `config.yml` for editor validation and autocompletion; each GitHub release also ships it as `omp-config.schema.json`
 - Added npm package launch for stdio MCP servers: a `package` entry (`name`, `bin`, `version`, `policy`, `runner`, `runtime`) runs the project's installed package or a package runner (`bunx` by default), with defaults in `mcp.packagePolicy`, `mcp.packageRunner`, and `mcp.packageRuntime`

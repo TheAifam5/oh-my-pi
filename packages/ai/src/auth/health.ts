@@ -105,11 +105,7 @@ export class CredentialHealth implements HealthApi {
 		const strategy = this.#deps.strategies(provider);
 		const usageProvider = this.#deps.usage.providerFor(provider);
 		const canFetchOAuthUsage = usageProvider !== undefined || this.#deps.store.getUsageReport !== undefined;
-		if (
-			!origin ||
-			(origin.kind !== "oauth" && origin.kind !== "api_key") ||
-			(strategy === undefined && (origin.kind !== "oauth" || !canFetchOAuthUsage))
-		) {
+		if (!origin || (origin.kind !== "oauth" && origin.kind !== "api_key")) {
 			return { state: "unknown", accounts: [] };
 		}
 
@@ -124,6 +120,12 @@ export class CredentialHealth implements HealthApi {
 				({ entry, index }) =>
 					entitled(index) && this.#deps.affinity.allows(provider, options.sessionId, entry.credential),
 			);
+		if (!stored.some(({ entry }) => entry.credential.type === origin.kind)) {
+			return { state: "unknown", accounts: [], unavailableReason: "no-entitled-account" };
+		}
+		if (strategy === undefined && (origin.kind !== "oauth" || !canFetchOAuthUsage)) {
+			return { state: "unknown", accounts: [] };
+		}
 		const oauthPool = stored.filter(({ entry }) => entry.credential.type === "oauth");
 		const apiKeyPool = stored.filter(({ entry }) => entry.credential.type === "api_key");
 		const loginApiKeyPool = apiKeyPool.filter(

@@ -4,13 +4,6 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { prompt } from "@oh-my-pi/pi-utils";
 import {
-	formatModelString,
-	getModelMatchPreferences,
-	resolveCliModel,
-	type ResolveCliModelResult,
-} from "../config/model-resolver";
-import type { Settings } from "../config/settings";
-import {
 	applyModelPreset,
 	deleteModelPreset,
 	formatModelPresetSwitch,
@@ -26,6 +19,9 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { formatModelString } from "../config/model-resolver";
+import { resolveSessionModelSelector } from "../session/model-selector";
+import type { Settings } from "../config/settings";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
@@ -49,27 +45,6 @@ import { cfgPlanEnabled } from "../plan-mode/settings";
 export function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
 	ctx.ui.requestRender();
-}
-
-/**
- * Resolve a `/model` / `/switch` selector the way `omp bench` and `--model`
- * do: exact `provider/id`, fuzzy ids (`opus`), role aliases (`@smol`, `smol`),
- * and `:level` thinking suffixes. Unqualified selectors prefer the session's
- * `--models` scope, else the authenticated set, before the full catalog.
- */
-function resolveSessionModelSelector(
-	selector: string,
-	session: AgentSession,
-	settings: Settings,
-): ResolveCliModelResult {
-	const scoped = session.scopedModels.map(entry => entry.model);
-	return resolveCliModel({
-		cliModel: selector,
-		modelRegistry: session.modelRegistry,
-		availableModels: scoped.length > 0 ? scoped : undefined,
-		settings,
-		preferences: getModelMatchPreferences(settings),
-	});
 }
 
 async function runWithDetachedModeDraft(
@@ -465,16 +440,25 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (command.args) {
 				const selector = command.args.trim();
-				const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
+				const resolved = await resolveSessionModelSelector(selector, runtime.session, runtime.settings, {
+					advanceActiveRole: true,
+				});
 				const match = resolved.model;
 				if (!match) {
 					return usage(
-						`Unknown model: ${selector}. Use ACP \`session/setModel\` for picker-driven selection or list available models with /model.`,
+						resolved.error ??
+							`Unknown model: ${selector}. Use ACP \`session/setModel\` for picker-driven selection or list available models with /model.`,
 						runtime,
 					);
 				}
 				try {
-					await runtime.session.setModel(match);
+					if (resolved.poolRole) {
+						await runtime.session.setModelTemporary(match, resolved.thinkingLevel, {
+							poolRole: resolved.poolRole,
+						});
+					} else {
+						await runtime.session.setModel(match);
+					}
 					if (resolved.thinkingLevel !== undefined) runtime.session.setThinkingLevel(resolved.thinkingLevel);
 					await runtime.output(`Model set to ${match.provider}/${match.id}.`);
 					await runtime.notifyTitleChanged?.();
@@ -500,7 +484,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "switch",
 		icon: "swap",
 		get description() {
-			return `Switch model for this session (same as ${formatKeyHint("alt+p")}); accepts fuzzy ids, provider/id, @role, :level`;
+			return `Switch model for this session (same as ${formatKeyHint("alt+p")}); accepts fuzzy ids, provider/id, @role[/member|/next], +group/member, :level`;
 		},
 		acpDescription: "Switch model for this session only",
 		acpInputHint: "[model]",
@@ -519,11 +503,19 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
-			if (!resolved.model) return usage(`Unknown model: ${selector}`, runtime);
+			const resolved = await resolveSessionModelSelector(selector, runtime.session, runtime.settings, {
+				advanceActiveRole: true,
+			});
+			if (!resolved.model) return usage(resolved.error ?? `Unknown model: ${selector}`, runtime);
 			try {
-				await runtime.session.setModelTemporary(resolved.model, resolved.thinkingLevel);
-				await runtime.output(`Session-only model: ${formatModelString(resolved.model)}.`);
+				await runtime.session.setModelTemporary(resolved.model, resolved.thinkingLevel, {
+					poolRole: resolved.poolRole,
+				});
+				await runtime.output(
+					resolved.poolRole
+						? `@${resolved.poolRole} → ${formatModelString(resolved.model)}`
+						: `Session-only model: ${formatModelString(resolved.model)}.`,
+				);
 				await runtime.notifyTitleChanged?.();
 				await runtime.notifyConfigChanged?.();
 				return commandConsumed();
@@ -538,13 +530,23 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showModelSelector({ temporaryOnly: true });
 				return;
 			}
-			const resolved = resolveSessionModelSelector(selector, runtime.ctx.session, runtime.ctx.settings);
+			const resolved = await resolveSessionModelSelector(selector, runtime.ctx.viewSession, runtime.ctx.settings, {
+				advanceActiveRole: true,
+			});
 			if (!resolved.model) {
-				runtime.ctx.showError(`Unknown model: ${selector}`);
+				runtime.ctx.showError(
+					(selector.startsWith("@") || selector.startsWith("+")) && resolved.error
+						? resolved.error
+						: `Unknown model: ${selector}`,
+				);
 				return;
 			}
 			if (resolved.warning) runtime.ctx.showStatus(resolved.warning);
-			await runtime.ctx.switchSessionModel(resolved.model, resolved.thinkingLevel);
+			if (resolved.poolRole) {
+				await runtime.ctx.switchSessionModel(resolved.model, resolved.thinkingLevel, resolved.poolRole);
+			} else {
+				await runtime.ctx.switchSessionModel(resolved.model, resolved.thinkingLevel);
+			}
 		},
 	},
 	{
@@ -789,7 +791,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			const target = resolveSessionModelSelector("@smol", runtime.session, runtime.settings);
+			const target = await resolveSessionModelSelector("@smol", runtime.session, runtime.settings);
 			if (target.error || !target.model) {
 				return usage(target.error ?? 'Model "@smol" not found', runtime);
 			}
@@ -797,7 +799,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return usage(`No API key for ${target.model.provider}/${target.model.id}`, runtime);
 			}
 			if (arg === "restart") {
-				const source = resolveSessionModelSelector("@default", runtime.session, runtime.settings);
+				const source = await resolveSessionModelSelector("@default", runtime.session, runtime.settings);
 				if (source.error || !source.model) {
 					return usage(source.error ?? 'Model "@default" not found', runtime);
 				}

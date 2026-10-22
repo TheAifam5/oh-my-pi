@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added optional `ModelUsageHealth.unavailableReason: "no-entitled-account"` to distinguish a model with no eligible stored account from unknown usage
 - Added provider billing evidence (`ProviderBilling`, `BillingSnapshot`, `BillingSource`, exact `Money` amounts with their currency) read from usage reports, with readers for Claude, Codex, Copilot, Cursor, Factory Droid, Charm Hyper, CommandCode, Synthetic, Gemini, Google Antigravity, Kimi, OpenCode Go, xAI, Z.AI, OpenRouter, Devin, DeepSeek, Moonshot (including the China balance in CNY), Novita, AIMLAPI, NanoGPT, Vercel AI Gateway, Venice, SiliconFlow (including China), and DeepInfra; subscriptions read available or exhausted from account-wide plan windows, an active NanoGPT token trial reads as free, and LM Studio, llama.cpp, and vLLM on a loopback address read as free
 - Added OpenRouter usage details: the paid key's remaining USD credit balance (fetched alongside the key limits with its own three-second deadline), when the key limit resets, the daily free-model counter, and a projected run-out time and daily spending rate from this key's UTC weekly usage
 - Added account names and exclusive account pins to the auth storage: a named `auth.accountPolicies` entry can be pinned per session, per project, or per pool member, and API keys are matched by a 16-hex-digit SHA-256 fingerprint

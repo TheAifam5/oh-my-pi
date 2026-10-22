@@ -187,6 +187,26 @@ describe("model entitlement routing", () => {
 		expect(await later.keys.get(ANTHROPIC, "s", { modelId: MYTHOS })).toBe("access-a");
 	});
 
+	test("health distinguishes no entitled account from unknown quota without resolving credentials", async () => {
+		const storage = await open();
+		await storage.credentials.set(ANTHROPIC, [
+			{ type: "oauth", access: "access-a", refresh: "r1", expires: farExpiry(), email: "a@example.com" },
+		]);
+		const [row] = storage.credentials.list(ANTHROPIC);
+		if (!row) throw new Error("Expected stored account");
+		await storage.limits.recordModelDenial(ANTHROPIC, undefined, { modelId: MYTHOS, credentialId: row.id });
+		const refresh = vi.spyOn(OAuthRefresher.prototype, "refresh");
+		expect(await storage.health.model(ANTHROPIC, { modelId: MYTHOS, reserveFraction: 0 })).toEqual({
+			state: "unknown",
+			accounts: [],
+			unavailableReason: "no-entitled-account",
+		});
+		expect(
+			(await storage.health.model(ANTHROPIC, { modelId: SONNET, reserveFraction: 0 })).unavailableReason,
+		).toBeUndefined();
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
 	test("recordModelDenial honors an explicit lifetime for the named credential", async () => {
 		const storage = await open();
 		await storage.credentials.set(ANTHROPIC, [

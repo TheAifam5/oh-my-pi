@@ -3799,6 +3799,14 @@ export class ModelRegistry {
 		return true;
 	}
 
+	/** Epoch ms at which a selector's active cooldown ends. */
+	selectorSuppressedUntil(selector: string): number | undefined {
+		if (!this.isSelectorSuppressed(selector)) return undefined;
+		return this.#suppressedSelectors.get(
+			normalizeSuppressedSelector(selector, (provider, id) => this.find(provider, id) !== undefined),
+		);
+	}
+
 	/**
 	 * Clear the cooldown suppression for one selector after an explicit user selection.
 	 */
