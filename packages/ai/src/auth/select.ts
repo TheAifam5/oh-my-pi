@@ -41,6 +41,7 @@ import {
 } from "./rank";
 import { mergeRefreshedCredential, OAUTH_REFRESH_SKEW_MS, type OAuthRefresher } from "./refresh";
 import type { AuthCredentialStore } from "./store";
+import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import {
 	type AccountLimitRefusal,
 	type ApiKeyCredential,
@@ -593,6 +594,42 @@ export class CredentialSelector {
 		return true;
 	}
 
+	async #outsideRequestReserve(
+		provider: string,
+		credential: AuthCredential,
+		index: number,
+		options: AuthApiKeyOptions | undefined,
+	): Promise<boolean> {
+		if (options?.minRemainingPct === undefined) return true;
+		if (!this.isUnblocked(provider, credential.type, index, options)) return false;
+		let report: UsageReport | null;
+		try {
+			report = await this.#deps.usage.report(provider, credential, options);
+		} catch (error) {
+			options.signal?.throwIfAborted();
+			logger.debug("request quota reserve usage unavailable", { provider, error: String(error) });
+			return true;
+		}
+		if (!report || Date.now() - report.fetchedAt > USAGE_REPORT_TTL_MS) return true;
+		const remaining = remainingUsageFraction(
+			this.#deps.strategies(provider),
+			report,
+			{ modelId: options.modelId },
+			Date.now(),
+		);
+		if (remaining === undefined || isWithinUsageReserve(options.minRemainingPct / 100, remaining)) return true;
+		const entry = this.#deps.pool.entries(provider)[index];
+		options.onReservedAccount?.(
+			maskedAccountLabel({
+				credentialId: entry?.id ?? -1,
+				type: credential.type,
+				email: credential.type === "oauth" ? credential.email : undefined,
+			}),
+			remaining * 100,
+		);
+		return false;
+	}
+
 	async selectApiKey(
 		provider: string,
 		sessionId: string | undefined,
@@ -600,7 +637,7 @@ export class CredentialSelector {
 		filter?: (credential: ApiKeyCredential) => boolean,
 	): Promise<ApiKeySelection | undefined> {
 		const entitled = this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds);
-		const credentials = this.#deps.pool
+		let credentials = this.#deps.pool
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is ApiKeySelection => {
@@ -609,6 +646,12 @@ export class CredentialSelector {
 				if (!entitled(entry.index)) return false;
 				return this.accountLimit(provider, entry.index, options) === undefined;
 			});
+		if (options?.minRemainingPct !== undefined) {
+			const eligible = await Promise.all(
+				credentials.map(entry => this.#outsideRequestReserve(provider, entry.credential, entry.index, options)),
+			);
+			credentials = credentials.filter((_entry, index) => eligible[index]);
+		}
 
 		if (credentials.length === 0) return undefined;
 		if (credentials.length === 1) return credentials[0];
@@ -1096,7 +1139,13 @@ export class CredentialSelector {
 			allowed.map(entry => this.accountRefusal(provider, entry.index, options, memo)),
 		);
 		const limited = new Set(allowed.filter((_entry, at) => refusals[at] !== undefined).map(entry => entry.index));
-		const credentials = allowed.filter(entry => !limited.has(entry.index));
+		let credentials = allowed.filter(entry => !limited.has(entry.index));
+		if (options?.minRemainingPct !== undefined) {
+			const eligible = await Promise.all(
+				credentials.map(entry => this.#outsideRequestReserve(provider, entry.credential, entry.index, options)),
+			);
+			credentials = credentials.filter((_entry, index) => eligible[index]);
+		}
 		const limitedDrain = this.#noteLimitedDrain(provider, sessionId, options?.modelId, limited);
 
 		if (credentials.length === 0) return undefined;

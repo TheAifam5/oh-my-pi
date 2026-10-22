@@ -1704,6 +1704,25 @@
           "type": "boolean",
           "default": false
         },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reservePct": {
+              "description": "Exclude accounts below this remaining quota percentage from advisor requests. Unset disables the guard; unknown or stale usage is allowed.",
+              "type": "number"
+            },
+            "whenReserved": {
+              "description": "When no account clears the advisor quota reserve, try the advisor fallback chain or skip this review.",
+              "type": "string",
+              "enum": [
+                "fallback",
+                "skip"
+              ],
+              "default": "fallback"
+            }
+          }
+        },
         "syncBacklog": {
           "description": "Pause main agent until advisor backlog falls below threshold. Numeric values cap wait at 30 seconds; strict waits for all scheduled reviews without a wall-clock cap. Off disables catch-up delays. Abort, failure, and disposal release waits.",
           "type": "string",

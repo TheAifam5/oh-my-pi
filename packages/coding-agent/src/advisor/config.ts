@@ -136,6 +136,10 @@ const advisorEntrySchema = type({
 	"maxNotesPerUpdate?": "number",
 	"owns?": "string[]",
 	"fallback?": "string",
+	"budget?": type({
+		"reservePct?": "0 <= number <= 100",
+		"whenReserved?": "'fallback' | 'skip'",
+	}),
 });
 
 type AdvisorYamlEntry = typeof advisorEntrySchema.infer;
@@ -454,6 +458,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 				instructions: entryInstructions,
 				owns: normalizeOwns(entry.owns),
 				fallback: entry.fallback?.trim() || undefined,
+				budget: entry.budget,
 			});
 		}
 	}
@@ -540,6 +545,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		if (a.reviewMode !== undefined) advisor.reviewMode = a.reviewMode;
 		if (a.reviewInterval !== undefined) advisor.reviewInterval = a.reviewInterval;
 		if (a.syncBacklog !== undefined) advisor.syncBacklog = normalizeSyncBacklog(a.syncBacklog);
+		if (a.budget !== undefined) advisor.budget = { ...a.budget };
 		if (a.instructions?.trim()) advisor.instructions = a.instructions;
 		if (a.enabled !== undefined) advisor.enabled = a.enabled;
 		if (typeof a.maxNotesPerUpdate === "number" && Number.isFinite(a.maxNotesPerUpdate) && a.maxNotesPerUpdate >= 1) {
@@ -645,6 +651,11 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 			}
 			if (advisor.enabled !== undefined) lines.push(`    enabled: ${advisor.enabled}`);
 			if (advisor.fallback?.trim()) lines.push(`    fallback: ${YAML.stringify(advisor.fallback.trim())}`);
+			if (advisor.budget !== undefined) {
+				advisorEntrySchema.assert(advisor);
+				lines.push("    budget:");
+				for (const line of YAML.stringify(advisor.budget).trim().split("\n")) lines.push(`      ${line}`);
+			}
 			if (
 				typeof advisor.maxNotesPerUpdate === "number" &&
 				Number.isFinite(advisor.maxNotesPerUpdate) &&

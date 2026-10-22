@@ -606,6 +606,10 @@ export interface ModelUsageHealthOptions {
 export type AuthApiKeyOptions = {
 	baseUrl?: string;
 	modelId?: string;
+	/** Minimum remaining quota percentage; unknown or stale usage remains eligible. */
+	minRemainingPct?: number;
+	/** Called for an otherwise eligible account excluded by minRemainingPct. */
+	onReservedAccount?: (account: string, remainingPct: number) => void;
 	/**
 	 * {@link oauthAccountKey}s of accounts known to serve `modelId` from multi-account discovery. When
 	 * at least one stored OAuth account of the provider is listed, OAuth accounts not listed are never

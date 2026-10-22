@@ -23,6 +23,51 @@ export const cfgAdvisorEnabled = register({
 	},
 });
 
+export const cfgAdvisorBudgetReservePct = register({
+	id: "advisor.budget.reservePct",
+	type: "number",
+	default: undefined,
+	validate: raw => {
+		if (raw === undefined) return;
+		if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0 || raw > 100) {
+			throw new Error("advisor.budget.reservePct must be a number from 0 to 100");
+		}
+	},
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Quota Reserve",
+		description:
+			"Exclude accounts below this remaining quota percentage from advisor requests. Unset disables the guard; unknown or stale usage is allowed.",
+		options: [
+			{ value: "", label: "Off" },
+			{ value: "0", label: "0%" },
+			{ value: "10", label: "10%" },
+			{ value: "20", label: "20%" },
+			{ value: "30", label: "30%" },
+			{ value: "50", label: "50%" },
+			{ value: "75", label: "75%" },
+			{ value: "100", label: "100%" },
+		],
+		condition: "advisorEnabled",
+	},
+});
+
+export const cfgAdvisorBudgetWhenReserved = register({
+	id: "advisor.budget.whenReserved",
+	type: "enum",
+	values: ["fallback", "skip"],
+	default: "fallback",
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Reserve Action",
+		description:
+			"When no account clears the advisor quota reserve, try the advisor fallback chain or skip this review.",
+		condition: "advisorEnabled",
+	},
+});
+
 export const cfgAdvisorSyncBacklog = register({
 	id: "advisor.syncBacklog",
 	protocolDefault: ["rpc", "acp"],

@@ -64,6 +64,22 @@ describe("discoverAdvisorConfigs", () => {
 		expect(sharedInstructions).toBe("Shared baseline for all advisors.");
 	});
 
+	it("preserves quota budget overrides through discovery and editor save", async () => {
+		const doc: WatchdogConfigDoc = {
+			advisors: [{ name: "Reserved", budget: { reservePct: 25, whenReserved: "skip" } }],
+		};
+		const file = path.join(tmp, "WATCHDOG.yml");
+		await Bun.write(file, serializeWatchdogConfig(doc));
+		const discovered = await discoverAdvisorConfigs(tmp, agentDir);
+		expect(discovered.advisors[0]?.budget).toEqual({ reservePct: 25, whenReserved: "skip" });
+		const loaded = await loadWatchdogConfigFile(file);
+		expect(loaded.advisors[0]?.budget).toEqual({ reservePct: 25, whenReserved: "skip" });
+		await Bun.write(file, "advisors:\n  - name: Invalid\n    budget: { reservePct: 101 }\n");
+		const invalid = await discoverAdvisorConfigs(tmp, agentDir);
+		expect(invalid.advisors).toEqual([]);
+		expect(invalid.warnings).toHaveLength(1);
+	});
+
 	it("distinguishes omitted tools, explicit no-tools, and invalid-only lists", async () => {
 		const yaml = [
 			"advisors:",

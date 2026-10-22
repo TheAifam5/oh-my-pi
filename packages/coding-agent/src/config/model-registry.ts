@@ -3324,7 +3324,7 @@ export class ModelRegistry {
 	async getApiKey(
 		model: Model<Api>,
 		sessionId?: string,
-		options?: { signal?: AbortSignal },
+		options?: Pick<AuthApiKeyOptions, "signal" | "minRemainingPct" | "onReservedAccount">,
 	): Promise<string | undefined> {
 		// A disabled provider gets no credential, so no request reaches it however
 		// its model was obtained.
@@ -3333,6 +3333,7 @@ export class ModelRegistry {
 			return kNoAuth;
 		}
 		return this.authStorage.keys.get(model.provider, sessionId, {
+			...options,
 			baseUrl: model.baseUrl,
 			modelId: model.id,
 			accountIds: model.accountAccess && Object.keys(model.accountAccess),

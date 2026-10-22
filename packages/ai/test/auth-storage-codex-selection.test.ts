@@ -352,6 +352,76 @@ describe("AuthStorage codex oauth ranking", () => {
 		}
 	});
 
+	test("request reserve excludes the minimum window without restricting a main session", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("reserved", "reserved@example.com") },
+			{ type: "oauth", ...createCredential("available", "available@example.com") },
+		]);
+		for (const [accountId, secondary] of [
+			["reserved", 0.9],
+			["available", 0.5],
+		] as const) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+					secondary: { usedFraction: secondary, resetInMs: WEEK_MS },
+				}),
+			);
+		}
+		const notices: string[] = [];
+		expect(
+			await authStorage.keys.get("openai-codex", "advisor", {
+				modelId: "gpt-5.4",
+				minRemainingPct: 20,
+				onReservedAccount: account => notices.push(account),
+			}),
+		).toBe("api-available");
+		expect(
+			await authStorage.keys.get("openai-codex", "all-reserved", {
+				modelId: "gpt-5.4",
+				minRemainingPct: 60,
+			}),
+		).toBeUndefined();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).not.toContain("reserved@example.com");
+		expect(
+			await authStorage.keys.get("openai-codex", "main", {
+				modelId: "gpt-5.4",
+				accountIds: ["reserved"],
+			}),
+		).toBe("api-reserved");
+	});
+
+	test("request reserve allows unknown, stale and exactly-at-threshold usage", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("account", "account@example.com") },
+		]);
+		const options = { modelId: "gpt-5.4", minRemainingPct: 20 };
+		expect(await authStorage.keys.get("openai-codex", "unknown", options)).toBe("api-account");
+		usageByAccount.set(
+			"account",
+			createCodexUsageReport({
+				accountId: "account",
+				primary: { usedFraction: 0.8, resetInMs: HOUR_MS },
+				secondary: { usedFraction: 0.1, resetInMs: WEEK_MS },
+			}),
+		);
+		await authStorage.usage.invalidate();
+		expect(await authStorage.keys.get("openai-codex", "boundary", options)).toBe("api-account");
+		const report = usageByAccount.get("account");
+		if (!report) throw new Error("missing usage fixture");
+		report.fetchedAt = Date.now() - 10 * 60_000;
+		const limit = report.limits[0];
+		if (!limit) throw new Error("missing usage limit");
+		limit.amount.usedFraction = 0.99;
+		await authStorage.usage.invalidate();
+		expect(await authStorage.keys.get("openai-codex", "stale", options)).toBe("api-account");
+	});
+
 	test("prefers near-reset weekly account over lower-used far-reset account", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

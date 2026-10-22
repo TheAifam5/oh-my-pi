@@ -99,6 +99,10 @@ import {
 } from "../advisor";
 import { sanitizeDisplayWarning, sanitizeDisplayWarnings } from "@oh-my-pi/pi-tui/render/render-utils";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
+import { cfgAdvisorBudgetReservePct, cfgAdvisorBudgetWhenReserved } from "../advisor/settings";
+import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
+import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
+import { sanitizeNoticeLine } from "../utils/notice-text";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -401,6 +405,9 @@ interface ActiveAdvisor {
 	/** Per-advisor catch-up policy override; `undefined` inherits the global
 	 *  `advisor.syncBacklog` setting dynamically at each boundary. */
 	syncBacklog: AdvisorSyncBacklog | undefined;
+	budget: AdvisorConfig["budget"];
+	reserveEpisode: boolean;
+	budgetUnavailable?: boolean;
 	/** Eligible updates since the last reset; a review is scheduled at each multiple of the interval. */
 	eligibleUpdates: number;
 	/** Primary-turn count when the latest review was scheduled; the update that
@@ -1154,7 +1161,7 @@ export class SessionAdvisors {
 		advisor.providerSessionId = providerSessionId;
 		advisor.agent.sessionId = providerSessionId;
 		advisor.agent.promptCacheKey = this.#host.agent.promptCacheKey ?? providerSessionId;
-		advisor.agent.getApiKey = requestModel => this.#host.modelRegistry.resolver(requestModel, providerSessionId);
+		advisor.agent.getApiKey = requestModel => this.#advisorKeyResolver(advisor, requestModel);
 		advisor.agent.setMetadataResolver(
 			providerSessionId
 				? provider => buildSessionMetadata(providerSessionId, provider, this.#host.modelRegistry.authStorage)
@@ -1382,6 +1389,8 @@ export class SessionAdvisors {
 			budget,
 			tier,
 			config.fallback?.trim() ?? "",
+			config.budget?.reservePct ?? "",
+			config.budget?.whenReserved ?? "",
 		].join("\u001f");
 	}
 
@@ -1616,7 +1625,7 @@ export class SessionAdvisors {
 				providerSessionState: this.#host.providerSessionState,
 				cursorExecHandlers: advisorCursorExecHandlers,
 				cwdResolver: () => this.#host.sessionManager.getCwd(),
-				getApiKey: requestModel => this.#host.modelRegistry.resolver(requestModel, advisorProviderSessionId),
+				getApiKey: requestModel => this.#advisorKeyResolver(advisorRef, requestModel),
 				streamFn: advisorStreamFn,
 				// Maintenance installs compactionSummary messages; the core Agent's
 				// default converter drops custom roles and would discard their replay.
@@ -1680,7 +1689,8 @@ export class SessionAdvisors {
 			});
 
 			const advisorAgentFacade: AdvisorAgent = {
-				prompt: async update => {
+				prompt: async (update, options) => {
+					if (!(await this.#prepareAdvisorBudget(advisorRef, options?.signal))) return;
 					let quarantined: string | undefined;
 					advisorLoopGuard.reset();
 					advisorLoopGuardStopped = false;
@@ -1710,6 +1720,14 @@ export class SessionAdvisors {
 						else await advisorAgent.prompt(input);
 						quarantined = quarantinedAdvisorOutput;
 					} finally {
+						if (
+							advisorRef.budgetUnavailable &&
+							(advisorRef.budget?.whenReserved ?? cfgAdvisorBudgetWhenReserved.get(this.#host.settings)) ===
+								"skip"
+						) {
+							advisorAgent.state.error = undefined;
+							advisorRef.budgetUnavailable = false;
+						}
 						if (advisorLoopGuardStopped) {
 							// A loop guard stop is a deliberate, bounded silent review, not
 							// a provider failure for AdvisorRuntime to retry/fallback.
@@ -1840,6 +1858,8 @@ export class SessionAdvisors {
 				reviewMode: descriptor.reviewMode,
 				reviewInterval: descriptor.reviewInterval,
 				syncBacklog: descriptor.syncBacklog,
+				budget: config.budget,
+				reserveEpisode: false,
 				eligibleUpdates: carried?.get(slug)?.eligibleUpdates ?? 0,
 				pendingCoveredTurn: 0,
 				retryFallbackPendingSuccess: false,
@@ -2237,6 +2257,117 @@ export class SessionAdvisors {
 		});
 	}
 
+	#advisorBudgetOptions(advisor: ActiveAdvisor, signal?: AbortSignal): AuthApiKeyOptions {
+		return {
+			minRemainingPct: advisor.budget?.reservePct ?? cfgAdvisorBudgetReservePct.get(this.#host.settings),
+			signal,
+			onReservedAccount: (account, remainingPct) => {
+				if (advisor.reserveEpisode) return;
+				advisor.reserveEpisode = true;
+				const action = advisor.budget?.whenReserved ?? cfgAdvisorBudgetWhenReserved.get(this.#host.settings);
+				const message = `Advisor "${advisor.name}" quota reserve: ${account} has ${remainingPct.toFixed(1)}% remaining; ${action === "skip" ? "skip review if no account is available" : "try fallback if no account is available"}.`;
+				this.#host.emitNotice("warning", sanitizeNoticeLine(message), "advisor");
+				logger.warn("advisor quota reserve", { advisor: advisor.name, account, remainingPct, action });
+			},
+		};
+	}
+
+	#advisorKeyResolver(advisor: ActiveAdvisor, model: Model): ApiKeyResolver {
+		const budget = this.#advisorBudgetOptions(advisor);
+		let reserved = false;
+		const resolve = this.#host.modelRegistry.resolver(model.provider, {
+			sessionId: advisor.providerSessionId,
+			baseUrl: model.baseUrl,
+			modelId: model.id,
+			accountIds: model.accountAccess && Object.keys(model.accountAccess),
+			...budget,
+			onReservedAccount: (account, remainingPct) => {
+				reserved = true;
+				budget.onReservedAccount?.(account, remainingPct);
+			},
+		});
+		return async request => {
+			reserved = false;
+			const result = await resolve(request);
+			advisor.budgetUnavailable = !result && reserved;
+			return result;
+		};
+	}
+
+	async #prepareAdvisorBudget(advisor: ActiveAdvisor, signal?: AbortSignal): Promise<boolean> {
+		const options = this.#advisorBudgetOptions(advisor, signal);
+		options.signal?.throwIfAborted();
+		if (options.minRemainingPct === undefined) {
+			advisor.reserveEpisode = false;
+			return true;
+		}
+		let reserved = false;
+		const notify = options.onReservedAccount;
+		options.onReservedAccount = (account, remainingPct) => {
+			reserved = true;
+			notify?.(account, remainingPct);
+		};
+		const currentModel = advisor.agent.state.model;
+		const key = await this.#host.modelRegistry.getApiKey(currentModel, advisor.providerSessionId, options);
+		options.signal?.throwIfAborted();
+		if (key) {
+			if (!reserved && !advisor.retryFallback) advisor.reserveEpisode = false;
+			return true;
+		}
+		if (!reserved) return true;
+		if ((advisor.budget?.whenReserved ?? cfgAdvisorBudgetWhenReserved.get(this.#host.settings)) === "skip") {
+			return false;
+		}
+		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
+		for (const role of this.#advisorFallbackChainKeys(advisor, currentSelector, currentModel)) {
+			const candidates = await this.#host.orderedRetryFallbackCandidates(role, currentSelector, currentModel, {
+				walkActive: advisor.retryFallback !== undefined,
+				signal: options.signal,
+			});
+			for (const selector of candidates) {
+				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const candidate = this.#host.resolveRetryFallbackCandidate(role, selector);
+				if (
+					!candidate ||
+					modelsAreEqual(candidate, currentModel) ||
+					!this.#canReplayAdvisorHistory(advisor, candidate)
+				)
+					continue;
+				if (!(await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, options))) continue;
+				options.signal?.throwIfAborted();
+				const originalThinkingLevel = advisor.thinkingLevel;
+				this.#host.noteRetryFallbackApplied(role, selector, currentSelector, currentModel);
+				const nextThinkingLevel = this.#setAdvisorModel(
+					advisor,
+					candidate,
+					selector.thinkingLevel ?? originalThinkingLevel,
+				);
+				if (advisor.retryFallback) {
+					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;
+				} else {
+					advisor.retryFallback = {
+						role,
+						originalSelector: currentSelector,
+						originalThinkingLevel,
+						lastAppliedThinkingLevel: nextThinkingLevel,
+						pinned: false,
+					};
+				}
+				advisor.retryFallbackPendingSuccess = true;
+				this.#host.settings.getStorage()?.recordModelUsage(formatModelStringWithRouting(candidate));
+				await this.#host.emitSessionEvent({
+					type: "retry_fallback_applied",
+					from: currentSelector,
+					to: selector.raw,
+					role,
+					reason: "Advisor accounts are below the quota reserve.",
+				});
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Switch one advisor model while preserving its context and effort invariants. */
 	#setAdvisorModel(advisor: ActiveAdvisor, model: Model, requestedThinkingLevel: ThinkingLevel): ThinkingLevel {
 		const resolvedThinkingLevel = resolveThinkingLevelForModel(model, requestedThinkingLevel);
@@ -2334,7 +2465,10 @@ export class SessionAdvisors {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
+		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, {
+			...this.#advisorBudgetOptions(advisor),
+			signal,
+		});
 		if (!apiKey) return;
 		signal.throwIfAborted();
 
@@ -2362,6 +2496,10 @@ export class SessionAdvisors {
 		signal: AbortSignal,
 	): Promise<boolean> {
 		if (error instanceof AdvisorOutputQuarantinedError) return false;
+		if (advisor.budgetUnavailable) {
+			advisor.budgetUnavailable = false;
+			return this.#prepareAdvisorBudget(advisor, signal);
+		}
 
 		const failedMessage = failedMessages.findLast(
 			(message): message is AssistantMessage => message.role === "assistant",
@@ -2538,7 +2676,10 @@ export class SessionAdvisors {
 				const candidate = this.#host.resolveRetryFallbackCandidate(role, selector);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
+				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, {
+					...this.#advisorBudgetOptions(advisor),
+					signal,
+				});
 				if (!apiKey) continue;
 				signal.throwIfAborted();
 
@@ -2728,6 +2869,11 @@ export class SessionAdvisors {
 		signal: AbortSignal,
 	): Promise<boolean> {
 		await this.#maybeRestoreAdvisorRetryFallbackPrimary(advisor, signal);
+		if (
+			(advisor.budget?.whenReserved ?? cfgAdvisorBudgetWhenReserved.get(this.#host.settings)) === "skip" &&
+			!(await this.#prepareAdvisorBudget(advisor, signal))
+		)
+			return false;
 		const agent = advisor.agent;
 		// Prior reviews' `read`/`grep`/`glob` output is re-sent on every later
 		// request; the deltas the advisor reviews and the notes it wrote (carried
@@ -2908,7 +3054,10 @@ export class SessionAdvisors {
 		});
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
+			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, {
+				...this.#advisorBudgetOptions(advisor),
+				signal,
+			});
 			if (!apiKey) continue;
 			if (
 				nativeCompactionFailure &&

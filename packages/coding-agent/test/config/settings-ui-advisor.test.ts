@@ -112,6 +112,57 @@ describe("settings panel advisor rows", () => {
 		expect(Settings.instance.getGlobalSettings().allowProjectMeteredPools).toBe(true);
 	});
 
+	it("writes an optional numeric quota reserve and clears it with Off", async () => {
+		cfgAdvisorEnabled.set(Settings.instance, true);
+		const host = createSettingsHost();
+		const selector = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: ["dark"],
+				providers: [],
+				settings: host,
+				plugins: createPluginSettingsHost(process.cwd()),
+			},
+			{ onChange: () => {}, onCancel: () => {} },
+		);
+		await selector.ready;
+		const row = () =>
+			selector
+				.render(120)
+				.map(line => stripVTControlCharacters(line))
+				.find(line => line.includes("Advisor Quota Reserve")) ?? "";
+		for (const char of "reservePct") selector.handleInput(char);
+		expect(
+			selector
+				.render(120)
+				.map(line => stripVTControlCharacters(line))
+				.join("\n"),
+		).toContain("Advisor Quota Reserve");
+		selector.handleInput("\x1b[B");
+		expect(row()).toMatch(/Reserve\s+Off/);
+		selector.handleInput("\r");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		expect(
+			selector
+				.render(120)
+				.map(line => stripVTControlCharacters(line))
+				.join("\n"),
+		).toContain("10%");
+		selector.handleInput("\r");
+		await selector.pendingWrite;
+		expect(host.get("advisor.budget.reservePct")).toBe(10);
+		expect(row()).toMatch(/Reserve\s+10%/);
+		selector.handleInput("\r");
+		selector.handleInput("\x1b[A");
+		selector.handleInput("\x1b[A");
+		selector.handleInput("\r");
+		await selector.pendingWrite;
+		expect(host.get("advisor.budget.reservePct")).toBeUndefined();
+		expect(row()).toMatch(/Reserve\s+Off/);
+	});
+
 	it("keeps every advisor label within the settings list's 30-column label column", () => {
 		const advisorDefs = getSettingsForTab(createSettingsHost().entries, "model").filter(
 			def => def.group === "Advisor",

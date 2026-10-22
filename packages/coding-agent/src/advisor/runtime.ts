@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentPromptOptions } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { raceWithSignal } from "@oh-my-pi/pi-ai/utils/abort";
@@ -27,7 +27,7 @@ import { fingerprintMessage } from "./message-fingerprint";
  * this field after every prompt to detect a failed turn.
  */
 export interface AdvisorAgent {
-	prompt(input: string | AgentMessage[]): Promise<void>;
+	prompt(input: string | AgentMessage[], options?: AgentPromptOptions & { signal?: AbortSignal }): Promise<void>;
 	abort(reason?: unknown): void;
 	reset(): void;
 	/**
@@ -1360,7 +1360,7 @@ export class AdvisorRuntime {
 					// tested), so the advisor sees identical context.
 					const splitMessages = this.#formatRawDeltaMessageChunks(preparedMessages, wip, batchIncludeThinking);
 					const promptInput: string | AgentMessage[] = splitMessages ?? batch();
-					const prompt = this.agent.prompt(promptInput);
+					const prompt = this.agent.prompt(promptInput, { signal: iterationAbort.signal });
 					this.#promptInFlight = prompt;
 					try {
 						await prompt;

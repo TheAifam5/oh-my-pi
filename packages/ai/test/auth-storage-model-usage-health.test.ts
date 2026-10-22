@@ -718,6 +718,32 @@ describe("AuthStorage Claude tier reserve health", () => {
 		]);
 	}
 
+	it("filters requests by the applicable Claude tier without restricting another model", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(0.96) });
+		expect(
+			await storage.keys.get("anthropic", "advisor-fable", {
+				modelId: "claude-fable-5",
+				minRemainingPct: 10,
+			}),
+		).toBeUndefined();
+		expect(
+			await storage.keys.get("anthropic", "advisor-opus", {
+				modelId: "claude-opus-4-8",
+				minRemainingPct: 10,
+			}),
+		).toBe("access-1");
+	});
+
+	it("filters requests by Claude's shared weekly window even when the tier has quota", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(0.1) });
+		expect(
+			await storage.keys.get("anthropic", "advisor-weekly", {
+				modelId: "claude-fable-5",
+				minRemainingPct: 30,
+			}),
+		).toBeUndefined();
+	});
+
 	it("reports reserve when the mapped Fable tier row is inside the reserve margin", async () => {
 		const storage = await createClaudeStorage({ "account-1": tieredReport(0.96) });
 		const health = await storage.health.model("anthropic", {

@@ -75,6 +75,23 @@ A classifier refusal by the advisor's primary model (for example Anthropic's `Re
 
 `retry.fallbackOn` also decides which advisor failures may switch models: under `usage-limit` only a usage limit walks the chain, and any other failure stays on the advisor's own model with its usual retries before the review is dropped; under `except-usage-limit` a usage limit rotates credentials, waits, or pauses the advisor instead of switching.
 
+### Quota reserve
+
+`advisor.budget.reservePct` enables an advisor-only quota guard (0–100); unset leaves it off. Before requests, accounts already excluded by entitlement, disabled-account settings, or blocks remain excluded. Accounts with known remaining quota below the reserve are also excluded. Remaining quota is the minimum across the applicable usage windows, including Claude 5-hour/7-day and tier scopes and Codex primary/secondary windows. Unknown usage or reports older than five minutes remain eligible.
+
+`advisor.budget.whenReserved` defaults to `fallback`: if no eligible account remains, the advisor walks its normal role-derived or explicit `fallback` chain without requesting a reserved account. `skip` drops that review instead. A masked-account notice and log identify the remaining percentage once per advisor reserve episode. Main sessions and subagents are not filtered.
+
+Each `WATCHDOG.yml` advisor can override either field independently; omitted fields inherit the global setting:
+
+```yaml
+advisors:
+   - name: Security
+     model: "@security"
+     budget:
+        reservePct: 25
+        whenReserved: skip
+```
+
 ### Default advisor settings
 
 When no `WATCHDOG.yml` roster is present, the default advisor uses these settings from the Model tab:

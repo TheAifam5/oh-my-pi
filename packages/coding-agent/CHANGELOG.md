@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added opt-in advisor quota reserves (`advisor.budget.reservePct` and `whenReserved`), per-advisor WATCHDOG overrides, fallback or skip behavior, masked reserve notices, and /settings controls without restricting main sessions or subagents
 - Added user-owned directory settings layers under the active profile, canonical ancestor resolution, collision-safe path markers, live reload, per-key directory writes, provenance, and `omp config dirs` inspection
 - Added /settings scope selection for Global, the current directory and existing ancestor layers, with provenance badges and shadow warnings; `Ctrl+S` (`tui.settings.cycleScope`) cycles the scope
 - Added `auth.disabledAccounts` (`<provider>/#<id>`, `<provider>/<name>`, or an account matcher) to keep accounts out of sessions per directory; each provider with an entry is restricted per session, subagents and advisors included, to its other stored OAuth accounts (its API keys excluded), an entry naming an API key (`keyFingerprint`, or an `#id`/name/matcher resolving to one) excludes all of that provider's API keys there with a notice, dead entries make the provider unusable with a warning, logins and settings edits apply live, and project settings cannot set it

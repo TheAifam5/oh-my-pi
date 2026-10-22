@@ -84,6 +84,7 @@ export interface AdvisorConfig {
 	reviewMode?: AdvisorReviewMode;
 	reviewInterval?: number;
 	syncBacklog?: AdvisorSyncBacklog;
+	budget?: { reservePct?: number; whenReserved?: "fallback" | "skip" };
 	/**
 	 * Retry fallback chain key (a `retry.fallbackChains` key or pool role) walked when this advisor's model fails;
 	 * omitted uses the role of an `@role` model, else `advisor`.
@@ -1275,6 +1276,10 @@ export class AdvisorConfigOverlayComponent implements Component {
 					{ k: "Tools", v: formatAdvisorTools(advisor.tools, "no tools") },
 					{ k: "Review", v: formatReviewCadence(advisor) },
 					{ k: "Sync backlog", v: this.#syncBacklogLabel(advisor) },
+					{
+						k: "Quota reserve",
+						v: this.#budgetLabel(advisor),
+					},
 					{ k: "Notes per update", v: this.#maxNotesLabel(advisor.maxNotesPerUpdate) },
 					{ k: "Owns", v: formatOwns(advisor.owns) },
 				],
@@ -1439,6 +1444,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			`${theme.fg("dim", "Tools:")} ${tools}`,
 			`${theme.fg("dim", "Review:")} ${formatReviewCadence(advisor)}`,
 			`${theme.fg("dim", "Sync backlog:")} ${syncBacklog}`,
+			`${theme.fg("dim", "Quota reserve:")} ${this.#budgetLabel(advisor)}`,
 			`${theme.fg("dim", "Notes per update:")} ${this.#maxNotesLabel(advisor.maxNotesPerUpdate)}`,
 			`${theme.fg("dim", "Owns:")} ${formatOwns(advisor.owns)}`,
 			"",
@@ -1521,6 +1527,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			advisor.reviewMode === undefined &&
 			advisor.reviewInterval === undefined &&
 			advisor.syncBacklog === undefined &&
+			advisor.budget === undefined &&
 			!advisor.instructions?.trim() &&
 			advisor.enabled !== false &&
 			advisor.maxNotesPerUpdate === undefined &&
@@ -1538,6 +1545,12 @@ export class AdvisorConfigOverlayComponent implements Component {
 	/** The advisor's explicit catch-up override, else the inherited global policy. */
 	#syncBacklogLabel(advisor: AdvisorConfig): string {
 		return advisor.syncBacklog ?? `${this.#deps.syncBacklog ?? "off"} (inherited)`;
+	}
+
+	#budgetLabel(advisor: AdvisorConfig): string {
+		const reserve = advisor.budget?.reservePct;
+		const label = reserve === undefined ? "inherit" : `${reserve}%`;
+		return `${label} · ${advisor.budget?.whenReserved ?? "inherit action"}`;
 	}
 
 	/** `selectValue`: the roster row to highlight, by item value. */

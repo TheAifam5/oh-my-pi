@@ -77,7 +77,10 @@ const PREFS_MENU_MAX = 12;
 /** Text settings whose values are paths, ids or commands (drawn in mono). */
 const MONO_TEXT_SETTING = /(path|dir|url|endpoint|host|command|model|id)$/i;
 /** Submenus whose rows show the selected option's label rather than the stored value. */
-const OPTION_LABEL_SETTINGS = new Set(["advisor.aggregation.judge.timeoutMs"]);
+const OPTION_LABEL_SETTINGS: Record<string, true> = {
+	"advisor.aggregation.judge.timeoutMs": true,
+	"advisor.budget.reservePct": true,
+};
 /** Submenus whose choices preview live while highlighted (the branches of `#createSubmenu`). */
 const PREVIEWED_SETTINGS = new Set([
 	"theme.dark",
@@ -1550,7 +1553,7 @@ export class SettingsSelectorComponent implements Component {
 
 			case "submenu": {
 				const raw = this.#getSubmenuCurrentValue(def.path, currentValue);
-				const shown = OPTION_LABEL_SETTINGS.has(def.path)
+				const shown = OPTION_LABEL_SETTINGS[def.path]
 					? (this.#submenuOptions(def).find(option => option.value === raw)?.label ?? raw)
 					: raw;
 				return {
@@ -1880,8 +1883,8 @@ export class SettingsSelectorComponent implements Component {
 				parsed = this.#context.settings.validateProviderLimits(parsed);
 			}
 			return this.#saveValue(path, parsed);
-		} else if (typeof currentValue === "number") {
-			return this.#saveValue(path, Number(value));
+		} else if (schemaType === "number") {
+			return value === "" ? this.#unsetValue(path) : this.#saveValue(path, Number(value));
 		} else if (typeof currentValue === "boolean") {
 			return this.#saveValue(path, value === "true");
 		} else {
