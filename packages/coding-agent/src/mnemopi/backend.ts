@@ -154,13 +154,7 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 	},
 
-	async buildDeveloperInstructions(
-		_agentDir,
-		_cwd,
-		settings,
-		session,
-		xdevMountedNames,
-	): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, _cwd, settings, session, xdevMountedNames): Promise<string | undefined> {
 		return withLoopPhase("mnemopi.recall", () => {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;

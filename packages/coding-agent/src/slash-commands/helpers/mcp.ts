@@ -506,7 +506,7 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 	if (!found) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
 
 	const emit = (text: string): void => {
-		void Promise.resolve(runtime.output(text)).catch(() => { });
+		void Promise.resolve(runtime.output(text)).catch(() => {});
 	};
 	const run = async (): Promise<SlashCommandResult> => {
 		try {
