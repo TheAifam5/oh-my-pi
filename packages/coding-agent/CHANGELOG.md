@@ -54,6 +54,7 @@
 
 ### Fixed
 
+- Fixed model hub pool writes accepting untrusted account order or drain names; refused edits now report an error without changing the global config
 - Fixed the model hub's account order and drain editors offering account names defined only in project settings and writing them into the global pool routing; they now offer only names from settings layers other than the project
 - Fixed main turns and advisors falling back to another model when Anthropic answered a `404` for the model on one account; they now try the provider's other accounts first
 - Fixed main turns and advisors sending a request to a blocked account when it was the only account entitled to the model; they now go straight to the fallback model, and the log names the masked account and when its block ends

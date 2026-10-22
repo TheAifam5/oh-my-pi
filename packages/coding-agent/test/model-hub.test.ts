@@ -1644,6 +1644,83 @@ describe("ModelHub", () => {
 			}
 		});
 
+		for (const kind of ["role", "chain", "group"] as const) {
+			test(`the ${kind} pool writer refuses project-only account order and drain without changing global config`, async () => {
+				const tmp = TempDir.createSync("@pi-model-hub-account-writer-");
+				try {
+					await Bun.write(
+						tmp.join(".omp", "config.yml"),
+						"auth:\n  accountPolicies:\n    - provider: test\n      name: projonly\n      account: { email: p@example.com }\n",
+					);
+					const settings = await fileSettings(
+						tmp,
+						"auth:\n  accountPolicies:\n    - provider: test\n      name: work\n      account: { email: w@example.com }\n",
+					);
+					const config = Bun.file(tmp.join("agent", "config.yml"));
+					const before = await config.text();
+					const globalBefore = structuredClone(settings.getGlobalSettings());
+					const revision = settings.revision;
+					const target = { kind, key: "smol" };
+					const pool = { strategy: "random", models: { a: { model: "test/model-a" } } };
+					for (const accounts of [{ order: ["work", "projonly"] }, { order: ["work"], drain: "projonly" }]) {
+						const refused = writeModelHubPool(settings, target, { ...pool, routing: { accounts } });
+						expect(refused).toContain("routing.accounts.");
+						expect(refused).toContain("projonly");
+						expect(refused).toContain("trusted auth.accountPolicies");
+						expect(settings.getGlobalSettings()).toEqual(globalBefore);
+						expect(settings.revision).toBe(revision);
+						await settings.flush();
+						expect(await config.text()).toBe(before);
+					}
+					const accepted = {
+						...pool,
+						routing: { accounts: { order: ["work"], drain: "work" } },
+					};
+					expect(writeModelHubPool(settings, target, accepted)).toBeUndefined();
+					await settings.flush();
+					expect(Bun.YAML.parse(await config.text())).toMatchObject(
+						kind === "role"
+							? { modelRoles: { smol: accepted } }
+							: kind === "chain"
+								? { retry: { fallbackChains: { smol: accepted } } }
+								: { modelGroups: { smol: accepted } },
+					);
+					expect(writeModelHubPool(settings, target, undefined)).toBeUndefined();
+					await settings.flush();
+					expect(await config.text()).not.toContain("drain:");
+				} finally {
+					AgentStorage.close();
+					tmp.removeSync();
+				}
+			});
+		}
+
+		test("the drain editor surfaces a writer refusal when a name loses trust before submission", () => {
+			const settings = Settings.isolated();
+			cfgAuthAccountPolicies.set(settings, [
+				{ provider: "test", name: "work", account: { email: "w@example.com" } },
+			]);
+			settings.setModelRoleSpec("smol", {
+				strategy: "random",
+				models: { a: { model: "test/model-a" } },
+			});
+			const { hub } = createHub({ models: [makeModel("test", "model-a")], scoped: true, settings });
+			enterRolesView(hub);
+			hub.handleInput(DOWN);
+			hub.handleInput("e");
+			hub.handleInput("\x1b[C");
+			hub.handleInput("\n");
+			hub.handleInput("\x1b[C");
+			cfgAuthAccountPolicies.set(settings, []);
+			const before = structuredClone(settings.getGlobalSettings());
+			hub.handleInput("\n");
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("routing.accounts.drain");
+			expect(rendered).toContain("work");
+			expect(rendered).toContain("trusted auth.accountPolicies");
+			expect(settings.getGlobalSettings()).toEqual(before);
+		});
+
 		const INVALID_SMOL_POOL = [
 			"modelRoles:",
 			"  default: test/model-a",

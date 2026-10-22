@@ -160,14 +160,7 @@ export function createModelBrowserSource(
 		roleAcceptsPools: role => roleAcceptsGroups(role),
 		poolWriteBlocker: target => poolWriteBlocker(settings, target),
 		get accountNames() {
-			// Names of the highest non-project `auth.accountPolicies` layer.
-			const policies = settings
-				.getLayerValues(cfgAuthAccountPolicies)
-				.findLast(layer => layer.source !== "project")?.value;
-			const names = (Array.isArray(policies) ? policies : []).flatMap(policy =>
-				isRecord(policy) && typeof policy.name === "string" ? [policy.name] : [],
-			);
-			return [...new Set(names)];
+			return trustedAccountNames(settings);
 		},
 		parseLimitSpec: spec => parsePoolLimitSpec(spec),
 		formatLimit: limit => {
@@ -184,12 +177,23 @@ export function createModelBrowserSource(
 	};
 }
 
+/** Names from the highest non-project `auth.accountPolicies` layer. */
+function trustedAccountNames(settings: Settings): string[] {
+	const policies = settings
+		.getLayerValues(cfgAuthAccountPolicies)
+		.findLast(layer => layer.source !== "project")?.value;
+	const names = (Array.isArray(policies) ? policies : []).flatMap(policy =>
+		isRecord(policy) && typeof policy.name === "string" ? [policy.name] : [],
+	);
+	return [...new Set(names)];
+}
+
 /**
  * Persist a pool edit from the model hub to the global config: `value` replaces the role's
  * `modelRoles` entry, the `retry.fallbackChains` entry, or the `modelGroups` entry; `undefined`
- * removes it.
+ * removes it. Account order and drain names must belong to the trusted account-policy layer.
  *
- * @returns the validator's message when the value is refused; nothing is written then.
+ * @returns the refusal message for an invalid value or untrusted account name; nothing is written then.
  */
 export function writeModelHubPool(
 	settings: Settings,
@@ -197,6 +201,19 @@ export function writeModelHubPool(
 	value: Readonly<Record<string, unknown>> | undefined,
 ): string | undefined {
 	try {
+		const routing = value?.routing;
+		const accounts = isRecord(routing) ? routing.accounts : undefined;
+		if (isRecord(accounts)) {
+			const trustedNames = trustedAccountNames(settings);
+			for (const field of ["order", "drain"] as const) {
+				const names = field === "order" && Array.isArray(accounts.order) ? accounts.order : [accounts[field]];
+				for (const name of names) {
+					if (typeof name === "string" && !trustedNames.includes(name)) {
+						return `routing.accounts.${field}: account ${JSON.stringify(name)} is not defined in trusted auth.accountPolicies`;
+					}
+				}
+			}
+		}
 		if (target.kind === "role") settings.setModelRoleSpec(target.key, value);
 		else if (target.kind === "chain") settings.setFallbackChainSpec(target.key, value);
 		else settings.setModelGroup(target.key, value);
