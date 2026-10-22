@@ -399,6 +399,8 @@ export interface AgentSessionConfig {
 	advisorSharedMaxNotesPerUpdate?: number;
 	/** Project context rendered for advisor sessions. */
 	advisorContextPrompt?: string;
+	/** Always-apply model-scoped rule bodies matching the resolved advisor model. */
+	advisorModelRules?: (model: Model) => readonly string[];
 	/** Memory backend developer instructions rendered for advisor sessions. */
 	advisorMemoryPrompt?: string;
 	/** Advisors discovered from WATCHDOG.yml. */

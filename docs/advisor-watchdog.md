@@ -36,10 +36,10 @@ Example:
 
 ```yaml
 modelRoles:
-  advisor: anthropic/claude-sonnet-4-5:medium
+   advisor: anthropic/claude-sonnet-4-5:medium
 
 advisor:
-  enabled: true
+   enabled: true
 ```
 
 Model selectors use normal role/model resolution, including provider-prefixed ids, canonical ids, fallback lists, and optional thinking suffixes.
@@ -54,13 +54,13 @@ When the advisor's model fails (outage, rate limit, unreachable endpoint), the a
 
 ```yaml
 modelRoles:
-  advisor: openai/gpt-5.5:medium
+   advisor: openai/gpt-5.5:medium
 
 retry:
-  fallbackChains:
-    advisor:
-      - anthropic/claude-sonnet-4-5:medium
-      - google-vertex/gemini-3-pro
+   fallbackChains:
+      advisor:
+         - anthropic/claude-sonnet-4-5:medium
+         - google-vertex/gemini-3-pro
 ```
 
 This follows the same rules as the primary's fallback: `retry.enabled` and `retry.modelFallback` must be on, candidates still cooling down, without credentials, or incompatible with native advisor history are skipped, and `retry.fallbackRevertPolicy: cooldown-expiry` returns the advisor to its primary model once the cooldown ends. Credential rotation is attempted before switching models. Short usage-limit blocks can instead be waited out within `retry.maxDelayMs` and the retry budget; longer/exhausted blocks pause the advisor.
@@ -103,18 +103,18 @@ While a primary prompt is running, eligible advisor notes can steer that run. Af
 
 Slash commands:
 
-| Command              | Effect                                                                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `/advisor`           | Toggle the advisor subsystem for this session (session-scoped override; does not change persisted `advisor.enabled`).                |
-| `/advisor on`        | Enable the configured/default advisor runtimes for this session. Session-scoped; not persisted to config.                            |
-| `/advisor off`       | Disable the advisor subsystem for this session and stop its runtimes. Session-scoped; not persisted to config.                       |
-| `/advisor status`    | Show each advisor's runtime state, model, context usage, token usage, and cost, then the active finding taxonomy and its owner warnings. |
-| `/advisor dump`      | In the TUI, copy the compact transcript (all active advisors when a roster is present) to the clipboard; other hosts return the text. |
-| `/advisor dump raw`  | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                      |
-| `/advisor configure` | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only. |
-| `/advisor findings [open\|all]` | List the session's open (default) or all advisor findings. See [Findings command](#findings-command). |
-| `/advisor findings resolve F<n>` | Close an open finding as `resolved`; persisted to the session. |
-| `/advisor findings reopen F<n>` | Reopen a resolved or expired finding; persisted to the session. |
+| Command                          | Effect                                                                                                                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `/advisor`                       | Toggle the advisor subsystem for this session (session-scoped override; does not change persisted `advisor.enabled`).                    |
+| `/advisor on`                    | Enable the configured/default advisor runtimes for this session. Session-scoped; not persisted to config.                                |
+| `/advisor off`                   | Disable the advisor subsystem for this session and stop its runtimes. Session-scoped; not persisted to config.                           |
+| `/advisor status`                | Show each advisor's runtime state, model, context usage, token usage, and cost, then the active finding taxonomy and its owner warnings. |
+| `/advisor dump`                  | In the TUI, copy the compact transcript (all active advisors when a roster is present) to the clipboard; other hosts return the text.    |
+| `/advisor dump raw`              | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                          |
+| `/advisor configure`             | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only.     |
+| `/advisor findings [open\|all]`  | List the session's open (default) or all advisor findings. See [Findings command](#findings-command).                                    |
+| `/advisor findings resolve F<n>` | Close an open finding as `resolved`; persisted to the session.                                                                           |
+| `/advisor findings reopen F<n>`  | Reopen a resolved or expired finding; persisted to the session.                                                                          |
 
 If the subsystem is enabled but no legacy/default or roster model resolves, status reports the configured advisors as inactive/`no_model`.
 
@@ -125,6 +125,8 @@ Entries left at `no_model` during startup are retried after background model dis
 At each primary update, `AdvisorRuntime` receives only the new transcript delta since its previous update. Deltas are rendered with reasoning, tool intent, watched-role markers, and expanded primary constraint context, so advisors can review assistant reasoning as well as user-visible text, tool calls, and tool results. Provider-bound messages and tool arguments/results are passed through the session secret obfuscator before reaching the advisor model.
 
 Most hidden `custom` messages collapse to a one-line summary in the delta. The primary agent's injected constraint context (`plan-mode-context` and `plan-mode-reference`) is instead rendered verbatim inside an XML-escaped `<primary-context kind="…">` wrapper, while repeated copies are deduplicated. Advisors also receive the primary's discovered project context files (`AGENTS.md` and related standing instructions) in a `<project-context>` system-prompt block and the active memory backend's shared developer instructions. Those instructions do not grant tools; explicit tool lists remain unchanged. If the session cwd is outside Git with exactly one direct child repository, an additional watchdog block tells the advisor which child is the active project.
+
+Advisors receive always-apply rules only when they declare a `models`, `providers`, `class`, or `family` selector and match the advisor's resolved model. The normal disabled-rule, builtin-rule, agent-scope, and TTSR bucketing filters still apply. These rule bodies follow shared watchdog instructions and precede the advisor's own `instructions`. Model fallback, cooldown restore, and context promotion re-evaluate the selection; unscoped rules remain excluded.
 
 Advisor messages already injected into the primary transcript are filtered out before the next delta is rendered. This prevents the advisor from recursively reviewing its own advice.
 
@@ -217,11 +219,11 @@ When `/advisor status` (TUI and text hosts) lists advisors, it ends with the act
 
 Severity routing:
 
-| Severity        | Delivery                                                                                                                                                             | Intended use                                                                 |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| omitted / `nit` | Non-interrupting aside, batched into the primary transcript at the next turn boundary. After a terminal answer it leaves a visible card unless `advisor.continueSeverity` is `nit`. | Cleanup, simplification, low-risk edge cases.                                |
+| Severity        | Delivery                                                                                                                                                                                                                 | Intended use                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| omitted / `nit` | Non-interrupting aside, batched into the primary transcript at the next turn boundary. After a terminal answer it leaves a visible card unless `advisor.continueSeverity` is `nit`.                                      | Cleanup, simplification, low-risk edge cases.                                |
 | `concern`       | Interrupting steering when delivery constraints permit it. After a terminal answer it requests a continuation at the default `advisor.continueSeverity`; set the threshold to `blocker` to leave a visible card instead. | Material risk, likely wrong direction, missing constraint, hallucinated API. |
-| `blocker`       | Interrupting steering message when the delivery constraints below permit it. A terminal answer never prevents it from triggering a turn.                            | Continuing would clearly waste work or produce broken output.                |
+| `blocker`       | Interrupting steering message when the delivery constraints below permit it. A terminal answer never prevents it from triggering a turn.                                                                                 | Continuing would clearly waste work or produce broken output.                |
 
 Accepted notes are rendered into the primary transcript as `<advisory>` elements whose body is `<anchor display> — <defect>`, followed by ` → <impact>` and ` → <fix>` when present, XML-escaped. A note belonging to a [finding](#findings-ledger) leads with `finding`, `category`, and `owner` (the category's live owner, when it has one), then `severity` and `kind`, then `reporters` (every advisor that reported the finding, owner first), the report's [`relation`](#relations) when it named the finding, and the reporting `advisor`:
 
@@ -243,8 +245,8 @@ A normal yield the agent drove itself is treated differently from a deliberate i
 
 - **While the loop is still streaming**, blockers can steer into the live turn. Nits and concerns from an in-progress review remain deferred until a final boundary.
 - **Once the loop has yielded and gone idle**, delivery keys on how the turn ended:
-  - If the primary's tail is a **terminal text answer with no queued work**, `advisor.continueSeverity` (default `concern`) decides: a note at or above it requests one continuation; a note below it is preserved as a visible card at the end of the transcript rather than waking the agent to restate a completed turn (#4840), and reaches the agent with your next message. All stop, cooldown, plan-mode, and client constraints still apply; a continuation they block is preserved as a card.
-  - Otherwise (the agent yielded mid-work, no terminal answer), an idle `concern`/`blocker` normally triggers a fresh turn so the advice is acted on immediately.
+   - If the primary's tail is a **terminal text answer with no queued work**, `advisor.continueSeverity` (default `concern`) decides: a note at or above it requests one continuation; a note below it is preserved as a visible card at the end of the transcript rather than waking the agent to restate a completed turn (#4840), and reaches the agent with your next message. All stop, cooldown, plan-mode, and client constraints still apply; a continuation they block is preserved as a card.
+   - Otherwise (the agent yielded mid-work, no terminal answer), an idle `concern`/`blocker` normally triggers a fresh turn so the advice is acted on immediately.
 
 Session/client constraints can preserve a note whose normal delivery path is steering:
 
@@ -271,13 +273,13 @@ While an advisor update reviews work still in progress, `AdviseTool` defers `nit
 
 `advise` takes optional `relatesTo` (an open finding id, `F<n>`) and `relation`, given together; one without the other is rejected as an invalid call.
 
-| `relation`  | Effect                                                                                                                                                                                                                                                                                                                                                           |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relation`  | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `duplicate` | Accepted only when the report's host anchor identity equals the finding's, or when both the report's and the finding's anchors are `approach` anchors (whatever their topics); otherwise the report is handled as if it named no finding. An accepted duplicate joins the finding and is delivered as an aside under it when its defect, impact, or fix differ from the lead report (the first owner report, else the first report); otherwise nothing is delivered. |
-| `adds`      | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                               |
-| `disputes`  | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                               |
-| `escalates` | Joins the finding; interrupts per the severity routing when its severity is strictly higher than the finding's, otherwise an aside.                                                                                                                                                                                                                              |
-| `resolved`  | From the finding's owner: joins the finding, closes it as `resolved`, and is delivered as an aside. From any other advisor it is handled as `disputes`.                                                                                                                                                                                                          |
+| `adds`      | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `disputes`  | Joins the finding; delivered as an aside under it.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `escalates` | Joins the finding; interrupts per the severity routing when its severity is strictly higher than the finding's, otherwise an aside.                                                                                                                                                                                                                                                                                                                                  |
+| `resolved`  | From the finding's owner: joins the finding, closes it as `resolved`, and is delivered as an aside. From any other advisor it is handled as `disputes`.                                                                                                                                                                                                                                                                                                              |
 
 A `relatesTo` id that is unknown, resolved, or expired is ignored: the report is handled as if it named no finding. A related report joins the named finding whatever its `category`. The finding's severity is the highest across its reports.
 
@@ -295,12 +297,12 @@ A finding is `open` until its owner reports `resolved`, the user resolves it wit
 
 `advisor.aggregation.judge` controls a pass (`src/advisor/findings-judge.ts`, prompt `src/prompts/advisor/findings-judge.md`) that runs when an advisor update ends:
 
-| Setting                                        | Default  | Effect                                                                              |
-| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------- |
-| `advisor.aggregation.judge.enabled`            | `false`  | Run the pass; off by default in interactive, RPC, and ACP sessions.                    |
-| `advisor.aggregation.judge.model`              | `@judge` | Judge model; `@judge` is the `judge` model role chain. Other values skip the pass.  |
-| `advisor.aggregation.judge.timeoutMs`          | `10000`  | Deadline of one group's judgment, fallback candidates included.                     |
-| `advisor.aggregation.judge.allowCrossDomain`   | `false`  | Sends advisor finding text (anchors, defects, impact, fix) to a judge on a different provider, base URL or account than the reporting advisors. |
+| Setting                                      | Default  | Effect                                                                                                                                          |
+| -------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `advisor.aggregation.judge.enabled`          | `false`  | Run the pass; off by default in interactive, RPC, and ACP sessions.                                                                             |
+| `advisor.aggregation.judge.model`            | `@judge` | Judge model; `@judge` is the `judge` model role chain. Other values skip the pass.                                                              |
+| `advisor.aggregation.judge.timeoutMs`        | `10000`  | Deadline of one group's judgment, fallback candidates included.                                                                                 |
+| `advisor.aggregation.judge.allowCrossDomain` | `false`  | Sends advisor finding text (anchors, defects, impact, fix) to a judge on a different provider, base URL or account than the reporting advisors. |
 
 Only anchor groups are judged: open findings sharing one [anchor identity](#anchors), in at least two categories, one of which gained a report during the update. Each group is one judgment holding every judged finding's id, category, anchor display, and reports (kind, severity, defect, impact, fix), with one choice question per pair that includes a finding touched by the update; each answer must be `same` or `distinct`, and any other answer fails the group. Findings judged `same` merge into the one whose category has the highest precedence (the oldest on a tie): every report of the merged finding joins the lead (none is dropped by the report cap), the lead keeps the higher severity, and the merged finding's id and category become aliases, so `/advisor findings resolve` on the old id and later reports in its category on that anchor reach the lead. Merges persist in the `advisor_findings` entry (`merged`). Delivery already routed during the update is unchanged.
 
@@ -365,12 +367,12 @@ Keep turn reviews asynchronous while waiting for final reviews:
 
 ```yaml
 advisors:
-  - name: Turn reviewer
-    reviewMode: turn
-    syncBacklog: off
-  - name: Final reviewer
-    reviewMode: agent-end
-    syncBacklog: strict
+   - name: Turn reviewer
+     reviewMode: turn
+     syncBacklog: off
+   - name: Final reviewer
+     reviewMode: agent-end
+     syncBacklog: strict
 ```
 
 Advisor failures do not permanently stall the primary. The host first attempts its credential/fallback recovery. Retriable failures are attempted up to three times before that backlog is dropped; three dropped-backlog cycles halt the runtime until an explicit reset, and a permanent request rejection can halt it after one cycle. A quota/usage-limit failure that cannot recover through credential rotation, model fallback, or a bounded cooldown wait pauses the advisor with its batch retained until `/advisor` rebuilds it, configuration is reloaded, a new session starts, or the process restarts. The primary's catch-up waiters (`advisor.syncBacklog`) are released as soon as an advisor is failing; only the headless shutdown drain waits through recovery.
@@ -470,33 +472,33 @@ Example:
 
 ```yaml
 instructions: |
-  Everyone: prefer diffs that keep tests unified.
+   Everyone: prefer diffs that keep tests unified.
 
 advisors:
-  - name: Architecture
-    enabled: true
-    model: anthropic/claude-sonnet-4-5:medium
-    tools: [read, grep, glob]
-    instructions: |
-      Watch cross-module coupling and public-API growth.
+   - name: Architecture
+     enabled: true
+     model: anthropic/claude-sonnet-4-5:medium
+     tools: [read, grep, glob]
+     instructions: |
+        Watch cross-module coupling and public-API growth.
 
-  - name: Fixer
-    enabled: false
-    model: anthropic/claude-sonnet-4-5:high
-    tools: [read, grep, glob, edit, bash]
-    instructions: |
-      You may edit and run tests to prove a fix locally, then advise.
+   - name: Fixer
+     enabled: false
+     model: anthropic/claude-sonnet-4-5:high
+     tools: [read, grep, glob, edit, bash]
+     instructions: |
+        You may edit and run tests to prove a fix locally, then advise.
 ```
 
 For a final-yield reviewer that runs every third completed primary turn:
 
 ```yaml
 advisors:
-  - name: Final reviewer
-    reviewMode: agent-end
-    reviewInterval: 3
-    instructions: |
-      Review the complete turn. Stay silent unless concrete evidence shows a material problem.
+   - name: Final reviewer
+     reviewMode: agent-end
+     reviewInterval: 3
+     instructions: |
+        Review the complete turn. Stay silent unless concrete evidence shows a material problem.
 ```
 
 Fields:

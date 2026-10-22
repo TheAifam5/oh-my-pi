@@ -64,7 +64,7 @@ import {
 	SUB_AGENT_RULE_NAME,
 } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
-import { anyRuleModelScoped } from "./capability/rule-model-scope";
+import { anyRuleModelScoped, ruleIsModelScoped } from "./capability/rule-model-scope";
 import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
@@ -420,6 +420,7 @@ import {
 	type SkillsSettings,
 } from "./extensibility/settings";
 import { cfgTtsr } from "./export/ttsr-settings";
+import { TtsrManager } from "./export/ttsr";
 import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRoles } from "./config/model-settings";
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
@@ -2460,7 +2461,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
 	const discovered = await logger.time("discoverTtsrRules", async () => {
-		const { TtsrManager } = await import("./export/ttsr");
 		const ttsrSettings = cfgTtsr.get(settings);
 		// Live source: enable/repeat/interrupt/context changes apply on the next check.
 		const ttsrManager = new TtsrManager(() => cfgTtsr.get(settings));
@@ -5219,6 +5219,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			cacheWarmer,
 			advisorWatchdogPrompt,
 			advisorContextPrompt,
+			advisorModelRules: advisorModel => {
+				const ttsrSettings = cfgTtsr.get(settings);
+				return bucketRules(
+					(toolSession.rules ?? []).filter(ruleIsModelScoped),
+					new TtsrManager(() => cfgTtsr.get(settings)),
+					{
+						builtinRules: ttsrSettings.builtinRules,
+						disabledRules: ttsrSettings.disabledRules,
+						agentName: resolvedAgentName,
+						model: advisorModel,
+					},
+				).alwaysApplyRules.map(rule => rule.content);
+			},
 			advisorMemoryPrompt,
 			advisorSharedInstructions: discoveredAdvisors.sharedInstructions,
 			advisorSharedMaxNotesPerUpdate: discoveredAdvisors.sharedMaxNotesPerUpdate,

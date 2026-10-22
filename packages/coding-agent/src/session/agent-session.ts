@@ -2599,6 +2599,7 @@ export class AgentSession implements SettingsScope {
 			sharedInstructions: config.advisorSharedInstructions,
 			sharedMaxNotesPerUpdate: config.advisorSharedMaxNotesPerUpdate,
 			contextPrompt: config.advisorContextPrompt,
+			modelRules: config.advisorModelRules,
 			memoryPrompt: config.advisorMemoryPrompt,
 			configs: config.advisorConfigs,
 			categories: config.advisorCategories,

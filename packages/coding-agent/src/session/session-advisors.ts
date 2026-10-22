@@ -384,6 +384,7 @@ interface ActiveAdvisor {
 	recorderClosed: Promise<void>;
 	agentUnsubscribe?: () => void;
 	model: Model;
+	buildSystemPrompt: (model: Model) => string[];
 	thinkingLevel: ThinkingLevel;
 	/**
 	 * The user selected `auto` for this advisor's effort. The classifier only
@@ -512,6 +513,8 @@ export interface SessionAdvisorsOptions {
 	sharedInstructions?: string;
 	sharedMaxNotesPerUpdate?: number;
 	contextPrompt?: string;
+	/** Always-apply model-scoped rule bodies matching the resolved advisor model. */
+	modelRules?: (model: Model) => readonly string[];
 	/** Active memory backend's developer instructions, wrapped for advisors. */
 	memoryPrompt?: string;
 	configs?: AdvisorConfig[];
@@ -649,6 +652,7 @@ export class SessionAdvisors {
 	#advisorSharedMaxNotesPerUpdate: number | undefined;
 	#advisorContextPrompt: string | undefined;
 	#advisorMemoryPrompt: string | undefined;
+	#advisorModelRules: SessionAdvisorsOptions["modelRules"];
 	#advisorStreamFn: StreamFn | undefined;
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
@@ -742,6 +746,7 @@ export class SessionAdvisors {
 		this.#advisorSharedMaxNotesPerUpdate = options.sharedMaxNotesPerUpdate;
 		this.#advisorContextPrompt = options.contextPrompt;
 		this.#advisorMemoryPrompt = options.memoryPrompt;
+		this.#advisorModelRules = options.modelRules;
 		this.#advisorConfigs = options.configs;
 		this.#advisorCategories =
 			options.categories ?? resolveAdvisorCategories(undefined, options.configs ?? []).categories;
@@ -1452,12 +1457,17 @@ export class SessionAdvisors {
 
 			// `#advisorWatchdogPrompt` already carries WATCHDOG.md + YAML shared
 			// instructions; `config.instructions` adds this advisor's specialization.
-			const systemPrompt = [prompt.render(advisorSystemPrompt, { max_notes_per_update: budgetPerUpdate })];
-			if (this.#advisorContextPrompt) systemPrompt.push(this.#advisorContextPrompt);
-			if (this.#advisorMemoryPrompt) systemPrompt.push(this.#advisorMemoryPrompt);
-			if (this.#advisorWatchdogPrompt) systemPrompt.push(this.#advisorWatchdogPrompt);
-			if (this.#advisorSharedInstructions) systemPrompt.push(this.#advisorSharedInstructions);
-			if (config.instructions?.trim()) systemPrompt.push(config.instructions.trim());
+			const buildSystemPrompt = (model: Model): string[] => {
+				const blocks = [prompt.render(advisorSystemPrompt, { max_notes_per_update: budgetPerUpdate })];
+				if (this.#advisorContextPrompt) blocks.push(this.#advisorContextPrompt);
+				if (this.#advisorMemoryPrompt) blocks.push(this.#advisorMemoryPrompt);
+				if (this.#advisorWatchdogPrompt) blocks.push(this.#advisorWatchdogPrompt);
+				if (this.#advisorSharedInstructions) blocks.push(this.#advisorSharedInstructions);
+				blocks.push(...(this.#advisorModelRules?.(model) ?? []));
+				if (config.instructions?.trim()) blocks.push(config.instructions.trim());
+				return blocks;
+			};
+			const systemPrompt = buildSystemPrompt(advisorModel);
 
 			// The default roster additionally gets `recall` when the active memory
 			// backend built it (MemoryRecallTool.createIf — hindsight/mnemopi only;
@@ -1823,6 +1833,7 @@ export class SessionAdvisors {
 				recorder,
 				recorderClosed: Promise.resolve(),
 				model: advisorModel,
+				buildSystemPrompt,
 				thinkingLevel: advisorThinkingLevel,
 				autoThinking: advisorAutoThinking,
 				providerSessionId: advisorProviderSessionId,
@@ -2231,6 +2242,7 @@ export class SessionAdvisors {
 		const resolvedThinkingLevel = resolveThinkingLevelForModel(model, requestedThinkingLevel);
 		const nextThinkingLevel = resolvedThinkingLevel ?? ThinkingLevel.Inherit;
 		advisor.agent.setModel(model);
+		advisor.agent.setSystemPrompt(advisor.buildSystemPrompt(model));
 		advisor.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
 		advisor.agent.setDisableReasoning(shouldDisableReasoning(nextThinkingLevel));
 		advisor.agent.appendOnlyContext?.invalidateForModelChange();
