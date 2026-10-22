@@ -48,9 +48,11 @@ function storedRows(credentials: Pick<CredentialsApi, "list" | "listUserDisabled
  *
  * A `#id` entry naming no stored row of its provider, and a name entry that the
  * trusted-layer `auth.accountPolicies` do not define for its provider, make the
- * provider unusable. A name or matcher matching no stored row excludes nothing.
- * A matched row without an OAuth identity key (an API key) cannot be excluded;
- * an entry matching only such rows is ignored. Every problem is an issue.
+ * provider unusable. A name or matcher matching no stored row excludes nothing
+ * beyond the provider's API keys. An entry selecting by `keyFingerprint`, or
+ * matching a row without an OAuth identity key (an API key), restricts its
+ * provider like any other entry: all of its API keys are excluded and its OAuth
+ * accounts stay usable unless excluded. Every problem and API-key entry is an issue.
  */
 export function resolveDisabledAccounts(
 	settings: Settings,
@@ -81,31 +83,27 @@ export function resolveDisabledAccounts(
 			`auth.disabledAccounts entry "${ref.label}" ${reason}; ${ref.provider} is unavailable in this directory until you ${FIX_HINT}.`,
 		);
 	};
-	const exclude = (ref: DisabledAccountRef, rows: readonly StoredAuthCredential[]) => {
+	const exclude = (ref: DisabledAccountRef, rows: readonly StoredAuthCredential[], namesApiKey = false) => {
 		if (providers.get(ref.provider) === null) return;
-		const keys: string[] = [];
-		let keyless = 0;
+		const excluded = providers.get(ref.provider) ?? new Set<string>();
+		providers.set(ref.provider, excluded);
+		let keyless = namesApiKey;
 		for (const row of rows) {
 			const key = resolveCredentialIdentityKey(ref.provider, row.credential);
-			if (key === null) keyless += 1;
-			else keys.push(key);
+			if (key === null) keyless = true;
+			else excluded.add(key);
 		}
-		if (keyless > 0) {
+		if (keyless) {
 			issue(
-				`keyless\0${ref.label}`,
-				`auth.disabledAccounts entry "${ref.label}" matches ${keyless === 1 ? "a stored credential" : `${keyless} stored credentials`} without an OAuth identity (an API key); API keys cannot be disabled individually per directory. Disabling any ${ref.provider} OAuth account already excludes ${ref.provider} API keys in that scope.`,
+				`api-key\0${ref.label}`,
+				`auth.disabledAccounts entry "${ref.label}" names an API key; API keys cannot be excluded individually, so all ${ref.provider} API keys (stored, environment, and runtime) are excluded in this directory, and a models.yml apiKey for ${ref.provider} makes its requests fail there. ${ref.provider} OAuth accounts not excluded stay usable.`,
 			);
-			if (keys.length === 0) return;
-		}
-		if (rows.length === 0) {
+		} else if (rows.length === 0) {
 			issue(
 				`unmatched\0${ref.label}`,
 				`auth.disabledAccounts entry "${ref.label}" matches no stored ${ref.provider} account; it excludes nothing.`,
 			);
 		}
-		const excluded = providers.get(ref.provider) ?? new Set<string>();
-		for (const key of keys) excluded.add(key);
-		providers.set(ref.provider, excluded);
 	};
 	const matching = (ref: DisabledAccountRef, policy: AuthAccountPolicy) => {
 		let matcher: AccountPolicies;
@@ -118,6 +116,7 @@ export function resolveDisabledAccounts(
 		exclude(
 			ref,
 			storedRows(credentials, ref.provider).filter(row => matcher.forStored(ref.provider, row.credential)),
+			policy.account.keyFingerprint !== undefined,
 		);
 	};
 

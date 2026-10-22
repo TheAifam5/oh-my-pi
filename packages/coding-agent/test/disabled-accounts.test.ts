@@ -303,34 +303,59 @@ describe("auth.disabledAccounts", () => {
 			]);
 		});
 
-		it("rejects entries that resolve only to credentials without an OAuth identity", async () => {
+		it("an #id, name, or matcher naming an API key restricts the provider to its OAuth accounts with a notice", async () => {
 			await storage.credentials.set(PROVIDER, [
 				oauth("a"),
 				{ type: "api_key", key: "sk-ant-test" } as AuthCredential,
 			]);
 			const apiRow = storage.credentials.list(PROVIDER).find(row => row.credential.type === "api_key");
 			if (!apiRow) throw new Error("expected a stored API key");
+			const fingerprint = apiKeyFingerprint("sk-ant-test");
+			const entries = [
+				`${PROVIDER}/#${apiRow.id}`,
+				`${PROVIDER}/ci-key`,
+				{ provider: PROVIDER, keyFingerprint: fingerprint },
+			];
 			const settings = await load({
 				overrides: {
 					auth: {
-						disabledAccounts: [
-							`${PROVIDER}/#${apiRow.id}`,
-							{ provider: PROVIDER, keyFingerprint: apiKeyFingerprint("sk-ant-test") },
-						],
+						accountPolicies: [{ provider: PROVIDER, name: "ci-key", account: { keyFingerprint: fingerprint } }],
+						disabledAccounts: [entries[0]],
+					},
+				},
+			});
+			const { raised, cleared } = scopeFor(settings);
+			for (const entry of entries) {
+				cfgAuthDisabledAccounts.override(settings, [entry]);
+				expect(storage.sessions.isRestricted(PROVIDER, SESSION)).toBe(true);
+				expect(allowed()).toEqual(["account-a"]);
+				expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+			}
+			expect(raised).toHaveLength(3);
+			expect(cleared).toHaveLength(2);
+			for (const message of raised) {
+				expect(message).toContain("names an API key");
+				expect(message).toContain(
+					`all ${PROVIDER} API keys (stored, environment, and runtime) are excluded in this directory, and a models.yml apiKey for ${PROVIDER} makes its requests fail there`,
+				);
+			}
+		});
+
+		it("a fingerprint matching no stored key still excludes every API key of the provider", async () => {
+			storage.keys.setRuntime(PROVIDER, "sk-ant-runtime");
+			const settings = await load({
+				overrides: {
+					auth: {
+						disabledAccounts: [{ provider: PROVIDER, keyFingerprint: apiKeyFingerprint("sk-ant-runtime") }],
 					},
 				},
 			});
 			const { raised } = scopeFor(settings);
-			expect(storage.sessions.isRestricted(PROVIDER, SESSION)).toBe(false);
-			expect(raised).toHaveLength(2);
-			for (const message of raised) {
-				expect(message).toContain("API keys cannot be disabled individually per directory");
-				expect(message).toContain(`Disabling any ${PROVIDER} OAuth account already excludes ${PROVIDER} API keys`);
-			}
-
-			// With an OAuth entry the provider is restricted, which leaves the API key out too.
-			cfgAuthDisabledAccounts.override(settings, [`${PROVIDER}/#${apiRow.id}`, `${PROVIDER}/#${rowId("a")}`]);
-			expect(allowed()).toEqual([]);
+			expect(allowed()).toEqual(["account-a", "account-b", "account-c"]);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toMatch(/^access-/);
+			expect(raised).toHaveLength(1);
+			expect(raised[0]).toContain("names an API key");
+			expect(raised.some(message => message.includes("matches no stored"))).toBe(false);
 		});
 	});
 
@@ -373,6 +398,103 @@ describe("auth.disabledAccounts", () => {
 			await writeGlobal({ auth: { disabledAccounts: [{ provider: PROVIDER, email: "a@example.com" }] } });
 			scopeFor(await load(), { [PROVIDER]: [keyA, keyB] });
 			expect(allowed()).toEqual(["account-b"]);
+		});
+
+		it.each([
+			["#id", () => `${PROVIDER}/#${rowId("a")}`],
+			["name", () => `${PROVIDER}/private`],
+			["matcher", () => ({ provider: PROVIDER, email: "a@example.com" })],
+		])("re-upserting the same OAuth identity keeps its row id and its %s exclusion", async (_kind, entry) => {
+			const id = rowId("a");
+			await writeGlobal({ auth: { accountPolicies: policies, disabledAccounts: [entry()] } });
+			const { raised } = scopeFor(await load());
+			expect(allowed()).toEqual(["account-b", "account-c"]);
+			await storage.credentials.upsert(PROVIDER, oauth("a", "access-a-2"));
+			await storage.credentials.upsert(PROVIDER, oauth("a", "access-a-3"));
+			expect(rowId("a")).toBe(id);
+			expect(allowed()).toEqual(["account-b", "account-c"]);
+			expect(storage.sessions.pin(PROVIDER, SESSION, id)).toBe(false);
+			expect(["access-b", "access-c"]).toContain((await storage.keys.get(PROVIDER, SESSION)) ?? "");
+			expect(raised).toEqual([]);
+		});
+
+		it.each([
+			["name", `${PROVIDER}/private`],
+			["matcher", { provider: PROVIDER, email: "a@example.com" }],
+		])("a deleted and re-added account gets a new row id and stays excluded by %s", async (_kind, entry) => {
+			const id = rowId("a");
+			await writeGlobal({ auth: { accountPolicies: policies, disabledAccounts: [entry] } });
+			const { raised, cleared } = scopeFor(await load());
+			expect(await storage.credentials.removeById(PROVIDER, id)).toBe(true);
+			expect(allowed()).toEqual(["account-b", "account-c"]);
+			expect(raised).toHaveLength(1);
+			expect(raised[0]).toContain("matches no stored");
+			expect(cleared).toEqual([]);
+
+			await storage.credentials.upsert(PROVIDER, oauth("a", "access-a-2"));
+			expect(rowId("a")).not.toBe(id);
+			expect(allowed()).toEqual(["account-b", "account-c"]);
+			expect(storage.sessions.pin(PROVIDER, SESSION, rowId("a"))).toBe(false);
+			expect(raised).toHaveLength(1);
+			expect(cleared).toEqual(raised);
+		});
+
+		it("a deleted and re-added account leaves its #id stale, failing the provider closed with a notice", async () => {
+			const id = rowId("a");
+			await writeGlobal({ auth: { disabledAccounts: [`${PROVIDER}/#${id}`] } });
+			const { raised } = scopeFor(await load());
+			expect(allowed()).toEqual(["account-b", "account-c"]);
+			expect(await storage.credentials.removeById(PROVIDER, id)).toBe(true);
+			await storage.credentials.upsert(PROVIDER, oauth("a", "access-a-2"));
+			expect(rowId("a")).not.toBe(id);
+			expect(allowed()).toEqual([]);
+			await expect(storage.keys.get(PROVIDER, SESSION)).rejects.toBeInstanceOf(MissingApiKeyError);
+			expect(raised).toEqual([
+				`auth.disabledAccounts entry "${PROVIDER}/#${id}" names no stored ${PROVIDER} credential; ${PROVIDER} is unavailable in this directory until you run \`omp account list\` to see stored accounts, then fix or remove the entry.`,
+			]);
+		});
+	});
+
+	describe("API keys", () => {
+		it("a directory layer excluding a stored API key by fingerprint leaves no request on any of the provider's API keys there", async () => {
+			await storage.credentials.set(PROVIDER, [
+				oauth("a"),
+				oauth("b"),
+				{ type: "api_key", key: "sk-ant-stored" } as AuthCredential,
+			]);
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			storage.keys.setRuntime(PROVIDER, "sk-ant-runtime");
+			await writeDirectory(cwd, {
+				auth: { disabledAccounts: [{ provider: PROVIDER, keyFingerprint: apiKeyFingerprint("sk-ant-stored") }] },
+			});
+			const { raised } = scopeFor(await load());
+			expect(allowed()).toEqual(["account-a", "account-b"]);
+			expect(raised).toEqual([
+				`auth.disabledAccounts entry "${PROVIDER} keyFingerprint=${apiKeyFingerprint("sk-ant-stored")}" names an API key; API keys cannot be excluded individually, so all ${PROVIDER} API keys (stored, environment, and runtime) are excluded in this directory, and a models.yml apiKey for ${PROVIDER} makes its requests fail there. ${PROVIDER} OAuth accounts not excluded stay usable.`,
+			]);
+
+			storage.keys.setConfig(PROVIDER, "sk-ant-config");
+			await expect(storage.keys.get(PROVIDER, SESSION)).rejects.toThrow("models.yml configures an apiKey");
+			storage.keys.removeConfig(PROVIDER);
+
+			const served = new Set<string | undefined>();
+			served.add(await storage.keys.get(PROVIDER, SESSION));
+			await storage.limits.markReached(PROVIDER, SESSION, { retryAfterMs: 3_600_000 });
+			served.add(await storage.keys.get(PROVIDER, SESSION));
+			await storage.limits.markReached(PROVIDER, SESSION, { retryAfterMs: 3_600_000 });
+			served.add(await storage.keys.get(PROVIDER, SESSION).catch(() => undefined));
+			expect(served).toContain("access-a");
+			expect(served).toContain("access-b");
+			for (const key of ["sk-ant-stored", "sk-ant-env", "sk-ant-runtime"]) expect(served.has(key)).toBe(false);
+
+			// Outside the directory the provider stays unrestricted.
+			const outside = path.join(root, "elsewhere");
+			await fs.promises.mkdir(outside, { recursive: true });
+			const elsewhere = await Settings.loadIsolated({ cwd: outside, agentDir });
+			instances.push(elsewhere);
+			scopeFor(elsewhere, {}, "session-2");
+			expect(storage.sessions.isRestricted(PROVIDER, "session-2")).toBe(false);
+			expect(await storage.keys.get(PROVIDER, "session-2")).toBe("sk-ant-runtime");
 		});
 	});
 
