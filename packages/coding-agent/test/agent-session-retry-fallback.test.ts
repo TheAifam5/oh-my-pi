@@ -382,6 +382,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": {
@@ -488,6 +489,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": {
@@ -564,6 +566,7 @@ describe("AgentSession retry fallback", () => {
 		// the first fallback, which is itself a chain key. Reaching the second
 		// fallback requires re-resolving the chain for the active model.
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": {
@@ -1954,6 +1957,7 @@ describe("AgentSession retry fallback", () => {
 
 		const primarySelector = "missing-provider/missing-model";
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": {
@@ -2663,6 +2667,7 @@ describe("AgentSession retry fallback", () => {
 		// The advisor role chain ends at the first fallback, which owns a chain of
 		// its own. Reaching the second requires re-resolving from the live model.
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": {
@@ -2752,6 +2757,7 @@ describe("AgentSession retry fallback", () => {
 		const advisorPrimarySelector = `${advisorPrimary.provider}/${advisorPrimary.id}`;
 		const advisorFallbackSelector = `${advisorFallback.provider}/${advisorFallback.id}`;
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"advisor.syncBacklog": "1",
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
@@ -3459,6 +3465,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 1,
 			"retry.maxRetries": 1,
@@ -3674,6 +3681,7 @@ describe("AgentSession retry fallback", () => {
 				},
 			});
 			const settings = Settings.isolated({
+				"retry.capacityRetries": 0,
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 5,
 				"retry.fallbackChains": {
@@ -3713,6 +3721,7 @@ describe("AgentSession retry fallback", () => {
 				},
 			});
 			const settings = Settings.isolated({
+				"retry.capacityRetries": 0,
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 5,
 				"retry.maxRetries": 1,
@@ -4414,6 +4423,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
@@ -4796,6 +4806,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 2,
@@ -7503,6 +7514,7 @@ describe("AgentSession retry fallback", () => {
 				},
 			});
 			const settings = Settings.isolated({
+				"retry.capacityRetries": 0,
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 5,
 				...scenario.settings,
@@ -7661,6 +7673,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
@@ -7824,6 +7837,7 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
@@ -8770,6 +8784,7 @@ describe("AgentSession retry fallback", () => {
 				firstError: "overloaded_error: provider returned error 503",
 			});
 			const settings = Settings.isolated({
+				"retry.capacityRetries": 0,
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 5,
 				"retry.fallbackChains": {
@@ -8816,6 +8831,7 @@ describe("AgentSession retry fallback", () => {
 				firstError: "overloaded_error: provider returned error 503",
 			});
 			const settings = Settings.isolated({
+				"retry.capacityRetries": 0,
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 5,
 				"retry.fallbackChains": {
@@ -9056,6 +9072,7 @@ describe("AgentSession retry fallback", () => {
 			},
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
@@ -9097,6 +9114,7 @@ describe("AgentSession retry fallback", () => {
 			},
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
@@ -9156,6 +9174,7 @@ describe("AgentSession retry fallback", () => {
 			},
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },

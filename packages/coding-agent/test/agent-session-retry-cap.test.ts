@@ -1747,6 +1747,7 @@ describe("AgentSession retry delay cap", () => {
 			},
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.maxDelayMs": 300_000,
 			"retry.maxRetries": 3,

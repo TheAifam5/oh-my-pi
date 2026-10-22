@@ -168,6 +168,8 @@ interface SessionToolsOptions {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
+	/** Whether any discovered rule is model-scoped; folds the concrete model into the prompt refresh key. */
+	hasModelScopedRules?: () => boolean;
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	xdev?: XdevState;
 	setActiveToolNames?: (names: Iterable<string>) => void;
@@ -461,6 +463,7 @@ export class SessionTools {
 	 */
 	#settingsRebuildDeferredForModel: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
+	#hasModelScopedRules: SessionToolsOptions["hasModelScopedRules"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	/**
 	 * Session-lifetime factory shared by every custom-tool wrapper. Defining it
@@ -534,6 +537,7 @@ export class SessionTools {
 		this.#ensureGoalRegistered = options.ensureGoalRegistered;
 		this.#reconcileSettingsGatedTools = options.reconcileSettingsGatedTools;
 		this.#rebuildSystemPrompt = options.rebuildSystemPrompt;
+		this.#hasModelScopedRules = options.hasModelScopedRules;
 		this.#getMcpServerInstructions = options.getMcpServerInstructions;
 		this.#xdev = options.xdev;
 		if (this.#xdev && this.#xdev.tools !== this.#toolRegistry) {
@@ -1037,7 +1041,9 @@ export class SessionTools {
 			cfgInlineToolDescriptors.get(this.#host.settings),
 			activeModel.id,
 		);
-		return `delegation-bias:${resolveDelegationBias(activeModel)}|inline-descriptors:${inlineDescriptors}`;
+		const policyKey = `delegation-bias:${resolveDelegationBias(activeModel)}|inline-descriptors:${inlineDescriptors}`;
+		// Model-scoped rules select prompt content per concrete model, independent of `includeModelInPrompt`.
+		return this.#hasModelScopedRules?.() ? `${formatModelString(activeModel)}|${policyKey}` : policyKey;
 	}
 
 	/**

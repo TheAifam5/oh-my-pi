@@ -1407,6 +1407,16 @@
           ],
           "default": "any"
         },
+        "capacityRetries": {
+          "description": "Same-model retries after a provider capacity error (at capacity, overloaded) before switching to another account, then to a fallback model",
+          "type": "number",
+          "default": 2
+        },
+        "capacityBaseDelayMs": {
+          "description": "First wait before a same-model capacity retry, in ms; doubles per retry, capped by retry.maxDelayMs. A provider retry-after hint replaces it",
+          "type": "number",
+          "default": 5000
+        },
         "usageAwareFallback": {
           "description": "Use reliable coding-plan quota reports to prefer same-provider accounts, then configured fallback models, before a hard usage limit. Ordinary configured API keys are excluded.",
           "type": "boolean",
@@ -1733,6 +1743,11 @@
         },
         "maxNotesPerUpdate": {
           "description": "Maximum non-blocker advice notes accepted per advisor prompt update (1–32). Blockers are exempt.",
+          "type": "number",
+          "default": 4
+        },
+        "maxConcurrentRequests": {
+          "description": "Maximum model requests all advisors of a session send at once; further requests wait for a free slot. 0 = unlimited.",
           "type": "number",
           "default": 4
         },

@@ -77,6 +77,7 @@ describe("headless advisor drain with a fallback reviewer", () => {
 			streamFn: primary.stream,
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 1,
 			"retry.fallbackChains": { advisor: [`anthropic/${BACKUP_ADVISOR}`] },

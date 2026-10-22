@@ -161,6 +161,30 @@ export const cfgAdvisorMaxNotesPerUpdate = register({
 	},
 });
 
+export const cfgAdvisorMaxConcurrentRequests = register({
+	id: "advisor.maxConcurrentRequests",
+	protocolDefault: ["rpc", "acp"],
+	type: "number",
+	default: 4,
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Concurrent Requests",
+		description:
+			"Maximum model requests all advisors of a session send at once; further requests wait for a free slot. 0 = unlimited.",
+		options: [
+			{ value: "1", label: "1 request", description: "Advisors take turns." },
+			{ value: "2", label: "2 requests" },
+			{ value: "3", label: "3 requests" },
+			{ value: "4", label: "4 requests", description: "Default." },
+			{ value: "6", label: "6 requests" },
+			{ value: "8", label: "8 requests" },
+			{ value: "0", label: "Unlimited" },
+		],
+		condition: "advisorEnabled",
+	},
+});
+
 export const cfgAdvisorEvictStaleResults = register({
 	id: "advisor.evictStaleResults",
 	protocolDefault: ["rpc", "acp"],

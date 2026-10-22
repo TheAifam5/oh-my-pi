@@ -820,6 +820,7 @@ describe("subagent runtime fallback on a real provider error", () => {
 				authStorage,
 				modelRegistry,
 				settings: Settings.isolated({
+					"retry.capacityRetries": 0,
 					"task.agentIdleTtlMs": 0,
 					"compaction.enabled": false,
 					"retry.baseDelayMs": 1,

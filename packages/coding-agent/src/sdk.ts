@@ -64,6 +64,7 @@ import {
 	SUB_AGENT_RULE_NAME,
 } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
+import { anyRuleModelScoped } from "./capability/rule-model-scope";
 import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
@@ -4310,19 +4311,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// injection state is retained only for rule names that remain registered.
 			// Sessions handed an explicit rule set (subagents inherit the parent's) keep it
 			// but still re-bucket, so live `ttsr.*` filter changes apply to them too.
-			if (hasSession) {
+			// The initial build re-buckets the startup snapshot against the resolved
+			// model when any rule is model-scoped.
+			if (hasSession || anyRuleModelScoped(allRules)) {
 				const ttsrSettings = cfgTtsr.get(settings);
-				const ruleItems =
-					options.rules ??
-					(
-						await logger.time("rediscoverRules", () =>
-							loadCapability<Rule>(ruleCapability.id, { cwd: promptCwd, agentDir }),
-						)
-					).items;
+				const ruleItems = !hasSession
+					? allRules
+					: (options.rules ??
+						(
+							await logger.time("rediscoverRules", () =>
+								loadCapability<Rule>(ruleCapability.id, { cwd: promptCwd, agentDir }),
+							)
+						).items);
 				const buckets = bucketRules(ruleItems, ttsrManager, {
 					builtinRules: ttsrSettings.builtinRules,
 					disabledRules: ttsrSettings.disabledRules,
 					agentName: resolvedAgentName,
+					model: agent?.state.model ?? model,
 					replaceTtsrRules: true,
 				});
 				rulebookRules = buckets.rulebookRules;
@@ -5293,6 +5298,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			hasModelScopedRules: () => anyRuleModelScoped(toolSession.rules),
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames,

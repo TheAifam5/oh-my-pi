@@ -135,6 +135,7 @@ const advisorEntrySchema = type({
 	"enabled?": "boolean",
 	"maxNotesPerUpdate?": "number",
 	"owns?": "string[]",
+	"fallback?": "string",
 });
 
 type AdvisorYamlEntry = typeof advisorEntrySchema.infer;
@@ -452,6 +453,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 				enabled: entry.enabled,
 				instructions: entryInstructions,
 				owns: normalizeOwns(entry.owns),
+				fallback: entry.fallback?.trim() || undefined,
 			});
 		}
 	}
@@ -545,6 +547,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		}
 		const owns = normalizeOwns(a.owns);
 		if (owns !== undefined) advisor.owns = owns;
+		if (a.fallback?.trim()) advisor.fallback = a.fallback.trim();
 		return advisor;
 	});
 	const doc: WatchdogConfigDoc = { advisors };
@@ -641,6 +644,7 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 				appendYamlString(lines, "    ", "instructions", advisor.instructions);
 			}
 			if (advisor.enabled !== undefined) lines.push(`    enabled: ${advisor.enabled}`);
+			if (advisor.fallback?.trim()) lines.push(`    fallback: ${YAML.stringify(advisor.fallback.trim())}`);
 			if (
 				typeof advisor.maxNotesPerUpdate === "number" &&
 				Number.isFinite(advisor.maxNotesPerUpdate) &&

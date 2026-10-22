@@ -86,6 +86,7 @@ describe("advisor classifier-refusal fallback", () => {
 			streamFn: primary.stream,
 		});
 		const settings = Settings.isolated({
+			"retry.capacityRetries": 0,
 			"compaction.enabled": false,
 			"compaction.methodOrder": ["soft"],
 			"compaction.keepRecentTokens": 1,

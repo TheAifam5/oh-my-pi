@@ -39,6 +39,7 @@ import type {
 import { isUsageLimitOutcome, resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
+import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
@@ -103,6 +104,7 @@ import {
 	formatModelString,
 	formatModelStringWithRouting,
 	resolveAdvisorRoleSelection,
+	resolveExplicitModelRole,
 	resolveModelOverride,
 } from "../config/model-resolver";
 import { MODEL_ROLES } from "../config/model-roles";
@@ -157,6 +159,7 @@ import {
 	cfgAdvisorEvictStaleResults,
 	cfgAdvisorFindingsDigest,
 	cfgAdvisorImmuneTurns,
+	cfgAdvisorMaxConcurrentRequests,
 	cfgAdvisorMaxNotesPerUpdate,
 	cfgAdvisorReviewInterval,
 	cfgAdvisorReviewMode,
@@ -164,7 +167,10 @@ import {
 } from "../advisor/settings";
 import { cfgContextPromotionEnabled } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
-import { cfgRetry, cfgTierAdvisor } from "./settings";
+import { cfgRetry, cfgRetryCapacity, cfgTierAdvisor } from "./settings";
+import { sessionAccountLogLabel } from "./account-log";
+import { capacityAccountBlockMs, capacityRetryDelayMs, isCapacityFailure } from "./capacity-retry";
+import { Semaphore } from "../task/parallel";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
 
@@ -404,6 +410,14 @@ interface ActiveAdvisor {
 	retryFallbackPendingSuccess: boolean;
 	/** Count of consecutive usage-limit block waits, bounded by retry.maxRetries; reset on turn success. */
 	usageLimitRetries: number;
+	/** Same-model capacity retries spent on the current model, bounded by retry.capacityRetries; reset on turn success or model change. */
+	capacityRetries: number;
+	/** Account switches since the last success or model change, bounded by retry.maxRetries. */
+	credentialSwitches: number;
+	/** `WATCHDOG.yml` `fallback`: the chain key walked first when this advisor's model fails. */
+	fallbackChain: string | undefined;
+	/** Role of an `@role` model selector, the default fallback chain key when it has candidates. */
+	modelRole: string | undefined;
 	signature: string;
 }
 /** First index whose provider usage may anchor the advisor's context estimate. */
@@ -441,6 +455,7 @@ interface AdvisorRuntimeDescriptor {
 	reviewInterval: number | undefined;
 	syncBacklog: AdvisorSyncBacklog | undefined;
 	autoThinking: boolean;
+	modelRole: string | undefined;
 	signature: string;
 }
 
@@ -637,6 +652,8 @@ export class SessionAdvisors {
 	#advisorStreamFn: StreamFn | undefined;
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
+	/** Session-wide `advisor.maxConcurrentRequests` gate shared by every advisor's model requests. */
+	#advisorRequestSlots = new Semaphore(0);
 	#advisorConfigs: AdvisorConfig[] | undefined;
 	/** Active finding taxonomy; every advisor's `advise` enumerates its ids. */
 	#advisorCategories: readonly AdvisorCategory[];
@@ -1322,6 +1339,7 @@ export class SessionAdvisors {
 				reviewInterval,
 				syncBacklog,
 				autoThinking,
+				modelRole: config.model ? resolveExplicitModelRole(config.model, this.#host.settings) : undefined,
 				// An `auto` advisor's concrete level changes every turn; signing the
 				// resolved level would make each change look like a config edit and
 				// rebuild the advisor, losing its context. Sign the selector instead.
@@ -1358,6 +1376,7 @@ export class SessionAdvisors {
 			instructions,
 			budget,
 			tier,
+			config.fallback?.trim() ?? "",
 		].join("\u001f");
 	}
 
@@ -1548,7 +1567,7 @@ export class SessionAdvisors {
 				mcpResources: this.#advisorMcpResources,
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
-			const advisorStreamFn: StreamFn = (requestModel, context, streamOptions) => {
+			const dispatchAdvisorStream: StreamFn = (requestModel, context, streamOptions) => {
 				// Read per request so a mid-session `providers.openaiWebsockets` change reaches advisors.
 				const options = {
 					...streamOptions,
@@ -1569,6 +1588,11 @@ export class SessionAdvisors {
 				}
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
+			const advisorStreamFn: StreamFn = (requestModel, context, streamOptions) =>
+				this.#withAdvisorRequestSlot(
+					() => dispatchAdvisorStream(requestModel, context, streamOptions),
+					streamOptions?.signal,
+				);
 			const advisorAgent = new Agent({
 				initialState: {
 					systemPrompt,
@@ -1748,6 +1772,8 @@ export class SessionAdvisors {
 					// A completed turn ended the usage-limit episode — start the next
 					// block's bounded wait budget fresh.
 					advisorRef.usageLimitRetries = 0;
+					advisorRef.capacityRetries = 0;
+					advisorRef.credentialSwitches = 0;
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
 					advisorRef.retryFallbackPendingSuccess = false;
@@ -1807,6 +1833,10 @@ export class SessionAdvisors {
 				pendingCoveredTurn: 0,
 				retryFallbackPendingSuccess: false,
 				usageLimitRetries: 0,
+				capacityRetries: 0,
+				credentialSwitches: 0,
+				fallbackChain: config.fallback?.trim() || undefined,
+				modelRole: descriptor.modelRole,
 				signature,
 			};
 			this.#refreshAdvisorProviderIdentity(advisorRef);
@@ -2206,6 +2236,8 @@ export class SessionAdvisors {
 		advisor.agent.appendOnlyContext?.invalidateForModelChange();
 		advisor.model = model;
 		advisor.thinkingLevel = nextThinkingLevel;
+		advisor.capacityRetries = 0;
+		advisor.credentialSwitches = 0;
 		return nextThinkingLevel;
 	}
 
@@ -2346,14 +2378,34 @@ export class SessionAdvisors {
 			return false;
 		}
 
+		const authStorage = this.#host.modelRegistry.authStorage;
+		const account = sessionAccountLogLabel(authStorage, currentModel.provider, advisor.providerSessionId);
+		logger.warn("advisor turn failed", {
+			advisor: advisor.name,
+			model: formatModelString(currentModel),
+			account,
+			error: message,
+		});
+
+		const retrySettings = cfgRetry.get(this.#host.settings);
+		// Every account switch retries at once, so the switches since the last
+		// success or model change are bounded by the provider's stored account
+		// count; past it, failures move on to the waits and model fallback below.
+		const maxCredentialSwitches = Math.max(1, authStorage.sessions.accounts(currentModel.provider).length);
+		const switchCredential = (switched: boolean): boolean => {
+			if (!switched || advisor.credentialSwitches >= maxCredentialSwitches) return false;
+			advisor.credentialSwitches++;
+			return true;
+		};
+
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
-			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
-				currentModel.provider,
-				advisor.providerSessionId,
-				{ error: message, modelId: currentModel.id, signal },
-			);
-			if (rotation.switched) return true;
+			const rotation = await authStorage.limits.rotate(currentModel.provider, advisor.providerSessionId, {
+				error: message,
+				modelId: currentModel.id,
+				signal,
+			});
+			if (switchCredential(rotation.switched)) return true;
 		}
 
 		const retryAfterMs = extractProviderRetryHint(currentModel.provider, message);
@@ -2367,19 +2419,15 @@ export class SessionAdvisors {
 		let usagePriorBlockedUntilMs: number | undefined;
 		let usagePriorBlockedUntilTimed: boolean | undefined;
 		if (usageLimit) {
-			const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
-				currentModel.provider,
-				advisor.providerSessionId,
-				{
-					retryAfterMs,
-					reason: AIError.parseRateLimitReason(message),
-					providerTimed: retryAfterMs !== undefined,
-					baseUrl: currentModel.baseUrl,
-					modelId: currentModel.id,
-					signal,
-				},
-			);
-			if (outcome.switched) return true;
+			const outcome = await authStorage.limits.markReached(currentModel.provider, advisor.providerSessionId, {
+				retryAfterMs,
+				reason: AIError.parseRateLimitReason(message),
+				providerTimed: retryAfterMs !== undefined,
+				baseUrl: currentModel.baseUrl,
+				modelId: currentModel.id,
+				signal,
+			});
+			if (switchCredential(outcome.switched)) return true;
 			usageRetryAtMs = outcome.retryAtMs;
 			usageBlockedUntilMs = outcome.blockedUntilMs;
 			usageRequestedBlockedUntilMs = outcome.requestedBlockedUntilMs;
@@ -2387,11 +2435,41 @@ export class SessionAdvisors {
 			usagePriorBlockedUntilMs = outcome.priorBlockedUntilMs;
 			usagePriorBlockedUntilTimed = outcome.priorBlockedUntilTimed;
 		}
-		if (!assistantFailure && !accountPolicyDenial && !usageLimit) return false;
+
+		// A capacity error is transient: back off and retry the same model, then
+		// another entitled account, then the fallback chain below.
+		const capacityFailure = !usageLimit && !accountPolicyDenial && isCapacityFailure(errorId, message);
+		if (capacityFailure && retrySettings.enabled) {
+			const capacity = cfgRetryCapacity.get(this.#host.settings);
+			if (advisor.capacityRetries < capacity.retries) {
+				const attempt = advisor.capacityRetries + 1;
+				const waitMs = capacityRetryDelayMs(capacity.baseDelayMs, attempt, retryAfterMs, retrySettings.maxDelayMs);
+				if (waitMs !== undefined) {
+					logger.debug("advisor backing off after capacity error", {
+						advisor: advisor.name,
+						model: formatModelString(currentModel),
+						account,
+						waitMs,
+						attempt,
+					});
+					await scheduler.wait(waitMs, { signal });
+					advisor.capacityRetries = attempt;
+					return true;
+				}
+			}
+			const outcome = await authStorage.limits.markReached(currentModel.provider, advisor.providerSessionId, {
+				retryAfterMs: capacityAccountBlockMs(retryAfterMs),
+				reason: "MODEL_CAPACITY_EXHAUSTED",
+				providerTimed: retryAfterMs !== undefined,
+				baseUrl: currentModel.baseUrl,
+				modelId: currentModel.id,
+				signal,
+			});
+			if (switchCredential(outcome.switched)) return true;
+		}
+		if (!assistantFailure && !accountPolicyDenial && !usageLimit && !capacityFailure) return false;
 
 		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
-
-		const retrySettings = cfgRetry.get(this.#host.settings);
 		// A usage-limit error with no sibling credential and no usable model
 		// fallback is not automatically fatal: wait out a transient credential
 		// block and retry, mirroring the primary turn-recovery. Only a wait past
@@ -2415,14 +2493,7 @@ export class SessionAdvisors {
 				: Promise.resolve(false);
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return declineUsageLimit();
 		if (!retryFallbackAdmits(retrySettings.fallbackOn, usageLimit)) return declineUsageLimit();
-		// Same two-key walk the main loop uses: the chain that owns this advisor's
-		// active fallback, then the chain the current model owns. Without the
-		// second key an advisor that lands on the last entry of one chain never
-		// reaches that entry's own chain and re-hits the dead model instead.
-		const chainKeys = this.#host.retryFallbackChainKeys(currentSelector, currentModel, {
-			pinnedRole: advisor.retryFallback?.role,
-			roleHint: "advisor",
-		});
+		const chainKeys = this.#advisorFallbackChainKeys(advisor, currentSelector, currentModel);
 		if (
 			!chainKeys.some(role => this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel).length > 0)
 		) {
@@ -2471,6 +2542,14 @@ export class SessionAdvisors {
 				}
 				advisor.retryFallbackPendingSuccess = true;
 				this.#host.settings.getStorage()?.recordModelUsage(formatModelStringWithRouting(candidate));
+				logger.warn("advisor retry fallback applied", {
+					advisor: advisor.name,
+					from: currentSelector,
+					to: selector.raw,
+					role,
+					account,
+					error: message,
+				});
 				await this.#host.emitSessionEvent({
 					type: "retry_fallback_applied",
 					from: currentSelector,
@@ -2482,6 +2561,32 @@ export class SessionAdvisors {
 			}
 		}
 		return declineUsageLimit();
+	}
+
+	/**
+	 * Chain keys an advisor's failed model walks, most specific first. The
+	 * advisor's `fallback`, else the role of its `@role` model when that role
+	 * has candidates, is walked first; otherwise the `advisor` role is only a
+	 * hint below the model's own exact or wildcard chain. An active walk keeps
+	 * the chain it started on.
+	 */
+	#advisorFallbackChainKeys(advisor: ActiveAdvisor, currentSelector: string, currentModel: Model): string[] {
+		const role = advisor.modelRole;
+		const configured =
+			advisor.fallbackChain ??
+			(role !== undefined &&
+			role !== "advisor" &&
+			this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel).length > 0
+				? role
+				: undefined);
+		// Same two-key walk the main loop uses: the chain that owns this advisor's
+		// active fallback, then the chain the current model owns. Without the
+		// second key an advisor that lands on the last entry of one chain never
+		// reaches that entry's own chain and re-hits the dead model instead.
+		return this.#host.retryFallbackChainKeys(currentSelector, currentModel, {
+			pinnedRole: advisor.retryFallback?.role ?? configured,
+			roleHint: configured ?? "advisor",
+		});
 	}
 
 	/**
@@ -2534,6 +2639,35 @@ export class SessionAdvisors {
 		// consume budget in the resumed/reset conversation.
 		advisor.usageLimitRetries = attempt;
 		return true;
+	}
+
+	/**
+	 * Start one advisor model request inside the session-wide
+	 * `advisor.maxConcurrentRequests` limit, read per request. The slot is held
+	 * until the returned stream settles; an abort while queued rejects with the
+	 * signal's reason.
+	 */
+	async #withAdvisorRequestSlot(
+		start: () => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+		signal: AbortSignal | undefined,
+	): Promise<AssistantMessageEventStream> {
+		const slots = this.#advisorRequestSlots;
+		slots.resize(cfgAdvisorMaxConcurrentRequests.get(this.#host.settings));
+		await slots.acquire(signal);
+		let held = true;
+		const release = (): void => {
+			if (!held) return;
+			held = false;
+			slots.release();
+		};
+		try {
+			const stream = await start();
+			stream.result().then(release, release);
+			return stream;
+		} catch (error) {
+			release();
+			throw error;
+		}
 	}
 
 	async #promoteAdvisorContextModel(

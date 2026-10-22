@@ -134,11 +134,14 @@ import {
 import { sanitizeNoticeLine } from "../utils/notice-text";
 import { resolveToolReplayClass } from "../tools/approval";
 import { interruptedToolExecution } from "./exit-diagnostics";
+import { sessionAccountLogLabel } from "./account-log";
+import { capacityAccountBlockMs, capacityRetryDelayMs, isCapacityFailure } from "./capacity-retry";
 
 import {
 	cfgFeaturesUnexpectedStopDetection,
 	cfgModelLoopGuardEnabled,
 	cfgRetry,
+	cfgRetryCapacity,
 	cfgRetryEnabled,
 	cfgRetryFallbackChains,
 	cfgRetryModelFallback,
@@ -442,6 +445,8 @@ export class TurnRecovery {
 	readonly #unexpectedStopJudgeTimeoutMs: number;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	/** Same-model capacity retries spent in the current retry saga on the current model; cleared by `resolveRetry()` and a model switch. */
+	#capacityRetries = 0;
 	/**
 	 * Selectors a classifier refusal has already moved off in the current retry saga; see the walk
 	 * bound below. Cleared in `resolveRetry()`, which every end of a saga goes through (an answer,
@@ -1060,9 +1065,10 @@ export class TurnRecovery {
 		return parsed ? formatRetryFallbackBaseSelector(parsed) : selector;
 	}
 
-	/** Resolve the pending retry promise; the saga is over, and so is its refusal walk. */
+	/** Resolve the pending retry promise; the saga is over, and so are its refusal walk and capacity retries. */
 	resolveRetry(): void {
 		this.#refusalWalkTried.clear();
+		this.#capacityRetries = 0;
 		if (this.#retryResolve) {
 			this.#retryResolve();
 			this.#retryResolve = undefined;
@@ -3048,6 +3054,9 @@ export class TurnRecovery {
 				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
 		const candidateSelector = formatModelStringWithRouting(candidate);
 		const previousModel = this.#host.model();
+		const previousAccount = previousModel
+			? sessionAccountLogLabel(this.#host.modelRegistry.authStorage, previousModel.provider, this.#host.sessionId())
+			: undefined;
 		// Capture the edit mode under the outgoing model so the base system prompt
 		// can be re-synced once the swap commits — `edit.modelVariants` and other
 		// model-dependent prompt policy would otherwise stay pinned to the
@@ -3093,6 +3102,13 @@ export class TurnRecovery {
 			this.#activeRetryFallback.pinned = this.#activeRetryFallback.pinned || options?.pinFallback === true;
 		}
 		await this.#host.syncAfterModelChange(previousEditMode);
+		logger.warn("retry fallback applied", {
+			from: currentSelector,
+			to: selector.raw,
+			role,
+			account: previousAccount,
+			reason: options?.reason,
+		});
 		await this.#host.emitSessionEvent({
 			type: "retry_fallback_applied",
 			from: currentSelector,
@@ -3662,6 +3678,60 @@ export class TurnRecovery {
 			}
 			if (switchedCredential) delayMs = 0;
 		}
+		// A capacity error is transient: back off and retry the same model, then
+		// another entitled account, then the fallback chain below. Rotation is
+		// limited to the retry budget, since a switched credential bypasses it.
+		let sameModelCapacityRetry = false;
+		if (
+			!staleOpenAIResponsesReplayError &&
+			!switchedCredential &&
+			!retryBudgetExhausted &&
+			currentModel &&
+			isCapacityFailure(id, errorMessage)
+		) {
+			const capacity = cfgRetryCapacity.get(this.#host.settings);
+			if (this.#capacityRetries < capacity.retries) {
+				const waitMs = capacityRetryDelayMs(
+					capacity.baseDelayMs,
+					this.#capacityRetries + 1,
+					parsedRetryAfterMs,
+					retrySettings.maxDelayMs,
+				);
+				if (waitMs !== undefined) {
+					this.#capacityRetries++;
+					sameModelCapacityRetry = true;
+					delayMs = waitMs;
+				}
+			}
+			if (!sameModelCapacityRetry) {
+				const capacityAbortController = new AbortController();
+				this.#retryAbortController?.abort();
+				this.#retryAbortController = capacityAbortController;
+				try {
+					switchedCredential = (
+						await this.#host.modelRegistry.authStorage.limits.markReached(
+							currentModel.provider,
+							this.#host.sessionId(),
+							{
+								retryAfterMs: capacityAccountBlockMs(parsedRetryAfterMs),
+								reason: "MODEL_CAPACITY_EXHAUSTED",
+								providerTimed: parsedRetryAfterMs !== undefined,
+								baseUrl: currentModel.baseUrl,
+								modelId: currentModel.id,
+								signal: capacityAbortController.signal,
+							},
+						)
+					).switched;
+				} catch (error) {
+					if (!capacityAbortController.signal.aborted) throw error;
+					if (this.#retryAbortController !== capacityAbortController) return false;
+					return this.#endCancelledRetry();
+				} finally {
+					if (this.#retryAbortController === capacityAbortController) this.#retryAbortController = undefined;
+				}
+				if (switchedCredential) delayMs = 0;
+			}
+		}
 		// A thinking-loop abort is not a provider failure — it is the loop guard
 		// asking for a same-model resample, paired with a hidden
 		// `thinking-loop-redirect` notice that only makes sense on the model that
@@ -3716,6 +3786,7 @@ export class TurnRecovery {
 				retrySettings.modelFallback &&
 				retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit)) &&
 				!thinkingLoop &&
+				!sameModelCapacityRetry &&
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&
 				!refusalWalkRepeats &&
@@ -3769,6 +3840,7 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
+				this.#capacityRetries = 0;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}

@@ -527,6 +527,43 @@ describe("per-advisor enabled field", () => {
 	});
 });
 
+describe("per-advisor fallback field", () => {
+	it("round-trips a fallback chain key through save, load, and discovery", async () => {
+		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-fallback-"));
+		await fsp.mkdir(path.join(tmp, ".git"));
+		try {
+			const file = path.join(tmp, "WATCHDOG.yml");
+			await saveWatchdogConfigFile(file, {
+				advisors: [{ name: "Security", model: "@security", fallback: " security " }, { name: "Plain" }],
+			});
+
+			const loaded = await loadWatchdogConfigFile(file);
+			expect(loaded.advisors.map(advisor => advisor.fallback)).toEqual(["security", undefined]);
+
+			const { advisors } = await discoverAdvisorConfigs(tmp, tmp);
+			expect(advisors.map(advisor => advisor.fallback)).toEqual(["security", undefined]);
+		} finally {
+			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("drops an advisor whose fallback is not a string", async () => {
+		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-fallback-bad-"));
+		await fsp.mkdir(path.join(tmp, ".git"));
+		try {
+			await Bun.write(
+				path.join(tmp, "WATCHDOG.yml"),
+				["advisors:", "  - name: Broken", "    fallback: [security]", "  - name: Fine"].join("\n"),
+			);
+			const { advisors, warnings } = await discoverAdvisorConfigs(tmp, tmp);
+			expect(advisors.map(advisor => advisor.name)).toEqual(["Fine"]);
+			expect(warnings.some(warning => warning.includes('"Broken" dropped'))).toBe(true);
+		} finally {
+			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("maxNotesPerUpdate configuration", () => {
 	it("discovers shared and per-advisor maxNotesPerUpdate from WATCHDOG.yml", async () => {
 		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-max-notes-"));

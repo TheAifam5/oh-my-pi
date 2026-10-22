@@ -792,6 +792,52 @@ export const cfgRetryFallbackOn = register({
 	},
 });
 
+export const cfgRetryCapacityRetries = register({
+	id: "retry.capacityRetries",
+	type: "number",
+	default: 2,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Capacity Retries",
+		description:
+			"Same-model retries after a provider capacity error (at capacity, overloaded) before switching to another account, then to a fallback model",
+		options: [
+			{ value: "0", label: "None", description: "Switch account or model on the first capacity error" },
+			{ value: "1", label: "1 retry" },
+			{ value: "2", label: "2 retries", description: "Default" },
+			{ value: "3", label: "3 retries" },
+			{ value: "5", label: "5 retries" },
+		],
+	},
+});
+
+export const cfgRetryCapacityBaseDelayMs = register({
+	id: "retry.capacityBaseDelayMs",
+	type: "number",
+	default: 5_000,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Capacity Backoff",
+		description:
+			"First wait before a same-model capacity retry, in ms; doubles per retry, capped by retry.maxDelayMs. A provider retry-after hint replaces it",
+		options: [
+			{ value: "1000", label: "1 second" },
+			{ value: "2000", label: "2 seconds" },
+			{ value: "5000", label: "5 seconds", description: "Default" },
+			{ value: "10000", label: "10 seconds" },
+			{ value: "30000", label: "30 seconds" },
+		],
+	},
+});
+
+/** Same-model retry policy for provider capacity errors. */
+export const cfgRetryCapacity = combine({
+	retries: cfgRetryCapacityRetries,
+	baseDelayMs: cfgRetryCapacityBaseDelayMs,
+});
+
 export const cfgRetryUsageAwareFallback = register({
 	id: "retry.usageAwareFallback",
 	type: "boolean",

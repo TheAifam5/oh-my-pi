@@ -84,6 +84,11 @@ export interface AdvisorConfig {
 	reviewMode?: AdvisorReviewMode;
 	reviewInterval?: number;
 	syncBacklog?: AdvisorSyncBacklog;
+	/**
+	 * Retry fallback chain key (a `retry.fallbackChains` key or pool role) walked when this advisor's model fails;
+	 * omitted uses the role of an `@role` model, else `advisor`.
+	 */
+	fallback?: string;
 	/** Category ids this advisor owns. */
 	owns?: string[];
 }
@@ -1519,7 +1524,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 			!advisor.instructions?.trim() &&
 			advisor.enabled !== false &&
 			advisor.maxNotesPerUpdate === undefined &&
-			advisor.owns === undefined
+			advisor.owns === undefined &&
+			!advisor.fallback?.trim()
 		);
 	}
 
