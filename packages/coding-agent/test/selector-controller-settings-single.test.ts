@@ -8,6 +8,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui";
 import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
+import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
 import * as sessionPins from "@oh-my-pi/pi-coding-agent/session/session-pins";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -117,6 +118,9 @@ describe("single-instance menus", () => {
 		controller.showSettingsSelector();
 		expect(overlays).toHaveLength(1);
 		expect(setFocus).toHaveBeenLastCalledWith(overlays[0]);
+		const selector = overlays[0];
+		if (!(selector instanceof SettingsSelectorComponent)) throw new Error("Expected the settings selector overlay");
+		await selector.ready;
 	});
 
 	// Regression: clicking Tern's composer model chip again while the picker was
@@ -198,7 +202,7 @@ describe("single-instance menus", () => {
 		shown[1]?.handleInput?.("\r");
 
 		expect(selected).not.toHaveBeenCalled();
-		expect(ctx.session.setModelTemporary).toHaveBeenCalledWith(model, undefined);
+		expect(ctx.session.setModelTemporary).toHaveBeenCalledWith(model, undefined, { poolRole: undefined });
 	});
 
 	it("uses only the newest callbacks for repeated selection-only picker requests", () => {

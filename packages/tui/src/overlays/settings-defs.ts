@@ -143,15 +143,34 @@ export interface SettingsDisplayEntry {
 	condition?: () => boolean;
 }
 
+/** A persistent destination for settings-panel edits. */
+export interface SettingsTarget {
+	id: string;
+	label: string;
+	note?: string;
+}
+
 export interface SettingsHost {
 	entries: readonly SettingsDisplayEntry[];
 	get(path: string): unknown;
-	set(path: string, value: unknown): void;
+	set(path: string, value: unknown): void | Promise<void>;
 	/**
-	 * Removes the value from the global config: a project or other layer, or an environment
-	 * variable, that configures the setting still applies; otherwise the default does.
+	 * Removes the setting from the selected persistent destination; a value from another layer or an
+	 * environment variable still applies, otherwise the default does.
 	 */
-	unset(path: string): void;
+	unset(path: string): void | Promise<void>;
+	/** Settles after destinations are resolved and the initial destination is selected. */
+	ready?: Promise<void>;
+	/** Selectable persistent destinations, in cycling order. */
+	readonly targets?: readonly SettingsTarget[];
+	/** Id of the selected destination. */
+	readonly target?: string;
+	/** Selects a destination by id; throws for an unknown id. */
+	selectTarget?(id: string): void;
+	/** Non-global layer supplying the effective value, or `undefined` for global and default values. */
+	provenance?(path: string): string | undefined;
+	/** Warning when a higher layer overrides values written to the selected destination. */
+	shadowWarning?(path: string): string | undefined;
 	normalizeProviderLimits(value: unknown): Record<string, number>;
 	validateProviderLimits(value: unknown): Record<string, number>;
 }

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added the `tui.settings.cycleScope` keybinding (default `Ctrl+S`) and write scopes to the settings panel: `SettingsHost` gains optional `ready`, `targets`, `target`, `selectTarget()`, `provenance()`, and `shadowWarning()`, `set`/`unset` may return promises, and `SettingItem.provenance` shows a source badge without changing the editable value
 - Added expandable role-pool and model-group members to the session model picker, with concrete model ids and current availability
 - Added rule model selectors to the extensions inspector and `fallback` to the advisor configuration type
 - Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and keys to turn a selector role into a pool, add, replace, remove, and reorder members, and cycle the strategy (including `quota`) and funding order; an invalid pool shows its validation problem and can be removed or replaced

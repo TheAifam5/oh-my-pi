@@ -45,6 +45,8 @@ export interface SettingItem {
 	warning?: string;
 	/** Current value to display (right side) */
 	currentValue: string;
+	/** Non-global source of the effective value, displayed without changing the editable value. */
+	provenance?: string;
 	/** If provided, Enter/Space cycles through these values */
 	values?: string[];
 	/** If provided, Enter opens this submenu. Receives current value and done callback. */
@@ -87,7 +89,7 @@ export function settingPrefsRow(item: SettingItem, control: TspPrefsControl): Ts
 	if (item.heading) return undefined;
 	const row: TspPrefsRow = {
 		id: item.id,
-		label: plainLine(item.label),
+		label: plainLine(item.provenance ? `${item.label} [${item.provenance}]` : item.label),
 		hint: item.description ? plainLine(item.description) : undefined,
 		warning: item.warning ? plainLine(item.warning) : undefined,
 		changed: item.changed === true ? true : undefined,
@@ -699,7 +701,7 @@ export class SettingsList implements Component {
 	#describeItem(item: NativeDescribedSetting): NativeNode {
 		const value = plainLine(String(item.currentValue ?? ""));
 		const changed = item.changed === true;
-		const signature = `${item.heading === true}\0${item.label}\0${value}\0${changed}\0${item.warning ?? ""}\0${item.description ?? ""}`;
+		const signature = `${item.heading === true}\0${item.label}\0${value}\0${changed}\0${item.warning ?? ""}\0${item.description ?? ""}\0${item.provenance ?? ""}`;
 		const cached = item[kNativeItem];
 		if (cached?.signature === signature) return cached.node;
 		let described: NativeNode;
@@ -712,6 +714,7 @@ export class SettingsList implements Component {
 			);
 		} else {
 			const label: TspSpan[] = [span(plainLine(item.label), changed ? "accent" : undefined)];
+			if (item.provenance) label.push(span(` [${plainLine(item.provenance)}]`, "muted"));
 			if (item.warning && this.#theme.warningMark)
 				label.push(span(` ${plainText(this.#theme.warningMark)}`, "warning"));
 			const detail: TspSpan[] = [];
@@ -774,7 +777,16 @@ export class SettingsList implements Component {
 		const labelPad = padding(Math.max(0, maxLabelWidth - visibleWidth(labelPlain)));
 		const separator = "  ";
 		const valueMaxWidth = rowWidth - prefixWidth - maxLabelWidth - visibleWidth(separator) - 2;
-		const valuePlain = truncateToWidth(String(item.currentValue ?? ""), valueMaxWidth, Ellipsis.Omit);
+		const badge = item.provenance
+			? `${truncateToWidth(`[${sanitizeSingleLine(item.provenance)}]`, Math.max(0, Math.floor(valueMaxWidth / 2)))} `
+			: "";
+		const valuePlain =
+			badge +
+			truncateToWidth(
+				String(item.currentValue ?? ""),
+				Math.max(0, valueMaxWidth - visibleWidth(badge)),
+				Ellipsis.Omit,
+			);
 		const hovered = !isSelected && this.#theme.hovered !== undefined && item.id === this.#hoveredItemId;
 		// De-emphasized rows (outside the active section) render as plain text
 		// under one dim wash so inner label/value colors don't fight it.

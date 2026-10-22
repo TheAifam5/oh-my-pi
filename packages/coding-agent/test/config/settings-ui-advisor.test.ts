@@ -119,7 +119,7 @@ describe("settings panel advisor rows", () => {
 		expect(advisorDefs.filter(def => def.label.length > 30).map(def => def.label)).toEqual([]);
 	});
 
-	it("shows the judge timeout row in seconds and picks from its stored value", () => {
+	it("shows the judge timeout row in seconds and picks from its stored value", async () => {
 		cfgAdvisorEnabled.set(Settings.instance, true);
 		const selector = new SettingsSelectorComponent(
 			{
@@ -132,6 +132,7 @@ describe("settings panel advisor rows", () => {
 			},
 			{ onChange: () => {}, onCancel: () => {} },
 		);
+		await selector.ready;
 		for (const char of "judge timeout") selector.handleInput(char);
 		const row = () =>
 			selector
@@ -143,6 +144,7 @@ describe("settings panel advisor rows", () => {
 		selector.handleInput("\r"); // Picker opens on the stored 10 seconds.
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\r"); // 20 seconds.
+		await selector.pendingWrite;
 		expect(cfgAdvisorAggregationJudgeTimeoutMs.get(Settings.instance)).toBe(20_000);
 		expect(row()).toMatch(/Timeout\s+20 seconds/);
 	});

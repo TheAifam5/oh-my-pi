@@ -45,8 +45,8 @@ function stubStdoutGeometry(cols: number): { restore(): void } {
 	};
 }
 
-function createSelector(onCancel: () => void = () => {}): SettingsSelectorComponent {
-	return new SettingsSelectorComponent(
+async function createSelector(onCancel: () => void = () => {}): Promise<SettingsSelectorComponent> {
+	const component = new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
@@ -60,6 +60,8 @@ function createSelector(onCancel: () => void = () => {}): SettingsSelectorCompon
 			onCancel,
 		},
 	);
+	await component.ready;
+	return component;
 }
 
 /** Switch the selector to the memory tab. SETTING_TABS puts memory at index 4 (after appearance/model/interaction/context). */
@@ -70,9 +72,9 @@ function focusMemoryTab(comp: SettingsSelectorComponent): void {
 }
 
 describe("SettingsSelectorComponent memory tab", () => {
-	it("reveals condition-gated Hindsight rows the moment memory.backend changes via the submenu", () => {
+	it("reveals condition-gated Hindsight rows the moment memory.backend changes via the submenu", async () => {
 		cfgMemoryBackend.set(settings, "off");
-		const comp = createSelector();
+		const comp = await createSelector();
 		focusMemoryTab(comp);
 		// Width 70 keeps the flat single-column layout (the wide split layout
 		// shows only the active section's rows, covered by the sidebar test).
@@ -87,6 +89,7 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[B");
 		comp.handleInput("\x1b[B");
 		comp.handleInput("\n");
+		await comp.pendingWrite;
 
 		expect(cfgMemoryBackend.get(settings)).toBe("hindsight");
 		const after = comp.render(70).join("\n");
@@ -96,10 +99,10 @@ describe("SettingsSelectorComponent memory tab", () => {
 		expect(after).toContain("Hindsight Auto Recall");
 	});
 
-	it("saves a pasted Hindsight API token from its settings row", () => {
+	it("saves a pasted Hindsight API token from its settings row", async () => {
 		cfgMemoryBackend.set(settings, "hindsight");
 		cfgHindsightApiToken.set(settings, "saved-secret-token");
-		const comp = createSelector();
+		const comp = await createSelector();
 
 		for (const ch of "hindsight api token") comp.handleInput(ch);
 		const row = comp.render(120).join("\n");
@@ -110,6 +113,7 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\n");
 		expect(comp.render(120).join("\n")).not.toContain("saved-secret-token");
 		comp.handleInput("\n");
+		await comp.pendingWrite;
 		expect(cfgHindsightApiToken.get(settings)).toBe("saved-secret-token");
 		expect(comp.render(120).join("\n")).not.toContain("saved-secret-token");
 
@@ -118,15 +122,16 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[200~test-token-123\x1b[201~");
 		expect(comp.render(120).join("\n")).not.toContain("test-token-123");
 		comp.handleInput("\n");
+		await comp.pendingWrite;
 
 		expect(cfgHindsightApiToken.get(settings)).toBe("test-token-123");
 		expect(loadHindsightConfig(settings).hindsightApiToken).toBe("test-token-123");
 		expect(comp.render(120).join("\n")).not.toContain("test-token-123");
 	});
 
-	it("hides Hindsight rows again when the backend is switched back to off without leaving the tab", () => {
+	it("hides Hindsight rows again when the backend is switched back to off without leaving the tab", async () => {
 		cfgMemoryBackend.set(settings, "hindsight");
-		const comp = createSelector();
+		const comp = await createSelector();
 		focusMemoryTab(comp);
 		// Width 70 keeps the flat layout so all sections' rows render inline.
 		expect(comp.render(70).join("\n")).toContain("Hindsight API URL");
@@ -137,6 +142,7 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[A");
 		comp.handleInput("\x1b[A");
 		comp.handleInput("\n");
+		await comp.pendingWrite;
 
 		expect(cfgMemoryBackend.get(settings)).toBe("off");
 		const after = comp.render(70).join("\n");
@@ -145,9 +151,9 @@ describe("SettingsSelectorComponent memory tab", () => {
 		expect(after).not.toContain("Hindsight Auto Recall");
 	});
 
-	it("clears the global settings search on Escape before closing the selector", () => {
+	it("clears the global settings search on Escape before closing the selector", async () => {
 		let cancelCount = 0;
-		const comp = createSelector(() => {
+		const comp = await createSelector(() => {
 			cancelCount++;
 		});
 
@@ -172,8 +178,8 @@ describe("SettingsSelectorComponent memory tab", () => {
 		expect(cancelCount).toBe(1);
 	});
 
-	it("puts the exact global settings search hit before incidental matches", () => {
-		const comp = createSelector();
+	it("puts the exact global settings search hit before incidental matches", async () => {
+		const comp = await createSelector();
 		for (const ch of "fetch provider") comp.handleInput(ch);
 
 		const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
@@ -190,8 +196,8 @@ describe("SettingsSelectorComponent memory tab", () => {
 		}
 	});
 
-	it("supports editor hotkeys in the global search bar", () => {
-		const comp = createSelector();
+	it("supports editor hotkeys in the global search bar", async () => {
+		const comp = await createSelector();
 		const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
 		const banner = (): string =>
 			comp
@@ -213,10 +219,10 @@ describe("SettingsSelectorComponent memory tab", () => {
 		expect(banner()).toContain("xmodel");
 	});
 
-	it("delegates Escape to an open settings submenu before closing the selector", () => {
+	it("delegates Escape to an open settings submenu before closing the selector", async () => {
 		let cancelCount = 0;
 		cfgMemoryBackend.set(settings, "off");
-		const comp = createSelector(() => {
+		const comp = await createSelector(() => {
 			cancelCount++;
 		});
 		focusMemoryTab(comp);

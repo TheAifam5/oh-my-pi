@@ -47,6 +47,7 @@ it("clearing a settings-panel text field removes the key from config.yml so its 
 	// The panel edits the configured layers: env values are never shown or pre-filled.
 	expect(host.get("hindsight.apiToken")).toBeUndefined();
 
+	const saved = Promise.withResolvers<void>();
 	const selector = new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
@@ -56,13 +57,15 @@ it("clearing a settings-panel text field removes the key from config.yml so its 
 			settings: host,
 			plugins: createPluginSettingsHost(projectDir),
 		},
-		{ onChange: () => {}, onCancel: () => {} },
+		{ onChange: () => saved.resolve(), onCancel: () => {} },
 	);
+	await selector.ready;
 
 	for (const ch of "searxng endpoint") selector.handleInput(ch);
 	selector.handleInput("\n"); // open the text field
 	selector.handleInput("\x15"); // clear it
 	selector.handleInput("\n"); // submit
+	await saved.promise;
 
 	expect(cfgSearxngEndpoint.get(settings)).toBe("https://env.example");
 	await settings.flush();

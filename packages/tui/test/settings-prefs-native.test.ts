@@ -199,7 +199,7 @@ describe("settings as a native prefs page", () => {
 		expect(roles(shell.node)).not.toContain("omp.prefs.preview.status");
 	});
 
-	it("maps number-like choices to a stepper and sets the chosen step like the submenu", () => {
+	it("maps number-like choices to a stepper and sets the chosen step like the submenu", async () => {
 		const { selector, values, changes } = harness();
 		send(selector, { type: "action", key: "", act: "page", value: "context", mods: [] });
 		expect(row(prefs(selector).props, "compaction.thresholdPercent").control).toEqual({
@@ -208,22 +208,26 @@ describe("settings as a native prefs page", () => {
 			labels: { "-1": "Default", "50": "50%", "80": "80%" },
 		});
 		send(selector, { type: "change", key: "", item: "compaction.thresholdPercent", value: 50 });
+		await selector.pendingWrite;
 		expect(values.get("compaction.thresholdPercent")).toBe(50);
-		expect(changes.at(-1)).toEqual(["compaction.thresholdPercent", "50"]);
+		expect(changes.at(-1)).toEqual(["compaction.thresholdPercent", 50]);
 		send(selector, { type: "change", key: "", item: "compaction.thresholdPercent", value: -1 });
+		await selector.pendingWrite;
 		expect(values.get("compaction.thresholdPercent")).toBe(-1);
 		// The submenu closed after the pick, as Enter closes it.
 		expect(prefs(selector).props.editing).toBeNull();
 	});
 
-	it("flips a switch through the list's change path and resets to the default with null", () => {
+	it("flips a switch through the list's change path and resets to the default with null", async () => {
 		const { selector, values, changes } = harness();
 		send(selector, { type: "change", key: "", item: "display.colorBlind", value: true });
+		await selector.pendingWrite;
 		expect(values.get("display.colorBlind")).toBe(true);
 		expect(changes).toEqual([["display.colorBlind", true]]);
 		expect(row(prefs(selector).props, "display.colorBlind").changed).toBe(true);
 
 		send(selector, { type: "change", key: "", item: "display.colorBlind", value: null });
+		await selector.pendingWrite;
 		expect(values.get("display.colorBlind")).toBe(false);
 		expect(row(prefs(selector).props, "display.colorBlind").changed).toBeUndefined();
 	});
@@ -243,24 +247,27 @@ describe("settings as a native prefs page", () => {
 		expect(values.get("theme.dark")).toBe("dark");
 	});
 
-	it("picks a menu option like Enter in the submenu", () => {
+	it("picks a menu option like Enter in the submenu", async () => {
 		const { selector, values, changes } = harness();
 		send(selector, { type: "change", key: "", item: "theme.dark", value: "light" });
+		await selector.pendingWrite;
 		expect(values.get("theme.dark")).toBe("light");
 		expect(changes.at(-1)).toEqual(["theme.dark", "light"]);
 		expect(row(prefs(selector).props, "theme.dark").control).toMatchObject({ value: "light" });
 	});
 
-	it("shows the text editor's draft and cursor while the keys edit it, and submits a pointer change", () => {
+	it("shows the text editor's draft and cursor while the keys edit it, and submits a pointer change", async () => {
 		const { selector, values } = harness();
 		send(selector, { type: "action", key: "", act: "page", value: "shell", mods: [] });
 		send(selector, { type: "activate", key: "", item: "shell.path" });
 		for (const ch of "/bin/zsh") selector.handleInput(ch);
 		expect(prefs(selector).props.editing).toEqual({ row: "shell.path", draft: "/bin/zsh", cursor: 8 });
 		selector.handleInput(ENTER);
+		await selector.pendingWrite;
 		expect(values.get("shell.path")).toBe("/bin/zsh");
 
 		send(selector, { type: "change", key: "", item: "shell.path", value: "/bin/fish" });
+		await selector.pendingWrite;
 		expect(values.get("shell.path")).toBe("/bin/fish");
 		expect(prefs(selector).props.editing).toBeNull();
 	});
@@ -284,7 +291,7 @@ describe("settings as a native prefs page", () => {
 		expect(values.get("providers.tokens")).toEqual(["replacement-token"]);
 	});
 
-	it("applies a reordered multiselect as the submenu would", () => {
+	it("applies a reordered multiselect as the submenu would", async () => {
 		const { selector, values, changes } = harness();
 		send(selector, { type: "action", key: "", act: "page", value: "providers", mods: [] });
 		expect(row(prefs(selector).props, "providers.order").control).toMatchObject({
@@ -293,6 +300,7 @@ describe("settings as a native prefs page", () => {
 			ordered: true,
 		});
 		send(selector, { type: "change", key: "", item: "providers.order", value: ["c", "a"] });
+		await selector.pendingWrite;
 		expect(values.get("providers.order")).toEqual(["c", "a"]);
 		expect(changes.at(-1)).toEqual(["providers.order", ["c", "a"]]);
 		expect(row(prefs(selector).props, "providers.order")).toMatchObject({

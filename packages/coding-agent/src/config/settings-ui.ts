@@ -1,6 +1,12 @@
-import { TERMINAL } from "@oh-my-pi/pi-tui";
+import { replaceTabs, TERMINAL } from "@oh-my-pi/pi-tui";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
-import { SETTING_TABS, type SettingsDisplayEntry, type SettingsHost } from "@oh-my-pi/pi-tui/overlays/settings-defs";
+import {
+	SETTING_TABS,
+	type SettingsDisplayEntry,
+	type SettingsHost,
+	type SettingsTarget,
+} from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { isSettingsInitialized, Settings, settings } from "./settings";
 import { orderedSettings } from "./all-settings";
 import { type AnySetting, lookup } from "./registry";
@@ -36,7 +42,7 @@ const CONDITIONS: Record<string, () => boolean> = {
 	usageAwareFallbackEnabled: whenSettings(s => cfgRetryUsageAwareFallback.get(s) === true),
 	planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
 	planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
-	// The editor writes the global layer; hide it so a project-supplied list is never promoted to global.
+	// Project-provided context-file lists are hidden from the settings editor.
 	contextFilesExtraNotProject: whenSettings(s => cfgContextFilesExtra.provenance(s) !== "project"),
 };
 
@@ -86,11 +92,73 @@ export function createSettingsHost(session?: SettingsHostSession): SettingsHost 
 		if (!setting) throw new Error(`Unknown setting: ${path}`);
 		return setting;
 	};
+	const targets: SettingsTarget[] = [{ id: "global", label: "Global" }];
+	let target = "global";
+	const ready = settings.listDirectoryLayerTargets().then(layers => {
+		for (const [index, layer] of layers.entries()) {
+			const label =
+				index === 0
+					? "This directory"
+					: layer.label === "root"
+						? "Root (/)"
+						: layer.label === "home"
+							? "Home (~)"
+							: layer.label === "tmp"
+								? "Temp"
+								: replaceTabs(shortenPath(layer.dir));
+			targets.push({
+				id: layer.dir,
+				label,
+				note:
+					layer.label === "root" || layer.label === "home"
+						? "Applies to every directory below and overrides project config."
+						: undefined,
+			});
+		}
+		if (layers[0]?.exists) target = layers[0].dir;
+	});
+	ready.catch(() => undefined);
+	const provenance = (path: string): string | undefined => {
+		const source = resolve(path).provenance(settings);
+		if (source === "global" || source === "default") return undefined;
+		if (source === "directory") {
+			return `directory ${replaceTabs(shortenPath(settings.getProvenanceDirectory(resolve(path)) ?? ""))}`;
+		}
+		return source;
+	};
 	return {
 		entries,
 		get: path => lookup(path)?.layered(settings),
-		set: (path, value) => resolve(path).set(settings, value),
-		unset: path => resolve(path).unset(settings),
+		set: (path, value) =>
+			target === "global"
+				? resolve(path).set(settings, value)
+				: settings.setDirectoryValue(target, resolve(path), value),
+		unset: path =>
+			target === "global" ? resolve(path).unset(settings) : settings.unsetDirectoryValue(target, resolve(path)),
+		ready,
+		targets,
+		get target() {
+			return target;
+		},
+		selectTarget: id => {
+			if (!targets.some(candidate => candidate.id === id)) throw new Error(`Unknown settings target: ${id}`);
+			target = id;
+		},
+		provenance,
+		shadowWarning: path => {
+			const source = provenance(path);
+			if (!source) return undefined;
+			if (target !== "global") {
+				const sourceDir = settings.getProvenanceDirectory(resolve(path));
+				const higher =
+					["overlay", "runtime", "env"].includes(source) ||
+					(sourceDir !== undefined &&
+						sourceDir !== target &&
+						sourceDir.startsWith(`${target.replace(/\/$/, "")}/`));
+				if (!higher) return undefined;
+			}
+			return `This setting is set in the ${source} layer.`;
+		},
 		normalizeProviderLimits: normalizeProviderMaxInFlightRequests,
 		validateProviderLimits: validateProviderMaxInFlightRequests,
 	};

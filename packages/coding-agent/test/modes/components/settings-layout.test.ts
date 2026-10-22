@@ -112,6 +112,7 @@ describe("settings layout", () => {
 				onCancel: () => {},
 			},
 		);
+		await selector.ready;
 
 		for (const ch of "composer shape") selector.handleInput(ch);
 		// Open the composer.shape submenu

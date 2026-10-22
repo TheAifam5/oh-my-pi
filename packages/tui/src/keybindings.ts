@@ -40,6 +40,8 @@ export interface Keybindings {
 	"tui.select.pageDown": true;
 	"tui.select.confirm": true;
 	"tui.select.cancel": true;
+	// Settings overlay actions
+	"tui.settings.cycleScope": true;
 }
 
 export type Keybinding = keyof Keybindings;
@@ -138,6 +140,10 @@ export const TUI_KEYBINDINGS = {
 	"tui.select.cancel": {
 		defaultKeys: ["escape", "ctrl+c"],
 		description: "Cancel selection",
+	},
+	"tui.settings.cycleScope": {
+		defaultKeys: "ctrl+s",
+		description: "Cycle the settings write scope",
 	},
 } as const satisfies KeybindingDefinitions;
 

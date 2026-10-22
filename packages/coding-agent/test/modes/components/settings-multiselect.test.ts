@@ -51,8 +51,8 @@ function stubStdoutGeometry(cols: number): { restore(): void } {
 	};
 }
 
-function createSelector(): SettingsSelectorComponent {
-	return new SettingsSelectorComponent(
+async function createSelector(): Promise<SettingsSelectorComponent> {
+	const component = new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
@@ -66,6 +66,8 @@ function createSelector(): SettingsSelectorComponent {
 			onCancel: () => {},
 		},
 	);
+	await component.ready;
+	return component;
 }
 
 function optionRow(component: SettingsSelectorComponent, label: string): number {
@@ -86,8 +88,8 @@ function clickOption(component: SettingsSelectorComponent, label: string): void 
 }
 
 describe("settings section sidebar", () => {
-	it("does not toggle the selected section's first setting", () => {
-		const comp = createSelector();
+	it("does not toggle the selected section's first setting", async () => {
+		const comp = await createSelector();
 		for (let i = 0; i < 7; i++) comp.handleInput("\x1b[C");
 		expect(cfgDevAutoqa.get(settings)).toBe(true);
 
@@ -99,8 +101,8 @@ describe("settings section sidebar", () => {
 	});
 });
 
-function openExtraContextFiles(): SettingsSelectorComponent {
-	const component = createSelector();
+async function openExtraContextFiles(): Promise<SettingsSelectorComponent> {
+	const component = await createSelector();
 	component.handleNativeEvent({ type: "action", key: "", act: "page", value: "context", mods: [] });
 	component.handleNativeEvent({ type: "activate", key: "", item: "contextFiles.extra" });
 	return component;
@@ -111,6 +113,7 @@ async function submitText(component: SettingsSelectorComponent, value: string): 
 	component.handleInput("\x0b");
 	for (const character of value) component.handleInput(character);
 	component.handleInput("\r");
+	await component.pendingWrite;
 	await Promise.resolve();
 }
 
@@ -122,7 +125,7 @@ function nativeErrorText(node: TspNode): string {
 
 describe("extra context filenames editor", () => {
 	it("saves multiple filenames as an array and lets users disable extras", async () => {
-		const component = openExtraContextFiles();
+		const component = await openExtraContextFiles();
 		await submitText(component, '["AGENTS.local.md","TEAM.md"]');
 		expect(cfgContextFilesExtra.get(settings)).toEqual(["AGENTS.local.md", "TEAM.md"]);
 
@@ -137,7 +140,7 @@ describe("extra context filenames editor", () => {
 		['["../TEAM.md"]', /file names, not paths/],
 	])("keeps the saved filenames when input %s is rejected", async (input, error) => {
 		cfgContextFilesExtra.set(settings, ["TEAM.md"]);
-		const component = openExtraContextFiles();
+		const component = await openExtraContextFiles();
 		await submitText(component, input);
 		expect(cfgContextFilesExtra.get(settings)).toEqual(["TEAM.md"]);
 		expect(Bun.stripANSI(component.render(120).join("\n"))).toMatch(error);
@@ -161,7 +164,7 @@ describe("extra context filenames editor", () => {
 			resetSettingsForTest();
 			await Settings.init({ cwd, agentDir });
 
-			const component = openExtraContextFiles();
+			const component = await openExtraContextFiles();
 			component.handleInput("\r");
 			await settings.flush();
 
