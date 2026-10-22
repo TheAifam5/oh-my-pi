@@ -296,7 +296,7 @@ export class ModelPickerComponent implements Component {
 			.filter(member => member.parent === parent)
 			.map(member => ({
 				provider: "",
-				id: `${member.selector}  ${member.model.provider}/${member.model.id}  ${member.state}`,
+				id: `${member.selector}  ${member.state}  ${member.model.provider}/${member.model.id}`,
 				selector: member.selector,
 				model: member.model,
 			}));

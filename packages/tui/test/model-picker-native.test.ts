@@ -622,6 +622,16 @@ test("session pool entries expand to named members with models and availability,
 	expect(rendered).toContain("blocked until 12:00:00");
 	expect(rendered).toContain("exhausted");
 	expect(rendered).toContain("no entitled account");
+	const narrowLines = picker.render(80).map(line => Bun.stripANSI(line));
+	for (const [selector, state] of [
+		["@security/mythos", "usable"],
+		["@security/blocked", "blocked until 12:00:00"],
+		["@security/spent", "exhausted"],
+		["@security/denied", "no entitled account"],
+	] as const) {
+		expect(narrowLines.find(line => line.includes(selector))).toContain(state);
+	}
+	for (const line of narrowLines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(80);
 	picker.handleNativeEvent({ type: "activate", key: "", item: "@security/mythos" });
 	expect(picked).toEqual(["@security/mythos"]);
 	picker.handleInput("\x1b[D");
