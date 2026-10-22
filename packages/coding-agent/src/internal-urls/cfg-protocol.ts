@@ -67,6 +67,7 @@ const PROVENANCE_LABELS: Record<SettingProvenance, string> = {
 	env: "environment variable",
 	runtime: "session override",
 	overlay: "--config overlay",
+	directory: "directory config",
 	project: "project config",
 	global: "global config",
 	default: "default",
@@ -289,7 +290,7 @@ function saveShadowingLayer(
 /** Only an environment variable outranks a session override. */
 const ABOVE_SESSION: readonly SettingProvenance[] = ["env"];
 /** Every layer that outranks the global config.yml a `/save` writes. */
-const ABOVE_GLOBAL: readonly SettingProvenance[] = ["env", "runtime", "overlay", "project"];
+const ABOVE_GLOBAL: readonly SettingProvenance[] = ["env", "runtime", "overlay", "directory", "project"];
 
 function callerSession(context: ResolveContext | WriteContext | undefined): ToolSession {
 	const session = context?.session;

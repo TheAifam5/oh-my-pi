@@ -10,6 +10,7 @@ import { ACCOUNT_NAME, MAX_ACCOUNT_NAME_LENGTH } from "@oh-my-pi/pi-ai/auth/poli
 import type { cfgDefaultThinkingLevel } from "../session/settings";
 import { parseLimitsSetting } from "./local-limits";
 import { assertModelGroupSectionWritable } from "./model-groups";
+import { type DisabledAccountEntry, validateDisabledAccounts } from "./disabled-accounts";
 
 /** Display metadata for one model tag. */
 export interface ModelTagDef {
@@ -46,6 +47,7 @@ const EMPTY_MODEL_GROUPS_RECORD: Record<string, Record<string, unknown>> = {};
 const EMPTY_MODEL_PRESETS_RECORD: Record<string, ModelPreset> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
 const EMPTY_AUTH_ACCOUNT_PINS: AuthAccountPins = {};
+const EMPTY_DISABLED_ACCOUNTS: readonly DisabledAccountEntry[] = [];
 const EMPTY_LIMITS: Readonly<Record<string, unknown>> = {};
 
 // Auth broker — credentials proxied through a remote `omp auth-broker serve`
@@ -95,8 +97,8 @@ function validateAuthAccountPins(raw: unknown): void {
 
 /**
  * Pins one provider account to every session whose working directory is inside a project.
- * Read from the global config, `--config` overlays, and runtime overrides only; project settings
- * cannot pin accounts.
+ * Read from the global config, directory layers, `--config` overlays, and runtime overrides; project
+ * settings cannot pin accounts.
  */
 export const cfgAuthAccountPins = register({
 	id: "auth.accountPins",
@@ -106,9 +108,23 @@ export const cfgAuthAccountPins = register({
 });
 
 /**
+ * Accounts sessions never use: `<provider>/#<credential id>`, `<provider>/<account name>`, or an
+ * account matcher `{ provider, email | accountId | projectId | orgId | keyFingerprint }`. Each
+ * provider with an entry is restricted to its other stored OAuth accounts (no API keys). Read from
+ * the global config, directory layers, `--config` overlays, and runtime overrides; ignored in
+ * project settings.
+ */
+export const cfgAuthDisabledAccounts = register({
+	id: "auth.disabledAccounts",
+	type: "array",
+	default: EMPTY_DISABLED_ACCOUNTS,
+	validate: validateDisabledAccounts,
+});
+
+/**
  * Local limits on spend, requests, and tokens, keyed by `provider/model-id`, `provider`, or `*`.
- * Read from the global config, `--config` overlays, and runtime overrides only; project settings
- * cannot set them.
+ * Read from the global config, directory layers, `--config` overlays, and runtime overrides; project
+ * settings cannot set them.
  */
 export const cfgLimits = register({
 	id: "limits",

@@ -2,6 +2,8 @@
 
 This document describes how the coding-agent currently loads models, applies overrides, resolves credentials, and chooses models at runtime.
 
+Settings such as `modelRoles`, `modelGroups`, and `limits` can be scoped through user-owned [directory layers](./settings.md#user-owned-directory-layers). These apply above repository settings and below explicit config overlays; record entries retain their replacement semantics. Directory layers do not add `models.yml` files or change model catalog discovery.
+
 ## What controls model behavior
 
 Primary implementation files:

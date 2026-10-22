@@ -66,7 +66,7 @@ import {
 import { bucketRules } from "./capability/rule-buckets";
 import { anyRuleModelScoped, ruleIsModelScoped } from "./capability/rule-model-scope";
 import type { EffectiveExtensionRoots } from "./capability/types";
-import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
+import { accountPoolScopeOf, type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { getApiKeyWorkspaceId } from "./config/model-provider-discovery";
@@ -2138,15 +2138,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// A started session forgets these copies when it is disposed; a failed start forgets them here.
 		startupCleanup.defer(() => sessions.forgetInherited(providerSessionId));
 	}
-	// From here on the session resolves every key through its pools; see
-	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
-	const accountPoolScope = options.oauthAccountPools
-		? new SessionAccountPoolScope(modelRegistry.authStorage, options.oauthAccountPools, providerSessionId)
-		: undefined;
-	if (accountPoolScope) {
-		modelRegistry = accountPoolScope.registry(modelRegistry);
-		startupCleanup.defer(() => accountPoolScope.release());
-	}
+	// From here on the session resolves every key through its account scope (pools and
+	// auth.disabledAccounts); see SessionAccountPoolScope. A child without its own pools keeps
+	// the pools of the scope that wraps its parent's registry. A startup failure leaves no
+	// session to lift them.
+	const accountPoolScope = new SessionAccountPoolScope(
+		modelRegistry.authStorage,
+		options.oauthAccountPools ?? accountPoolScopeOf(modelRegistry)?.pools ?? {},
+		providerSessionId,
+		settings,
+	);
+	modelRegistry = accountPoolScope.registry(modelRegistry);
+	startupCleanup.defer(() => accountPoolScope.release());
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||

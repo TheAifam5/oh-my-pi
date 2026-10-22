@@ -356,7 +356,7 @@ export interface AgentSessionConfig {
 	agentKind?: "main" | "sub";
 	/** Provider-facing session ID override. */
 	providerSessionId?: string;
-	/** OAuth account pools enforced on the session's key lookups; the session lifts them on dispose. */
+	/** Account restrictions (OAuth account pools, `auth.disabledAccounts`) enforced on the session's key lookups; the session lifts them on dispose. */
 	accountPoolScope?: SessionAccountPoolScope;
 	/** Whether the provider prompt-cache key was explicit or fork-inherited. */
 	providerPromptCacheKeySource?: "explicit" | "fork";

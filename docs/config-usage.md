@@ -163,7 +163,7 @@ Each setting is declared once with `register({ id, type, default, env?, protocol
 - `cfgX.setEntry(scope, key, v)` / `cfgX.setMember(scope, item, { member })` — write one entry of a record setting (`undefined` removes it) or add/remove one item of a list setting in the global layer; the save changes only that entry or item in `config.yml`, so entries another layer (a `--config` overlay) supplies never land there.
 - `cfgX.override(scope, v)` / `cfgX.clearOverride(scope)` — runtime-only override, never persisted.
 - `cfgX.map(fn)` / `combine({...}, fn)` — memoized derived values; `.listen(scope, cb)` observes changes of a handle or derivation.
-- `cfgX.provenance(scope)` — layer supplying the value: `"env" | "runtime" | "overlay" | "project" | "global" | "default"`.
+- `cfgX.provenance(scope)` — layer supplying the value: `"env" | "runtime" | "overlay" | "directory" | "project" | "global" | "default"`. `Settings.getProvenanceDirectory(setting)` names a directory source; `getLayerValues(setting)` includes its `dir`.
 - `cfgX.layered(scope)` — the value from the settings layers alone, ignoring the environment variable (what the settings panel shows and edits).
 
 A configured value that does not fit the declared type (or enum values) is ignored with a warning and the default is used; a definition's `validate` rejects malformed values on load, on every reload, and before every write. A keep-last-good watcher reload, and a save that merges external edits to `config.yml`, keep only the invalid file's layer at its last good values (the warning names the file) while the other layers still refresh. A configured `null` generally counts as unset. Record entries such as model roles and model presets can use `null` in runtime or overlay layers as tombstones that hide lower-layer entries; a global null entry remains unset. A project-layer `null` at any depth is dropped before the merge with one warning per path (`Settings: ignoring project null value; lower layers apply`), so it never clears a global value; array items are not touched, and cleared project model roles are dropped without a warning. Inside project `modelRoles`, `retry.fallbackChains`, and `modelGroups` entries, `null` values are left to model-group validation instead (a `null` entry falls back to the global entry), and an empty record key such as `modelGroups:` is dropped without a warning. Project objects nested more than 64 levels deep are dropped the same way (`Settings: ignoring project value nested too deeply`). Warnings are limited to 32 paths per project scope and repeat after moving to another project. Project files are deep-merged with each other first, so a `null` in a higher-priority project file also hides a lower-priority project file's value.
@@ -175,9 +175,10 @@ Effective precedence, highest first:
 1. Environment variable declared on the definition (`env: "NAME"`), parsed by the setting's type; unparseable text counts as unset. Booleans follow `parseFlag`: empty is unset, `1`/`y`/`true`/`yes`/`on` (lower or upper case) is true, any other text is false
 2. Runtime overrides: in-memory, non-persistent
 3. Config overlays: `PI_CONFIG_FILES` (platform path-list), followed by repeated `omp --config <path>` files; all are loaded as `config.yml`-style YAML for this process only
-4. Project settings: discovered via the settings capability (`settings.json` and `config.yml` from providers)
-5. Global settings: the first present file among `~/.omp/agent/config.yml` and `config.yaml`
-6. Definition default
+4. User-owned directory layers: `<agentDir>/directories/<session-folder-name>/config.yml`, canonical ancestors outermost first
+5. Project settings: discovered via the settings capability (`settings.json` and `config.yml` from providers)
+6. Global settings: the first present file among `~/.omp/agent/config.yml` and `config.yaml`
+7. Definition default
 
 A definition may instead declare `env: { name, fallback: true }`: that variable only replaces the default, and any layer configuring a non-null value wins over it (used by `SEARXNG_BASIC_*`). `fallback: "blank"` also lets the variable win over a configured empty or whitespace string (used by `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`, and `MNEMOPI_EMBEDDING_MODEL`).
 
@@ -189,11 +190,14 @@ Subagents receive `parent.overlay(overrides)`: reads fall through to the parent 
 
 Generic setting-handle writes target the global layer; config overlays are read-only. Model roles have explicit project-write APIs: `setProjectModelRole()` / `clearProjectModelRole()` update the project layer and persist only the changed roles to `<cwd>/.omp/config.yml`. If an existing runtime override would shadow the role, setting a project role temporarily replaces it; clearing removes that runtime slot. The original override is captured for restoration when changing project scope.
 
+Directory-layer writes use the asynchronous `Settings.setDirectoryValue(dir, setting, value)`, `unsetDirectoryValue(dir, setting)`, and `writeDirectoryEntry(dir, setting, key, value)` APIs. Each write re-reads under a file lock and changes only the requested path; the file retains `path` metadata when its final setting is removed. `listDirectoryLayerTargets(cwd)` lists the current directory and existing ancestor layers. Directory layers are trusted user settings; project restrictions also see directory-defined model groups.
+
 ### Settings load failures
 
 - Missing global/project YAML is treated as empty configuration.
 - Invalid global or native-project YAML is moved to a unique `.broken-<timestamp>-<pid>-<uuid>` sibling under a file lock, then startup fails with the original and backup paths. An unreadable file fails without being moved.
 - Every `PI_CONFIG_FILES` / `--config` overlay is strict: missing files, invalid YAML, and non-mapping document roots are hard errors. Overlay files are not quarantined.
+- Directory layers require an exact canonical `path` marker. Missing or mismatched markers warn and skip the file. Invalid YAML, unknown keys, or invalid values warn and skip the whole file at startup; reload retains its last good version. Discovery does not write directory-layer storage.
 
 ## Migration behavior still active
 

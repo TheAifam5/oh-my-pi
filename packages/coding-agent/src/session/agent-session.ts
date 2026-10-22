@@ -900,6 +900,9 @@ function todoRetryMatches(failed: Record<string, unknown>, retry: Record<string,
 /** `notice` source of an unavailable account pin warning. */
 export const ACCOUNT_PIN_NOTICE_SOURCE = "account-pin";
 
+/** `notice` source of an `auth.disabledAccounts` problem. */
+export const DISABLED_ACCOUNTS_NOTICE_SOURCE = "disabled-accounts";
+
 export class AgentSession implements SettingsScope {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1108,7 +1111,7 @@ export class AgentSession implements SettingsScope {
 	readonly #providerSessionIds = new Set<string>();
 	/** `sessionId\0provider` (session file id) already told that an account restriction overrides its recorded pin. */
 	readonly #ignoredPinNotices = new Set<string>();
-	/** OAuth account pools enforced on this session's key lookups; lifted on dispose. */
+	/** Account restrictions (OAuth account pools, `auth.disabledAccounts`) enforced on this session's key lookups; lifted on dispose. */
 	#accountPoolScope: SessionAccountPoolScope | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
 	#autolearnCaptureAbortController: AbortController | undefined;
@@ -2461,6 +2464,22 @@ export class AgentSession implements SettingsScope {
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#accountPoolScope = config.accountPoolScope;
+		this.#accountPoolScope?.setIssueSink({
+			raised: message => {
+				// A notice emitted before anyone subscribes (construction) is lost; the header renders configWarnings later.
+				if (this.#eventListeners.length > 0) {
+					this.emitNotice("warning", message, DISABLED_ACCOUNTS_NOTICE_SOURCE);
+				} else {
+					this.configWarnings.push(message);
+				}
+			},
+			cleared: message => {
+				const index = this.configWarnings.indexOf(message);
+				if (index === -1) return;
+				this.configWarnings.splice(index, 1);
+				this.#emit({ type: "config_warnings_changed" });
+			},
+		});
 		this.#inheritedProviderPromptCacheKey =
 			config.providerPromptCacheKeySource === "fork" ? this.agent.promptCacheKey : undefined;
 		// Owner-routed async delivery: completions for jobs this agent owns are

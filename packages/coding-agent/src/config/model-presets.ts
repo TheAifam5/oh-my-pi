@@ -167,7 +167,7 @@ export function deleteModelPreset(settings: Settings, name: string): ModelPreset
 export function modelPresetShadowOwner(
 	settings: Settings,
 	name: string,
-): "runtime" | "overlay" | "project" | undefined {
+): "runtime" | "overlay" | "directory" | "project" | undefined {
 	const owned = settings.getOwnedModelPreset(name);
 	return owned && owned.source !== "global" ? owned.source : undefined;
 }
@@ -176,6 +176,7 @@ const SOURCE_LABELS: Record<SettingProvenance, string> = {
 	env: "environment",
 	runtime: "command line",
 	overlay: "--config file",
+	directory: "directory config",
 	project: "project config",
 	global: "global config",
 	default: "default",

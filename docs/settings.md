@@ -1,6 +1,6 @@
 # Settings
 
-`omp` resolves settings from built-in defaults, a persistent global config file, optional project-local config, one-shot CLI overlays, and in-memory runtime overrides. Reach for project settings when one repository needs a different provider set, model role, tool policy, memory backend, or UI behavior than your global defaults — without touching your machine-wide configuration.
+`omp` resolves settings from built-in defaults, a persistent global config file, optional project-local config, user-owned directory layers, one-shot CLI overlays, and in-memory runtime overrides. Directory layers apply to a canonical directory and its descendants without placing trusted settings in a repository.
 
 Settings are stored as plain YAML mappings. Every key, its type, default, and enum values come from its setting definition (declared with `register(...)` next to the owning feature, e.g. `packages/coding-agent/src/tools/settings.ts`, and collected by `packages/coding-agent/src/config/all-settings.ts`). `omp config` exposes the complete schema; the interactive `/settings` panel exposes entries with supported UI editors. Some entries are conditional; numbers and arrays without UI choices remain config-file-only unless the setting opts into the panel's JSON editor (such as `contextFiles.extra`).
 
@@ -18,6 +18,7 @@ Settings are stored as plain YAML mappings. Every key, its type, default, and en
 | Global legacy     | `~/.omp/agent/settings.json`                          | Considered for migration only when neither main YAML filename exists. | Not written; renamed to `settings.json.bak` after a non-empty migrated YAML file is successfully saved. |
 | Project           | `<cwd>/.omp/config.yml` (plus `.omp/settings.json`)   | Loaded when the process working directory has a non-empty `.omp/`.                                                                       | Settings commands do not write arbitrary project keys. With `modelRoleStorage: project`, model-selector role assignments update only `modelRoles` here; edit other keys by hand. |
 | Project legacy    | `<cwd>/.omp/settings.json`                            | Still read; project `config.yml` is merged on top of it.                                                                                 | Not written by settings commands.                                                                                                                                                |
+| Directory | `<agentDir>/directories/<session-folder-name>/config.yml` | Matching canonical ancestors apply outermost first, above project settings. | Explicit directory writers update only the selected setting or record entry. |
 | CLI overlay       | Any file passed with `--config <file>`                | Loaded after global and project settings, for that one process. Repeatable.                                                              | Never persisted.                                                                                                                                                                 |
 | Runtime overrides | In-memory only                                        | Set by settings overrides such as `--approval-mode`, role flags, and feature env vars. | Never persisted. |
 
@@ -40,7 +41,7 @@ The canonical global file is YAML at `config.yml`; `config.yaml` is accepted as 
 
 ## Reading and writing settings
 
-Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. The CLI reads effective values including setting environment variables. The panel shows and edits merged settings-layer values, not environment-supplied values; descriptions note active env overrides so env credentials are never pre-filled or persisted. Ordinary persistent writes land in the **global** file; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).
+Use the interactive `/settings` panel inside a session, or the `omp config` command from a shell. The CLI reads effective values including setting environment variables. The panel shows and edits merged settings-layer values, not environment-supplied values; descriptions note active env overrides so env credentials are never pre-filled or persisted. Ordinary persistent writes land in the **global** file or, from `/settings`, the selected directory layer; model-selector role changes are the exception when `modelRoleStorage: project` (see [Where writes go](#where-writes-go)).
 
 ```bash
 omp config list                 # all settings with current effective values
@@ -71,10 +72,11 @@ This only controls the startup splash animation. It does not rerun setup or chan
 | `omp config set <key> <value>` | Parse `<value>` against the key's schema type, write it to the global main YAML file, and print the value written. When another source still supplies the effective value, it says which instead (`--json`: `overriddenBy` is the env var name, or `project`, `overlay`, or `runtime`; `fallbackEnv` names a fallback env var used while the saved value is blank). |
 | `omp config reset <key>`       | Delete the global key, allowing another configured layer or the schema default to apply. Prints the resulting effective value, masking non-empty credentials as `********`; JSON omits a credential's `value` and emits `{ key, redacted: true }`. |
 | `omp config path`              | Print the active agent directory (honors `PI_CODING_AGENT_DIR`).                                                                                                                                                                                                                                  |
+| `omp config dirs`              | List stored directory layers as directory, folder, and status (`ok`, `orphan`, `mismatch`, or `invalid`). `--json` emits `[{ dir, folder, status }]`; `dir` is `null` when the file has no usable `path`. Never changes storage. |
 | `omp config schema`            | Print the JSON Schema (draft 2020-12) of `config.yml` to stdout, built from the setting definitions: each key's type, enum values, default, and description. Credential defaults are omitted. Configured values never affect the output. `-o, --out <file>` writes it to a file instead. |
 | `omp config init-xdg`          | On Linux and macOS, create the `omp` directories under the effective XDG data, state, and cache homes. It does not move existing files or set the XDG environment variables. Other platforms exit non-zero.                                                                                       |
 
-`omp config` with no subcommand lists settings. `--help` or `-h` displays command help. The `--json` flag is accepted by `list`, `get`, `set`, and `reset`.
+`omp config` with no subcommand lists settings. `--help` or `-h` displays command help. The `--json` flag is accepted by `list`, `get`, `set`, `reset`, and `dirs`.
 
 ### Editor validation
 
@@ -105,7 +107,7 @@ Setting-specific normalization and validation still apply after parsing. For exa
 
 ### Where writes go
 
-`omp config set`, `omp config reset`, `/settings`, and persistent runtime settings changes write the global main YAML file under the active agent directory. Runtime-only overrides are not saved. Settings commands do not write arbitrary keys to `<cwd>/.omp/config.yml`. Model-role assignment or clearing with `modelRoleStorage: project` updates only the affected roles there; missing project roles fall back to global roles. To create another project-local override, edit the project file directly (see [Project-local config](#project-local-config)).
+`omp config set` and `omp config reset` write the global main YAML file under the active agent directory. `/settings` writes to the scope shown above its list: the current directory's layer when that layer file exists, otherwise Global. `Ctrl+S` (`tui.settings.cycleScope`) cycles Global, the current directory, and ancestors with existing layer files; the Plugins tab has no scope. Runtime-only overrides are not saved. Settings commands do not write arbitrary keys to `<cwd>/.omp/config.yml`. Model-role assignment or clearing with `modelRoleStorage: project` updates only the affected roles there; edit other project keys directly.
 
 Saves are debounced and re-read the file under a lock. Disjoint external edits are preserved. If an external writer changed the same global setting or model role after a local change was staged, the stale local change is skipped with a warning rather than overwriting the newer file value.
 
@@ -113,24 +115,55 @@ Saves through a symlinked main config preserve the link and update its resolved 
 
 ### Live file changes
 
-Interactive sessions and RPC/RPC-UI hosts watch the main global file, project settings sources, and config overlays. Changes are reloaded after a short debounce, preserving runtime overrides. A layer that fails to parse or validate keeps its last good values and logs a warning; other valid layers can still refresh. Live reload does not move the invalid file to a `.broken-*` backup.
+Interactive sessions and RPC/RPC-UI hosts watch the main global file, project settings sources, every ancestor directory-layer file (including missing files), and config overlays. Changes are reloaded after a short debounce, preserving runtime overrides. A layer that fails to parse or validate keeps its last good values and logs a warning; other valid layers can still refresh. Live reload does not move invalid directory-layer files to a `.broken-*` backup.
 
 Symlinked configs follow edits to their target and replacement of any intermediate file or directory symlink, including profile links. After a link switches targets, subsequent edits to the new target are watched too.
 
 Reloading changes the settings values available to consumers; startup-only work is not rerun. Provider-source switches take effect on the next discovery pass. Task/eval dispatch also reloads persisted settings before resolving a subagent's policy.
 
-Routing changes to `modelRoles`, `retry.fallbackChains`, and `task.agentModelOverrides` apply to subsequent subagent launches and fallback decisions without restarting the host. `auth.accountPolicies` and `retry.usageReservePct` also update the long-lived account router for subsequent credential selection and quota checks. Reloading does not restart running subagents or switch a healthy active session's model; explicit runtime overrides still take precedence.
+Routing changes to `modelRoles`, `retry.fallbackChains`, and `task.agentModelOverrides` apply to subsequent subagent launches and fallback decisions without restarting the host. `auth.accountPolicies` and `retry.usageReservePct` also update the long-lived account router for subsequent credential selection and quota checks. `auth.disabledAccounts` edits apply to running sessions, their subagents, and advisors on the next credential lookup. Reloading does not restart running subagents or switch a healthy active session's model; explicit runtime overrides still take precedence.
 
 ### Prompt settings on prefix-bound models
 
 Some models bind thinking to the cached prompt prefix, such as Claude Sonnet 5.5 and Opus 5.5: rewriting the system prompt or a tool definition the model already received discards that cache. Once such a session has sent its first request, settings that only change prompt text apply at the next `/new` or model switch, with a one-time notice: `personality`, `includeModelInPrompt`, `includeWorkspaceTree`, `tools.xdevDocs`, `tools.xdevInlineDevices`, `vault.enabled`, `tui.renderMermaid`, `tui.renderSvg`, `tui.autoGraph`, `tui.reactions`, `skillful`, the skill listing from `skills.*` and `disabledExtensions`, and the prompt's list of `workspace.additionalDirectories` and `dev.autoqa` note (the roots themselves apply at once). Tool-affecting settings (`tools.xdev`, `inlineToolDescriptors`, `tools.format`, `tools.intentTracing`, `async.enabled`, `bash.autoBackground.enabled`, `eval.autoBackground.enabled`, `task.eager`, `task.batch`), TTSR settings (`ttsr.*`), and `secrets.enabled` (Hide Secrets) apply immediately. A tool gate such as `grep.enabled` adds or removes its tool at once and tells the model in a hidden notice; descriptions the model already received stay unchanged until the next rebuild. Gates that change the definition of a tool that stays active (`launch.enabled` for `bash`, `eval.py`/`eval.js` for `eval`, `ida.*` for `read`) take effect for the model at the next `/new` or model switch, with the same notice; until then, a call using a since-disabled feature is rejected. A resumed session already holds a cached prompt, so it follows these rules from its first tool change: MCP, RPC host, extension, memory, and think tools that arrive later are announced in a hidden notice, and their prompt text applies at the next `/new` or model switch. Other models, and sessions that have not sent a request yet, apply every change immediately.
+
+## User-owned directory layers
+
+Each layer lives at `<agentDir>/directories/<session-folder-name>/config.yml`, following the active profile. The folder uses the session naming format: `-<home-relative-path>`, `-tmp-<temp-relative-path>`, or `--<absolute-path>--`, with `/`, `\`, and `:` replaced by `-`. Home itself is `-`, the temp root is `-tmp`, and `/` is `----`. Spaces and dots are retained. The temp root is checked before home.
+
+```yaml
+path: /home/me/projects/acme
+defaultThinkingLevel: high
+disabledProviders: [example-provider]
+```
+
+The reserved top-level `path` must equal the canonical directory represented by the layer. A missing or mismatched path warns and the layer is ignored; copied or colliding folder names do not transfer settings to another directory. Writers refuse an existing file whose stored path differs, naming both directories. Loading never creates, renames, or migrates directory-layer files.
+
+Resolution follows the real path of the working directory, walks every ancestor through the filesystem root, and includes home and temporary directories. Directory layers are trusted like global settings, including pool accounts, metered funding, local limits, and `auth.disabledAccounts` (with the account names their `auth.accountPolicies` define). Project restrictions remain in force, including restrictions on redefining directory-defined model groups.
+
+For example, to keep a private Claude account out of every session under `~/work`, add to `<agentDir>/directories/-work/config.yml`:
+
+```yaml
+path: /home/me/work
+auth:
+  disabledAccounts:
+    - anthropic/private          # an auth.accountPolicies name from a trusted layer
+    - anthropic/#14              # a stored credential id (`omp account list`)
+    - { provider: anthropic, email: me@example.com }
+```
+
+Malformed YAML, unknown keys, or invalid values skip the whole layer with a warning at startup. Reload keeps that file's last good version until a valid edit or deletion. Changing the working directory re-scopes directory layers; subagents inherit their parent's scope.
+
+`omp config dirs` lists stored layers with their directory, folder, and status: `ok`, `orphan` (directory missing), `mismatch` (folder or canonical path differs), or `invalid` (missing path, malformed YAML, or invalid settings). `--json` emits the same fields.
+
+The `Settings` APIs `setDirectoryValue(dir, setting, value)`, `unsetDirectoryValue(dir, setting)`, and `writeDirectoryEntry(dir, setting, key, value)` await locked, per-key persistence and preserve unrelated external edits. A first write creates the folder and `path` metadata; unsetting the final setting keeps a metadata-only file. `listDirectoryLayerTargets(cwd)` returns the current directory and ancestors with existing files, deepest first, with `dir`, `file`, `exists`, and `label` (`root`, `home`, `tmp`, or `dir`).
 
 ## Precedence
 
 From lowest to highest priority, the effective value of a setting is built as:
 
 ```text
-built-in defaults  <-  global config  <-  project config  <-  CLI overlays  <-  runtime overrides  <-  setting env var
+built-in defaults <- global config <- project config <- directory layers <- CLI overlays <- runtime overrides <- setting env var
 ```
 
 From highest to lowest:
@@ -138,9 +171,10 @@ From highest to lowest:
 1. **Setting env var** — an environment variable declared on the setting's definition (for example `PI_PY` for `eval.py`, `OMP_AUTH_BROKER_URL` for `auth.broker.url`). Parsed by the setting's type unless it declares a custom parser; unparseable text (such as `PI_EDIT_VARIANT=auto`) counts as unset. Booleans follow the `parseFlag` convention: empty counts as unset, `1`/`y`/`true`/`yes`/`on` (all-lowercase or all-uppercase) mean true, and any other value means false. A few are declared as fallbacks instead (`SEARXNG_*`, `MNEMOPI_EMBEDDING_MODEL`): they only replace the built-in default, so any configured layer wins over them — except a configured `null`, which counts as unset. `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`, and `MNEMOPI_EMBEDDING_MODEL` also apply when the setting is a blank string.
 2. **Runtime overrides** — settings applied in memory for the current process, including `--smol`, `--slow`, `--plan`, `--approval-mode`, `--auto-approve`/`--yolo`, `--hide-thinking`, `--advisor`, `--external-thinking`, and protocol-mode defaults. Never persisted. Other one-shot options such as `--model`, `--thinking`, `--service-tier`, `--no-lsp`, `--no-pty`, and `--api-key` affect session/model/transport options rather than all being registry settings. Protocol-mode defaults (RPC/ACP) hold only while nothing else configures the setting: a settings write or reset of it, a `config.yml` or project edit picked up by a reload, or an ACP session's own project config replaces them.
 3. **CLI config overlays** — each `--config <file>`; later overlay files override earlier ones.
-4. **Project settings** — `<cwd>/.omp/settings.json` then `<cwd>/.omp/config.yml` (and contributions from other discovery providers at project level).
-5. **Global settings** — the active agent/profile directory's `config.yml` (or existing `config.yaml`).
-6. **Built-in defaults** — from the setting definition.
+4. **Directory layers** — every canonical ancestor from the filesystem root through the current directory; deeper layers win.
+5. **Project settings** — `<cwd>/.omp/settings.json` then `<cwd>/.omp/config.yml` (and contributions from other discovery providers at project level).
+6. **Global settings** — the active agent/profile directory's `config.yml` (or existing `config.yaml`).
+7. **Built-in defaults** — from the setting definition.
 
 A key that is unset at every layer resolves to its default at read time.
 
@@ -470,7 +504,7 @@ Existing configs are migrated automatically when loaded. Retired backend selecto
 | ---------------------- | ------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `modelRoles`           | record  | `{}`                        | Map of role name to primary selector or ordered primary candidates. Custom chat roles can be introduced through assignments, `modelTags`, or `cycleOrder`. `--smol`/`--slow`/`--plan` and their `PI_*_MODEL` vars override those roles for a run; `--model` selects the active chat model.                                                                                                                                                                                       |
 | `modelGroups`          | record  | `{}`                        | Named model groups: `strategy` (`priority`, `round-robin`, `weighted-random`, `random`, `quota`, `cheapest`, `least-used`, `least-loaded`, `p2c`, or `shuffle-bag`, or a list of up to 4 of them whose entries before the last are `quota`, `cheapest`, `least-used`, or `least-loaded`, such as `[quota, cheapest]`), optional `strategyOptions` for the listed strategies (`order` for priority and round-robin, `objective`, `capacityMetric`, and `tolerance` in (0, 0.5] for quota, `window: { type: rolling, durationMs }` for least-used), `routing` (`funding`, `quota`, `limits`, `accounts`, `cache: { affinity, pricing }`, and `spending` with `policy: provider-managed` or `policy: local-hard-budget` and a `budget`; see [Model pools](./models.md#model-pools)), `profiles`, and a `models` mapping of member aliases to `{ model, defaultEffort?, weight?, account? }`. Roles and fallback chains reference a group with `{ use: <name>, profile?: <profile> }` or `+<name>[@<profile>]`. Names match `[a-z0-9][a-z0-9_-]*`. Where a selector string is expected (role aliases such as `@engineer`, presets), a group reads as its members joined by `,` in strategy order, each with its profile or default effort. |
-| `allowProjectMeteredPools` | boolean | `false` | Lets project settings add pools whose `routing.funding.order` includes `metered` and redefine `modelGroups` entries a lower layer defines. Read from the global config, `--config` overlays, and runtime overrides only; a project value is ignored with a warning. Toggled on the `/settings` Model tab (Retry & Fallback), which writes the global config. |
+| `allowProjectMeteredPools` | boolean | `false` | Lets project settings add pools whose `routing.funding.order` includes `metered` and redefine `modelGroups` entries a lower layer defines. Read from the global config, directory layers, `--config` overlays, and runtime overrides; a project value is ignored with a warning. Toggled on the `/settings` Model tab (Retry & Fallback). |
 | `modelRoleStorage`     | enum    | `global`                    | `global` saves model-selector role assignments in the active global/profile config; `project` saves only those role assignments in `<cwd>/.omp/config.yml`. Missing project roles fall back to global roles.                                                                                                                                                                                                     |
 | `modelPresets`         | record  | `{}`                        | Named model presets, each `{ modelRoles, defaultThinkingLevel }`. Written by `/modelpreset save` and the `/models` Roles view (`s`); applied by `/modelpreset switch`. Saves write only the named entry to the global config; project-defined presets are listed and applied but never copied globally. Presets hold selector strings only: roles assigned a model group are left out when saving (the save message names them). Applying a preset leaves a model-group role unchanged unless the preset names that role, in which case the preset's selector replaces the group. See [Model presets](./models.md#model-presets). |
 | `modelTags`            | record  | `{}`                        | Custom role/tag metadata; can introduce additional chat roles.                                                                                                                                                                                                                                                                                                                                                   |
@@ -1062,6 +1096,7 @@ searxng:
 | `task.agentAccountPools`            | record  | `{}`      | Exact-name task/eval agent → provider id → OAuth identity keys (the `identityKey` values of [client account pools](./auth-broker-gateway.md#client-account-pools-routing-not-authorization), e.g. `email:<address>\|org:<id>` for Anthropic; `omp usage accounts` lists them). The agent authenticates for each listed provider only with those accounts, never another account or an API key, and fails when none can serve; an empty list allows no account. A malformed entry fails settings load. See [Task agent discovery](./task-agent-discovery.md#model-and-structured-output-precedence). |
 | `auth.accountPolicies`              | array   | `[]`      | Per-account routing: `provider`, `account` selector, optional `name`, `priority`, `reservePct`, `reclaimAbovePct`, `drain`, `returnMargin`, `returnCooldownMs`, `spend`, `returnWhen`, `limits`, `resetOn`, `autoRedeem`. A stored API key is selected by `keyFingerprint`. See [Auth broker and gateway](./auth-broker-gateway.md#configyml-keys). |
 | `auth.accountPins`                  | record  | `{}`      | Absolute project directory → provider id → account `name`; sessions inside the project use only that account; calls without a session id (`omp token`, model discovery) ignore it. Ignored in project settings. Listed and edited for every directory on the `/account` Project pins page. |
+| `auth.disabledAccounts`             | array   | `[]`      | Accounts sessions never use: `<provider>/#<credential id>` (`omp account list`), `<provider>/<name>` (an `auth.accountPolicies` name from the global config, a directory layer, a `--config` overlay, or a runtime override; never the project's), or a matcher `{ provider, email \| accountId \| projectId \| orgId \| keyFingerprint }` with `auth.accountPolicies[].account` semantics. Each provider with an entry is restricted, per session (subagents and advisors included), to its stored OAuth accounts minus the excluded ones, so its runtime, environment, and stored API keys are not used in that scope, and a `models.yml` `apiKey` for it makes its requests fail there. API keys cannot be excluded one by one; an entry matching only API keys is ignored with a warning. An `#id` naming no stored credential of its provider, or a name no trusted layer defines, makes the provider unusable in that scope and shows a warning naming the entry; a name or matcher matching nothing excludes nothing and warns once. Logins, logouts, and settings edits apply without a restart. The deepest layer's list replaces shallower ones. Ignored in project settings, with a warning. Independent of `omp account disable`. |
 | `limits`                            | record  | `{}`      | Local limits on spend, requests, and tokens keyed by `provider/model-id`, `provider`, or `*`. Ignored in project settings. Listed and edited on the `/account` Global limits page. See [Local limits](./models.md#local-limits). |
 | `secrets.enabled`                   | boolean | `false`   | Enable configured secret obfuscation and built-in credential-shaped token redaction before provider requests. See [Secret obfuscation](./secrets.md).                                                                                                                                                                                                                                                                                  |
 

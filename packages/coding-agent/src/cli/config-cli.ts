@@ -5,11 +5,15 @@
  * The settings registry (`config/registry.ts`) is the source of truth for available settings.
  */
 
-import { APP_NAME, getAgentDir, isRecord } from "@oh-my-pi/pi-utils";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { YAML } from "bun";
+import { directoryLayerFile } from "../config/directory-layers";
+import { APP_NAME, getAgentDir, isEnoent, isRecord } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { orderedSettings } from "../config/all-settings";
 import { type AnySetting, lookup } from "../config/registry";
-import { Settings, settings } from "../config/settings";
+import { Settings, settings, validateDirectoryLayerSettings } from "../config/settings";
 import { renderSettingsSchema } from "../config/settings-schema";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { initXdg } from "./commands/init-xdg";
@@ -18,7 +22,7 @@ import { initXdg } from "./commands/init-xdg";
 // Types
 // =============================================================================
 
-export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "schema" | "init-xdg";
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "dirs" | "schema" | "init-xdg";
 
 export interface ConfigCommandArgs {
 	action: ConfigAction;
@@ -66,7 +70,7 @@ function findSettingDef(path: string): CliSettingDef | undefined {
 // Argument Parser
 // =============================================================================
 
-const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "schema", "init-xdg"];
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "dirs", "schema", "init-xdg"];
 
 /**
  * Parse config subcommand arguments.
@@ -173,6 +177,9 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 	await Settings.init();
 
 	switch (cmd.action) {
+		case "dirs":
+			await handleDirectories(cmd.flags);
+			break;
 		case "list":
 			await handleList(cmd.flags);
 			break;
@@ -350,6 +357,11 @@ function shadowingSource(setting: AnySetting): { json: Record<string, string>; m
 						message: `$${name} overrides this value; unset it for the saved value to apply.`,
 					};
 		}
+		case "directory":
+			return {
+				json: { overriddenBy: provenance },
+				message: `User-owned directory settings for ${settings.getProvenanceDirectory(setting) ?? settings.getCwd()} override this value.`,
+			};
 		case "project":
 			return {
 				json: { overriddenBy: provenance },
@@ -416,6 +428,62 @@ function handlePath(): void {
 	console.log(getAgentDir());
 }
 
+/** One stored directory layer and its consistency status. */
+export interface DirectoryLayerListing {
+	dir: string | null;
+	folder: string;
+	status: "ok" | "orphan" | "mismatch" | "invalid";
+}
+
+/** Lists stored directory layers under `agentDir`, sorted by folder, without modifying storage. */
+export async function listDirectoryLayers(agentDir: string = getAgentDir()): Promise<DirectoryLayerListing[]> {
+	const root = path.join(agentDir, "directories");
+	let entries: fs.Dirent[];
+	try {
+		entries = await fs.promises.readdir(root, { withFileTypes: true });
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+	const listings: DirectoryLayerListing[] = [];
+	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+		const folder = path.join(root, entry.name);
+		let dir: string | null = null;
+		let status: DirectoryLayerListing["status"] = "invalid";
+		try {
+			const parsed: unknown = YAML.parse(await Bun.file(path.join(folder, "config.yml")).text());
+			if (isRecord(parsed) && typeof parsed.path === "string" && path.isAbsolute(parsed.path)) {
+				dir = parsed.path;
+				const values = { ...parsed };
+				delete values.path;
+				validateDirectoryLayerSettings(values);
+				status = directoryLayerFile(agentDir, dir) === path.join(folder, "config.yml") ? "ok" : "mismatch";
+				if (status === "ok") {
+					try {
+						const stat = await fs.promises.stat(dir);
+						if (!stat.isDirectory()) status = "orphan";
+						else if ((await fs.promises.realpath(dir)) !== dir) status = "mismatch";
+					} catch (error) {
+						status = isEnoent(error) ? "orphan" : "invalid";
+					}
+				}
+			}
+		} catch {}
+		listings.push({ dir, folder, status });
+	}
+	return listings;
+}
+
+async function handleDirectories(flags: { json?: boolean }): Promise<void> {
+	const layers = await listDirectoryLayers();
+	if (flags.json) {
+		await writeStdout(`${JSON.stringify(layers, null, 2)}\n`);
+		return;
+	}
+	for (const layer of layers) console.log(`${layer.dir ?? "(missing path)"}\t${layer.folder}\t${layer.status}`);
+}
+
 // =============================================================================
 // Help
 // =============================================================================
@@ -429,6 +497,7 @@ ${chalk.bold("Commands:")}
   set <key> <value>  Set a setting value
   reset <key>        Remove a setting from config.yml so its default applies
   path               Print the config directory path
+  dirs               List user-owned directory layers and their status
   schema             Print the JSON Schema of config.yml
   init-xdg           Initialize XDG Base Directory structure
 

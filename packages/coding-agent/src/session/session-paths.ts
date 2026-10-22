@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { encodeDirectoryName } from "@oh-my-pi/pi-utils/directory-name";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getTerminalId } from "@oh-my-pi/pi-tui/ttyid";
 import {
@@ -100,17 +101,17 @@ function getDefaultSessionDirName(cwd: string): {
 	// The temp root is checked first: it is the more specific root wherever it
 	// nests inside home (Windows' `%USERPROFILE%\AppData\Local\Temp`).
 	if (isRelativeWithin(tempRelative)) {
-		encodedDirName = encodeRelativeSessionDirName("-tmp", tempRelative);
+		encodedDirName = encodeDirectoryName(canonicalCwd, canonicalHome, canonicalTempRoot);
 		if (inHome) {
 			shadowedHomeDirName = encodeRelativeSessionDirName("-", homeRelative);
 			shadowedHomeHashedDirName = encodeHashedSessionDirName(canonicalCwd, "home");
 		}
 		scope = "tmp";
 	} else if (inHome) {
-		encodedDirName = encodeRelativeSessionDirName("-", homeRelative);
+		encodedDirName = encodeDirectoryName(canonicalCwd, canonicalHome, canonicalTempRoot);
 		scope = "home";
 	} else {
-		encodedDirName = encodeLegacyAbsoluteSessionDirName(canonicalCwd);
+		encodedDirName = encodeDirectoryName(canonicalCwd, canonicalHome, canonicalTempRoot);
 		scope = "abs";
 	}
 	return {

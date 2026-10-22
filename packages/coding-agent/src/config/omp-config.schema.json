@@ -30,6 +30,10 @@
           "type": "object",
           "additionalProperties": true,
           "default": {}
+        },
+        "disabledAccounts": {
+          "type": "array",
+          "default": []
         }
       }
     },

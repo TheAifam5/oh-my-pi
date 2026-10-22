@@ -1,5 +1,5 @@
 /**
- * Layered settings store (global config, project, `--config` overlay, runtime overrides) with
+ * Layered settings store (global, project, directory, config overlay, runtime) with
  * background persistence. Values are typed and read through registry handles
  * (see `./registry`), declared next to their domain and collected by `./all-settings`:
  *
@@ -78,6 +78,7 @@ import {
 import {
 	cfgAllowProjectMeteredPools,
 	cfgAuthAccountPolicies,
+	cfgAuthDisabledAccounts,
 	cfgModelGroups,
 	cfgModelRoles,
 	cfgModelRoleStorage,
@@ -85,12 +86,24 @@ import {
 import { cfgRetryFallbackChains } from "../session/settings";
 import { cfgShellPath } from "../exec/settings";
 
+import {
+	directoryAncestors,
+	directoryLayerFile,
+	directoryLayerTargets,
+	type DirectoryLayerTarget,
+} from "./directory-layers";
+
+interface DirectoryLayer {
+	dir: string;
+	file: string;
+	settings: RawSettings;
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Settings layer that supplies an effective value; see {@link Settings.getProvenance}. */
-export type SettingProvenance = "env" | "runtime" | "overlay" | "project" | "global" | "default";
+export type SettingProvenance = "env" | "runtime" | "overlay" | "directory" | "project" | "global" | "default";
 
 /** Raw settings object as stored in YAML */
 export interface RawSettings {
@@ -482,7 +495,7 @@ interface ModelGroupReadCache {
 }
 
 /** Settings layer a model-group value comes from. */
-type ModelGroupLayerSource = "global" | "project" | "overlay" | "runtime";
+type ModelGroupLayerSource = "global" | "project" | "directory" | "overlay" | "runtime";
 
 /** Reports one model-group problem at a settings path; `issues` lists the parse problems of a dropped value. */
 type ModelGroupWarn = (path: string, message: string, issues?: readonly ModelGroupIssue[]) => void;
@@ -507,7 +520,7 @@ interface ModelGroupLayerPolicy {
 	source: ModelGroupLayerSource;
 	/** Whether the project layer may add metered funding and redefine `definedBelow` groups (`allowProjectMeteredPools`). */
 	allowProjectMetered: boolean;
-	/** Group names the global layer, a `--config` overlay, a runtime override, or an overlay parent defines. */
+	/** Group names defined by trusted layers or an overlay parent. */
 	definedBelow?: ReadonlySet<string>;
 	/** The layers below and above the project ({@link lowerPoolRecords}), whose pool limits a project entry may only tighten. */
 	lower?: RawSettings;
@@ -733,8 +746,8 @@ function withGlobalPoolLimits(
  *   and lists pass unchanged.
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
  *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
- *   to global), and `allowProjectMeteredPools`, pool member `account` fields, `routing.accounts`, and
- *   `auth.accountPolicies[].limits` are dropped.
+ *   to global), and `allowProjectMeteredPools`, `auth.disabledAccounts`, pool member `account` fields,
+ *   `routing.accounts`, and `auth.accountPolicies[].limits` are dropped.
  *   Unless `allowProjectMetered`, a `modelGroups` entry named in `definedBelow` and an inline
  *   group whose funding includes `metered` are dropped too.
  *
@@ -753,6 +766,13 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 	if (project && Object.hasOwn(layer, cfgAllowProjectMeteredPools.id)) {
 		warn(cfgAllowProjectMeteredPools.id, "is read from the global config only; ignored in project settings");
 		result = withLayerValue(result, cfgAllowProjectMeteredPools.segments, undefined);
+	}
+	if (project && getByPath(layer, cfgAuthDisabledAccounts.segments) !== undefined) {
+		warn(
+			cfgAuthDisabledAccounts.id,
+			"is read from the global config, directory layers, --config overlays, and runtime overrides only; ignored in project settings",
+		);
+		result = withLayerValue(result, cfgAuthDisabledAccounts.segments, undefined);
 	}
 	for (const { segments, section } of MODEL_GROUP_RECORDS) {
 		const record = getByPath(layer, segments);
@@ -858,10 +878,36 @@ function assertPersistable(setting: AnySetting, value: unknown): void {
 	if (definition.type === "record") definition.validateWrite?.(value);
 }
 
+/**
+ * Validates one directory layer mapping without its `path` marker.
+ *
+ * @throws Error on an unknown setting path, excessive nesting, or a value its definition rejects.
+ */
+export function validateDirectoryLayerSettings(settings: RawSettings): void {
+	const checkPaths = (record: RawSettings, prefix = "", depth = 0): void => {
+		if (depth > MAX_SETTINGS_MERGE_DEPTH) throw new Error("Directory settings exceed maximum nesting depth");
+		for (const [key, value] of Object.entries(record)) {
+			const id = prefix ? `${prefix}.${key}` : key;
+			if (lookupSetting(id)) continue;
+			if (!settingsGroupOnlyPrefixes()[id] || !isRecord(value)) throw new Error(`Unknown setting "${id}"`);
+			checkPaths(value, id, depth + 1);
+		}
+	};
+	checkPaths(settings);
+	for (const setting of allSettings()) {
+		const value = getByPath(settings, setting.segments);
+		if (value === undefined || value === null) continue;
+		setting.assertWritable(value);
+		assertPersistable(setting, value);
+		setting.definition.validate?.(value);
+	}
+}
+
 /** One instance's own layers, lowest precedence first. */
 interface OwnLayers {
 	global: RawSettings;
 	project: RawSettings;
+	directory: DirectoryLayer[];
 	configOverlay: RawSettings;
 	overrides: RawSettings;
 }
@@ -1156,6 +1202,7 @@ export class Settings {
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
+	#directory: DirectoryLayer[] = [];
 	/** Last successfully loaded native .omp/config.yml contents. */
 	#projectFileSettings: RawSettings = {};
 	/** Logical config paths whose malformed targets were moved aside. */
@@ -1493,7 +1540,7 @@ export class Settings {
 
 	/**
 	 * Layer supplying the effective value of `setting`, in merge precedence order:
-	 * runtime override → config overlay → project → global → (overlay parent) → schema default.
+	 * runtime → config overlay → directory (deepest first) → project → global → parent → default.
 	 * A value that merges to `null` is unset and reports `"default"`.
 	 */
 	getProvenance(setting: AnySetting): SettingProvenance {
@@ -1502,6 +1549,7 @@ export class Settings {
 		const own = this.#liveModelGroupLayers();
 		if (getByPath(own.overrides, segments) !== undefined) return "runtime";
 		if (getByPath(own.configOverlay, segments) !== undefined) return "overlay";
+		if (own.directory.some(layer => getByPath(layer.settings, segments) !== undefined)) return "directory";
 		if (getByPath(this.#projectLayerForMerge(own), segments) !== undefined) return "project";
 		if (getByPath(own.global, segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
@@ -1509,24 +1557,103 @@ export class Settings {
 
 	/**
 	 * Every layer's own configured value of `setting`, lowest precedence first: an overlay parent's
-	 * layers, then global, project, `--config` overlay, and runtime override. Layers that leave the
+	 * layers, then global, project, directory ancestors, `--config` overlay, and runtime override. Layers that leave the
 	 * setting unset are omitted; a configured `null` is included, except in the project layer, which
 	 * drops its `null` values before merging.
 	 */
-	getLayerValues(setting: AnySetting): { source: SettingProvenance; value: unknown }[] {
+	getLayerValues(setting: AnySetting): { source: SettingProvenance; value: unknown; dir?: string }[] {
 		const values = this.#parent?.getLayerValues(setting) ?? [];
 		const own = this.#liveModelGroupLayers();
 		const layers: [SettingProvenance, RawSettings][] = [
 			["global", own.global],
 			["project", this.#projectLayerForMerge(own)],
+			...own.directory.map(layer => ["directory", layer.settings] as [SettingProvenance, RawSettings]),
 			["overlay", own.configOverlay],
 			["runtime", own.overrides],
 		];
 		for (const [source, layer] of layers) {
 			const value = getByPath(layer, setting.segments);
-			if (value !== undefined) values.push({ source, value });
+			if (value !== undefined) {
+				const dir =
+					source === "directory" ? own.directory.find(candidate => candidate.settings === layer)?.dir : undefined;
+				values.push({ source, value, ...(dir ? { dir } : {}) });
+			}
 		}
 		return values;
+	}
+
+	/** Directory of the deepest directory layer supplying `setting`; undefined for any other provenance. */
+	getProvenanceDirectory(setting: AnySetting): string | undefined {
+		if (this.getProvenance(setting) !== "directory") return undefined;
+		return this.getLayerValues(setting).findLast(layer => layer.source === "directory")?.dir;
+	}
+
+	/** Lists `cwd` (canonical) and every ancestor with an existing layer file, deepest first. */
+	listDirectoryLayerTargets(cwd: string = this.#cwd): Promise<DirectoryLayerTarget[]> {
+		return directoryLayerTargets(this.#agentDir, cwd);
+	}
+
+	/**
+	 * Persists `value` for `setting` in the layer of `dir`, creating the folder and `path` marker on first write.
+	 *
+	 * @throws Error on a read-only or overlay instance, a path collision, an unreadable or malformed layer, or an invalid value.
+	 */
+	async setDirectoryValue(dir: string, setting: AnySetting, value: unknown): Promise<void> {
+		setting.assertWritable(value);
+		assertPersistable(setting, value);
+		await this.#writeDirectoryPath(dir, setting.segments, value);
+	}
+
+	/** Removes `setting` from the layer of `dir`; the file remains with its `path` marker. Throws like {@link setDirectoryValue}. */
+	async unsetDirectoryValue(dir: string, setting: AnySetting): Promise<void> {
+		await this.#writeDirectoryPath(dir, setting.segments, undefined);
+	}
+
+	/** Persists one record entry in the layer of `dir`; `undefined` removes it. Throws like {@link setDirectoryValue}. */
+	async writeDirectoryEntry(dir: string, setting: AnySetting, key: string, value: unknown): Promise<void> {
+		if (setting.type !== "record") throw new Error(`Setting ${setting.id} is not a record`);
+		if (setting === cfgModelRoles) assertModelRoleName(key);
+		if (value !== undefined) {
+			setting.assertWritable({ [key]: value });
+			assertPersistable(setting, { [key]: value });
+		}
+		await this.#writeDirectoryPath(dir, [...setting.segments, key], value);
+	}
+
+	async #writeDirectoryPath(dir: string, segments: readonly string[], value: unknown): Promise<void> {
+		if (!this.#persist || this.#parent || this.#savesCancelled)
+			throw new Error("Directory settings require a writable persisted settings instance");
+		const canonical = await fs.promises.realpath(dir);
+		const file = directoryLayerFile(this.#agentDir, canonical);
+		await fs.promises.mkdir(path.dirname(file), { recursive: true });
+		await this.#withYamlWriteLock(file, async writePath => {
+			let settings: RawSettings;
+			try {
+				const parsed: unknown = YAML.parse(await Bun.file(writePath).text());
+				if (!isRecord(parsed)) throw new Error(`Directory config must be a mapping: ${file}`);
+				if (parsed.path !== canonical) {
+					throw new Error(
+						`Directory config collision: ${file} belongs to ${String(parsed.path)}, not ${canonical}`,
+					);
+				}
+				settings = parsed;
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+				settings = { path: canonical };
+			}
+			setByPath(settings, segments, value);
+			const candidate = { ...settings };
+			delete candidate.path;
+			this.#validateDirectorySettings(candidate);
+			await this.#writeYamlAtomically(writePath, stringifyYamlConfig(settings));
+		});
+		await this.#exclusive("rescope", async () => {
+			const previous = this.#snapshot();
+			this.#directory = await this.#readDirectoryLayers(this.#cwd);
+			this.#rebuildMerged();
+			this.#fireChangesSince(previous);
+			this.#syncFileWatchers();
+		});
 	}
 
 	/**
@@ -1825,6 +1952,7 @@ export class Settings {
 		addFile(path.join(projectCwd, ".claude", "settings.json"));
 		for (const file of this.#projectSourcePaths) addFile(file);
 		for (const file of this.#configFiles) addFile(file);
+		for (const dir of directoryAncestors(this.#cwd)) addFile(directoryLayerFile(this.#agentDir, dir));
 		return targets;
 	}
 
@@ -1925,7 +2053,7 @@ export class Settings {
 
 	/**
 	 * Independent instance scoped to `cwd`: same global, `--config` overlay, and runtime layers, the
-	 * project layer re-read for `cwd` (persisted instances). An {@link overlay} clones its parent for
+	 * project and directory layers re-read for `cwd`. An {@link overlay} clones its parent for
 	 * `cwd` and re-applies its own layers on top, so inherited values carry over.
 	 *
 	 * @throws Error when a configured value fails its definition's `validate` check.
@@ -1944,6 +2072,8 @@ export class Settings {
 			cloned.#storage = this.#storage;
 			cloned.#configPath = this.#configPath;
 			cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
+			cloned.#directory =
+				this.#configPath !== null ? await cloned.#readDirectoryLayers(cwd) : structuredClone(this.#directory);
 			if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
 			cloned.#configFiles = [...this.#configFiles];
 			cloned.#overlayShellPathSource = this.#overlayShellPathSource;
@@ -2017,6 +2147,7 @@ export class Settings {
 				this.#readProjectSettings(false, { rejectNewWarnings: keepLastGood }),
 				this.#readConfigOverlays(false),
 			]);
+			const directory = await this.#readDirectoryLayers(this.#cwd, this.#directory);
 			if (mutationGeneration !== this.#persistedMutationGeneration) continue;
 			this.#modelGroupWarningsSeen.clear();
 			for (const result of [globalResult, projectResult, overlayResult]) {
@@ -2070,6 +2201,7 @@ export class Settings {
 			// accepted so far: an invalid file keeps its own layer's last good values while the
 			// other layers still refresh. Strict validates the whole refresh and throws.
 			let layers = this.#ownLayers();
+			layers = { ...layers, directory };
 			const adopted: LayerRefresh[] = [];
 			for (const refresh of refreshed) {
 				const trial: OwnLayers = { ...layers, [refresh.layer]: refresh.settings };
@@ -2084,6 +2216,7 @@ export class Settings {
 			for (const refresh of adopted) refresh.commit();
 			this.#global = layers.global;
 			this.#project = layers.project;
+			this.#directory = layers.directory;
 			this.#configOverlay = layers.configOverlay;
 			this.#overrides = layers.overrides;
 			for (const setting of settled) this.#softPins.delete(setting);
@@ -2148,6 +2281,7 @@ export class Settings {
 			const candidate: OwnLayers = {
 				global: this.#global,
 				project: project?.settings ?? this.#project,
+				directory: this.#configPath !== null ? await this.#readDirectoryLayers(normalized) : this.#directory,
 				configOverlay: this.#configOverlay,
 				overrides:
 					this.#savedRuntimeModelRoleOverrides.size === 0 ? this.#overrides : this.#buildOriginalOverrides(),
@@ -2162,6 +2296,7 @@ export class Settings {
 			const previous = this.#snapshot();
 			this.#cwd = normalized;
 			this.#overrides = candidate.overrides;
+			this.#directory = candidate.directory;
 			for (const setting of settledPins) this.#softPins.delete(setting);
 			this.#savedRuntimeModelRoleOverrides.clear();
 			if (project) {
@@ -2262,6 +2397,8 @@ export class Settings {
 		if (Object.hasOwn(this.#configOverlay, "shellPath")) {
 			return this.#overlayShellPathSource ?? "the active config overlay";
 		}
+		const directory = this.#directory.findLast(layer => Object.hasOwn(layer.settings, "shellPath"));
+		if (directory) return directory.file;
 		if (Object.hasOwn(this.#project, "shellPath")) {
 			return this.#projectShellPathSource ?? "the active project configuration";
 		}
@@ -2283,6 +2420,7 @@ export class Settings {
 	extensionsSourceLevel(): "user" | "project" {
 		if (Object.hasOwn(this.#overrides, "extensions")) return "user";
 		if (Object.hasOwn(this.#configOverlay, "extensions")) return "user";
+		if (this.#directory.some(layer => Object.hasOwn(layer.settings, "extensions"))) return "user";
 		if (Object.hasOwn(this.#project, "extensions")) return "project";
 		if (this.#parent && !Object.hasOwn(this.#global, "extensions")) return this.#parent.extensionsSourceLevel();
 		return "user";
@@ -2680,6 +2818,7 @@ export class Settings {
 		const own = this.#liveModelGroupLayers();
 		if (this.#modelRoleLayerOwns(own.overrides, role)) return "runtime";
 		if (this.#modelRoleLayerOwns(own.configOverlay, role)) return "overlay";
+		if (own.directory.some(layer => this.#modelRoleLayerOwns(layer.settings, role))) return "directory";
 		if (this.#modelRoleLayerOwns(own.project, role)) return "project";
 		if (this.#modelRoleLayerOwns(own.global, role)) return "global";
 		return this.#parent?.getModelRoleProvenance(role) ?? "default";
@@ -2704,10 +2843,13 @@ export class Settings {
 	 */
 	getOwnedModelPreset(
 		name: string,
-	): { entry: unknown; source: "runtime" | "overlay" | "project" | "global" } | undefined {
+	): { entry: unknown; source: "runtime" | "overlay" | "directory" | "project" | "global" } | undefined {
 		const layers = [
 			{ layer: this.#overrides, source: "runtime", tombstone: true },
 			{ layer: this.#configOverlay, source: "overlay", tombstone: true },
+			...this.#directory
+				.toReversed()
+				.map(({ settings }) => ({ layer: settings, source: "directory" as const, tombstone: true })),
 			{ layer: projectLayerForMerge(this.#project), source: "project", tombstone: false },
 			{ layer: this.#global, source: "global", tombstone: false },
 		] as const;
@@ -2789,6 +2931,7 @@ export class Settings {
 		if (projectResult.status === "rejected") throw projectResult.reason;
 
 		this.#project = projectResult.value;
+		this.#directory = await this.#readDirectoryLayers(this.#cwd);
 		this.#configOverlay = await this.#loadConfigOverlays();
 
 		// Build merged view (global → project → overrides; project wins over global)
@@ -2820,6 +2963,7 @@ export class Settings {
 		}
 
 		this.#project = projectResult.value;
+		this.#directory = await this.#readDirectoryLayers(this.#cwd);
 		this.#configOverlay = await this.#loadConfigOverlays();
 		this.#rebuildMerged();
 		this.#validateAll();
@@ -3364,6 +3508,43 @@ export class Settings {
 		const result = await this.#readProjectSettings(true);
 		this.#commitProjectRead(result);
 		return result.settings;
+	}
+
+	#validateDirectorySettings(settings: RawSettings): void {
+		validateDirectoryLayerSettings(settings);
+	}
+
+	async #readDirectoryLayers(cwd: string, previous: readonly DirectoryLayer[] = []): Promise<DirectoryLayer[]> {
+		const layers: DirectoryLayer[] = [];
+		for (const dir of directoryAncestors(cwd)) {
+			const file = directoryLayerFile(this.#agentDir, dir);
+			try {
+				const parsed: unknown = YAML.parse(await Bun.file(file).text());
+				if (!isRecord(parsed)) throw new Error("directory layer must be a YAML mapping");
+				if (parsed.path !== dir) {
+					logger.warn("Settings: ignoring directory layer with missing or mismatched path", {
+						file,
+						expected: dir,
+						stored: parsed.path,
+					});
+					continue;
+				}
+				const settings = { ...parsed };
+				delete settings.path;
+				this.#validateDirectorySettings(settings);
+				layers.push({ dir, file, settings });
+			} catch (error) {
+				if (isEnoent(error)) continue;
+				logger.warn("Settings: invalid directory layer; keeping last good version when available", {
+					file,
+					dir,
+					error: String(error),
+				});
+				const good = previous.find(layer => layer.dir === dir && layer.file === file);
+				if (good) layers.push(good);
+			}
+		}
+		return layers;
 	}
 
 	/** Adopts the read-side state of a project read whose layer is being committed. */
@@ -4794,6 +4975,7 @@ export class Settings {
 		return {
 			global: this.#global,
 			project: this.#project,
+			directory: this.#directory,
 			configOverlay: this.#configOverlay,
 			overrides: this.#overrides,
 		};
@@ -4812,9 +4994,16 @@ export class Settings {
 	/** {@link #mergeModelGroupLayers} with `project` standing in for the prepared project layer. */
 	#mergeOwnLayersWith(own: OwnLayers, project: RawSettings): RawSettings {
 		let merged = this.#deepMerge(this.#deepMerge({}, own.global), project);
+		for (const layer of own.directory) merged = this.#deepMerge(merged, layer.settings);
 		merged = this.#deepMerge(merged, own.configOverlay);
 		merged = this.#deepMerge(merged, own.overrides);
-		return applyMergeHooks(merged, [own.global, project, own.configOverlay, own.overrides]);
+		return applyMergeHooks(merged, [
+			own.global,
+			project,
+			...own.directory.map(layer => layer.settings),
+			own.configOverlay,
+			own.overrides,
+		]);
 	}
 
 	/**
@@ -4832,6 +5021,7 @@ export class Settings {
 			cached.parentRevision === parentRevision &&
 			cached.layers.global === own.global &&
 			cached.layers.project === own.project &&
+			cached.layers.directory === own.directory &&
 			cached.layers.configOverlay === own.configOverlay &&
 			cached.layers.overrides === own.overrides
 		) {
@@ -4899,10 +5089,14 @@ export class Settings {
 			allowProjectMetered: true,
 		});
 		const global = modelGroupLayerForMerge(layers.global, unrestricted("global"), warn("global"));
+		const directory = layers.directory.map(layer => ({
+			...layer,
+			settings: modelGroupLayerForMerge(layer.settings, unrestricted("directory"), warn("directory")),
+		}));
 		const configOverlay = modelGroupLayerForMerge(layers.configOverlay, unrestricted("overlay"), warn("overlay"));
 		const overrides = modelGroupLayerForMerge(layers.overrides, unrestricted("runtime"), warn("runtime"));
 		const definedBelow = new Set<string>(this.#parent ? Object.keys(cfgModelGroups.get(this.#parent)) : []);
-		for (const layer of [global, configOverlay, overrides]) {
+		for (const layer of [global, ...directory.map(layer => layer.settings), configOverlay, overrides]) {
 			const groups = getByPath(layer, cfgModelGroups.segments);
 			if (isRecord(groups)) for (const name of Object.keys(groups)) definedBelow.add(name);
 		}
@@ -4912,16 +5106,25 @@ export class Settings {
 				source: "project",
 				allowProjectMetered: this.#allowProjectMeteredPools(layers),
 				definedBelow,
-				lower: lowerPoolRecords(global, [configOverlay, overrides], this.#parent),
+				lower: lowerPoolRecords(
+					global,
+					[...directory.map(layer => layer.settings), configOverlay, overrides],
+					this.#parent,
+				),
 			},
 			warn("project"),
 		);
-		return { global, project, configOverlay, overrides };
+		return { global, project, directory, configOverlay, overrides };
 	}
 
-	/** `allowProjectMeteredPools` from the runtime, `--config` overlay, or global layer, else the overlay parent's. */
+	/** `allowProjectMeteredPools` from runtime, `--config` overlay, deepest directory, or global layer, else the parent's. */
 	#allowProjectMeteredPools(layers: OwnLayers): boolean {
-		for (const layer of [layers.overrides, layers.configOverlay, layers.global]) {
+		for (const layer of [
+			layers.overrides,
+			layers.configOverlay,
+			...layers.directory.map(layer => layer.settings).reverse(),
+			layers.global,
+		]) {
 			const value = getByPath(layer, cfgAllowProjectMeteredPools.segments);
 			if (typeof value === "boolean") return value;
 		}
@@ -4977,6 +5180,9 @@ export class Settings {
 		const sources: [ModelGroupLayerSource, RawSettings][] = [
 			["runtime", own.overrides],
 			["overlay", own.configOverlay],
+			...own.directory
+				.toReversed()
+				.map(layer => ["directory", layer.settings] as [ModelGroupLayerSource, RawSettings]),
 			["project", own.project],
 			["global", own.global],
 		];
