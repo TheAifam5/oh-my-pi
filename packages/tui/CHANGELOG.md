@@ -14,13 +14,22 @@
 
 ### Added
 
-- Usage dashboard details show credit-balance spending rates and projected run-out countdowns
-- `AdvisorConfig` takes `owns` and `WatchdogConfigDoc` takes `categories` (`AdvisorCategoryConfig`) for advisor finding categories
-- `AdvisorNote` takes optional `finding`, `category`, `owner`, `reporters` and `relation`; advisor cards group notes by finding and label each with its finding, category and reporter count
+- Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and keys to turn a selector role into a pool, add, replace, remove, and reorder members, and cycle the strategy (including `quota`) and funding order; an invalid pool shows its validation problem and can be removed or replaced
+- Added routing editors to model hub pools: `a`/`h` toggle cache affinity and pricing, `u`/`r` cycle quota unknown handling and reserve, and `e` edits account order, drain target, drain spend, return triggers, metered funding with its spending policy or local budget, local limits, strategy lists, and quota tolerance; pool summaries show quota, accounts, and cache routing
+- Added model-group editing to the model hub: a pool that references `modelGroups.<name>` edits the global group, and `⇧G` points a role or chain at a group, turns an inline pool into a new group, renames a group with its references, or deletes it into an inline copy
+- Added the account manager overlay behind `/account`, listing stored accounts by provider with name, priority, reserve, drain and spend classes, pins, limits with usage, remaining quota with reset countdowns, and balances with spending projections
+- Added host pages (`AccountManagerDeps.pages`) to the account manager, listed after the providers
+- Added credit-balance spending rates and projected run-out countdowns to usage dashboard details, and the currency of non-USD balances to usage amounts
+- Added `setChatMarkdownTransform()` for display-only Markdown transforms of user, assistant, and thinking text in the transcript
+- Added `ToolExecutionRenderers` and the tool card `renderers` option, which replace a tool's renderers (also for tool names with no registered tool) in the transcript, rewind and copy selectors, agent hub, and agent transcript viewer; `renderShell: "self"` drops the card padding and background
+- Added `parseThinkingSuffix()` and `splitThinkingSuffix()` to `thinking`; the model selector overlay re-exports them
+- Added `owns` to `AdvisorConfig` and `categories` (`AdvisorCategoryConfig`) to `WatchdogConfigDoc` for advisor finding categories
+- Added optional `finding`, `category`, `owner`, `reporters`, and `relation` to `AdvisorNote`; advisor cards group notes by finding and label each with its finding, category, and reporter count
+- Added per-advisor and file-level "Notes per update" (1–32, inherit clears), per-advisor owned-category selection, and a categories editor (lower-kebab ids, description, roster owner, precedence) to `/advisor configure`; saving drops categories without a description with a warning
 
 ### Fixed
 
-- The status line's usage timeout bounds its own wait without cancelling the host's background fetch
+- Fixed the status line's usage timeout cancelling the host's background usage fetch; it now bounds only its own wait
 
 ## [18.12.4] - 2026-10-20
 

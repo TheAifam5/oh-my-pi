@@ -48,12 +48,22 @@ function envNote(setting: AnySetting): string {
 		: ` $${setting.envName} overrides this setting while it is set.`;
 }
 
+/** Session state the panel's visibility conditions read alongside the settings. */
+export interface SettingsHostSession {
+	/** Whether advisors are enabled for the current session (persisted or toggled by `/advisor`). */
+	isAdvisorEnabled(): boolean;
+}
+
 /**
  * Adapt the application schema and settings store to the terminal overlay. The panel shows and
  * edits the value of the settings layers, never an environment-supplied one (so an env credential
  * is never pre-filled or written to config); descriptions note an active environment variable.
+ * With `session`, advisor rows are also shown while the session's advisor is enabled.
  */
-export function createSettingsHost(): SettingsHost {
+export function createSettingsHost(session?: SettingsHostSession): SettingsHost {
+	const conditions: Record<string, () => boolean> = session
+		? { ...CONDITIONS, advisorEnabled: () => session.isAdvisorEnabled() || CONDITIONS.advisorEnabled() }
+		: CONDITIONS;
 	const entries: SettingsDisplayEntry[] = [];
 	for (const tab of SETTING_TABS) {
 		for (const setting of orderedSettings()) {
@@ -67,7 +77,7 @@ export function createSettingsHost(): SettingsHost {
 				ui: note ? { ...ui, description: `${ui.description}${note}` } : ui,
 				enumValues: setting.enumValues,
 				credential: setting.isCredential,
-				condition: ui.condition ? CONDITIONS[ui.condition] : undefined,
+				condition: ui.condition ? conditions[ui.condition] : undefined,
 			});
 		}
 	}

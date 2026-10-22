@@ -414,6 +414,7 @@ describe("interactive /usage account visibility", () => {
 					advisors: [],
 				}),
 				fetchUsageReports: () => refresh.promise,
+				getAdvisorTaxonomyStatus: () => ({ heading: "Categories: none (declared empty).", rows: [], warnings: [] }),
 				modelRegistry: { authStorage },
 			},
 		});
@@ -421,6 +422,37 @@ describe("interactive /usage account visibility", () => {
 		expect(stripVTControlCharacters(ctx.reportContainer.render(120).join("\n"))).toContain("Advisor Status");
 		refresh.resolve([]);
 		await result;
+	});
+
+	it("shows the advisor taxonomy and its warnings in the TUI status report", async () => {
+		const ctx = createInteractiveModeContext({
+			reportContainer: new Container(),
+			commandReportRows: () => 20,
+			ui: { terminal: { columns: 120, rows: 30 } },
+			session: {
+				getAdvisorStats: () => ({
+					configured: true,
+					active: false,
+					contextWindow: 0,
+					contextTokens: 0,
+					tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					cost: 0,
+					messages: { user: 0, assistant: 0, total: 0 },
+					advisors: [],
+				}),
+				getAdvisorTaxonomyStatus: () => ({
+					heading: "Categories (1, declared):",
+					rows: ["security: owner Security (not live), precedence 2, declared"],
+					warnings: ['category "security": owner "Security" is not a configured advisor'],
+				}),
+				modelRegistry: { authStorage },
+			},
+		});
+		await new CommandController(ctx).handleAdvisorStatusCommand();
+		const report = stripVTControlCharacters(ctx.reportContainer.render(120).join("\n"));
+		expect(report).toContain("Categories (1, declared):");
+		expect(report).toContain("security: owner Security (not live), precedence 2, declared");
+		expect(report).toContain('category "security": owner "Security" is not a configured advisor');
 	});
 
 	it("warns without opening the dashboard when usage reporting is not configured", async () => {

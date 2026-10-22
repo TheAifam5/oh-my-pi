@@ -104,7 +104,7 @@ Slash commands:
 | `/advisor`           | Toggle the advisor subsystem for this session (session-scoped override; does not change persisted `advisor.enabled`).                |
 | `/advisor on`        | Enable the configured/default advisor runtimes for this session. Session-scoped; not persisted to config.                            |
 | `/advisor off`       | Disable the advisor subsystem for this session and stop its runtimes. Session-scoped; not persisted to config.                       |
-| `/advisor status`    | Show each advisor's runtime state, model, context usage, token usage, and cost.                                                      |
+| `/advisor status`    | Show each advisor's runtime state, model, context usage, token usage, and cost, then the active finding taxonomy and its owner warnings. |
 | `/advisor dump`      | In the TUI, copy the compact transcript (all active advisors when a roster is present) to the clipboard; other hosts return the text. |
 | `/advisor dump raw`  | Copy/return the full dump, including system prompt, tools, thinking, and calls.                                                      |
 | `/advisor configure` | Open the interactive TUI editor for project- or user-level `WATCHDOG.yml`. Non-TUI command hosts report that the editor is TUI-only. |
@@ -206,6 +206,8 @@ Without a `categories` key in any discovered `WATCHDOG.yml`, the bundled taxonom
 | `architecture` | Architecture                |
 
 `categories: {}` declares an empty taxonomy, which removes `category` from `advise`. A category has a live owner when its owner advisor is built and its status is `running`.
+
+When `/advisor status` (TUI and text hosts) lists advisors, it ends with the active taxonomy: one line per category with its id, owner and whether that owner is live, precedence, and source (`default` for the bundled taxonomy, `declared` otherwise), followed by the owner-resolution warnings: a category owner that names no configured advisor, and an advisor `owns` id that is unknown or owned by another advisor.
 
 ### Delivery
 
@@ -453,6 +455,12 @@ Later project files sit closer to the end of the advisor prompt, so narrower dir
 Discovery and `/advisor configure` use the same per-entry validation: malformed entries are skipped with named warnings while healthy advisors remain usable. Invalid YAML or a non-mapping document is skipped with a file warning. Problems appear in an aggregated startup/editor warning and remain visible inside the editor after switching project/user scope. Saving the editor document writes only valid entries.
 
 The editor's Project scope targets the repository-root `WATCHDOG.yml` (cwd when outside a repository); User scope targets the active agent directory. It edits an existing `.yaml` in place when no `.yml` exists at that scope, rather than creating a competing file.
+
+The editor also sets each file's budgets and taxonomy:
+
+- **Notes per update**: the top-level `maxNotesPerUpdate` (roster row `Notes per update`; the native page `Shared settings`) and each advisor's own value, an integer from 1 to 32. `inherit` (or resetting the native field) clears the value.
+- **Owns categories**: each advisor's `owns`, picked from the active category ids: the file's declared `categories`, or the bundled taxonomy when it declares none. Owned ids outside that list stay selected until cleared.
+- **Categories**: lists the file's declared categories, or the bundled taxonomy with its roster-resolved owners. Customizing the bundled taxonomy copies it into the file, and so does adding a category to a file without `categories`, before the new entry; `Use bundled defaults` removes the key. An entry has a lower-kebab id (`a-z` and `0-9` words joined by single hyphens), a description, an owner picked from the roster or none, and a precedence number or none. Renaming a category renames it in every advisor's `owns`; removing one removes it from them. The editor shows the dropped-entry and owner-resolution warnings discovery would report. Saving drops a category without a description with a warning and writes the valid entries only.
 
 Example:
 

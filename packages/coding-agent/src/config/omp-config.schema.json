@@ -70,6 +70,7 @@
       "default": {}
     },
     "allowProjectMeteredPools": {
+      "description": "Let project settings add pools funded by metered (pay-per-use) accounts and redefine model groups a lower layer defines. Read from the global config, --config overlays, and runtime overrides; a project value is ignored.",
       "type": "boolean",
       "default": false
     },
@@ -1731,7 +1732,7 @@
           "default": 1
         },
         "maxNotesPerUpdate": {
-          "description": "Maximum non-blocker advice notes accepted per advisor prompt update (1–32; UI offers 1–5 quick picks). Blockers are exempt.",
+          "description": "Maximum non-blocker advice notes accepted per advisor prompt update (1–32). Blockers are exempt.",
           "type": "number",
           "default": 4
         },
@@ -1759,10 +1760,12 @@
                   "default": false
                 },
                 "model": {
+                  "description": "Model that judges advisor findings. Only @judge (the 'judge' model role chain) is supported.",
                   "type": "string",
                   "default": "@judge"
                 },
                 "timeoutMs": {
+                  "description": "Deadline of one anchor group's judgment, fallback candidates included; on timeout the findings stay as recorded.",
                   "type": "number",
                   "default": 10000
                 },

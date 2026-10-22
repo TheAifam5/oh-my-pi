@@ -81,6 +81,30 @@ import {
 	type StripState as HubStripState,
 } from "./hub-frame";
 import { renderSegmentTrack } from "../chrome/segment-track";
+import {
+	accountDrain,
+	accountList,
+	accountOrder,
+	appendPoolLimit,
+	BUDGET_SPEC_USAGE,
+	cycleQuotaReserve,
+	cycleQuotaUnknown,
+	draftRecord,
+	formatBudgetSpec,
+	POOL_DRAIN_RETURN,
+	POOL_DRAIN_SPEND,
+	poolLimitList,
+	removePoolLimit,
+	setAccountDrain,
+	setMeteredSpending,
+	setQuotaTolerance,
+	spendingPolicy,
+	strategyNames,
+	toggleAccountEntry,
+	toggleCacheField,
+	toggleStrategy,
+	parseBudgetSpec,
+} from "./model-hub-routing";
 
 const MODEL_HUB_BODY_MIN_WIDTH = 28;
 
@@ -121,6 +145,9 @@ export interface ModelHubPoolTarget {
 	key: string;
 }
 
+/** Where a pool edit is written: a role or chain entry, or the `modelGroups.<key>` entry a reference names. */
+export type ModelHubWriteTarget = ModelHubPoolTarget | { kind: "group"; key: string };
+
 /** One pool member as the hub shows it. */
 export interface ModelHubPoolMember {
 	alias: string;
@@ -131,7 +158,7 @@ export interface ModelHubPoolMember {
 	weight?: number;
 }
 
-/** Read-only view of a pool configured at a role or fallback-chain entry. */
+/** View of a pool configured at a role or fallback-chain entry. */
 export interface ModelHubPool {
 	/** `inline`: the group is written at the entry; `ref`: the entry names `modelGroups.<group>`. */
 	source: { kind: "inline" } | { kind: "ref"; group: string; profile?: string };
@@ -141,10 +168,16 @@ export interface ModelHubPool {
 	members: readonly ModelHubPoolMember[];
 	/** Authorized billing classes in funding order; empty when the pool configures none. */
 	funding: readonly string[];
-	/** Spending policy as display text; never edited by the hub. */
+	/** Spending policy as display text. */
 	spending?: string;
-	/** Local limits as display text (how many, and the one closest to its cap); never edited by the hub. */
+	/** Local limits as display text (how many, and the one closest to its cap). */
 	limits?: string;
+	/** `routing.quota` as display text (reserve, observation age, unknown handling). */
+	quota?: string;
+	/** `routing.accounts` as display text (order, drain target, drain spend, return triggers). */
+	accounts?: string;
+	/** `routing.cache` as display text (affinity, pricing). */
+	cache?: string;
 	/** Why the hub must not edit this pool; undefined when it may. */
 	readOnly?: string;
 	/**
@@ -152,9 +185,15 @@ export interface ModelHubPool {
 	 * model; the hub can only remove such an entry. Undefined for a valid pool.
 	 */
 	invalid?: string;
-	/** The entry exactly as configured, present only when the hub may edit it; edits round-trip through a copy. */
+	/**
+	 * The configuration edits replace, present only when the hub may edit it: the entry for an inline
+	 * pool, the `modelGroups.<group>` definition for a reference. Edits round-trip through a copy.
+	 */
 	raw?: Readonly<Record<string, unknown>>;
 }
+
+/** A pool limit parsed from the `<metric> <max> [<window>] [warn|skip]` syntax, or why it does not parse. */
+export type ModelHubLimitSpecResult = { limit: Readonly<Record<string, unknown>> } | { error: string };
 
 /** Live preferences and selector operations supplied by the host. */
 export interface ModelHubSource extends ModelBrowserSource {
@@ -190,6 +229,18 @@ export interface ModelHubSource extends ModelBrowserSource {
 	billingFor?(model: string): string | undefined;
 	/** Changes (by identity) whenever {@link billingFor} may answer differently; absent: never. */
 	readonly billingRevision?: unknown;
+	/** Names of the stored accounts (`auth.accountPolicies[].name`) `routing.accounts` may list; absent: none. */
+	readonly accountNames?: readonly string[];
+	/** A pool limit from the `/account` limit syntax; absent hosts take no typed limits. */
+	parseLimitSpec?(spec: string): ModelHubLimitSpecResult;
+	/** A configured pool limit in the `/account` limit syntax; undefined for an entry that does not parse. */
+	formatLimit?(limit: unknown): string | undefined;
+	/** Names of the effective `modelGroups` entries; absent: none. */
+	readonly modelGroupNames?: readonly string[];
+	/** Effective role and chain entries that reference `modelGroups.<name>`. */
+	modelGroupReferences?(name: string): readonly ModelHubPoolTarget[];
+	/** Why a global write of `modelGroups.<name>` would not take effect; undefined when it would. */
+	modelGroupWriteBlocker?(name: string): string | undefined;
 }
 
 /** Catalog capabilities required by the model hub. */
@@ -235,11 +286,12 @@ export interface ModelHubCallbacks {
 	/** Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key. */
 	onFallbackChainChange?: (role: string, chain: string[]) => void;
 	/**
-	 * Persist a pool edit: `value` replaces the entry at `target`, `undefined` removes it.
-	 * Returns the validator's message when the value is refused and nothing was written.
+	 * Persist a pool edit: `value` replaces the entry at `target` (a role or chain entry, or a
+	 * `modelGroups` entry), `undefined` removes it. Returns the validator's message when the value is
+	 * refused and nothing was written.
 	 */
 	onPoolChange?: (
-		target: ModelHubPoolTarget,
+		target: ModelHubWriteTarget,
 		value: Readonly<Record<string, unknown>> | undefined,
 	) => string | undefined;
 	/** Locked provider activation: forward to the /login flow. */
@@ -305,11 +357,15 @@ interface SidebarAnchor {
 }
 
 interface StripChip extends HubStripChip<
-	"assign" | "unassign" | "fallback" | "fallbackModel" | "fallbackProvider" | "scope" | "thinking"
+	"assign" | "unassign" | "fallback" | "fallbackModel" | "fallbackProvider" | "scope" | "thinking" | "pool"
 > {
 	role?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	scope?: ModelRoleSelectionScope;
+	/** A pool editor chip's edit, or the editor it opens. */
+	apply?: () => void;
+	/** A pool editor chip whose entry is selected. */
+	on?: boolean;
 }
 
 type StripState =
@@ -346,6 +402,22 @@ type StripState =
 			error?: string;
 			confirm?: { value: string; message: string };
 			preview?: { value: string; text: string | undefined };
+	  }
+	| (HubStripState<StripChip> & {
+			/** A pool editor: chips that edit a pool or open another editor. */
+			kind: "pool";
+			title: string;
+			/** Rebuilds the chips after an edit; set on editors that stay open across edits. */
+			refresh?: () => StripChip[];
+	  })
+	| {
+			/** Footer text input of a pool editor; `submit` returns why the text was refused, keeping it open. */
+			kind: "field";
+			label: string;
+			hint: string;
+			input: Input;
+			error?: string;
+			submit: (value: string) => string | undefined;
 	  };
 
 /** A Roles-view command; keys and the picker's action bar both run {@link ModelHubComponent}'s `#runRolesAction`. */
@@ -365,7 +437,13 @@ type RolesAction =
 	| "pool"
 	| "strategy"
 	| "funding"
-	| "weight";
+	| "weight"
+	| "affinity"
+	| "pricing"
+	| "quotaUnknown"
+	| "reserve"
+	| "routing"
+	| "groups";
 
 /** Printable keys of the Roles view and the command each runs. */
 const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
@@ -385,6 +463,12 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	g: "strategy",
 	o: "funding",
 	w: "weight",
+	a: "affinity",
+	h: "pricing",
+	u: "quotaUnknown",
+	r: "reserve",
+	e: "routing",
+	G: "groups",
 };
 
 /** Strategies `g` cycles through: each needs no options, or only an `order` the hub derives from the members. */
@@ -415,6 +499,9 @@ const POOL_FUNDING_CYCLE: readonly (readonly string[])[] = [
 
 /** Weights `w` cycles a weighted-random member through; `undefined` leaves the strategy default. */
 const POOL_WEIGHT_CYCLE: readonly (number | undefined)[] = [undefined, 1, 2, 3, 5, 10];
+
+/** Pool limit syntax, the `/account` limit syntax without provider evidence. */
+const LIMIT_SPEC_HINT = "<usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip]";
 
 /** Longest member alias the hub derives from a model id; the validator allows 64 and suffixes need room. */
 const POOL_ALIAS_MAX_LENGTH = 48;
@@ -509,15 +596,6 @@ function rolesRowKey(row: RolesRow, index: number): string {
 		case "newFallback":
 			return row.kind;
 	}
-}
-
-/** `parent[key]` as a mapping, replacing a missing or non-mapping value with an empty one. */
-function draftRecord(parent: Record<string, unknown>, key: string): Record<string, unknown> {
-	const value = parent[key];
-	if (isRecord(value)) return value;
-	const created: Record<string, unknown> = {};
-	parent[key] = created;
-	return created;
 }
 
 /**
@@ -1912,9 +1990,22 @@ export class ModelHubComponent implements Component {
 
 	#activateStripChip(): void {
 		const strip = this.#strip;
-		if (!strip || strip.kind === "name") return;
+		if (!strip || strip.kind === "name" || strip.kind === "field") return;
 		const chip = strip.chips[strip.index];
 		if (!chip) return;
+		if (strip.kind === "pool") {
+			chip.apply?.();
+			// An editor that opened another editor has handed the footer over.
+			if (this.#strip !== strip) return;
+			const chips = strip.refresh?.() ?? [];
+			if (chips.length === 0) {
+				this.#closeStrip();
+				return;
+			}
+			strip.chips = chips;
+			strip.index = Math.min(strip.index, chips.length - 1);
+			return;
+		}
 		switch (chip.action) {
 			case "assign":
 				if (chip.role) {
@@ -2176,20 +2267,26 @@ export class ModelHubComponent implements Component {
 		return { target, selectors };
 	}
 
-	/**
-	 * Persist `value` at `target` through the host. A refused value leaves the
-	 * settings untouched and its validator message in the status row.
-	 */
-	#writePool(target: ModelHubPoolTarget, value: Readonly<Record<string, unknown>> | undefined): boolean {
+	/** Persist `value` at `target` through the host; the refusal (sanitized) when nothing was written. */
+	#savePool(target: ModelHubWriteTarget, value: Readonly<Record<string, unknown>> | undefined): string | undefined {
 		const write = this.#callbacks.onPoolChange;
-		if (!write) return false;
+		if (!write) return "pool edits are not available here";
 		let error: string | undefined;
 		try {
 			error = write(target, value);
 		} catch (failure) {
 			error = failure instanceof Error ? failure.message : String(failure);
 		}
-		this.#poolStatus = error === undefined ? undefined : { text: sanitizeDisplayLine(error), tone: "error" };
+		return error === undefined ? undefined : sanitizeDisplayLine(error);
+	}
+
+	/**
+	 * Persist `value` at `target` through the host. A refused value leaves the
+	 * settings untouched and its validator message in the status row.
+	 */
+	#writePool(target: ModelHubWriteTarget, value: Readonly<Record<string, unknown>> | undefined): boolean {
+		const error = this.#savePool(target, value);
+		this.#poolStatus = error === undefined ? undefined : { text: error, tone: "error" };
 		this.#refreshAfterMutation();
 		return error === undefined;
 	}
@@ -2199,13 +2296,41 @@ export class ModelHubComponent implements Component {
 		this.#poolStatus = { text: sanitizeDisplayLine(text), tone: "warning" };
 	}
 
+	/**
+	 * A copy of the editable pool at `target` after `mutate`, with where it is written: the entry, or
+	 * the `modelGroups` entry a reference names. Undefined when the pool is not editable or `mutate`
+	 * returns false.
+	 */
+	#poolDraft(
+		target: ModelHubPoolTarget,
+		mutate: (draft: Record<string, unknown>) => boolean,
+	): { write: ModelHubWriteTarget; draft: Record<string, unknown> } | undefined {
+		const pool = this.#pool(target);
+		if (!this.#poolEditable(pool)) return undefined;
+		const draft = structuredClone(pool.raw) as Record<string, unknown>;
+		if (!mutate(draft)) return undefined;
+		return { write: pool.source.kind === "ref" ? { kind: "group", key: pool.source.group } : target, draft };
+	}
+
 	/** Apply `mutate` to a copy of the editable pool at `target` and persist it; `mutate` returns false to skip the write. */
 	#editPool(target: ModelHubPoolTarget, mutate: (draft: Record<string, unknown>) => boolean): boolean {
-		const pool = this.#pool(target);
-		if (!this.#poolEditable(pool)) return false;
-		const draft = structuredClone(pool.raw) as Record<string, unknown>;
-		if (!mutate(draft)) return false;
-		return this.#writePool(target, draft);
+		const edit = this.#poolDraft(target, mutate);
+		return edit !== undefined && this.#writePool(edit.write, edit.draft);
+	}
+
+	/** {@link #editPool} for a footer field: the refusal, which the field shows, instead of a status-row message. */
+	#editPoolFromField(
+		target: ModelHubPoolTarget,
+		mutate: (draft: Record<string, unknown>) => void,
+	): string | undefined {
+		const edit = this.#poolDraft(target, draft => {
+			mutate(draft);
+			return true;
+		});
+		if (!edit) return undefined;
+		const error = this.#savePool(edit.write, edit.draft);
+		this.#refreshAfterMutation();
+		return error;
 	}
 
 	/** `m`: turn a legacy selector value into a `priority` pool, one member per selector in configured order. */
@@ -2342,7 +2467,7 @@ export class ModelHubComponent implements Component {
 	#cyclePoolStrategy(target: ModelHubPoolTarget): void {
 		const pool = this.#pool(target);
 		if (pool && Array.isArray(pool.raw?.strategy)) {
-			this.#poolNotice(`strategy list ${pool.strategy} is not in the hub's strategy cycle; change it in config`);
+			this.#poolNotice(`strategy list ${pool.strategy} is not in the hub's strategy cycle; change it with e`);
 			return;
 		}
 		this.#editPool(target, draft => {
@@ -2433,9 +2558,415 @@ export class ModelHubComponent implements Component {
 		});
 	}
 
+	// ─── Routing editors ────────────────────────────────────────────────────
+
+	/** A pool editor chip: `apply` runs on Enter, `on` marks a selected entry. */
+	#poolChip(label: string, apply: () => void, on = false): StripChip {
+		const shown = sanitizeDisplayLine(label);
+		return {
+			label: shown,
+			styled: on ? theme.fg("accent", `${theme.status.enabled} ${shown}`) : theme.fg("muted", shown),
+			action: "pool",
+			apply,
+			...(on ? { on: true } : {}),
+		};
+	}
+
+	/**
+	 * Open a chip editor titled `title`; with `stay`, it stays open across edits and rebuilds its
+	 * chips from `chips` after each. Returns false, opening nothing, when there are no chips.
+	 */
+	#openPoolStrip(title: string, chips: () => StripChip[], stay: boolean): boolean {
+		const built = chips();
+		if (built.length === 0) return false;
+		this.#strip = { kind: "pool", title: sanitizeDisplayLine(title), chips: built, index: 0 };
+		if (stay) this.#strip.refresh = chips;
+		return true;
+	}
+
+	/** Open a footer field prefilled with `value`; `submit` returns why the text was refused. */
+	#openPoolField(label: string, hint: string, value: string, submit: (value: string) => string | undefined): void {
+		const input = new Input();
+		input.setValue(value);
+		this.#strip = { kind: "field", label: sanitizeDisplayLine(label), hint, input, submit };
+	}
+
+	/** Run the open field's submit: close it when accepted, else show why it was refused. */
+	#submitField(): void {
+		const strip = this.#strip;
+		if (strip?.kind !== "field") return;
+		const error = strip.submit(strip.input.getValue());
+		if (this.#strip !== strip) return;
+		if (error === undefined) this.#closeStrip();
+		else strip.error = sanitizeDisplayLine(error);
+	}
+
+	/** Apply a draft edit to the editable pool at `target` from a chip. */
+	#poolEdit(target: ModelHubPoolTarget, mutate: (draft: Record<string, unknown>) => void): () => void {
+		return () => {
+			this.#editPool(target, draft => {
+				mutate(draft);
+				return true;
+			});
+		};
+	}
+
+	#accountNames(): readonly string[] {
+		try {
+			return this.#settings.accountNames ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	#modelGroupNames(): readonly string[] {
+		try {
+			return this.#settings.modelGroupNames ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/** `e`: the routing editors of the editable pool at `target`. */
+	#openRoutingMenu(target: ModelHubPoolTarget): void {
+		this.#openPoolStrip(
+			"Routing",
+			() => [
+				this.#poolChip("account order", () => this.#openAccountOrder(target)),
+				this.#poolChip("drain", () => this.#openAccountDrain(target)),
+				this.#poolChip("drain spend", () => this.#openAccountList(target, "spend")),
+				this.#poolChip("return when", () => this.#openAccountList(target, "returnWhen")),
+				this.#poolChip("metered", () => this.#openMetered(target)),
+				this.#poolChip("limits", () => this.#openLimits(target)),
+				this.#poolChip("strategies", () => this.#openStrategies(target)),
+				this.#poolChip("quota tolerance", () => this.#openTolerance(target)),
+			],
+			false,
+		);
+	}
+
+	/** `routing.accounts.order`: each named account toggles in or out, appended at the end. */
+	#openAccountOrder(target: ModelHubPoolTarget): void {
+		const opened = this.#openPoolStrip(
+			"Account order",
+			() => {
+				const order = accountOrder(this.#pool(target)?.raw);
+				return [...new Set([...order, ...this.#accountNames()])].map(name => {
+					const at = order.indexOf(name);
+					const edit = this.#poolEdit(target, draft => toggleAccountEntry(draft, "order", name));
+					return this.#poolChip(at >= 0 ? `${at + 1} ${name}` : name, edit, at >= 0);
+				});
+			},
+			true,
+		);
+		if (!opened) this.#poolNotice("No named accounts; name one with /account first");
+	}
+
+	/** `routing.accounts.drain`: one named account, or none. */
+	#openAccountDrain(target: ModelHubPoolTarget): void {
+		const drain = accountDrain(this.#pool(target)?.raw);
+		const names = [...new Set([...(drain === undefined ? [] : [drain]), ...this.#accountNames()])];
+		if (names.length === 0) {
+			this.#poolNotice("No named accounts; name one with /account first");
+			return;
+		}
+		this.#openPoolStrip(
+			"Drain",
+			() => [
+				this.#poolChip(
+					"none",
+					this.#poolEdit(target, draft => setAccountDrain(draft, undefined)),
+					drain === undefined,
+				),
+				...names.map(name =>
+					this.#poolChip(
+						name,
+						this.#poolEdit(target, draft => setAccountDrain(draft, name)),
+						name === drain,
+					),
+				),
+			],
+			false,
+		);
+	}
+
+	/** `routing.accounts.spend` or `returnWhen`: each class or trigger toggles. */
+	#openAccountList(target: ModelHubPoolTarget, field: "spend" | "returnWhen"): void {
+		const values = field === "spend" ? POOL_DRAIN_SPEND : POOL_DRAIN_RETURN;
+		this.#openPoolStrip(
+			field === "spend" ? "Drain spend" : "Return when",
+			() => {
+				const selected = accountList(this.#pool(target)?.raw, field);
+				return values.map(value =>
+					this.#poolChip(
+						value,
+						this.#poolEdit(target, draft => toggleAccountEntry(draft, field, value)),
+						selected.includes(value),
+					),
+				);
+			},
+			true,
+		);
+	}
+
+	/** `metered` funding with its spending policy, or neither. */
+	#openMetered(target: ModelHubPoolTarget): void {
+		const policy = spendingPolicy(this.#pool(target)?.raw);
+		this.#openPoolStrip(
+			"Metered",
+			() => [
+				this.#poolChip(
+					"provider-managed",
+					this.#poolEdit(target, draft => setMeteredSpending(draft, { policy: "provider-managed" })),
+					policy === "provider-managed",
+				),
+				this.#poolChip("local hard budget…", () => this.#openBudget(target), policy === "local-hard-budget"),
+				this.#poolChip(
+					"off",
+					this.#poolEdit(target, draft => setMeteredSpending(draft, undefined)),
+					!policy,
+				),
+			],
+			false,
+		);
+	}
+
+	#openBudget(target: ModelHubPoolTarget): void {
+		this.#openPoolField("Budget:", BUDGET_SPEC_USAGE, formatBudgetSpec(this.#pool(target)?.raw), value => {
+			const parsed = parseBudgetSpec(value);
+			if ("error" in parsed) return parsed.error;
+			return this.#editPoolFromField(target, draft => setMeteredSpending(draft, parsed.spending));
+		});
+	}
+
+	/** `routing.limits`: each limit chip removes it; the last chip adds one typed in the `/account` limit syntax. */
+	#openLimits(target: ModelHubPoolTarget): void {
+		const opened = this.#openPoolStrip(
+			"Limits",
+			() => {
+				const chips = poolLimitList(this.#pool(target)?.raw).map((limit, index) =>
+					this.#poolChip(
+						`remove ${this.#limitLabel(limit)}`,
+						this.#poolEdit(target, draft => removePoolLimit(draft, index)),
+					),
+				);
+				if (this.#settings.parseLimitSpec) chips.push(this.#poolChip("add…", () => this.#openLimitField(target)));
+				return chips;
+			},
+			true,
+		);
+		if (!opened) this.#poolNotice("This pool has no limits, and limits cannot be typed here");
+	}
+
+	#limitLabel(limit: unknown): string {
+		let label: string | undefined;
+		try {
+			label = this.#settings.formatLimit?.(limit);
+		} catch {
+			label = undefined;
+		}
+		return label ?? JSON.stringify(limit) ?? "limit";
+	}
+
+	#openLimitField(target: ModelHubPoolTarget): void {
+		this.#openPoolField("Limit:", LIMIT_SPEC_HINT, "", value => {
+			let parsed: ModelHubLimitSpecResult | undefined;
+			try {
+				parsed = this.#settings.parseLimitSpec?.(value);
+			} catch (error) {
+				return error instanceof Error ? error.message : String(error);
+			}
+			if (!parsed) return undefined;
+			if ("error" in parsed) return parsed.error;
+			return this.#editPoolFromField(target, draft => appendPoolLimit(draft, parsed.limit));
+		});
+	}
+
+	/** Strategy list: each strategy toggles, appended at the end; the list order is the chip numbering. */
+	#openStrategies(target: ModelHubPoolTarget): void {
+		this.#openPoolStrip(
+			"Strategies",
+			() => {
+				const pool = this.#pool(target);
+				const names = strategyNames(pool?.raw);
+				const aliases = (pool?.members ?? []).map(member => member.alias);
+				return POOL_STRATEGY_CYCLE.map(name => {
+					const at = names.indexOf(name);
+					const edit = this.#poolEdit(target, draft => toggleStrategy(draft, name, aliases));
+					return this.#poolChip(at >= 0 ? `${at + 1} ${name}` : name, edit, at >= 0);
+				});
+			},
+			true,
+		);
+	}
+
+	/** `strategyOptions.tolerance` of a quota strategy; empty removes it. */
+	#openTolerance(target: ModelHubPoolTarget): void {
+		const options = this.#pool(target)?.raw?.strategyOptions;
+		const current = isRecord(options) && typeof options.tolerance === "number" ? String(options.tolerance) : "";
+		this.#openPoolField("Quota tolerance:", "a number in (0, 0.5] · empty removes", current, value => {
+			const text = value.trim();
+			const tolerance = text.length === 0 ? undefined : Number(text);
+			if (tolerance !== undefined && !Number.isFinite(tolerance)) return "Tolerance must be a number in (0, 0.5]";
+			return this.#editPoolFromField(target, draft => setQuotaTolerance(draft, tolerance));
+		});
+	}
+
+	// ─── Model groups ───────────────────────────────────────────────────────
+
+	/** The entry `G` on `row` edits: a pool-capable role or a fallback chain the global layer supplies. */
+	#groupEntry(row: RolesRow | undefined): ModelHubPoolTarget | undefined {
+		if (!this.#callbacks.onPoolChange || !row) return undefined;
+		let target: ModelHubPoolTarget;
+		switch (row.kind) {
+			case "role":
+				if (!this.#settings.roleAcceptsPools?.(row.role)) return undefined;
+				target = { kind: "role", key: row.role };
+				break;
+			case "chainKey":
+			case "pool":
+			case "fallback":
+				target = { kind: "chain", key: row.role };
+				break;
+			case "poolMember":
+				target = row.target;
+				break;
+			default:
+				return undefined;
+		}
+		try {
+			return this.#settings.poolWriteBlocker?.(target) === undefined ? target : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Config path of a role or chain entry. */
+	#entryPath(target: ModelHubPoolTarget): string {
+		return `${target.kind === "role" ? "modelRoles" : "retry.fallbackChains"}.${target.key}`;
+	}
+
+	/**
+	 * Chips of the `G` editor on `entry`: point it at each other model group; turn its inline pool into
+	 * a new group; rename or delete the group it references.
+	 */
+	#groupChips(entry: ModelHubPoolTarget): StripChip[] {
+		const pool = this.#pool(entry);
+		const current = pool?.source.kind === "ref" ? pool.source.group : undefined;
+		const chips = this.#modelGroupNames()
+			.filter(name => name !== current)
+			.map(name => this.#poolChip(`use +${name}`, () => this.#writePool(entry, { use: name })));
+		if (!this.#poolEditable(pool)) return chips;
+		const raw = pool.raw;
+		if (current === undefined) {
+			chips.push(this.#poolChip("new group…", () => this.#openNewGroup(entry, raw)));
+		} else {
+			const profile = pool.source.kind === "ref" ? pool.source.profile : undefined;
+			chips.push(
+				this.#poolChip(`rename +${current}…`, () => this.#openRenameGroup(current, raw)),
+				this.#poolChip(`delete +${current}`, () => this.#deleteGroup(entry, current, raw, profile)),
+			);
+		}
+		return chips;
+	}
+
+	/** Whether `G` on `row` opens an editor with something to do. */
+	#groupsAvailable(row: RolesRow | undefined): boolean {
+		const entry = this.#groupEntry(row);
+		return entry !== undefined && this.#groupChips(entry).length > 0;
+	}
+
+	/** `G`: the model-group editor of the entry `row` edits. */
+	#openGroupStrip(row: RolesRow | undefined): void {
+		const entry = this.#groupEntry(row);
+		if (entry) this.#openPoolStrip(`Group of ${entry.key}`, () => this.#groupChips(entry), false);
+	}
+
+	/** Name a new `modelGroups` entry holding the inline pool `raw`, and point `entry` at it. */
+	#openNewGroup(entry: ModelHubPoolTarget, raw: Readonly<Record<string, unknown>>): void {
+		this.#openPoolField("New group name:", "(letters, digits, - and _)", "", value => {
+			const name = value.trim();
+			if (name.length === 0) return "Enter a group name";
+			if (this.#modelGroupNames().includes(name)) return `modelGroups.${name} already exists`;
+			const { profile, ...definition } = raw;
+			const created = this.#savePool({ kind: "group", key: name }, definition);
+			if (created !== undefined) return created;
+			const pointed = this.#savePool(entry, typeof profile === "string" ? { use: name, profile } : { use: name });
+			if (pointed !== undefined) this.#savePool({ kind: "group", key: name }, undefined);
+			this.#refreshAfterMutation();
+			return pointed;
+		});
+	}
+
+	#openRenameGroup(from: string, raw: Readonly<Record<string, unknown>>): void {
+		this.#openPoolField(`Rename +${from} to:`, "(letters, digits, - and _)", from, value =>
+			this.#renameGroup(from, value.trim(), raw),
+		);
+	}
+
+	/**
+	 * Rename `modelGroups.<from>` to `to`: write the definition `raw` under `to`, point every entry
+	 * that references `from` at `to` (keeping its profile), then remove `from`. Refused, writing
+	 * nothing, when `to` exists or a referencing entry comes from a layer above global.
+	 */
+	#renameGroup(from: string, to: string, raw: Readonly<Record<string, unknown>>): string | undefined {
+		if (to === from) return undefined;
+		if (to.length === 0) return "Enter a group name";
+		if (this.#modelGroupNames().includes(to)) return `modelGroups.${to} already exists`;
+		const references = this.#groupReferences(from);
+		for (const reference of references) {
+			const blocker = this.#settings.poolWriteBlocker?.(reference);
+			if (blocker !== undefined) return `${this.#entryPath(reference)} uses +${from} and is ${blocker}`;
+		}
+		const created = this.#savePool({ kind: "group", key: to }, raw);
+		if (created !== undefined) return created;
+		for (const reference of references) {
+			const source = this.#pool(reference)?.source;
+			const profile = source?.kind === "ref" ? source.profile : undefined;
+			const error = this.#savePool(reference, profile === undefined ? { use: to } : { use: to, profile });
+			if (error !== undefined) {
+				this.#refreshAfterMutation();
+				return error;
+			}
+		}
+		const removed = this.#savePool({ kind: "group", key: from }, undefined);
+		this.#refreshAfterMutation();
+		return removed;
+	}
+
+	#groupReferences(name: string): readonly ModelHubPoolTarget[] {
+		try {
+			return this.#settings.modelGroupReferences?.(name) ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * Delete `modelGroups.<name>`, which only `entry` references: `entry` keeps the pool as an inline
+	 * copy of `raw` (with its `profile`). Declined while another entry references the group.
+	 */
+	#deleteGroup(
+		entry: ModelHubPoolTarget,
+		name: string,
+		raw: Readonly<Record<string, unknown>>,
+		profile: string | undefined,
+	): void {
+		const others = this.#groupReferences(name).filter(
+			reference => reference.kind !== entry.kind || reference.key !== entry.key,
+		);
+		if (others.length > 0) {
+			const users = others.map(reference => this.#entryPath(reference)).join(", ");
+			this.#poolNotice(`+${name} is still used by ${users}; point those elsewhere first`);
+			return;
+		}
+		if (!this.#writePool(entry, profile === undefined ? { ...raw } : { ...raw, profile })) return;
+		this.#writePool({ kind: "group", key: name }, undefined);
+	}
+
 	// ─── Pool display ───────────────────────────────────────────────────────
 
-	/** One-line pool summary: members, strategy, funding order, read-only routing, and why it is read-only. */
+	/** One-line pool summary: members, strategy, funding order, routing, and why it is read-only. */
 	#poolSummary(pool: ModelHubPool | undefined): string {
 		if (!pool) return "invalid pool · fix it in config";
 		if (pool.invalid !== undefined) return sanitizeDisplayLine(`invalid pool · skipped · ${pool.invalid}`);
@@ -2451,6 +2982,9 @@ export class ModelHubComponent implements Component {
 			pool.funding.length > 0 ? `funding ${pool.funding.join(" → ")}` : undefined,
 			pool.spending ? `spending ${pool.spending}` : undefined,
 			pool.limits ? `limits ${pool.limits}` : undefined,
+			pool.quota ? `quota ${pool.quota}` : undefined,
+			pool.accounts ? `accounts ${pool.accounts}` : undefined,
+			pool.cache ? `cache ${pool.cache}` : undefined,
 			pool.readOnly ? `read-only: ${pool.readOnly}` : undefined,
 		];
 		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
@@ -2821,6 +3355,15 @@ export class ModelHubComponent implements Component {
 			if (strip.purpose === "compaction") strip.error = undefined;
 			return;
 		}
+		if (strip.kind === "field") {
+			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+				this.#submitField();
+				return;
+			}
+			strip.input.handleInput(data);
+			strip.error = undefined;
+			return;
+		}
 		if (moveStripSelection(strip, data)) return;
 		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
 			this.#activateStripChip();
@@ -3013,6 +3556,25 @@ export class ModelHubComponent implements Component {
 			case "weight":
 				if (row?.kind === "poolMember" && editable) this.#cyclePoolWeight(row.target, row.alias);
 				return;
+			case "affinity":
+			case "pricing":
+				if (editable) {
+					const field = action === "affinity" ? "affinity" : "pricing";
+					this.#poolEdit(editable.target, draft => toggleCacheField(draft, field))();
+				}
+				return;
+			case "quotaUnknown":
+				if (editable) this.#poolEdit(editable.target, cycleQuotaUnknown)();
+				return;
+			case "reserve":
+				if (editable) this.#poolEdit(editable.target, cycleQuotaReserve)();
+				return;
+			case "routing":
+				if (editable) this.#openRoutingMenu(editable.target);
+				return;
+			case "groups":
+				this.#openGroupStrip(row);
+				return;
 			case "new":
 				this.#openNameStrip("role");
 				return;
@@ -3061,7 +3623,12 @@ export class ModelHubComponent implements Component {
 		// Footer strip chips (columns stay in frame coordinates).
 		if (footerColumn !== undefined && this.#strip) {
 			const strip = this.#strip;
-			if (event.leftClick && strip.kind !== "name" && this.#frame.selectChipAt(strip, footerColumn)) {
+			if (
+				event.leftClick &&
+				strip.kind !== "name" &&
+				strip.kind !== "field" &&
+				this.#frame.selectChipAt(strip, footerColumn)
+			) {
 				this.#activateStripChip();
 			}
 			return true;
@@ -3338,9 +3905,19 @@ export class ModelHubComponent implements Component {
 		if (!row || !target) return undefined;
 		const editable = this.#rowEditablePool(row) !== undefined;
 		const hints: ({ label: string; keys: KeyName[] } | false)[] = [];
-		const routing = editable && [
-			{ label: "strategy", keys: ["g"] as KeyName[] },
-			{ label: "funding", keys: ["o"] as KeyName[] },
+		const routing = [
+			...(editable
+				? [
+						{ label: "strategy", keys: ["g"] as KeyName[] },
+						{ label: "funding", keys: ["o"] as KeyName[] },
+						{ label: "routing", keys: ["e"] as KeyName[] },
+						{ label: "cache affinity", keys: ["a"] as KeyName[] },
+						{ label: "cache pricing", keys: ["h"] as KeyName[] },
+						{ label: "quota unknown", keys: ["u"] as KeyName[] },
+						{ label: "quota reserve", keys: ["r"] as KeyName[] },
+					]
+				: []),
+			...(this.#groupsAvailable(row) ? [{ label: "group", keys: ["shift+g"] as KeyName[] }] : []),
 		];
 		if (row.kind === "role") {
 			hints.push(
@@ -3348,7 +3925,7 @@ export class ModelHubComponent implements Component {
 				this.#rolePool(row.role)?.invalid !== undefined && { label: "replace", keys: ["enter"] },
 				this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
 				this.#poolClearable(target) && { label: "clear", keys: ["x"] },
-				...(routing || []),
+				...routing,
 				{ label: "cycle", keys: ["c"] },
 				{ label: "reorder", keys: ["[", "]"] },
 				{ label: "new", keys: ["n"] },
@@ -3365,13 +3942,13 @@ export class ModelHubComponent implements Component {
 				this.#poolMemberEffortItem(row) !== undefined && { label: "effort", keys: ["t"] },
 				editable && poolTailStrategy(pool) === "weighted-random" && { label: "weight", keys: ["w"] },
 				editable && this.#poolOrdered(target) && { label: "reorder", keys: ["[", "]"] },
-				...(routing || []),
+				...routing,
 			);
 		} else {
 			hints.push(
 				editable && { label: "add member", keys: ["enter", "f"] },
 				this.#poolClearable(target) && { label: "clear chain", keys: ["x"] },
-				...(routing || []),
+				...routing,
 			);
 		}
 		return hints.filter(hint => hint !== false);
@@ -3641,6 +4218,12 @@ export class ModelHubComponent implements Component {
 				}
 				return `${enter} create + pick model · ${cancel} cancel`;
 			}
+			if (strip.kind === "field") return `${enter} save · ${cancel} cancel`;
+			if (strip.kind === "pool") {
+				return strip.refresh
+					? `${leftRight} choose · ${enter} toggle · ${cancel} done`
+					: `${leftRight} choose · ${enter} apply · ${cancel} cancel`;
+			}
 			if (strip.kind === "role") return `${leftRight} choose · ${enter} assign/clear · ${cancel} cancel`;
 			if (strip.kind === "scope") return `${leftRight} save scope · ${enter} choose · ${cancel} cancel`;
 			return `${leftRight} thinking level · ${enter} apply · ${cancel} keep`;
@@ -3682,7 +4265,9 @@ export class ModelHubComponent implements Component {
 				const parts = poolHints.map(hint => `${formatKeyHints(hint.keys)} ${hint.label}`);
 				return [`${upDown} rows`, ...parts, `${left} providers`].join(" · ");
 			}
-			const convert = this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : "";
+			const convert = `${this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : ""}${
+				this.#groupsAvailable(row) ? ` · ${formatKeyHint("shift+g")} group` : ""
+			}`;
 			if (row?.kind === "fallback") {
 				// Advertise `t` only when the entry resolves: wildcards always
 				// inherit and unknown models have no ladder to offer, so the
@@ -3751,11 +4336,23 @@ export class ModelHubComponent implements Component {
 			}
 			return truncateToWidth(`${label} ${inputLine} ${hint}`, width);
 		}
+		if (strip.kind === "field") {
+			const inputWidth = Math.max(8, Math.min(40, width - visibleWidth(strip.label) - 24));
+			const inputLine = strip.input.render(inputWidth)[0] ?? "";
+			const hint =
+				strip.error !== undefined
+					? theme.fg("error", strip.error)
+					: theme.fg("dim", sanitizeDisplayLine(strip.hint));
+			return truncateToWidth(`${theme.fg("accent", strip.label)} ${inputLine} ${hint}`, width);
+		}
 
-		const prefix =
-			strip.kind === "role"
-				? `${theme.fg("accent", strip.item.id)}${theme.fg("dim", " →")} `
-				: `${theme.fg(this.#settings.getRoleInfo(strip.role ?? "").color ?? "muted", (this.#settings.getRoleInfo(strip.role ?? "").tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${strip.item.id} →`)} `;
+		let prefix: string;
+		if (strip.kind === "pool") prefix = `${theme.fg("accent", strip.title)}${theme.fg("dim", " →")} `;
+		else if (strip.kind === "role") prefix = `${theme.fg("accent", strip.item.id)}${theme.fg("dim", " →")} `;
+		else {
+			const info = this.#settings.getRoleInfo(strip.role ?? "");
+			prefix = `${theme.fg(info.color ?? "muted", (info.tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${strip.item.id} →`)} `;
+		}
 
 		// Horizontal window: once the strip overflows, drop leading chips behind
 		// a dim ellipsis so the selected chip (plus one chip of lookahead when it
@@ -3875,7 +4472,8 @@ export class ModelHubComponent implements Component {
 					// A chip click picks and applies it, like the footer mouse path.
 					const strip = this.#strip;
 					const index = Number(event.item);
-					if (!strip || strip.kind === "name" || !Number.isInteger(index) || !strip.chips[index]) return;
+					if (!strip || strip.kind === "name" || strip.kind === "field") return;
+					if (!Number.isInteger(index) || !strip.chips[index]) return;
 					strip.index = index;
 					this.#activateStripChip();
 					break;
@@ -4446,6 +5044,15 @@ export class ModelHubComponent implements Component {
 		const cancel = (label: string): TspPickerAction => ({ ...CLOSE_ACTION, label });
 		if (this.#assignmentPending) return [CLOSE_ACTION];
 		if (strip) {
+			if (strip.kind === "field") {
+				return [pickerAction("poolField", "Save", "enter", { primary: true }), cancel("Cancel")];
+			}
+			if (strip.kind === "pool") {
+				return [
+					pickerAction("stripApply", strip.refresh ? "Toggle" : "Apply", "enter", { primary: true }),
+					cancel(strip.refresh ? "Done" : "Cancel"),
+				];
+			}
 			const apply =
 				strip.kind === "name"
 					? strip.purpose === "compaction"
@@ -4499,7 +5106,9 @@ export class ModelHubComponent implements Component {
 					if (hint.keys[0] === "[")
 						return [roleAction("earlier", "Earlier", "["), roleAction("later", "Later", "]")];
 					const key = hint.keys.includes("enter") ? "enter" : hint.keys[0]!;
-					const action = key === "enter" ? "pick" : ROLES_ACTION_KEYS[key];
+					// A shifted letter runs the command of the capital it types.
+					const typed = key.startsWith("shift+") ? key.slice("shift+".length).toUpperCase() : key;
+					const action = key === "enter" ? "pick" : ROLES_ACTION_KEYS[typed];
 					const label = `${hint.label.charAt(0).toUpperCase()}${hint.label.slice(1)}`;
 					return action ? [roleAction(action, label, key, key === "enter")] : [];
 				});
@@ -4556,6 +5165,7 @@ export class ModelHubComponent implements Component {
 					actions.push(roleAction("pick", "New role", "enter", true));
 					break;
 			}
+			if (this.#groupsAvailable(row)) actions.push(roleAction("groups", "Model group", "shift+g"));
 			return compact([...actions, CLOSE_ACTION]);
 		}
 		if (lockedView) {
@@ -4600,8 +5210,23 @@ export class ModelHubComponent implements Component {
 				items: [],
 			};
 		}
+		if (strip.kind === "field") {
+			return {
+				label: [
+					span(`${strip.label} `, "muted"),
+					span(strip.input.getValue(), "mono"),
+					span("▏", "accent"),
+					strip.error !== undefined
+						? span(`  ${strip.error}`, "error")
+						: span(`  ${sanitizeDisplayLine(strip.hint)}`, "dim"),
+				],
+				items: [],
+			};
+		}
 		let label: TspSpan[];
-		if (strip.kind === "role") {
+		if (strip.kind === "pool") {
+			label = [span(strip.title, "muted")];
+		} else if (strip.kind === "role") {
 			// The second step of "New fallback chain…" reuses the role strip with key chips only.
 			const keyStrip = strip.chips.every(chip => chip.label.startsWith("for "));
 			label = keyStrip
@@ -4630,6 +5255,7 @@ export class ModelHubComponent implements Component {
 							: undefined;
 				const dot = level !== undefined ? thinkingDotToken(level) : undefined;
 				const on =
+					chip.on === true ||
 					chip.action === "unassign" ||
 					(strip.kind === "thinking" &&
 						chip.thinkingLevel !== undefined &&
@@ -4902,7 +5528,7 @@ export class ModelHubComponent implements Component {
 		return children;
 	}
 
-	/** A pool's preview section: strategy, funding, read-only routing, then each member with effort and weight. */
+	/** A pool's preview section: strategy, funding, routing, then each member with effort and weight. */
 	#poolPreview(pool: ModelHubPool | undefined, head: string): NativeChild[] {
 		if (!pool || pool.invalid !== undefined) {
 			const message =
@@ -4920,6 +5546,9 @@ export class ModelHubComponent implements Component {
 				: undefined,
 			pool.spending ? row("Spending", pool.spending) : undefined,
 			pool.limits ? row("Limits", pool.limits) : undefined,
+			pool.quota ? row("Quota", pool.quota) : undefined,
+			pool.accounts ? row("Accounts", pool.accounts) : undefined,
+			pool.cache ? row("Cache", pool.cache) : undefined,
 			pool.readOnly ? row("Read-only", pool.readOnly) : undefined,
 		];
 		const members = pool.members.map(member => {
@@ -5021,7 +5650,8 @@ export class ModelHubComponent implements Component {
 			case "strip": {
 				const strip = this.#strip;
 				const index = Number(value);
-				if (!strip || strip.kind === "name" || !Number.isInteger(index) || !strip.chips[index]) return;
+				if (!strip || strip.kind === "name" || strip.kind === "field") return;
+				if (!Number.isInteger(index) || !strip.chips[index]) return;
 				strip.index = index;
 				this.#activateStripChip();
 				return;
@@ -5037,6 +5667,9 @@ export class ModelHubComponent implements Component {
 				return;
 			case "compactionPoint":
 				this.#submitNameStrip();
+				return;
+			case "poolField":
+				this.#submitField();
 				return;
 			case "cancel":
 				if (this.#strip) this.#closeStrip();
@@ -5079,6 +5712,8 @@ export class ModelHubComponent implements Component {
 				const glyph = chip.thinkingLevel === undefined ? "" : thinkingLevelGlyph(chip.thinkingLevel, theme);
 				return glyph ? [span(glyph, "accent"), span(` ${chip.label}`)] : [span(chip.label)];
 			}
+			case "pool":
+				return chip.on ? [span(`${theme.status.enabled} ${chip.label}`, "accent")] : [span(chip.label, "muted")];
 			default:
 				return [span(plainText(chip.styled), "muted")];
 		}
@@ -5113,8 +5748,29 @@ export class ModelHubComponent implements Component {
 				preset ? "presetName" : "roleName",
 			);
 		}
+		if (strip.kind === "field") {
+			return node(
+				"row",
+				{ gap: "sm", align: "center" },
+				[
+					text([span(strip.label, "accent")]),
+					col([strip.input], { grow: 1 }),
+					text(
+						[
+							strip.error !== undefined
+								? span(strip.error, "error")
+								: span(sanitizeDisplayLine(strip.hint), "dim"),
+						],
+						{ wrap: "word" },
+					),
+				],
+				"poolField",
+			);
+		}
 		let prefix: TspSpan[];
-		if (strip.kind === "role") {
+		if (strip.kind === "pool") {
+			prefix = [span(strip.title, "accent"), span(" →", "dim")];
+		} else if (strip.kind === "role") {
 			prefix = [span(strip.item.id, "accent"), span(" →", "dim")];
 		} else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
@@ -5171,6 +5827,12 @@ export class ModelHubComponent implements Component {
 					return [keys("save scope", "left", "right"), keys("choose", "enter"), cancel("cancel")];
 				case "thinking":
 					return [keys("thinking level", "left", "right"), keys("apply", "enter"), cancel("keep")];
+				case "field":
+					return [keys("save", "enter"), cancel("cancel")];
+				case "pool":
+					return strip.refresh
+						? [keys("choose", "left", "right"), keys("toggle", "enter"), cancel("done")]
+						: [keys("choose", "left", "right"), keys("apply", "enter"), cancel("cancel")];
 			}
 		}
 		if (this.#assigning !== null) {
@@ -5222,6 +5884,7 @@ export class ModelHubComponent implements Component {
 				];
 			}
 			const convert = this.#legacyPoolSource(row) ? keys("pool", "m") : undefined;
+			const group = this.#groupsAvailable(row) ? keys("group", "shift+g") : undefined;
 			if (row?.kind === "fallback") {
 				// Advertise `t` only where a strip would open, as the ANSI footer does.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
@@ -5234,6 +5897,7 @@ export class ModelHubComponent implements Component {
 					compaction,
 					reorder,
 					convert,
+					group,
 					keys("providers", "left"),
 				];
 			}
@@ -5243,6 +5907,7 @@ export class ModelHubComponent implements Component {
 					keys("add fallback", "enter", "f"),
 					keys("clear chain", "x"),
 					convert,
+					group,
 					keys("providers", "left"),
 				];
 			}
@@ -5258,6 +5923,7 @@ export class ModelHubComponent implements Component {
 				editable ? keys("thinking", "t") : undefined,
 				compaction,
 				convert,
+				group,
 				keys("cycle", "c"),
 				reorder,
 				keys("new", "n"),

@@ -771,6 +771,7 @@ export class CommandController {
 				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
 				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
 			}
+			info += this.#advisorTaxonomyReport();
 			this.showCommandReport({
 				title: `Advisor Status (${stats.advisors.length} advisors)`,
 				body: new Text(info.trim(), 0, 0),
@@ -821,7 +822,20 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
 		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+		info += this.#advisorTaxonomyReport();
 		this.showCommandReport({ title: "Advisor Status", body: new Text(info.trim(), 0, 0) });
+	}
+
+	/** The `/advisor status` taxonomy section: heading, one line per category, then warnings. */
+	#advisorTaxonomyReport(): string {
+		const { heading, rows, warnings } = this.ctx.session.getAdvisorTaxonomyStatus();
+		let report = `\n${theme.bold(heading)}\n`;
+		for (const row of rows) report += `  • ${row}\n`;
+		if (warnings.length > 0) {
+			report += `${theme.fg("warning", "Category warnings:")}\n`;
+			for (const warning of warnings) report += `${theme.fg("warning", `  ! ${warning}`)}\n`;
+		}
+		return report;
 	}
 
 	/**

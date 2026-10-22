@@ -448,6 +448,7 @@ import {
 	type AdvisorFindingCommandResult,
 	type AdvisorStats,
 	type AdvisorStatusOverviewEntry,
+	type AdvisorTaxonomyStatus,
 	SessionAdvisors,
 	type SessionAdvisorsHost,
 } from "./session-advisors";
@@ -497,6 +498,7 @@ export type {
 	AdvisorFindingCommandResult,
 	AdvisorStats,
 	AdvisorStatusOverviewEntry,
+	AdvisorTaxonomyStatus,
 	PerAdvisorStat,
 } from "./session-advisors";
 
@@ -15802,6 +15804,11 @@ export class AgentSession implements SettingsScope {
 	 */
 	formatAdvisorStatus(): string {
 		return this.#advisors.formatAdvisorStatus();
+	}
+
+	/** The active finding taxonomy and its owner-resolution warnings for `/advisor status`. */
+	getAdvisorTaxonomyStatus(): AdvisorTaxonomyStatus {
+		return this.#advisors.getAdvisorTaxonomyStatus();
 	}
 
 	/**

@@ -346,4 +346,147 @@ describe("account manager deps", () => {
 		expect(billing).toContain("Balance $12.50 left · $2.50/day · runs out in 5d");
 		expect(billing).toContain("Requests 75/100 requests left");
 	});
+
+	it("sets an OAuth account's saved-reset windows and auto-redeem, and refuses them for an API key", async () => {
+		const { settings, deps, ids } = await open({ auth: { accountPolicies: [workPolicy] } });
+		const auth = () => settings.getGlobalSettings().auth;
+		const fields = () => deps.load().find(account => account.id === ids.anthropic)!.fields;
+		const resetOn = fields().find(field => field.id === "reset-on")!;
+		expect([resetOn.key, resetOn.value, resetOn.readOnly]).toEqual(["w", "any", undefined]);
+		expect(resetOn.choices?.map(choice => [choice.id, choice.on])).toEqual([
+			["reset-on:5h", false],
+			["reset-on:7d", false],
+			["reset-on:any", true],
+		]);
+
+		expect((await deps.apply(ids.anthropic!, "reset-on:7d", "on")).message).toBe("work resets on 7d.");
+		expect((await deps.apply(ids.anthropic!, "reset-on:5h", "on")).message).toBe("work resets on 5h, 7d.");
+		expect(auth()).toEqual({ accountPolicies: [{ ...workPolicy, resetOn: ["5h", "7d"] }] });
+		expect((await deps.apply(ids.anthropic!, "reset-on:any", "off")).error).toContain("Choose 5h or 7d");
+		expect((await deps.apply(ids.anthropic!, "reset-on:any", "on")).message).toBe("work resets on any window.");
+		expect(auth()).toEqual({ accountPolicies: [workPolicy] });
+
+		const autoRedeem = fields().find(field => field.id === "auto-redeem")!;
+		expect([autoRedeem.key, autoRedeem.value]).toEqual(["a", "inherit"]);
+		expect(autoRedeem.choices?.map(choice => choice.label)).toEqual(["yes", "no", "unset", "inherit"]);
+		expect((await deps.apply(ids.anthropic!, "auto-redeem:yes", "on", "inherit")).message).toBe(
+			"work auto-redeem: yes.",
+		);
+		expect(auth()).toEqual({ accountPolicies: [{ ...workPolicy, autoRedeem: "yes" }] });
+		expect((await deps.apply(ids.anthropic!, "auto-redeem:no", "on", "inherit")).error).toContain("changed");
+		expect((await deps.apply(ids.anthropic!, "auto-redeem:inherit", "on", "yes")).message).toBe(
+			"work auto-redeem: inherit.",
+		);
+		expect(auth()).toEqual({ accountPolicies: [workPolicy] });
+
+		const openai = deps.load().find(account => account.provider === "openai")!;
+		for (const id of ["reset-on", "auto-redeem"]) {
+			expect(openai.fields.find(field => field.id === id)?.readOnly).toBe("applies to OAuth accounts only");
+		}
+		expect((await deps.apply(ids.openai!, "auto-redeem:yes", "on", "inherit")).error).toContain(
+			"OAuth accounts only",
+		);
+		expect((await deps.apply(ids.openai!, "reset-on:5h", "on")).error).toContain("OAuth accounts only");
+		expect(auth()).toEqual({ accountPolicies: [workPolicy] });
+	});
+
+	it("lists global limits and adds, edits, and removes them in the account limit grammar", async () => {
+		const monthly = { id: "all", metric: "usd", max: "20", window: { type: "calendar", period: "month" } };
+		const daily = { metric: "requests", max: 100, window: { type: "calendar", period: "day" } };
+		const { settings, deps } = await open({ limits: { "*": [monthly] } }, { limits: { openai: [daily] } });
+		const limits = () => settings.getGlobalSettings().limits;
+		const page = () => deps.pages!().find(candidate => candidate.id === "limits")!;
+		expect(page().rows.map(row => [row.name, row.identity])).toEqual([
+			["*", "every call"],
+			["openai", "calls to this provider"],
+			["(add scope)", "limits for a provider/model, a provider, or * (every call)"],
+		]);
+		const [all, openai, add] = page().rows;
+		expect(openai!.fields[0]!.readOnly).toBe('limits["openai"] is set in the runtime layer');
+		expect((await deps.apply(openai!.id, "limit:add", "usd 1 day")).error).toContain("runtime layer");
+
+		const edit = all!.fields[0]!.choices!.find(choice => choice.id === "limit:edit:0")!;
+		expect([edit.label, edit.expect]).toEqual(["edit usd 20 month skip (id all)", "usd 20 month skip"]);
+		expect((await deps.apply(all!.id, edit.id, "usd 30 week warn", edit.expect)).message).toBe("* has 1 limit.");
+		expect(limits()).toEqual({
+			"*": [{ id: "all", metric: "usd", max: "30", window: { type: "calendar", period: "week" }, onLimit: "warn" }],
+		});
+
+		const refused = await deps.apply(add!.id, "limit:add", "anthropic usage 80");
+		expect(refused.error).toContain("only allowed on auth.accountPolicies limits");
+		expect((await deps.apply(add!.id, "limit:add", "role:default usd 1 day")).error).toContain(
+			"must be provider/model-id, provider, or *",
+		);
+		expect((await deps.apply(add!.id, "limit:add", "anthropic")).error).toContain(
+			"Enter <provider/model|provider|*>",
+		);
+		expect((await deps.apply(add!.id, "limit:add", "anthropic/claude-opus-4-5 tokens 1000 1h")).message).toBe(
+			"anthropic/claude-opus-4-5 has 1 limit.",
+		);
+		expect(limits()).toMatchObject({
+			"anthropic/claude-opus-4-5": [
+				{ metric: "tokens", max: 1000, window: { type: "rolling", durationMs: 3_600_000 } },
+			],
+		});
+		const opus = page().rows.find(row => row.name === "anthropic/claude-opus-4-5")!;
+		expect(opus.identity).toBe("calls to this model");
+		expect(opus.details.find(detail => detail.label === "limit")?.value).toContain("1000 tokens per 1h");
+
+		expect((await deps.apply(opus.id, "limit:remove:0", "", "tokens 1000 1h skip")).message).toBe(
+			"anthropic/claude-opus-4-5 has 0 limits.",
+		);
+		expect(Object.keys(limits() as object)).toEqual(["*"]);
+	});
+
+	it("lists project pins of every directory and changes or removes one without touching the others", async () => {
+		await authStorage.credentials.set("anthropic", [
+			{ type: "oauth", access: "a", refresh: "r", expires: Date.now() + 3_600_000, email: "a@example.com" },
+			{ type: "oauth", access: "b", refresh: "s", expires: Date.now() + 3_600_000, email: "b@example.com" },
+		]);
+		const homePolicy = { provider: "anthropic", name: "home", account: { email: "b@example.com" } };
+		const project = fs.realpathSync(tempDir.path());
+		const elsewhere = path.join(project, "elsewhere");
+		const overlaid = path.join(project, "overlaid");
+		fs.mkdirSync(elsewhere);
+		fs.mkdirSync(overlaid);
+		const { settings, deps } = await open(
+			{
+				auth: {
+					accountPolicies: [workPolicy, homePolicy],
+					accountPins: { [project]: { anthropic: "work" }, [elsewhere]: { anthropic: "work", openai: "spare" } },
+				},
+			},
+			{ "auth.accountPins": { [overlaid]: { anthropic: "home" } } },
+		);
+		const pins = () => (settings.getGlobalSettings().auth as { accountPins?: unknown } | undefined)?.accountPins;
+		const page = () => deps.pages!().find(candidate => candidate.id === "pins")!;
+		const rows = page().rows;
+		expect(rows.map(row => [row.provider, row.identity, row.badges])).toEqual([
+			["anthropic", "work", ["this directory"]],
+			["anthropic", "work", []],
+			["openai", "spare", ["no stored account"]],
+			["anthropic", "home", ["runtime"]],
+		]);
+		const [, elsewhereAnthropic, elsewhereOpenai, runtime] = rows;
+		expect(runtime!.fields.every(field => field.readOnly === "set in the runtime layer")).toBe(true);
+		expect((await deps.apply(runtime!.id, "pin:remove", "", "home")).error).toContain("runtime layer");
+
+		const account = elsewhereAnthropic!.fields.find(field => field.id === "pin:account")!;
+		expect(account.choices?.map(choice => [choice.label, choice.on])).toEqual([
+			["home", false],
+			["work", true],
+		]);
+		expect((await deps.apply(elsewhereAnthropic!.id, "pin:account:home", "on", "work")).message).toContain(
+			'Pinned anthropic to "home"',
+		);
+		expect((await deps.apply(elsewhereAnthropic!.id, "pin:account:work", "on", "work")).error).toContain("changed");
+		expect((await deps.apply(elsewhereOpenai!.id, "pin:remove", "", "spare")).message).toContain(
+			"Removed the openai pin",
+		);
+		expect(pins()).toEqual({ [project]: { anthropic: "work" }, [elsewhere]: { anthropic: "home" } });
+		expect((await deps.apply(elsewhereAnthropic!.id, "pin:account:nobody", "on", "home")).error).toContain(
+			'No anthropic account is named "nobody"',
+		);
+		expect(pins()).toEqual({ [project]: { anthropic: "work" }, [elsewhere]: { anthropic: "home" } });
+	});
 });

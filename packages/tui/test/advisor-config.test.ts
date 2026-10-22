@@ -59,7 +59,7 @@ describe("advisor review mode picker", () => {
 		overlay.handleInput("\r"); // Review mode.
 		overlay.handleInput("\r"); // Accept current mode without navigating.
 		overlay.handleInput("\x1b"); // Back to roster.
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply.
 		await Promise.resolve();
 
@@ -95,7 +95,7 @@ describe("advisor sync backlog picker", () => {
 		for (let i = 0; i < 5; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Pick strict.
 		overlay.handleInput("\x1b"); // Back to roster.
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply.
 		await Promise.resolve();
 
@@ -114,7 +114,7 @@ describe("advisor sync backlog picker", () => {
 		overlay.handleInput("\x1b[A"); // Up to inherit.
 		overlay.handleInput("\r"); // Pick inherit.
 		overlay.handleInput("\x1b"); // Back to roster.
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply.
 		await Promise.resolve();
 
@@ -133,7 +133,7 @@ describe("advisor sync backlog picker", () => {
 		for (let i = 0; i < 5; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Pick strict.
 		overlay.handleInput("\x1b"); // Back to roster.
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply.
 		await Promise.resolve();
 
@@ -181,7 +181,7 @@ describe("advisor sync backlog picker", () => {
 			saved = structuredClone(doc);
 		});
 
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply without touching the seeded row.
 		await Promise.resolve();
 
@@ -194,13 +194,13 @@ describe("advisor sync backlog picker", () => {
 			saved = structuredClone(doc);
 		});
 
-		for (let i = 0; i < 4; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Save & apply without touching the row.
 		await Promise.resolve();
 
-		// The row is a real roster entry (per-advisor budget, not editable in the
-		// overlay), not the synthetic seed: save must not collapse the roster to
-		// empty, which would silently delete the entry from the file.
+		// The row is a real roster entry carrying a per-advisor budget, not the
+		// synthetic seed: save must not collapse the roster to empty, which
+		// would silently delete the entry from the file.
 		expect(saved?.advisors).toEqual([{ name: "default", maxNotesPerUpdate: 2 }]);
 	});
 
@@ -233,7 +233,7 @@ describe("advisor sync backlog picker", () => {
 		// Opening the project file shows nothing — the host owns initial warnings.
 		expect(warnings).toEqual([]);
 
-		for (let i = 0; i < 3; i++) overlay.handleInput("\x1b[B");
+		for (let i = 0; i < 5; i++) overlay.handleInput("\x1b[B");
 		overlay.handleInput("\r"); // Switch scope to user.
 		// The overlay awaits the same promise; awaiting it here runs after its continuation.
 		await pendingLoad;
@@ -268,5 +268,240 @@ describe("advisor sync backlog picker", () => {
 		const frame = overlay.render(100).join("\n");
 		expect(frame).toContain('advisor "Bad" dropped');
 		expect(warnings).toEqual([]);
+	});
+});
+
+describe("advisor taxonomy and notes budget editing", () => {
+	beforeAll(async () => {
+		const theme = await getThemeByName("dark");
+		if (!theme) throw new Error("theme unavailable");
+		setThemeInstance(theme);
+	});
+
+	const taxonomyDeps: AdvisorConfigDeps = {
+		...deps,
+		maxNotesPerUpdate: 4,
+		defaultCategories: [
+			{ id: "logic", description: "Logic.", owner: "Correctness" },
+			{ id: "security", description: "Sec.", owner: "Security", precedence: 1 },
+		],
+	};
+
+	const open = (
+		doc: WatchdogConfigDoc,
+		sink: { saved?: WatchdogConfigDoc; notices: string[]; warnings: string[] },
+		extra?: Partial<AdvisorConfigDeps>,
+	) =>
+		new AdvisorConfigOverlayComponent({} as TUI, { ...taxonomyDeps, ...extra }, "project", doc, {
+			loadDoc: async () => ({ advisors: [] }),
+			save: async (_scope, saved) => {
+				sink.saved = structuredClone(saved);
+			},
+			close: () => {},
+			requestRender: () => {},
+			notify: message => sink.notices.push(message),
+			warn: message => sink.warnings.push(message),
+		});
+
+	const press = (overlay: AdvisorConfigOverlayComponent, key: string, times = 1) => {
+		for (let i = 0; i < times; i++) overlay.handleInput(key);
+	};
+	const type = (overlay: AdvisorConfigOverlayComponent, value: string, erase = 0) => {
+		press(overlay, "\x7f", erase);
+		for (const char of value) overlay.handleInput(char);
+	};
+	const down = "\x1b[B";
+
+	it("edits budgets, owns, and categories from the keyboard and saves only valid categories", async () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] } as {
+			saved?: WatchdogConfigDoc;
+			notices: string[];
+			warnings: string[];
+		};
+		const overlay = open({ advisors: [{ name: "Security" }, { name: "Speed" }] }, sink);
+
+		// Roster: Security, Speed, add, shared, notes per update, categories, scope, save, close.
+		press(overlay, down, 4);
+		press(overlay, "\r"); // Shared notes per update ("inherit").
+		type(overlay, "40", "inherit".length);
+		press(overlay, "\r"); // Out of range: rejected, editor stays.
+		type(overlay, "6", 2);
+		press(overlay, "\r");
+
+		press(overlay, down);
+		press(overlay, "\r"); // Categories: logic (default), security (default), add, customize, back.
+		press(overlay, down, 3);
+		press(overlay, "\r"); // Customize the bundled defaults.
+		press(overlay, down, 2);
+		press(overlay, "\r"); // + Add category.
+		type(overlay, "Hot Paths");
+		press(overlay, "\r"); // Not lower-kebab: rejected.
+		type(overlay, "perf-hot", "Hot Paths".length);
+		press(overlay, "\r"); // Category detail: id, description, owner, precedence, remove, back.
+		press(overlay, down);
+		press(overlay, "\r");
+		type(overlay, "Hot paths.");
+		press(overlay, "\r");
+		press(overlay, down, 2);
+		press(overlay, "\r"); // Owner: none, Security, Speed.
+		press(overlay, down, 2);
+		press(overlay, "\r");
+		press(overlay, down, 3);
+		press(overlay, "\r"); // Precedence ("none").
+		type(overlay, "3", "none".length);
+		press(overlay, "\r");
+		press(overlay, "\x1b"); // Categories list on perf-hot: logic, security, perf-hot, add, use defaults, back.
+		press(overlay, down);
+		press(overlay, "\r");
+		type(overlay, "empty-one");
+		press(overlay, "\r"); // Created without a description.
+		press(overlay, "\x1b");
+		press(overlay, "\x1b"); // Roster, on the categories row.
+
+		press(overlay, "\x1b[A", 4);
+		press(overlay, "\r"); // Speed detail.
+		press(overlay, down, 6);
+		press(overlay, "\r"); // Notes per update ("inherit").
+		type(overlay, "2", "inherit".length);
+		press(overlay, "\r");
+		press(overlay, down, 7);
+		press(overlay, "\r"); // Owns: logic, security, perf-hot, empty-one, Done.
+		press(overlay, "\r"); // Toggle logic.
+		press(overlay, down, 2);
+		press(overlay, "\r"); // Toggle perf-hot.
+		press(overlay, "\x1b"); // Apply.
+		press(overlay, "\x1b"); // Roster.
+
+		press(overlay, down, 7);
+		press(overlay, "\r"); // Save & apply.
+		await Promise.resolve();
+
+		expect(sink.saved).toEqual({
+			maxNotesPerUpdate: 6,
+			categories: {
+				logic: { description: "Logic." },
+				security: { description: "Sec.", owner: "Security", precedence: 1 },
+				"perf-hot": { description: "Hot paths.", owner: "Speed", precedence: 3 },
+			},
+			advisors: [{ name: "Security" }, { name: "Speed", maxNotesPerUpdate: 2, owns: ["logic", "perf-hot"] }],
+		});
+		expect(sink.notices).toEqual([
+			"Notes per update must be an integer from 1 to 32, or inherit.",
+			"Category ids are lower-kebab: a-z and 0-9 words joined by single hyphens.",
+		]);
+		expect(sink.warnings).toEqual(['WATCHDOG.yml: category "empty-one" dropped — empty id or description']);
+	});
+
+	it("edits the taxonomy from the native prefs page, renaming owns references and clearing with reset", async () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] } as {
+			saved?: WatchdogConfigDoc;
+			notices: string[];
+			warnings: string[];
+		};
+		const overlay = open(
+			{
+				maxNotesPerUpdate: 5,
+				categories: { logic: { description: "Logic." }, docs: { description: "Docs.", owner: "Ghost" } },
+				advisors: [{ name: "Security", owns: ["docs"], maxNotesPerUpdate: 9 }],
+			},
+			sink,
+		);
+		const action = (act: string, value?: string) =>
+			overlay.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
+		const change = (item: string, value: string | number | string[] | null) =>
+			overlay.handleNativeEvent({ type: "change", key: "", item, value });
+
+		action("page", "advisor:0");
+		change("maxNotesPerUpdate", 40);
+		change("maxNotesPerUpdate", null);
+		change("owns", ["docs", "logic"]);
+		action("page", "categories");
+		change("category:0:id", "Not Kebab");
+		change("category:0:id", "docs");
+		change("category:0:id", "correctness");
+		change("category:0:precedence", 4);
+		change("category:1:owner", "Security");
+		action("add-category");
+		for (const char of "api") overlay.handleInput(char);
+		action("field-save");
+		change("category:2:description", "Public API.");
+		change("category:2:precedence", 7);
+		change("category:2:precedence", null);
+		action("delete", "category:1:delete");
+
+		action("page", "shared");
+		change("sharedMaxNotes", null);
+		action("save");
+		await Promise.resolve();
+
+		expect(sink.saved).toEqual({
+			categories: { correctness: { description: "Logic.", precedence: 4 }, api: { description: "Public API." } },
+			advisors: [{ name: "Security", owns: ["correctness"] }],
+		});
+		expect(sink.notices).toEqual([
+			"Category ids are lower-kebab: a-z and 0-9 words joined by single hyphens.",
+			'Category "docs" already exists.',
+		]);
+	});
+
+	it("keeps the bundled taxonomy when the first category is added to a file without categories", async () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] } as {
+			saved?: WatchdogConfigDoc;
+			notices: string[];
+			warnings: string[];
+		};
+		const overlay = open({ advisors: [{ name: "Security" }] }, sink);
+		const action = (act: string) => overlay.handleNativeEvent({ type: "action", key: "", act, mods: [] });
+
+		action("add-category");
+		for (const char of "logic") overlay.handleInput(char);
+		action("field-save"); // A bundled id: rejected.
+		for (let i = 0; i < "logic".length; i++) overlay.handleInput("\x7f");
+		for (const char of "api") overlay.handleInput(char);
+		action("field-save");
+		overlay.handleNativeEvent({ type: "change", key: "", item: "category:2:description", value: "Public API." });
+		action("save");
+		await Promise.resolve();
+
+		expect(sink.saved?.categories).toEqual({
+			logic: { description: "Logic." },
+			security: { description: "Sec.", owner: "Security", precedence: 1 },
+			api: { description: "Public API." },
+		});
+		expect(sink.notices).toEqual(['Category "logic" already exists.']);
+	});
+
+	it("shows the bundled taxonomy with roster owners and the host's owner-resolution warnings on the categories page", () => {
+		const overlay = open(
+			{ advisors: [{ name: "Security", owns: ["nope"] }] },
+			{ notices: [], warnings: [] },
+			{
+				resolveCategoryWarnings: doc =>
+					doc.advisors.flatMap(advisor =>
+						(advisor.owns ?? []).map(id => `advisor "${advisor.name}": owns unknown category "${id}" — ignored`),
+					),
+			},
+		);
+		overlay.handleNativeEvent({ type: "action", key: "", act: "page", value: "categories", mods: [] });
+		const cx: DescribeContext = {
+			cols: 120,
+			reduceMotion: false,
+			dark: true,
+			supports: () => true,
+			feature: () => true,
+		};
+		const props = overlay.describe(cx).p as {
+			page: string;
+			sections: { id: string; rows: { id: string; label: string; hint?: string; warning?: string }[] }[];
+		};
+		expect(props.page).toBe("categories");
+		const defaults = props.sections.find(section => section.id === "defaults")?.rows;
+		expect(defaults?.map(row => [row.label, row.hint])).toEqual([
+			["logic", "owner none · Logic."],
+			["security", "owner Security · precedence 1 · Sec."],
+		]);
+		expect(props.sections.find(section => section.id === "taxonomy-warnings")?.rows[0]?.warning).toBe(
+			'advisor "Security": owns unknown category "nope" — ignored',
+		);
 	});
 });

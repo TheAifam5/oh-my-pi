@@ -1,14 +1,16 @@
 /**
  * Fullscreen /account manager, shown on the alternate screen like /models.
  *
- * A sidebar of providers (All accounts, then one entry per provider), a body
- * listing the stored accounts with the selected account's details below, and
- * a footer that turns into a chip strip while editing. Enter on an account
+ * A sidebar of providers (All accounts, then one entry per provider, then the
+ * host's pages such as global limits and project pins), a body listing the
+ * stored accounts or page rows with the selected row's details below, and
+ * a footer that turns into a chip strip while editing. Enter on a row
  * opens its field strip; a field either applies at once (toggles), opens a
  * text input, or opens a second strip of choices. Every field also has a
  * single-key shortcut from the list. The host owns meaning and persistence:
- * fields arrive described by {@link AccountManagerDeps.load} and edits go
- * back through {@link AccountManagerDeps.apply} by action id.
+ * fields arrive described by {@link AccountManagerDeps.load} and
+ * {@link AccountManagerDeps.pages}, and edits go back through
+ * {@link AccountManagerDeps.apply} by action id.
  */
 
 import type { TspSpan } from "@oh-my-pi/pi-wire";
@@ -67,10 +69,11 @@ export interface AccountManagerField extends AccountManagerAction {
 	choices?: AccountManagerAction[];
 }
 
-/** One stored account as the manager shows it. */
+/** One stored account as the manager shows it, or one row of an {@link AccountManagerPage}. */
 export interface AccountManagerAccount {
-	/** Stable id, unique across providers. */
+	/** Stable id, unique across providers and pages. */
 	id: string;
+	/** Provider id; empty for a page row that belongs to no provider. */
 	provider: string;
 	name?: string;
 	/** Email, organization, or `API key <fingerprint>`; never key material. */
@@ -90,9 +93,21 @@ export interface AccountManagerResult {
 	error?: string;
 }
 
+/** A page listed after the providers (global limits, project pins); its rows edit like accounts. */
+export interface AccountManagerPage {
+	/** Stable id, unique among pages. */
+	id: string;
+	label: string;
+	/** Text shown in place of the rows when there are none. */
+	empty: string;
+	rows: AccountManagerAccount[];
+}
+
 /** Host-owned account listing and persistence. */
 export interface AccountManagerDeps {
 	load: () => AccountManagerAccount[];
+	/** Pages listed after the providers; their rows' edits go through {@link apply} by row id. */
+	pages?: () => AccountManagerPage[];
 	/**
 	 * Apply `actionId` to an account. `value` is the typed text of an input action, or the target
 	 * state (`on` or `off`) of a toggle; `expect` is the action's {@link AccountManagerAction.expect}.
@@ -106,8 +121,9 @@ export interface AccountManagerCallbacks {
 	onCancel: () => void;
 }
 
-interface SidebarEntry extends HubSidebarEntry<"all" | "provider" | "separator"> {
+interface SidebarEntry extends HubSidebarEntry<"all" | "provider" | "page" | "separator"> {
 	provider?: string;
+	page?: AccountManagerPage;
 }
 
 type StripChip = HubStripChip<AccountManagerAction & { choices?: AccountManagerAction[] }>;
@@ -161,6 +177,7 @@ export class AccountManagerComponent implements Component {
 	#callbacks: AccountManagerCallbacks;
 
 	#accounts: AccountManagerAccount[] = [];
+	#pages: AccountManagerPage[] = [];
 	#entries: SidebarEntry[] = [];
 	#activeEntryId = "all";
 	#focus: "scope" | "list" = "list";
@@ -237,6 +254,27 @@ export class AccountManagerComponent implements Component {
 				annotation: String(count),
 			});
 		}
+		try {
+			this.#pages = (this.#deps.pages?.() ?? []).map(page => ({
+				...page,
+				label: sanitizeDisplaySingleLine(page.label),
+				empty: sanitizeDisplaySingleLine(page.empty),
+				rows: page.rows.map(sanitizeAccount),
+			}));
+		} catch (error) {
+			this.#pages = [];
+			this.#notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
+		}
+		if (this.#pages.length > 0) entries.push({ id: "sep:pages", kind: "separator", label: "" });
+		for (const page of this.#pages) {
+			entries.push({
+				id: `page:${page.id}`,
+				kind: "page",
+				label: page.label,
+				page,
+				annotation: String(page.rows.length),
+			});
+		}
 		this.#entries = entries;
 		if (!entries.some(entry => entry.id === this.#activeEntryId)) this.#activeEntryId = "all";
 		this.#buildRows();
@@ -253,7 +291,9 @@ export class AccountManagerComponent implements Component {
 		this.#rows =
 			entry.kind === "provider"
 				? this.#accounts.filter(account => account.provider === entry.provider)
-				: this.#accounts;
+				: entry.kind === "page"
+					? (entry.page?.rows ?? [])
+					: this.#accounts;
 	}
 
 	#selected(): AccountManagerAccount | undefined {
@@ -261,7 +301,10 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#account(id: string): AccountManagerAccount | undefined {
-		return this.#accounts.find(account => account.id === id);
+		return (
+			this.#accounts.find(account => account.id === id) ??
+			this.#pages.flatMap(page => page.rows).find(row => row.id === id)
+		);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -521,7 +564,8 @@ export class AccountManagerComponent implements Component {
 		if (this.#busy) return { text: "Saving…", tone: "muted" };
 		if (this.#notice) return { text: sanitizeDisplaySingleLine(this.#notice.text), tone: this.#notice.tone };
 		const entry = this.#activeEntry();
-		const scope = entry.kind === "provider" ? `${entry.label} accounts` : "All accounts";
+		const scope =
+			entry.kind === "provider" ? `${entry.label} accounts` : entry.kind === "page" ? entry.label : "All accounts";
 		return { text: `${scope} · ${this.#rows.length}`, tone: "muted" };
 	}
 
@@ -540,13 +584,16 @@ export class AccountManagerComponent implements Component {
 		else if (this.#rowIndex >= this.#listScroll + visibleRows) this.#listScroll = this.#rowIndex - visibleRows + 1;
 		let nameWidth = 0;
 		for (const account of this.#rows) nameWidth = Math.max(nameWidth, visibleWidth(this.#accountTitle(account)));
-		const multiProvider = this.#activeEntry().kind === "all";
+		const multiProvider = this.#activeEntry().kind !== "provider";
 		for (let i = this.#listScroll; i < Math.min(this.#rows.length, this.#listScroll + visibleRows); i++) {
 			const account = this.#rows[i]!;
 			const active = i === this.#rowIndex;
 			const cursor = active && this.#focus === "list" ? theme.fg("accent", theme.nav.cursor) : " ";
 			const name = this.#accountTitle(account).padEnd(nameWidth);
-			const provider = multiProvider ? `${theme.fg("dim", sanitizeDisplaySingleLine(account.provider))}  ` : "";
+			const provider =
+				multiProvider && account.provider
+					? `${theme.fg("dim", sanitizeDisplaySingleLine(account.provider))}  `
+					: "";
 			let line = ` ${cursor} ${active ? theme.bold(theme.fg("accent", name)) : name}  ${provider}${sanitizeDisplaySingleLine(account.identity)}`;
 			const badges = theme.fg("dim", sanitizeDisplaySingleLine(account.badges.join(" · ")));
 			const lineWidth = visibleWidth(line);
@@ -556,13 +603,18 @@ export class AccountManagerComponent implements Component {
 			}
 			lines.push(truncateToWidth(line, width));
 		}
-		if (this.#rows.length === 0) lines.push(theme.fg("dim", " No stored accounts. Log in with /login."));
+		if (this.#rows.length === 0) {
+			const entry = this.#activeEntry();
+			const empty =
+				entry.kind === "page" ? ` ${entry.page?.empty ?? ""}` : " No stored accounts. Log in with /login.";
+			lines.push(theme.fg("dim", empty));
+		}
 		while (lines.length < rows - detailRows) lines.push("");
 		lines.push(theme.fg("border", "─".repeat(Math.max(1, width))));
 		if (selected) {
 			lines.push(
 				truncateToWidth(
-					` ${theme.bold(theme.fg("accent", this.#accountTitle(selected)))}  ${theme.fg("dim", sanitizeDisplaySingleLine(`${selected.provider} · ${selected.identity}`))}`,
+					` ${theme.bold(theme.fg("accent", this.#accountTitle(selected)))}  ${theme.fg("dim", sanitizeDisplaySingleLine([selected.provider, selected.identity].filter(Boolean).join(" · ")))}`,
 					width,
 				),
 			);
@@ -685,13 +737,18 @@ export class AccountManagerComponent implements Component {
 	#describeBody(): NativeNode {
 		const status = this.#statusText();
 		const selected = this.#selected();
-		const multiProvider = this.#activeEntry().kind === "all";
+		const multiProvider = this.#activeEntry().kind !== "provider";
 		const items = this.#rows.map(account =>
 			node(
 				"item",
 				{
 					label: [span(account.name ?? "(unnamed)", account.name ? "strong" : "dim")],
-					detail: [span(multiProvider ? `${account.provider} · ${account.identity}` : account.identity, "dim")],
+					detail: [
+						span(
+							multiProvider && account.provider ? `${account.provider} · ${account.identity}` : account.identity,
+							"dim",
+						),
+					],
 					value: account.badges.length > 0 ? [span(account.badges.join(" · "), "dim")] : undefined,
 				},
 				undefined,

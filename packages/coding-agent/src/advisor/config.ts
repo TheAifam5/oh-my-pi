@@ -14,6 +14,7 @@ import {
 	type AdvisorConfig,
 	type AdvisorConfigScope,
 	type AdvisorSyncBacklog,
+	normalizeAdvisorCategoryEntry,
 	type WatchdogConfigDoc,
 } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
@@ -46,6 +47,8 @@ export interface AdvisorCategory {
 	owner?: string;
 	/** Rank among categories competing for one finding; higher leads. */
 	precedence?: number;
+	/** Set on entries of the bundled taxonomy ({@link DEFAULT_ADVISOR_CATEGORIES}). */
+	bundled?: true;
 }
 
 /**
@@ -165,23 +168,17 @@ function parseCategories(
 	}
 	const categories = new Map<string, AdvisorCategoryConfig>();
 	for (const [rawId, rawEntry] of Object.entries(raw)) {
-		const id = rawId.trim();
 		const result = categoryEntrySchema(rawEntry);
 		if (result instanceof type.errors) {
 			warnings.push(`${path}: category "${rawId}" dropped — ${result.summary}`);
 			continue;
 		}
-		if (!id || !result.description.trim()) {
-			warnings.push(`${path}: category "${rawId}" dropped — empty id or description`);
+		const normalized = normalizeAdvisorCategoryEntry(rawId, result);
+		if ("error" in normalized) {
+			warnings.push(`${path}: category "${rawId}" dropped — ${normalized.error}`);
 			continue;
 		}
-		const category: AdvisorCategoryConfig = { description: result.description };
-		const owner = result.owner?.trim();
-		if (owner) category.owner = owner;
-		if (result.precedence !== undefined && Number.isFinite(result.precedence)) {
-			category.precedence = result.precedence;
-		}
-		categories.set(id, category);
+		categories.set(normalized.id, normalized.category);
 	}
 	return categories;
 }
@@ -249,23 +246,23 @@ export function resolveAdvisorCategories(
 	declared: ReadonlyMap<string, AdvisorCategoryConfig> | undefined,
 	advisors: readonly AdvisorConfig[],
 ): { categories: AdvisorCategory[]; warnings: string[] } {
-	const warnings: string[] = [];
 	const rosterNames = new Map(advisors.map(advisor => [slugifyAdvisorName(advisor.name), advisor.name]));
 	const categories = new Map<string, AdvisorCategory>();
 	if (declared === undefined) {
 		for (const { owner, ...category } of DEFAULT_ADVISOR_CATEGORIES) {
 			const rosterOwner = owner === undefined ? undefined : rosterNames.get(slugifyAdvisorName(owner));
-			categories.set(category.id, rosterOwner === undefined ? { ...category } : { ...category, owner: rosterOwner });
+			categories.set(
+				category.id,
+				rosterOwner === undefined
+					? { ...category, bundled: true }
+					: { ...category, owner: rosterOwner, bundled: true },
+			);
 		}
 	} else {
 		for (const [id, config] of declared) {
 			const category: AdvisorCategory = { id, description: config.description.trim().replace(/\s+/g, " ") };
 			if (config.owner !== undefined) {
-				const rosterOwner = rosterNames.get(slugifyAdvisorName(config.owner));
-				if (rosterOwner === undefined) {
-					warnings.push(`category "${id}": owner "${config.owner}" is not a configured advisor`);
-				}
-				category.owner = rosterOwner ?? config.owner;
+				category.owner = rosterNames.get(slugifyAdvisorName(config.owner)) ?? config.owner;
 			}
 			if (config.precedence !== undefined) category.precedence = config.precedence;
 			categories.set(id, category);
@@ -274,20 +271,47 @@ export function resolveAdvisorCategories(
 	for (const advisor of advisors) {
 		for (const id of advisor.owns ?? []) {
 			const category = categories.get(id);
+			if (category && category.owner === undefined) category.owner = advisor.name;
+		}
+	}
+	const resolved = [...categories.values()];
+	return { categories: resolved, warnings: advisorCategoryWarnings(resolved, advisors) };
+}
+
+/**
+ * Owner-resolution warnings for a resolved taxonomy (see
+ * {@link resolveAdvisorCategories}): a category owner that names no roster
+ * advisor, then, per advisor in roster order, each `owns` id that is unknown
+ * or owned by another advisor.
+ */
+export function advisorCategoryWarnings(
+	categories: readonly AdvisorCategory[],
+	advisors: readonly AdvisorConfig[],
+): string[] {
+	const warnings: string[] = [];
+	const roster = new Set(advisors.map(advisor => slugifyAdvisorName(advisor.name)));
+	for (const category of categories) {
+		if (category.owner !== undefined && !roster.has(slugifyAdvisorName(category.owner))) {
+			warnings.push(`category "${category.id}": owner "${category.owner}" is not a configured advisor`);
+		}
+	}
+	const byId = new Map(categories.map(category => [category.id, category]));
+	for (const advisor of advisors) {
+		for (const id of advisor.owns ?? []) {
+			const category = byId.get(id);
 			if (!category) {
 				warnings.push(`advisor "${advisor.name}": owns unknown category "${id}" — ignored`);
-				continue;
-			}
-			if (category.owner === undefined) {
-				category.owner = advisor.name;
-			} else if (slugifyAdvisorName(category.owner) !== slugifyAdvisorName(advisor.name)) {
+			} else if (
+				category.owner !== undefined &&
+				slugifyAdvisorName(category.owner) !== slugifyAdvisorName(advisor.name)
+			) {
 				warnings.push(
 					`advisor "${advisor.name}": category "${id}" is owned by "${category.owner}" — ownership kept`,
 				);
 			}
 		}
 	}
-	return { categories: [...categories.values()], warnings };
+	return warnings;
 }
 
 /**

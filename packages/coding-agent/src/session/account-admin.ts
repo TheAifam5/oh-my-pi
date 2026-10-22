@@ -2,11 +2,11 @@
  * Account administration shared by `omp account`, the `/account` manager, and
  * the account selector: naming accounts and setting their priority, reserve,
  * drain return thresholds, limits, and saved-reset policy (`auth.accountPolicies` in the user
- * config), pinning a project to an account (`auth.accountPins`), setting a pool
- * member's preferred account, and logging an account out.
+ * config), pinning a project directory to an account (`auth.accountPins`), editing the top-level
+ * `limits`, setting a pool member's preferred account, and logging an account out.
  *
  * Every write goes to the user (global) config layer only and is validated
- * against the stored credentials before it is applied.
+ * before it is applied: policy writes against the stored credentials.
  */
 
 import * as path from "node:path";
@@ -31,11 +31,14 @@ import {
 	type AccountLimit,
 	isAccountEvidenceLimit,
 	LOCAL_LIMIT_PERIODS,
+	type LocalLimit,
 	parseAccountLimits,
+	parseLocalLimits,
 } from "@oh-my-pi/pi-ai/usage/limits";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { GLOBAL_LIMIT_KEY, limitKeyScope } from "../config/local-limits";
 import type { ModelGroup, ParsedModelValue } from "../config/model-groups";
-import { cfgAuthAccountPins, cfgAuthAccountPolicies, cfgModelGroups } from "../config/model-settings";
+import { cfgAuthAccountPins, cfgAuthAccountPolicies, cfgLimits, cfgModelGroups } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import { canonicalDir, projectAccountPin } from "./account-pins";
 import { loadEffectiveAuthAccountPolicyConfig } from "./auth-broker-config";
@@ -791,6 +794,228 @@ function shadowingPinLayers(
 export function projectPinWriteBlocker(settings: Settings, cwd: string, provider: string): string | undefined {
 	const layers = shadowingPinLayers(settings, cwd, pins => Object.hasOwn(pins, provider));
 	return layers.length > 0 ? `auth.accountPins for this project is set in the ${layers.at(-1)} layer` : undefined;
+}
+
+const PIN_LAYER_RANK = { global: 0, overlay: 1, runtime: 2 } as const;
+
+/** A layer that sets `auth.accountPins` and is applied: the user config, a `--config` overlay, or a runtime override. */
+export type AppliedPinLayer = keyof typeof PIN_LAYER_RANK;
+
+/** One `auth.accountPins` pin as listed. */
+export interface ProjectPinListing {
+	/** Canonical project directory. */
+	dir: string;
+	provider: string;
+	/** Pinned account name. */
+	name: string;
+	/** Layer the pin is configured in. */
+	source: AppliedPinLayer;
+	/** Later layer that pins the same directory and provider and replaces this pin. */
+	shadowedBy?: AppliedPinLayer;
+}
+
+/**
+ * Every project pin of the user config, `--config` overlays, and runtime overrides, sorted by
+ * directory, provider, then layer. Project-layer pins are never applied and are not listed.
+ */
+export function listProjectPins(settings: Settings): ProjectPinListing[] {
+	const pins: ProjectPinListing[] = [];
+	for (const location of userPinLocations(settings).values()) {
+		for (const [provider, name] of Object.entries(location.pins)) {
+			pins.push({ dir: location.dir, provider, name, source: "global" });
+		}
+	}
+	for (const { source, value } of settings.getLayerValues(cfgAuthAccountPins)) {
+		if ((source !== "overlay" && source !== "runtime") || !isRecord(value)) continue;
+		for (const [key, entry] of Object.entries(value)) {
+			const dir = canonicalDir(key);
+			for (const [provider, name] of Object.entries(stringPins(entry))) pins.push({ dir, provider, name, source });
+		}
+	}
+	for (const pin of pins) {
+		let shadowedBy: AppliedPinLayer | undefined;
+		for (const other of pins) {
+			if (other.dir !== pin.dir || other.provider !== pin.provider) continue;
+			if (PIN_LAYER_RANK[other.source] > PIN_LAYER_RANK[shadowedBy ?? pin.source]) shadowedBy = other.source;
+		}
+		if (shadowedBy) pin.shadowedBy = shadowedBy;
+	}
+	return pins.sort(
+		(a, b) =>
+			a.dir.localeCompare(b.dir) ||
+			a.provider.localeCompare(b.provider) ||
+			PIN_LAYER_RANK[a.source] - PIN_LAYER_RANK[b.source],
+	);
+}
+
+/** The last overlay or runtime layer whose `auth.accountPins` pins `provider` at the canonical `dir`. */
+function pinShadowLayer(settings: Settings, dir: string, provider: string): AppliedPinLayer | undefined {
+	let layer: AppliedPinLayer | undefined;
+	for (const { source, value } of settings.getLayerValues(cfgAuthAccountPins)) {
+		if ((source !== "overlay" && source !== "runtime") || !isRecord(value)) continue;
+		const pins = Object.entries(value);
+		if (pins.some(([key, entry]) => canonicalDir(key) === dir && Object.hasOwn(stringPins(entry), provider))) {
+			layer = source;
+		}
+	}
+	return layer;
+}
+
+/**
+ * Why a user-config pin edit for `provider` at the project directory `dir` would not apply: an
+ * overlay or runtime `auth.accountPins` value pins that directory and provider; undefined otherwise.
+ */
+export function projectDirPinWriteBlocker(settings: Settings, dir: string, provider: string): string | undefined {
+	const layer = pinShadowLayer(settings, canonicalDir(dir), provider);
+	return layer ? `auth.accountPins of ${provider} for this directory is set in the ${layer} layer` : undefined;
+}
+
+/** Result of a pin edit at a named project directory. */
+export interface ProjectDirPinResult extends AccountWriteResult {
+	/** Canonical directory whose pins were changed. */
+	projectDir: string;
+}
+
+/**
+ * Pin `provider` at the project directory `dir` to the account named `name` in the user config,
+ * or with `name` undefined remove that pin. Other directories and providers keep their pins.
+ *
+ * @throws AccountAdminError when no `provider` account policy has that name, or there is no
+ * user-config pin to remove.
+ */
+export function setProjectDirPin(
+	settings: Settings,
+	authStorage: AuthStorage,
+	dir: string,
+	provider: string,
+	name: string | undefined,
+): ProjectDirPinResult {
+	const projectDir = canonicalDir(dir);
+	const location = userPinLocations(settings).get(projectDir) ?? { dir: projectDir, keys: [], pins: {} };
+	if (name === undefined) {
+		if (!Object.hasOwn(location.pins, provider)) {
+			throw new AccountAdminError(`The user config does not pin ${provider} for ${projectDir}.`);
+		}
+		const { [provider]: _removed, ...kept } = location.pins;
+		writePinLocation(settings, location, kept);
+	} else {
+		const named = cfgAuthAccountPolicies
+			.get(settings)
+			.some(policy => policy.provider === provider && policy.name === name);
+		if (!named) {
+			throw new AccountAdminError(`No ${provider} account is named "${name}". Name one with \`omp account label\`.`);
+		}
+		writePinLocation(settings, location, { ...location.pins, [provider]: name });
+	}
+	const warnings: string[] = [];
+	const layer = pinShadowLayer(settings, projectDir, provider);
+	if (layer) {
+		warnings.push(
+			`A ${layer} auth.accountPins value pins ${provider} for ${projectDir}; this change does not apply there.`,
+		);
+	}
+	if (name !== undefined && !authStorage.sessions.accounts(provider).some(account => account.name === name)) {
+		warnings.push(`No stored ${provider} account is named "${name}"; requests fail until one is.`);
+	}
+	return { projectDir, ...(warnings.length > 0 ? { warning: warnings.join(" ") } : {}) };
+}
+
+/** A layer that sets top-level `limits` and is applied: the user config, a `--config` overlay, or a runtime override. */
+export type AppliedLimitsLayer = "global" | "overlay" | "runtime";
+
+/** One top-level `limits` key as listed. */
+export interface GlobalLimitListing {
+	/** `provider/model-id`, `provider`, or `*` (every call). */
+	key: string;
+	/** The applied entry's limits; empty when `invalid` is set. */
+	limits: LocalLimit[];
+	/** Layer whose entry applies; a later layer replaces an earlier one's entry whole. */
+	source: AppliedLimitsLayer;
+	/** Why the applied entry cannot be parsed. */
+	invalid?: string;
+}
+
+/** Top-level `limits` keys of the user config, `--config` overlays, and runtime overrides: `*` first, then by key. */
+export function listGlobalLimits(settings: Settings): GlobalLimitListing[] {
+	const byKey = new Map<string, GlobalLimitListing>();
+	for (const { source, value } of settings.getLayerValues(cfgLimits)) {
+		if ((source !== "global" && source !== "overlay" && source !== "runtime") || !isRecord(value)) continue;
+		for (const [key, entry] of Object.entries(value)) {
+			if (entry === null || entry === undefined) continue;
+			const { limits, issues } = parseLocalLimits(entry, `limits["${key}"]`);
+			const issue = issues[0];
+			byKey.set(key, {
+				key,
+				limits: issue ? [] : limits,
+				source,
+				...(issue ? { invalid: `${issue.path} ${issue.message}` } : {}),
+			});
+		}
+	}
+	return [...byKey.values()].sort((a, b) =>
+		a.key === GLOBAL_LIMIT_KEY ? -1 : b.key === GLOBAL_LIMIT_KEY ? 1 : a.key.localeCompare(b.key),
+	);
+}
+
+/**
+ * The user-config `limits` entry `key`, parsed; empty when unset.
+ *
+ * @throws AccountAdminError when the entry is invalid, so a later write never drops it silently.
+ */
+export function userGlobalLimits(settings: Settings, key: string): LocalLimit[] {
+	const configured = settings.getGlobalSettings().limits;
+	const entry = isRecord(configured) ? configured[key] : undefined;
+	if (entry === null || entry === undefined) return [];
+	const { limits, issues } = parseLocalLimits(entry, `limits["${key}"]`);
+	const issue = issues[0];
+	if (issue) throw new AccountAdminError(`${issue.path} ${issue.message}; fix it in the config.`);
+	return limits;
+}
+
+/**
+ * Why a user-config `limits` edit of `key` would not apply: an overlay or runtime `limits` value
+ * sets that key and replaces the entry; undefined otherwise.
+ */
+export function globalLimitWriteBlocker(settings: Settings, key: string): string | undefined {
+	let layer: string | undefined;
+	for (const { source, value } of settings.getLayerValues(cfgLimits)) {
+		if ((source === "overlay" || source === "runtime") && isRecord(value) && Object.hasOwn(value, key)) {
+			layer = source;
+		}
+	}
+	return layer ? `limits["${key}"] is set in the ${layer} layer` : undefined;
+}
+
+/**
+ * Replace the user-config `limits` entry `key` (`provider/model-id`, `provider`, or `*`); an empty
+ * list removes it.
+ *
+ * @throws AccountAdminError when the key or a limit is invalid, or two limits are the same.
+ */
+export function setGlobalLimits(settings: Settings, key: string, limits: readonly unknown[]): AccountWriteResult {
+	if (!limitKeyScope(key)) {
+		throw new AccountAdminError(`limits key "${key}" must be provider/model-id, provider, or *.`);
+	}
+	const parsed = parseLocalLimits(limits, `limits["${key}"]`);
+	if (parsed.issues.length === 0) {
+		const duplicate = parsed.limits.findIndex((limit, index) =>
+			parsed.limits.slice(0, index).some(earlier => Bun.deepEquals(earlier, limit)),
+		);
+		if (duplicate !== -1) {
+			throw new AccountAdminError(
+				`${formatAccountLimitSpec(parsed.limits[duplicate]!)} is already a limit of ${key}.`,
+			);
+		}
+	}
+	try {
+		cfgLimits.setEntry(settings, key, limits.length > 0 ? limits : undefined);
+	} catch (error) {
+		throw new AccountAdminError(error instanceof Error ? error.message : String(error));
+	}
+	const blocker = globalLimitWriteBlocker(settings, key);
+	return blocker
+		? { warning: `${blocker}, which replaces the user config entry; this change does not apply there.` }
+		: {};
 }
 
 /** The views of an account policy's `configured` limits, ledger limits counted under the account's usage key. */

@@ -151,4 +151,54 @@ describe("AccountManager", () => {
 		expect(text.replace(ANSI_PATTERN, "")).toContain("evil line");
 		expect(text.split("\n").length).toBe(clean.manager.render(140).join("\n").split("\n").length);
 	});
+
+	test("lists host pages after the providers and applies a page row's field by row id", async () => {
+		const applied: [string, string, string | undefined][] = [];
+		const limit = account("limits:*", "", {
+			name: "*",
+			identity: "every call",
+			badges: ["1 limit"],
+			details: [{ label: "limit", value: "0.00 / 20 USD per month" }],
+			fields: [{ id: "limit:add", label: "add", key: "a", value: "", input: { initial: "", hint: "a limit" } }],
+		});
+		const manager = new AccountManagerComponent(
+			tuiStub,
+			{
+				load: () => [account("a", "anthropic")],
+				pages: () => [
+					{ id: "limits", label: "Global limits", empty: "No global limits.", rows: [limit] },
+					{ id: "pins", label: "Project \x1b[2Jpins", empty: "No project pins.", rows: [] },
+				],
+				apply: async (rowId, actionId, value) => {
+					applied.push([rowId, actionId, value]);
+					return { message: "* has 2 limits." };
+				},
+			},
+			{ onCancel: () => {} },
+		);
+		const screen = () => manager.render(140).join("\n").replace(ANSI_PATTERN, "");
+		expect(screen()).toMatch(/Global limits\s+1/);
+		expect(screen()).toMatch(/Project pins\s+0/);
+		expect(screen()).not.toContain("every call");
+
+		manager.handleInput("\x1b[D"); // focus the sidebar
+		manager.handleInput("\x1b[B"); // anthropic
+		manager.handleInput("\x1b[B"); // Global limits, past the separator
+		expect(screen()).toContain("Global limits · 1");
+		expect(screen()).toMatch(/\*\s+every call\s+.*1 limit/);
+		expect(screen()).toContain("0.00 / 20 USD per month");
+
+		manager.handleInput("\x1b[C"); // focus the rows
+		manager.handleInput("a");
+		for (const key of "usd 5 day") manager.handleInput(key);
+		manager.handleInput(ENTER);
+		await settle();
+		expect(applied).toEqual([["limits:*", "limit:add", "usd 5 day"]]);
+		expect(screen()).toContain("* has 2 limits.");
+
+		manager.handleInput("\x1b[D");
+		manager.handleInput("\x1b[B"); // Project pins
+		expect(screen()).toContain("No project pins.");
+		expect(screen()).not.toContain("No stored accounts");
+	});
 });

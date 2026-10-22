@@ -872,7 +872,7 @@ even when its spec declares `input: [text, image]`; `--json` keeps the declared 
 
 ### Model pools in the Roles view
 
-A role or fallback chain whose value is a model group (see `modelGroups` in [Settings](./settings.md)) shows a pool summary instead of a single model: member count, strategy, funding order, and, as read-only text, any spending policy. Its members follow, in scheduling order, each with its effort, weight, and catalog presence.
+A role or fallback chain whose value is a model group (see `modelGroups` in [Settings](./settings.md)) shows a pool summary instead of a single model: member count, strategy, funding order, spending policy (with a local budget's id, window cap, and per-request cap), local limits, `routing.quota` (reserve, observation age, unknown handling), `routing.accounts` (order, drain target, drain spend, return triggers), and `routing.cache` (affinity, pricing). Its members follow, in scheduling order, each with its effort, weight, and catalog presence.
 
 | Key | Row | Effect |
 | --- | --- | --- |
@@ -882,14 +882,31 @@ A role or fallback chain whose value is a model group (see `modelGroups` in [Set
 | `Enter` / `x` | member | Replaces / removes the member. |
 | `t` / `w` | member | Sets the member's `defaultEffort` / cycles its weight (weighted-random only, alone or as the last entry of a strategy list). |
 | `[` / `]` | member | Moves the member in a priority or round-robin order, alone or as the last entry of a strategy list. |
-| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, and shuffle-bag, whatever the funding order and spending policy. Leaving a strategy drops its `strategyOptions`: leaving quota drops its `tolerance`, and leaving weighted-random also drops member weights. least-used always gets the default window; set `strategyOptions.window` or a quota `tolerance` in config. A pool with a strategy list keeps its strategy; change it in config. A strategy list shows as its entries joined by `→`. On a member row the cursor stays on that member. |
+| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, and shuffle-bag, whatever the funding order and spending policy. Leaving a strategy drops its `strategyOptions`: leaving quota drops its `tolerance`, and leaving weighted-random also drops member weights. least-used always gets the default window; set `strategyOptions.window` in config, and a quota `tolerance` with `e`. A pool with a strategy list keeps its strategy; change the list with `e`. A strategy list shows as its entries joined by `→`. On a member row the cursor stays on that member. |
 | `o` | pooled row | Sets and then cycles the funding order (`included`, `included → free`, `free → included`, `free`); a configured `metered` stays last. It never removes the funding order: a pool without one applies no billing filter, which is wider than any listed order. |
 | `x` | pooled role / fallback pool | Clears the role / removes the chain. |
 | `Enter` / `x` | invalid pooled role | Replaces the entry with one model / removes it. |
+| `a` / `h` | pooled row | Toggles `routing.cache.affinity` / `routing.cache.pricing` on, and back off by removing it. |
+| `u` | pooled row | Cycles `routing.quota.unknown` through `exclude`, `allow`, and unset. |
+| `r` | pooled row | Cycles `routing.quota.reserveFraction` through 0.05, 0.1, 0.2, 0.3, and unset (the global reserve). |
+| `e` | pooled row | Opens the routing editors, listed below. |
+| `⇧G` | pool-capable role, fallback chain, or pooled row | Opens the model-group editor, described below. |
+
+The routing editors open as a chip strip; toggling editors stay open across edits, and `Esc` closes them:
+
+- **account order**: each named account (`auth.accountPolicies[].name`) toggles in or out of `routing.accounts.order`, appended at the end; chips show their position.
+- **drain**: sets `routing.accounts.drain` to one named account, or `none`.
+- **drain spend** / **return when**: toggle the `routing.accounts.spend` classes (`plan`, `credits`, `money`) / `returnWhen` triggers (`reset`, `credits-added`, `money-available`). A billing trigger needs its `spend` class.
+- **metered**: `provider-managed`, or `local hard budget…` typed as `<id> <perRequestMax> <maxSpend> <window>` (window `<n>m`, `<n>h`, `<n>d`; USD, such as `daily 0.50 5.00 1d`), sets `routing.spending` and appends `metered` to the funding order (which starts as `included` when the pool has none). `off` removes both, so the validator refuses it where `metered` is the only funding class.
+- **limits**: each limit chip removes that `routing.limits` entry; `add…` takes a limit in the `/account` limit syntax, `<usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip]`.
+- **strategies**: each strategy toggles in or out of the strategy list, appended at the end; chips show their position. One remaining entry is written as a plain strategy. `strategyOptions` keeps only the fields a remaining entry consumes; a new priority or round-robin entry orders the members in their current order; dropping weighted-random drops member weights.
+- **quota tolerance**: sets `strategyOptions.tolerance`, a number in (0, 0.5]; empty removes it.
+
+The model-group editor on a role or chain entry lists `use +<name>` for each other `modelGroups` entry, pointing the entry at it. On an inline pool, `new group…` names a new `modelGroups` entry holding the pool and points the entry at it (an inline `profile` stays on the reference). On a pool that references a group, `rename +<name>…` writes the group under the new name, points every role and chain that references it at the new name (keeping their profiles), and removes the old name; it is refused while a referencing entry comes from a layer above global. `delete +<name>` removes the group and leaves this entry an inline copy of it (with its profile); it is declined while another entry still references the group.
 
 How pools pick models at runtime is described in [Model pools](#model-pools).
 
-Edits are written to the global config through the same strict validation as other settings writes. A refused edit shows the validator's message and writes nothing. A pool whose value comes from a project, `--config`, or runtime layer is shown read-only, since a global write would not take effect. A pool that references `modelGroups.<name>` is read-only too, because the group is shared; `x` still removes the reference from the global config. A global role entry that fails validation (for example, a pool without `strategy`) selects no model; its row shows the validator's message instead of the pool.
+Edits are written to the global config through the same strict validation as other settings writes. A refused edit shows the validator's message (in the field, for typed values) and writes nothing. A pool whose value comes from a project, `--config`, or runtime layer is shown read-only, since a global write would not take effect. A pool that references `modelGroups.<name>` edits that group in the global config, so the change applies to every entry that references it; it is read-only when a layer above global defines the group. `x` on the pool row removes the reference itself. A global role entry that fails validation (for example, a pool without `strategy`) selects no model; its row shows the validator's message instead of the pool.
 
 ## Context promotion
 

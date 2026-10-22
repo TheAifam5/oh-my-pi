@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `beforeToolExecution` hook to `AgentLoopConfig` and `Agent`, called for each tool call about to run, after validation and before `tool_execution_start`
+- Added `terminate` to blocking `beforeToolCall` results: when every call in a batch is blocked with `terminate`, the loop records the results and goes to its stop boundary instead of starting another model turn
+- Added the `transformHeaders` option to `Agent`, passed to provider requests
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

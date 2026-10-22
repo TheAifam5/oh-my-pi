@@ -193,6 +193,13 @@ export const cfgAllowProjectMeteredPools = register({
 	id: "allowProjectMeteredPools",
 	type: "boolean",
 	default: false,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Allow Project Metered Pools",
+		description:
+			"Let project settings add pools funded by metered (pay-per-use) accounts and redefine model groups a lower layer defines. Read from the global config, --config overlays, and runtime overrides; a project value is ignored.",
+	},
 });
 
 /** Named model presets; no settings-panel UI — managed by `/modelpreset` and the model hub. */

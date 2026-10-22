@@ -23,8 +23,14 @@ import {
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
+import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
+import type { TspPickerProps } from "@oh-my-pi/pi-wire";
 
-import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import {
+	cfgAuthAccountPolicies,
+	cfgCycleOrder,
+	cfgModelPresets,
+} from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -37,6 +43,21 @@ function normalize(lines: readonly string[]): string {
 /** The footer row (hint line or an active chip strip) of a rendered frame. */
 function footerLine(lines: readonly string[]): string {
 	return stripVTControlCharacters(lines[lines.length - 2] ?? "");
+}
+
+const PICKER_CX: DescribeContext = {
+	cols: 160,
+	reduceMotion: false,
+	dark: true,
+	supports: () => true,
+	feature: () => true,
+};
+
+/** The hub described as the data-first picker. */
+function pickerProps(hub: ModelHubComponent): TspPickerProps {
+	const root = hub.describe(PICKER_CX);
+	if (root.k !== "picker" || !root.p) throw new Error(`expected a picker root, got ${root.k}`);
+	return root.p as TspPickerProps;
 }
 
 function makeModel(
@@ -1665,7 +1686,7 @@ describe("ModelHub", () => {
 				expect(normalize(hub.render(220))).toContain(strategy.join(" → "));
 				hub.handleInput("g");
 				expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy });
-				expect(normalize(hub.render(220))).toContain("change it in config");
+				expect(normalize(hub.render(220))).toContain("change it with e");
 			}
 		});
 
@@ -1807,14 +1828,18 @@ describe("ModelHub", () => {
 			expect(pool?.limits).toBeUndefined();
 			expect(pool?.raw).toEqual(settings.getModelRoleEntries().smol as Record<string, unknown>);
 
-			// A reference shows the shared group through its profile and is never written from the hub.
+			// A reference shows the shared group through its profile; edits replace the global group definition.
 			const ref = source.getPool?.({ kind: "role", key: "slow" });
 			expect(ref).toMatchObject({
 				source: { kind: "ref", group: "fast", profile: "deep" },
 				members: [{ alias: "m", model: "test/model-m", effort: "high" }],
 			});
-			expect(ref?.readOnly).toBe("edit modelGroups.fast in config");
-			expect(ref?.raw).toBeUndefined();
+			expect(ref?.readOnly).toBeUndefined();
+			expect(ref?.raw).toEqual({
+				strategy: "random",
+				models: { m: { model: "test/model-m" } },
+				profiles: { deep: { m: { effort: "high" } } },
+			});
 			// A runtime-layer value would shadow a global write.
 			expect(source.poolWriteBlocker?.({ kind: "role", key: "slow" })).toBe("set in the runtime layer");
 			expect(source.poolWriteBlocker?.({ kind: "role", key: "smol" })).toBeUndefined();
@@ -2125,6 +2150,398 @@ describe("ModelHub", () => {
 			hub.handleInput("\x1b[C"); // inherit → off
 			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [`${selector}:off`]);
+		});
+
+		describe("pool routing editors", () => {
+			const RIGHT = "\x1b[C";
+			const BACKSPACE = "\x7f";
+			const NAMED_ACCOUNTS = [
+				{ provider: "anthropic", name: "work", account: { email: "work@example.com" } },
+				{ provider: "anthropic", name: "home", account: { email: "home@example.com" } },
+			];
+
+			function type(hub: ModelHubComponent, text: string): void {
+				for (const ch of text) hub.handleInput(ch);
+			}
+
+			/** Open the `e` routing menu on the selected row and run its `index`-th editor. */
+			function openRoutingEditor(hub: ModelHubComponent, index: number): void {
+				hub.handleInput("e");
+				for (let i = 0; i < index; i++) hub.handleInput(RIGHT);
+				hub.handleInput("\n");
+			}
+
+			function smolRouting(settings: Settings): Record<string, unknown> | undefined {
+				const entry = settings.getModelRoleEntries().smol as Record<string, unknown>;
+				return entry.routing as Record<string, unknown> | undefined;
+			}
+
+			function twoModels(): Model[] {
+				return [makeModel("test", "model-a"), makeModel("test", "model-b")];
+			}
+
+			test("the source and the roles view show a pool's quota, accounts, and cache routing", () => {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: "quota",
+					models: { a: { model: "test/model-a" } },
+					routing: {
+						quota: { reserveFraction: 0.1, maxObservationAgeMs: 900_000, unknown: "exclude" },
+						accounts: { order: ["work", "home"], drain: "work", spend: ["plan", "credits"], returnWhen: "reset" },
+						cache: { affinity: true, pricing: false },
+						funding: { order: ["included", "metered"] },
+						spending: {
+							policy: "local-hard-budget",
+							budget: {
+								id: "daily",
+								currency: "USD",
+								perRequestMax: "0.50",
+								window: { type: "rolling", durationMs: 86_400_000, maxSpend: "5.00" },
+							},
+						},
+					},
+				});
+				expect(createModelBrowserSource(settings).getPool?.({ kind: "role", key: "smol" })).toMatchObject({
+					quota: "reserve 0.1, max age 15m, unknown exclude",
+					accounts: "order work → home, drain work, spend plan+credits, return reset",
+					cache: "affinity, pricing off",
+					spending: "local-hard-budget daily: $5.00 per 1d, $0.50 per request",
+				});
+				const { hub } = createHub({ models: [makeModel("test", "model-a")], scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				const rendered = normalize(hub.render(400));
+				expect(rendered).toContain("quota reserve 0.1, max age 15m, unknown exclude");
+				expect(rendered).toContain("accounts order work → home, drain work, spend plan+credits, return reset");
+				expect(rendered).toContain("cache affinity, pricing off");
+			});
+
+			test("a and h toggle cache affinity and pricing; u and r cycle the quota unknown handling and reserve", () => {
+				const settings = pooledSettings();
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(footerLine(hub.render(400))).toContain("a cache affinity");
+
+				hub.handleInput("a");
+				expect(smolRouting(settings)?.cache).toEqual({ affinity: true });
+				hub.handleInput("h");
+				expect(smolRouting(settings)?.cache).toEqual({ affinity: true, pricing: true });
+				hub.handleInput("a");
+				hub.handleInput("h");
+				expect(smolRouting(settings)).not.toHaveProperty("cache");
+
+				const unknown: unknown[] = [];
+				for (let i = 0; i < 3; i++) {
+					hub.handleInput("u");
+					unknown.push(smolGroup(settings).routing?.quota?.unknown);
+				}
+				expect(unknown).toEqual(["exclude", "allow", undefined]);
+				const reserve: unknown[] = [];
+				for (let i = 0; i < 5; i++) {
+					hub.handleInput("r");
+					reserve.push(smolGroup(settings).routing?.quota?.reserveFraction);
+				}
+				expect(reserve).toEqual([0.05, 0.1, 0.2, 0.3, undefined]);
+				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
+			});
+
+			test("e edits routing.accounts from the named accounts, and a refused trigger writes nothing", () => {
+				const settings = pooledSettings();
+				cfgAuthAccountPolicies.set(settings, NAMED_ACCOUNTS);
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+
+				openRoutingEditor(hub, 0); // account order
+				expect(footerLine(hub.render(220))).toContain("Account order →");
+				hub.handleInput("\n"); // work
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // home
+				hub.handleInput(ESC);
+				expect(smolGroup(settings).routing?.accounts).toEqual({ order: ["work", "home"] });
+
+				openRoutingEditor(hub, 1); // drain: none, work, home
+				hub.handleInput(RIGHT);
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n");
+				openRoutingEditor(hub, 2); // drain spend
+				hub.handleInput("\n"); // plan
+				hub.handleInput(ESC);
+				expect(smolGroup(settings).routing?.accounts).toEqual({
+					order: ["work", "home"],
+					drain: "home",
+					spend: ["plan"],
+				});
+
+				openRoutingEditor(hub, 3); // return when
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // credits-added needs spend credits
+				expect(normalize(hub.render(220))).toContain("credits-added requires spend to include credits");
+				expect(smolGroup(settings).routing?.accounts?.returnWhen).toBeUndefined();
+				hub.handleInput(LEFT);
+				hub.handleInput("\n"); // reset
+				hub.handleInput(ESC);
+				expect(smolGroup(settings).routing?.accounts?.returnWhen).toEqual(["reset"]);
+
+				openRoutingEditor(hub, 0);
+				hub.handleInput("\n"); // work out
+				hub.handleInput("\n"); // home out
+				hub.handleInput(ESC);
+				expect(smolGroup(settings).routing?.accounts).toEqual({
+					drain: "home",
+					spend: ["plan"],
+					returnWhen: ["reset"],
+				});
+			});
+
+			test("e authorizes metered funding with a spending policy, and turning it off removes both", () => {
+				const settings = pooledSettings();
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+
+				openRoutingEditor(hub, 4); // metered
+				hub.handleInput("\n"); // provider-managed
+				expect(smolRouting(settings)).toEqual({
+					funding: { order: ["included", "metered"] },
+					spending: { policy: "provider-managed" },
+				});
+
+				openRoutingEditor(hub, 4);
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // local hard budget…
+				type(hub, "daily 9.00 5.00 1d");
+				hub.handleInput("\n");
+				expect(footerLine(hub.render(220))).toContain("perRequestMax exceeds window.maxSpend");
+				expect(smolGroup(settings).routing?.spending).toEqual({ policy: "provider-managed" });
+				for (let i = 0; i < 18; i++) hub.handleInput(BACKSPACE);
+				type(hub, "daily $0.50 5.00 1d");
+				hub.handleInput("\n");
+				expect(smolGroup(settings).routing?.spending).toEqual({
+					policy: "local-hard-budget",
+					budget: {
+						id: "daily",
+						currency: "USD",
+						perRequestMax: "0.50",
+						window: { type: "rolling", durationMs: 86_400_000, maxSpend: "5.00" },
+					},
+				});
+
+				openRoutingEditor(hub, 4);
+				hub.handleInput(RIGHT);
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // off
+				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
+			});
+
+			test("turning metered off where it is the only funding class is refused by the validator", () => {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: "random",
+					models: { a: { model: "test/model-a" } },
+					routing: { funding: { order: ["metered"] }, spending: { policy: "provider-managed" } },
+				});
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				openRoutingEditor(hub, 4);
+				hub.handleInput(RIGHT);
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // off
+				expect(normalize(hub.render(220))).toContain(
+					"modelRoles.smol.routing.funding.order: must list billing classes",
+				);
+				expect(smolGroup(settings).routing?.spending).toEqual({ policy: "provider-managed" });
+			});
+
+			test("e adds pool limits in the /account limit syntax and removes them", () => {
+				const settings = pooledSettings();
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+
+				openRoutingEditor(hub, 5); // limits: add…
+				hub.handleInput("\n");
+				type(hub, "requests 100 1h warn");
+				hub.handleInput("\n");
+				expect(smolGroup(settings).routing?.limits).toEqual([
+					{ metric: "requests", max: 100, window: { type: "rolling", durationMs: 3_600_000 }, onLimit: "warn" },
+				]);
+
+				openRoutingEditor(hub, 5);
+				expect(footerLine(hub.render(220))).toContain("remove requests 100 1h warn");
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // add…
+				type(hub, "usage 0.5");
+				hub.handleInput("\n");
+				expect(footerLine(hub.render(220))).toContain("usage is only allowed on auth.accountPolicies limits");
+				for (let i = 0; i < 9; i++) hub.handleInput(BACKSPACE);
+				type(hub, "bogus");
+				hub.handleInput("\n");
+				expect(footerLine(hub.render(220))).toContain("Limit: <usd|requests|tokens>");
+				hub.handleInput(ESC);
+				expect(smolGroup(settings).routing?.limits).toHaveLength(1);
+
+				openRoutingEditor(hub, 5);
+				hub.handleInput("\n"); // remove the limit
+				hub.handleInput(ESC);
+				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
+			});
+
+			test("e builds a strategy list and sets its quota tolerance within (0, 0.5]", () => {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: "cheapest",
+					models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				});
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				const smol = () => settings.getModelRoleEntries().smol as Record<string, unknown>;
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+
+				openRoutingEditor(hub, 6); // strategies, in the order g cycles them
+				for (let i = 0; i < 4; i++) hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // quota
+				expect(smol().strategy).toEqual(["cheapest", "quota"]);
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // cheapest out
+				expect(smol().strategy).toBe("quota");
+				for (let i = 0; i < 5; i++) hub.handleInput(LEFT);
+				hub.handleInput("\n"); // priority
+				hub.handleInput(ESC);
+				expect(smol()).toMatchObject({ strategy: ["quota", "priority"], strategyOptions: { order: ["a", "b"] } });
+
+				openRoutingEditor(hub, 7); // quota tolerance
+				type(hub, "0.2");
+				hub.handleInput("\n");
+				expect(smol().strategyOptions).toEqual({ order: ["a", "b"], tolerance: 0.2 });
+
+				openRoutingEditor(hub, 7);
+				for (let i = 0; i < 3; i++) hub.handleInput(BACKSPACE);
+				type(hub, "0.9");
+				hub.handleInput("\n");
+				expect(footerLine(hub.render(220))).toContain("must be a number in (0, 0.5]");
+				expect(smol().strategyOptions).toEqual({ order: ["a", "b"], tolerance: 0.2 });
+			});
+
+			test("the picker shows a pool editor as its strip with toggle actions", () => {
+				const settings = pooledSettings();
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				openRoutingEditor(hub, 6); // strategies
+				const props = pickerProps(hub);
+				expect(props.strip?.label).toEqual([{ t: "Strategies", s: "muted" }]);
+				expect(props.strip?.items.find(item => item.on)?.label).toBe("1 weighted-random");
+				expect(props.actions?.map(action => action.label)).toEqual(["Toggle", "Done"]);
+			});
+
+			test("a pool that references a model group edits the global group, unless another layer defines it", () => {
+				const settings = Settings.isolated();
+				settings.setModelGroup("fast", { strategy: "random", models: { a: { model: "test/model-a" } } });
+				settings.setModelRoleSpec("smol", { use: "fast" });
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(normalize(hub.render(220))).toContain("SMOL pool +fast · 1 model · random");
+
+				hub.handleInput("a");
+				hub.handleInput("\n"); // add a member
+				type(hub, "model-b");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({
+					fast: {
+						strategy: "random",
+						models: { a: { model: "test/model-a" }, "model-b": { model: "test/model-b" } },
+						routing: { cache: { affinity: true } },
+					},
+				});
+				expect(settings.getModelRoleEntries().smol).toEqual({ use: "fast" });
+
+				const runtime = Settings.isolated({
+					modelGroups: { fast: { strategy: "random", models: { a: { model: "test/model-a" } } } },
+				});
+				runtime.setModelRoleSpec("smol", { use: "fast" });
+				const pool = createModelBrowserSource(runtime).getPool?.({ kind: "role", key: "smol" });
+				expect(pool?.readOnly).toBe("modelGroups.fast is set in the runtime layer");
+				expect(pool?.raw).toBeUndefined();
+			});
+
+			test("G declines renaming or deleting a group a shadowed global entry still references", () => {
+				const settings = Settings.isolated();
+				settings.setModelGroup("shared", { strategy: "random", models: { a: { model: "test/model-a" } } });
+				settings.setModelRoleSpec("smol", { use: "shared" });
+				settings.setFallbackChainSpec("smol", { use: "shared" });
+				cfgRetryFallbackChains.override(settings, { smol: ["test/model-b"] });
+				expect(createModelBrowserSource(settings).modelGroupReferences?.("shared")).toEqual([
+					{ kind: "role", key: "smol" },
+					{ kind: "chain", key: "smol" },
+				]);
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				hub.handleInput("G");
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // delete +shared
+				expect(normalize(hub.render(220))).toContain("+shared is still used by retry.fallbackChains.smol");
+				hub.handleInput("G");
+				hub.handleInput("\n"); // rename +shared…
+				type(hub, "-2");
+				hub.handleInput("\n");
+				expect(footerLine(hub.render(220))).toContain(
+					"retry.fallbackChains.smol uses +shared and is set in the runtime layer",
+				);
+				expect(Object.keys(settings.getGlobalSettings().modelGroups as object)).toEqual(["shared"]);
+			});
+
+			test("G turns a pool into a model group, points a chain at it, renames it, and deletes it", () => {
+				const settings = pooledSettings();
+				settings.setFallbackChainSpec("smol", ["test/model-b"]);
+				const smolRaw = settings.getModelRoleEntries().smol;
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				const groups = () => settings.getGlobalSettings().modelGroups;
+				const chain = () => cfgRetryFallbackChains.get(settings).smol as unknown;
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				expect(footerLine(hub.render(400))).toContain("⇧G group");
+
+				hub.handleInput("G");
+				hub.handleInput("\n"); // new group…
+				type(hub, "shared");
+				hub.handleInput("\n");
+				expect(groups()).toEqual({ shared: smolRaw });
+				expect(settings.getModelRoleEntries().smol).toEqual({ use: "shared" });
+
+				for (let i = 0; i < 3; i++) hub.handleInput(DOWN); // members a, b, then the chain entry
+				hub.handleInput("G");
+				hub.handleInput("\n"); // use +shared
+				expect(chain()).toEqual({ use: "shared" });
+
+				for (let i = 0; i < 3; i++) hub.handleInput(UP); // back to SMOL
+				hub.handleInput("G");
+				hub.handleInput("\n"); // rename +shared…
+				for (let i = 0; i < "shared".length; i++) hub.handleInput(BACKSPACE);
+				type(hub, "team");
+				hub.handleInput("\n");
+				expect(groups()).toEqual({ team: smolRaw });
+				expect(settings.getModelRoleEntries().smol).toEqual({ use: "team" });
+				expect(chain()).toEqual({ use: "team" });
+
+				hub.handleInput("G");
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // delete +team, still used by the chain
+				expect(normalize(hub.render(220))).toContain("+team is still used by retry.fallbackChains.smol");
+				expect(groups()).toEqual({ team: smolRaw });
+
+				settings.setFallbackChainSpec("smol", undefined);
+				hub.refreshAfterExternalMutation();
+				hub.handleInput("G");
+				hub.handleInput(RIGHT);
+				hub.handleInput("\n"); // delete +team: SMOL keeps the pool inline
+				expect(groups() ?? {}).toEqual({});
+				expect(settings.getModelRoleEntries().smol).toEqual(smolRaw);
+			});
 		});
 	});
 

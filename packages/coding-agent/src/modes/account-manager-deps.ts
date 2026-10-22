@@ -1,3 +1,10 @@
+import * as path from "node:path";
+import {
+	RESET_AUTO_REDEEM_MODES,
+	RESET_ON_WINDOWS,
+	type ResetAutoRedeemOverride,
+	type ResetOnWindow,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import { resolveUsedFraction, type UsageLimit, type UsageReport } from "@oh-my-pi/pi-ai/usage";
 import type { AccountLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import type {
@@ -5,6 +12,7 @@ import type {
 	AccountManagerAction,
 	AccountManagerDeps,
 	AccountManagerField,
+	AccountManagerPage,
 	AccountManagerResult,
 } from "@oh-my-pi/pi-tui/overlays/account-manager";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -16,6 +24,8 @@ import {
 import { formatAbsoluteOnlyAmount, formatUsageProjection } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { formatDuration, formatNumber, logger, withTimeout } from "@oh-my-pi/pi-utils";
+import { GLOBAL_LIMIT_KEY } from "../config/local-limits";
+import { cfgAuthAccountPolicies } from "../config/model-settings";
 import type { Settings } from "../config/settings";
 import {
 	type AccountListing,
@@ -23,28 +33,37 @@ import {
 	accountLimits,
 	accountPolicyWriteBlocker,
 	formatAccountLimitSpec,
+	globalLimitWriteBlocker,
 	labelAccount,
 	listAccounts,
+	listGlobalLimits,
 	listPoolMembers,
+	listProjectPins,
 	type PoolMemberListing,
 	type PoolMemberRef,
 	parseAccountLimitSpec,
 	pinProjectAccount,
 	poolMemberPath,
+	projectDirPinWriteBlocker,
 	projectPinWriteBlocker,
 	setAccountDrain,
 	setAccountLimits,
 	setAccountPriority,
 	setAccountReserve,
+	setAccountResets,
 	setAccountReturn,
 	setAccountEnabled,
+	setGlobalLimits,
 	setPoolMemberAccount,
+	setProjectDirPin,
 	unpinProjectAccount,
+	userGlobalLimits,
 } from "../session/account-admin";
+import { canonicalDir } from "../session/account-pins";
 import type { SessionPinOutcome, SessionUnpinOutcome } from "../session/agent-session-types";
 import { loadEffectiveAuthAccountPolicyConfig } from "../session/auth-broker-config";
 import type { AuthStorage } from "../session/auth-storage";
-import { formatLimitUsage } from "../session/local-limits";
+import { configuredLimitTargets, formatLimitUsage, limitStatus } from "../session/local-limits";
 import { DEFAULT_GROUP_OBSERVATION_MAX_AGE_MS, providerBillingResults } from "../session/retry-fallback-groups";
 import { describeSessionPinOutcome, describeSessionUnpinOutcome } from "../slash-commands/helpers/session-pin";
 import { reportIdentifiers } from "../slash-commands/helpers/usage-accounts";
@@ -71,15 +90,25 @@ const NAME_HINT = "Account name: lowercase letters, digits, - and _";
 const DEFAULT_LIMIT_SPEC = "usd 5 day skip";
 const LIMIT_HINT =
 	"<usd|requests|tokens> <max> <day|week|month|Nm|Nh|Nd> [warn|skip], or <usage|credits|extra-usd> <max>";
+const GLOBAL_LIMIT_HINT = "<usd|requests|tokens> <max> <day|week|month|Nm|Nh|Nd> [warn|skip]";
+const NEW_SCOPE_HINT = `<provider/model|provider|*> ${GLOBAL_LIMIT_HINT}`;
 const SPEND_CLASSES = ["credits", "money"] as const;
 const RETURN_TRIGGERS = ["reset", "credits-added", "money-available"] as const;
+/** `autoRedeem` choices: the override modes, then `inherit` (no override). */
+const AUTO_REDEEM_CHOICES = [...RESET_AUTO_REDEEM_MODES, "inherit"] as const;
 const MINUTE_MS = 60_000;
 /** Longest wait on the credential store or the policy loader before the manager gives up, in ms. */
 export const STORE_TIMEOUT_MS = 10_000;
 export const STORE_TIMEOUT_MESSAGE = "Timed out reading the credential store";
 /** Actions applied with a target state (`on` or `off`) rather than typed text. */
 const TOGGLES =
-	/^(?:enabled|drain|pin-session|pin-project|spend:.*|return:(?:reset|credits-added|money-available)|pool:.*)$/;
+	/^(?:enabled|drain|pin-session|pin-project|spend:.*|return:(?:reset|credits-added|money-available)|reset-on:.*|pool:.*)$/;
+/** Row id prefix of the global limits page: the `limits` key follows. */
+const LIMITS_ROW = "limits:";
+/** Row id of the global limits page's row that adds a new key. */
+const LIMITS_NEW_ROW = "limits+";
+/** Row id prefix of the project pins page: `[source, dir, provider]` as JSON follows. */
+const PIN_ROW = "pin:";
 
 function accountId(row: Pick<AccountListing, "provider" | "account">): string {
 	return `${row.provider}#${row.account.credentialId}`;
@@ -87,6 +116,50 @@ function accountId(row: Pick<AccountListing, "provider" | "account">): string {
 
 function memberActionId(member: PoolMemberRef): string {
 	return `pool:${JSON.stringify([member.kind, member.key, member.alias])}`;
+}
+
+/** Edit and remove actions for each of `limits`, then add, in the limit spec grammar; `expect` is the shown spec. */
+function limitActions(limits: readonly AccountLimit[], hint: string, initial: string): AccountManagerAction[] {
+	const actions: AccountManagerAction[] = limits.flatMap((limit, index) => {
+		const spec = formatAccountLimitSpec(limit);
+		const label = "id" in limit && limit.id !== undefined ? `${spec} (id ${limit.id})` : spec;
+		return [
+			{ id: `limit:edit:${index}`, label: `edit ${label}`, input: { initial: spec, hint }, expect: spec },
+			{ id: `limit:remove:${index}`, label: `remove ${label}`, expect: spec },
+		];
+	});
+	actions.push({ id: "limit:add", label: "add…", input: { initial, hint } });
+	return actions;
+}
+
+/**
+ * `limits` after the `limit:add`, `limit:edit:<i>`, or `limit:remove:<i>` action with the typed
+ * spec `value`, or the refusal; an edited limit keeps its `id`.
+ *
+ * @throws AccountAdminError when `value` is not a limit spec.
+ */
+function nextLimits(
+	limits: readonly AccountLimit[],
+	actionId: string,
+	value: string,
+	expect: string | undefined,
+): unknown[] | { error: string } {
+	const match = /^limit:(?:(add)|(edit|remove):(0|[1-9]\d*))$/.exec(actionId);
+	const index = match?.[3] === undefined ? undefined : Number(match[3]);
+	if (!match || (index !== undefined && index >= limits.length)) {
+		return { error: `Unknown limit action: ${actionId}` };
+	}
+	if (index !== undefined && formatAccountLimitSpec(limits[index]!) !== expect) {
+		return { error: "That limit changed since it was shown; reload with ctrl+r." };
+	}
+	const next: unknown[] = [...limits];
+	if (match[1]) next.push(parseAccountLimitSpec(value));
+	else if (match[2] === "edit") {
+		const edited = limits[index!]!;
+		const id = "id" in edited ? edited.id : undefined;
+		next[index!] = { ...(id === undefined ? {} : { id }), ...parseAccountLimitSpec(value) };
+	} else next.splice(index!, 1);
+	return next;
 }
 
 /**
@@ -191,6 +264,11 @@ function minutes(ms: number): string {
 	return `${Number((ms / MINUTE_MS).toFixed(2))} min`;
 }
 
+/** A successful write's confirmation `message` with the write's warning, if any. */
+function written(message: string, result: { warning?: string }): AccountManagerResult {
+	return { message, ...(result.warning ? { warning: result.warning } : {}) };
+}
+
 /** Supply the `/account` manager with stored accounts and apply its edits through account-admin. */
 export function createAccountManagerDeps(host: AccountManagerHost): AccountManagerDeps {
 	const { settings, authStorage, cwd, session } = host;
@@ -224,19 +302,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 			limitsInvalid = error instanceof Error ? error.message : String(error);
 		}
 		const providerMembers = members.filter(member => parseModelString(member.model)?.provider === row.provider);
-		const limitChoices: AccountManagerAction[] = limits.flatMap((limit, index) => {
-			const spec = formatAccountLimitSpec(limit);
-			return [
-				{
-					id: `limit:edit:${index}`,
-					label: `edit ${spec}`,
-					input: { initial: spec, hint: LIMIT_HINT },
-					expect: spec,
-				},
-				{ id: `limit:remove:${index}`, label: `remove ${spec}`, expect: spec },
-			];
-		});
-		limitChoices.push({ id: "limit:add", label: "add…", input: { initial: DEFAULT_LIMIT_SPEC, hint: LIMIT_HINT } });
+		const autoRedeem = row.autoRedeem ?? "inherit";
 		return [
 			{
 				id: "name",
@@ -318,6 +384,34 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				],
 			},
 			{
+				id: "reset-on",
+				label: "resets on",
+				key: "w",
+				value: row.resetOn === undefined ? "any" : row.resetOn.join(", "),
+				readOnly: oauthOnly,
+				choices: [
+					...RESET_ON_WINDOWS.map(window => ({
+						id: `reset-on:${window}`,
+						label: window,
+						on: row.resetOn?.includes(window) === true,
+					})),
+					{ id: "reset-on:any", label: "any", on: row.resetOn === undefined },
+				],
+			},
+			{
+				id: "auto-redeem",
+				label: "auto-redeem",
+				key: "a",
+				value: autoRedeem,
+				readOnly: oauthOnly,
+				choices: AUTO_REDEEM_CHOICES.map(mode => ({
+					id: `auto-redeem:${mode}`,
+					label: mode,
+					on: autoRedeem === mode,
+					expect: autoRedeem,
+				})),
+			},
+			{
 				id: "pin-session",
 				label: "session pin",
 				key: "s",
@@ -359,7 +453,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				key: "l",
 				value: limitsInvalid ? "invalid" : String(limits.length),
 				readOnly: limitsInvalid ?? policyReadOnly,
-				choices: limitChoices,
+				choices: limitActions(limits, LIMIT_HINT, DEFAULT_LIMIT_SPEC),
 			},
 		];
 	};
@@ -468,7 +562,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 		const policyBlocker = accountPolicyWriteBlocker(settings);
 		const policyAction =
 			["name", "priority", "reserve", "drain", "pin-project"].includes(actionId) ||
-			/^(spend|return|limit|pool):/.test(actionId);
+			/^(spend|return|reset-on|auto-redeem|limit|pool):/.test(actionId);
 		if (policyAction && policyBlocker) return { error: `${policyBlocker}; change it there.` };
 		if (TOGGLES.test(actionId) && value !== "on" && value !== "off") {
 			return { error: "A toggle needs its target state (on or off)." };
@@ -480,10 +574,6 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 			return parsed;
 		};
 		const optionalNumber = (what: string): number | undefined => (value === "" ? undefined : number(what));
-		const written = (message: string, result: { warning?: string }): AccountManagerResult => ({
-			message,
-			...(result.warning ? { warning: result.warning } : {}),
-		});
 		const toggled = <T extends string>(current: readonly T[], entry: T): T[] =>
 			on ? [...new Set([...current, entry])] : current.filter(candidate => candidate !== entry);
 		if (actionId === "name") {
@@ -555,20 +645,37 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				setAccountDrain(settings, authStorage, row.provider, ref, { returnWhen }),
 			);
 		}
+		const resetWindow = RESET_ON_WINDOWS.find(candidate => actionId === `reset-on:${candidate}`);
+		if (resetWindow || actionId === "reset-on:any") {
+			let resetOn: readonly ResetOnWindow[] | undefined;
+			if (resetWindow) {
+				const next = toggled(row.resetOn ?? [], resetWindow);
+				resetOn = next.length > 0 ? RESET_ON_WINDOWS.filter(window => next.includes(window)) : undefined;
+			} else if (!on) {
+				return { error: `Choose ${RESET_ON_WINDOWS.join(" or ")} to limit the windows ${label} resets on.` };
+			}
+			return written(
+				`${label} resets on ${resetOn === undefined ? "any window" : resetOn.join(", ")}.`,
+				setAccountResets(settings, authStorage, ref, { resetOn }),
+			);
+		}
+		const autoRedeemChoice = AUTO_REDEEM_CHOICES.find(candidate => actionId === `auto-redeem:${candidate}`);
+		if (autoRedeemChoice) {
+			const current = row.autoRedeem ?? "inherit";
+			if (expect !== undefined && expect !== current) {
+				return { error: "Auto-redeem changed since it was shown; reload with ctrl+r." };
+			}
+			if (autoRedeemChoice === current) return { message: `${label} auto-redeem is already ${current}.` };
+			const autoRedeem: ResetAutoRedeemOverride | undefined =
+				autoRedeemChoice === "inherit" ? undefined : autoRedeemChoice;
+			return written(
+				`${label} auto-redeem: ${autoRedeemChoice}.`,
+				setAccountResets(settings, authStorage, ref, { autoRedeem }),
+			);
+		}
 		if (actionId.startsWith("limit:")) {
-			const limits = accountLimits(settings, ref);
-			const match = /^limit:(?:(add)|(edit|remove):(0|[1-9]\d*))$/.exec(actionId);
-			const index = match?.[3] === undefined ? undefined : Number(match[3]);
-			if (!match || (index !== undefined && index >= limits.length)) {
-				return { error: `Unknown limit action: ${actionId}` };
-			}
-			if (index !== undefined && formatAccountLimitSpec(limits[index]!) !== expect) {
-				return { error: "That limit changed since it was shown; reload with ctrl+r." };
-			}
-			const next: unknown[] = [...limits];
-			if (match[1]) next.push(parseAccountLimitSpec(value));
-			else if (match[2] === "edit") next[index!] = parseAccountLimitSpec(value);
-			else next.splice(index!, 1);
+			const next = nextLimits(accountLimits(settings, ref), actionId, value, expect);
+			if (!Array.isArray(next)) return next;
 			return written(
 				`${label} has ${next.length} limit${next.length === 1 ? "" : "s"}.`,
 				setAccountLimits(settings, authStorage, ref, next),
@@ -626,14 +733,218 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 		return { error: `Unknown account action: ${actionId}` };
 	};
 
+	const limitsPage = (): AccountManagerPage => {
+		const ledger = settings.getStorage()?.usageLedger;
+		const nowMs = Date.now();
+		const targets = configuredLimitTargets(settings);
+		const rows: AccountManagerAccount[] = listGlobalLimits(settings).map(entry => {
+			const scope =
+				entry.key === GLOBAL_LIMIT_KEY
+					? "every call"
+					: entry.key.includes("/")
+						? "calls to this model"
+						: "calls to this provider";
+			const usage = entry.limits.map((limit, index) => {
+				const targetKey = limit.id !== undefined ? `id:${limit.id}` : `${entry.key}#${index}`;
+				const target = targets.find(candidate => candidate.key === targetKey);
+				return target
+					? formatLimitUsage(limitStatus(ledger, target, entry.key, nowMs), nowMs)
+					: formatAccountLimitSpec(limit);
+			});
+			const shadowed = entry.source !== "global";
+			return {
+				id: `${LIMITS_ROW}${entry.key}`,
+				provider: "",
+				name: entry.key,
+				identity: scope,
+				badges: [
+					entry.invalid ? "invalid" : `${entry.limits.length} limit${entry.limits.length === 1 ? "" : "s"}`,
+					shadowed ? entry.source : undefined,
+				].filter((badge): badge is string => badge !== undefined),
+				details: [
+					{ label: "covers", value: scope },
+					{
+						label: "layer",
+						value: shadowed ? `${entry.source}; shown read-only` : "user config",
+						tone: shadowed ? "warning" : "dim",
+					},
+					...(entry.invalid
+						? [{ label: "invalid", value: entry.invalid, tone: "error" as const }]
+						: usage.map(value => ({ label: "limit", value }))),
+				],
+				fields: [
+					{
+						id: "limits",
+						label: "limits",
+						key: "l",
+						value: entry.invalid ? "invalid" : String(entry.limits.length),
+						readOnly: entry.invalid ?? globalLimitWriteBlocker(settings, entry.key),
+						choices: limitActions(entry.limits, GLOBAL_LIMIT_HINT, DEFAULT_LIMIT_SPEC),
+					},
+				],
+			};
+		});
+		rows.push({
+			id: LIMITS_NEW_ROW,
+			provider: "",
+			name: "(add scope)",
+			identity: "limits for a provider/model, a provider, or * (every call)",
+			badges: [],
+			details: [{ label: "add", value: NEW_SCOPE_HINT, tone: "dim" }],
+			fields: [
+				{
+					id: "limit:add",
+					label: "add",
+					key: "a",
+					value: "scope and limit",
+					input: { initial: `${GLOBAL_LIMIT_KEY} ${DEFAULT_LIMIT_SPEC}`, hint: NEW_SCOPE_HINT },
+				},
+			],
+		});
+		return { id: "limits", label: "Global limits", empty: "No global limits.", rows };
+	};
+
+	const pinsPage = (): AccountManagerPage => {
+		const here = canonicalDir(cwd());
+		const policyReadOnly = accountPolicyWriteBlocker(settings);
+		const policies = cfgAuthAccountPolicies.get(settings);
+		const rows: AccountManagerAccount[] = listProjectPins(settings).map(pin => {
+			const names = [
+				...new Set(
+					policies.flatMap(policy =>
+						policy.provider === pin.provider && policy.name !== undefined ? [policy.name] : [],
+					),
+				),
+			].sort();
+			const readOnly =
+				pin.source === "global"
+					? (policyReadOnly ?? projectDirPinWriteBlocker(settings, pin.dir, pin.provider))
+					: `set in the ${pin.source} layer`;
+			const relative = path.relative(pin.dir, here);
+			const coversHere = relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+			const stored = authStorage.sessions.accounts(pin.provider).some(account => account.name === pin.name);
+			const shadowed = pin.source !== "global";
+			return {
+				id: `${PIN_ROW}${JSON.stringify([pin.source, pin.dir, pin.provider])}`,
+				provider: pin.provider,
+				name: shortenPath(pin.dir),
+				identity: pin.name,
+				badges: [
+					coversHere ? "this directory" : undefined,
+					shadowed ? pin.source : undefined,
+					pin.shadowedBy ? `replaced by ${pin.shadowedBy}` : undefined,
+					stored ? undefined : "no stored account",
+				].filter((badge): badge is string => badge !== undefined),
+				details: [
+					{ label: "directory", value: pin.dir },
+					{
+						label: "account",
+						value: stored
+							? `${pin.provider}/${pin.name}`
+							: `${pin.provider}/${pin.name} (not stored; requests fail)`,
+						tone: stored ? "success" : "warning",
+					},
+					{
+						label: "layer",
+						value: shadowed ? `${pin.source}; shown read-only` : "user config",
+						tone: shadowed ? "warning" : "dim",
+					},
+					...(pin.shadowedBy
+						? [{ label: "replaced", value: `a ${pin.shadowedBy} pin applies instead`, tone: "warning" as const }]
+						: []),
+				],
+				fields: [
+					{
+						id: "pin:account",
+						label: "account",
+						key: "a",
+						value: pin.name,
+						readOnly: readOnly ?? (names.length === 0 ? `no ${pin.provider} account has a name` : undefined),
+						choices: names.map(name => ({
+							id: `pin:account:${name}`,
+							label: name,
+							on: name === pin.name,
+							expect: pin.name,
+						})),
+					},
+					{ id: "pin:remove", label: "remove", key: "x", value: "unpin", readOnly, expect: pin.name },
+				],
+			};
+		});
+		return {
+			id: "pins",
+			label: "Project pins",
+			empty: "No project pins. Pin the current project from an account (j).",
+			rows,
+		};
+	};
+
+	/** Apply an edit to a page row; undefined when `id` names no page row. */
+	const runPageRow = (
+		id: string,
+		actionId: string,
+		value: string,
+		expect: string | undefined,
+	): AccountManagerResult | undefined => {
+		if (id === LIMITS_NEW_ROW || id.startsWith(LIMITS_ROW)) {
+			let key = id.slice(LIMITS_ROW.length);
+			let spec = value;
+			if (id === LIMITS_NEW_ROW) {
+				if (actionId !== "limit:add") return { error: `Unknown limits action: ${actionId}` };
+				const match = /^(\S+)\s+(\S.*)$/.exec(value.trim());
+				if (!match) return { error: `Enter ${NEW_SCOPE_HINT}.` };
+				key = match[1]!;
+				spec = match[2]!;
+			}
+			const blocker = globalLimitWriteBlocker(settings, key);
+			if (blocker) return { error: `${blocker}; change it there.` };
+			const next = nextLimits(userGlobalLimits(settings, key), actionId, spec, expect);
+			if (!Array.isArray(next)) return next;
+			return written(
+				`${key} has ${next.length} limit${next.length === 1 ? "" : "s"}.`,
+				setGlobalLimits(settings, key, next),
+			);
+		}
+		if (!id.startsWith(PIN_ROW)) return undefined;
+		const parsed: unknown = JSON.parse(id.slice(PIN_ROW.length));
+		if (!Array.isArray(parsed) || parsed.length !== 3 || !parsed.every(part => typeof part === "string")) {
+			return { error: `Unknown pin: ${id}` };
+		}
+		const [source, dir, provider] = parsed as [string, string, string];
+		if (source !== "global") return { error: `That pin is set in the ${source} layer; change it there.` };
+		const blocker = accountPolicyWriteBlocker(settings) ?? projectDirPinWriteBlocker(settings, dir, provider);
+		if (blocker) return { error: `${blocker}; change it there.` };
+		const current = listProjectPins(settings).find(
+			pin => pin.source === "global" && pin.dir === dir && pin.provider === provider,
+		);
+		if (!current) return { error: "That pin is no longer configured; reload with ctrl+r." };
+		if (expect !== undefined && expect !== current.name) {
+			return { error: "That pin changed since it was shown; reload with ctrl+r." };
+		}
+		if (actionId === "pin:remove") {
+			const result = setProjectDirPin(settings, authStorage, dir, provider, undefined);
+			return written(`Removed the ${provider} pin of ${shortenPath(result.projectDir)}.`, result);
+		}
+		if (actionId.startsWith("pin:account:")) {
+			const name = actionId.slice("pin:account:".length);
+			if (name === current.name) return { message: `${shortenPath(dir)} already pins ${provider} to "${name}".` };
+			const result = setProjectDirPin(settings, authStorage, dir, provider, name);
+			return written(`Pinned ${provider} to "${name}" for ${shortenPath(result.projectDir)}.`, result);
+		}
+		return { error: `Unknown pin action: ${actionId}` };
+	};
+
 	return {
 		load,
+		pages: () => [limitsPage(), pinsPage()],
 		refresh: () => withTimeout(authStorage.credentials.reload(), STORE_TIMEOUT_MS, STORE_TIMEOUT_MESSAGE),
 		apply: async (id, actionId, value = "", expect) => {
 			let result: AccountManagerResult;
 			const revision = settings.revision;
 			try {
 				await withTimeout(authStorage.credentials.reload(), STORE_TIMEOUT_MS, STORE_TIMEOUT_MESSAGE);
+				const pageResult = runPageRow(id, actionId, value, expect);
+				if (pageResult) return pageResult;
 				const row = listAccounts(settings, authStorage, cwd()).find(candidate => accountId(candidate) === id);
 				if (!row) return { error: "That account is no longer stored." };
 				if (actionId === "enabled") {

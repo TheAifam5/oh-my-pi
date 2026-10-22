@@ -14,12 +14,9 @@
 
 ### Added
 
-- Added the "Anthropic (Console API key)" login (`omp login anthropic-api-key`), which refuses OAuth and Admin keys and checks the key against Anthropic before saving it as an `anthropic` account
-
-### Changed
-
-- The "Anthropic (Console API key)" login accepts personal API keys (`sk-ant-usr…`) besides `sk-ant-api…` keys
-- The "Anthropic (Console API key)" login asks for an optional workspace ID after the key; `login "api-key"` rules accept `workspace-prompt` (`CompiledApiKeyLogin.workspacePrompt`)
+- Added the "Anthropic (Console API key)" login (`omp login anthropic-api-key`), which accepts `sk-ant-api…` and personal `sk-ant-usr…` keys, refuses OAuth and Admin keys, asks for an optional workspace ID, and checks the key against Anthropic before saving it as an `anthropic` account; `login "api-key"` rules accept `workspace-prompt` (`CompiledApiKeyLogin.workspacePrompt`)
+- Added prompt-cache lifetimes for OpenAI and Azure OpenAI GPT models and Moonshot Kimi K3, used by pool cache affinity; cache warming now requires the new `promptCacheWarming` flag, which the Anthropic and Bedrock Claude routes and a models.yml `promptCache` set
+- Added `ModelSamplingParams` and the `samplingParams` and `samplingParamsByThinkingLevel` model fields
 
 ## [18.12.5] - 2026-10-21
 

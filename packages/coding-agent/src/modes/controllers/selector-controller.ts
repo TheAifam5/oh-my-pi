@@ -22,8 +22,10 @@ import {
 } from "@oh-my-pi/pi-utils";
 import {
 	ADVISOR_DEFAULT_TOOL_NAMES,
+	DEFAULT_ADVISOR_CATEGORIES,
 	discoverAdvisorConfigs,
 	loadWatchdogConfigFile,
+	resolveAdvisorCategories,
 	resolveAdvisorConfigEditPath,
 	saveWatchdogConfigFile,
 } from "../../advisor";
@@ -143,7 +145,7 @@ import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboa
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
-import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
+import { cfgAdvisorMaxNotesPerUpdate, cfgAdvisorSyncBacklog } from "../../advisor/settings";
 import { cfgBranchSummaryEnabled } from "../../session/context-settings";
 import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../../session/settings";
@@ -359,7 +361,7 @@ export class SelectorController {
 						providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
 							(a, b) => a.localeCompare(b),
 						),
-						settings: createSettingsHost(),
+						settings: createSettingsHost(this.ctx.session),
 						plugins: createPluginSettingsHost(getProjectDir()),
 						model: this.ctx.session.model,
 						imageBudget: this.ctx.ui.imageBudget,
@@ -549,6 +551,13 @@ export class SelectorController {
 				defaultModelLabel: defaultAdvisorModel
 					? `${defaultAdvisorModel.provider}/${defaultAdvisorModel.id}`
 					: undefined,
+				maxNotesPerUpdate: cfgAdvisorMaxNotesPerUpdate.get(this.ctx.settings),
+				defaultCategories: DEFAULT_ADVISOR_CATEGORIES,
+				resolveCategoryWarnings: doc =>
+					resolveAdvisorCategories(
+						doc.categories === undefined ? undefined : new Map(Object.entries(doc.categories)),
+						doc.advisors,
+					).warnings,
 			};
 			const overlay = new AdvisorConfigOverlayComponent(this.ctx.ui, deps, initialScope, initialDoc, {
 				loadDoc: async scope => loadWatchdogConfigFile(await resolveAdvisorConfigEditPath(scope, dirs)),
@@ -1165,7 +1174,7 @@ export class SelectorController {
 						if (refused !== undefined) return refused;
 						const name =
 							target.kind === "role" ? (getRoleInfo(target.key, settings)?.tag ?? target.key) : target.key;
-						const pool = `${name} ${target.kind === "role" ? "pool" : "fallback pool"}`;
+						const pool = `${name} ${target.kind === "role" ? "pool" : target.kind === "group" ? "model group" : "fallback pool"}`;
 						this.ctx.showStatus(value === undefined ? `${pool} cleared` : `${pool} saved`);
 						return undefined;
 					} catch (error) {

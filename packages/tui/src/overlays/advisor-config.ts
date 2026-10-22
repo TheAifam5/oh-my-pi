@@ -17,7 +17,7 @@
  */
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type Model, resolveUsedFraction, type UsageLimit, type UsageReport } from "@oh-my-pi/pi-ai";
-import { formatDuration } from "@oh-my-pi/pi-utils";
+import { formatDuration, slugify } from "@oh-my-pi/pi-utils";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import {
 	type Component,
@@ -30,7 +30,7 @@ import {
 	truncateToWidth,
 } from "../index";
 import { getSelectListTheme, theme } from "../theme";
-import { sanitizeDisplayWarnings } from "../render/render-utils";
+import { sanitizeDisplayWarning, sanitizeDisplayWarnings } from "../render/render-utils";
 import { formatKeyHint } from "../app-keybindings";
 import { editorKey, editorKeys } from "../chrome/keybinding-hints";
 import { HookEditorComponent } from "./hook-editor";
@@ -96,6 +96,14 @@ export interface AdvisorCategoryConfig {
 	precedence?: number;
 }
 
+/** One category of the bundled taxonomy, active while the edited file declares no `categories`. */
+export interface AdvisorDefaultCategory {
+	id: string;
+	description: string;
+	owner?: string;
+	precedence?: number;
+}
+
 /** Which level a `WATCHDOG.yml` lives at: the project root or the user agent dir. */
 export type AdvisorConfigScope = "project" | "user";
 
@@ -158,6 +166,12 @@ export interface AdvisorConfigDeps {
 	syncBacklog?: AdvisorSyncBacklog;
 	/** Formatted advisor-role model shown on the seeded default row (e.g. "anthropic/claude-..."). */
 	defaultModelLabel?: string;
+	/** Global `advisor.maxNotesPerUpdate`, inherited when the file sets no budget. */
+	maxNotesPerUpdate?: number;
+	/** Bundled taxonomy, active while the edited file declares no `categories`. */
+	defaultCategories?: readonly AdvisorDefaultCategory[];
+	/** Owner-resolution warnings for the edited file's taxonomy against its roster. */
+	resolveCategoryWarnings?: (doc: WatchdogConfigDoc) => string[];
 }
 
 const PREVIEW_WIDTH = 60;
@@ -239,6 +253,97 @@ const SYNC_BACKLOG_INHERIT = "inherit";
 /** The tools list's terminal-only "Done" row; the picker applies with its own action instead. */
 const TOOLS_DONE = "__done";
 
+/** Inclusive bounds of a `maxNotesPerUpdate` budget. */
+const MAX_NOTES_MIN = 1;
+const MAX_NOTES_MAX = 32;
+/** `advisor.maxNotesPerUpdate` default, inherited when the host supplies no setting value. */
+const MAX_NOTES_DEFAULT = 4;
+
+/** Category ids the editor creates: lower-kebab. */
+const CATEGORY_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/** Owner choice value for "no owner"; trimmed advisor names are never empty. */
+const CATEGORY_OWNER_NONE = "";
+
+/**
+ * Normalize one `categories` entry as discovery loads it: trimmed id and
+ * owner (an empty owner is dropped), a finite precedence only. An empty id or
+ * description yields the drop reason instead.
+ */
+export function normalizeAdvisorCategoryEntry(
+	rawId: string,
+	entry: AdvisorCategoryConfig,
+): { id: string; category: AdvisorCategoryConfig } | { error: string } {
+	const id = rawId.trim();
+	if (!id || !entry.description.trim()) return { error: "empty id or description" };
+	const category: AdvisorCategoryConfig = { description: entry.description };
+	const owner = entry.owner?.trim();
+	if (owner) category.owner = owner;
+	if (entry.precedence !== undefined && Number.isFinite(entry.precedence)) category.precedence = entry.precedence;
+	return { id, category };
+}
+
+/** The entries of `categories` that discovery loads, plus one warning per dropped entry. */
+function validAdvisorCategories(categories: Readonly<Record<string, AdvisorCategoryConfig>>): {
+	categories: Record<string, AdvisorCategoryConfig>;
+	warnings: string[];
+} {
+	const valid: Record<string, AdvisorCategoryConfig> = {};
+	const warnings: string[] = [];
+	for (const [rawId, entry] of Object.entries(categories)) {
+		const normalized = normalizeAdvisorCategoryEntry(rawId, entry);
+		if ("error" in normalized) warnings.push(`category "${rawId}" dropped — ${normalized.error}`);
+		else valid[normalized.id] = normalized.category;
+	}
+	return { categories: valid, warnings };
+}
+
+/** Whether `value` is a valid `maxNotesPerUpdate`: an integer 1–32. */
+function isMaxNotesBudget(value: number): boolean {
+	return Number.isInteger(value) && value >= MAX_NOTES_MIN && value <= MAX_NOTES_MAX;
+}
+
+/** A typed notes budget: blank or `inherit` clears (`null`); an integer 1–32 sets it; else `undefined`. */
+function parseMaxNotes(value: string): number | null | undefined {
+	const trimmed = value.trim();
+	if (trimmed === "" || trimmed.toLowerCase() === "inherit") return null;
+	const budget = Number(trimmed);
+	return isMaxNotesBudget(budget) ? budget : undefined;
+}
+
+/** The selected ids in `order`; none selected omits `owns`. */
+function commitOwns(selected: ReadonlySet<string>, order: readonly string[]): string[] | undefined {
+	const owns = order.filter(id => selected.has(id));
+	return owns.length > 0 ? owns : undefined;
+}
+
+/** A typed precedence: blank or `none` clears (`null`); a finite number sets it; else `undefined`. */
+function parsePrecedence(value: string): number | null | undefined {
+	const trimmed = value.trim();
+	if (trimmed === "" || trimmed.toLowerCase() === "none") return null;
+	const precedence = Number(trimmed);
+	return Number.isFinite(precedence) ? precedence : undefined;
+}
+
+function formatOwns(owns: readonly string[] | undefined): string {
+	return owns?.length ? owns.join(", ") : "none";
+}
+
+/** One-line category label: owner, precedence, and the description's first line. */
+function formatCategorySummary(category: { description: string; owner?: string; precedence?: number }): string {
+	const parts = [`owner ${category.owner ?? "none"}`];
+	if (category.precedence !== undefined) parts.push(`precedence ${category.precedence}`);
+	parts.push(previewLineOrNone(category.description));
+	return parts.join(" · ");
+}
+
+/** A text editor's titled card over the prefs page. */
+interface FieldCard {
+	role: string;
+	title: string;
+	hint: string;
+}
+
 /**
  * A picker editor as a component of its own: a component's root picker stays
  * where it is described, the prefs page's editor slot, where a picker
@@ -304,7 +409,42 @@ type Screen =
 	| "review-mode"
 	| "review-interval"
 	| "sync-backlog"
-	| "instructions";
+	| "max-notes"
+	| "owns"
+	| "instructions"
+	| "categories"
+	| "category"
+	| "category-id"
+	| "category-description"
+	| "category-owner"
+	| "category-precedence";
+
+/** Screens editing the taxonomy; the prefs page shows the categories page under them. */
+const CATEGORY_SCREENS: Partial<Record<Screen, true>> = {
+	categories: true,
+	category: true,
+	"category-id": true,
+	"category-description": true,
+	"category-owner": true,
+	"category-precedence": true,
+};
+
+/** Screens whose editor sits over the prefs page. */
+const PREFS_EDITOR_SCREENS: Partial<Record<Screen, true>> = {
+	model: true,
+	thinking: true,
+	"review-mode": true,
+	"review-interval": true,
+	"sync-backlog": true,
+	"max-notes": true,
+	owns: true,
+	tools: true,
+	instructions: true,
+	"category-id": true,
+	"category-description": true,
+	"category-owner": true,
+	"category-precedence": true,
+};
 
 /** Footer key hints per screen for the described overlay (the ANSI footer strings carry the same keys). */
 function screenHints(screen: Screen): (NativeHint | undefined)[] {
@@ -316,8 +456,12 @@ function screenHints(screen: Screen): (NativeHint | undefined)[] {
 				actionHint("tui.select.cancel", "close"),
 			];
 		case "detail":
+		case "categories":
+		case "category":
 			return [actionHint("tui.select.confirm", "edit field"), actionHint("tui.select.cancel", "back")];
 		case "name":
+		case "category-id":
+		case "category-description":
 			return [actionHint("tui.input.submit", "save"), actionHint("tui.select.cancel", "cancel")];
 		case "model":
 			return [
@@ -328,9 +472,18 @@ function screenHints(screen: Screen): (NativeHint | undefined)[] {
 		case "thinking":
 		case "review-mode":
 		case "sync-backlog":
+		case "category-owner":
 			return [actionHint("tui.select.confirm", "pick"), actionHint("tui.select.cancel", "back")];
 		case "review-interval":
+		case "max-notes":
+		case "category-precedence":
 			return [actionHint("tui.input.submit", "save"), actionHint("tui.select.cancel", "cancel")];
+		case "owns":
+			return [
+				actionHint("tui.select.confirm", "toggle"),
+				{ keys: [], label: "Done applies" },
+				actionHint("tui.select.cancel", "apply"),
+			];
 		case "tools":
 			return [
 				actionHint("tui.select.confirm", "toggle"),
@@ -360,7 +513,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 	#cachedReports: UsageReport[] | null = null;
 	#dirty = false;
 
-	/** The advisor the detail screen (and its editors) edits; -1 on the roster or the shared instructions. */
+	/** The advisor the detail screen (and its editors) edits; -1 on the roster, the shared settings, or the categories. */
 	#detailIndex = -1;
 	#nativePrefs: { signature: string; editor: NativeNode | undefined; node: NativeNode } | undefined;
 	/** The editor over the prefs page, rebuilt only when one of `deps` changes identity. */
@@ -368,13 +521,15 @@ export class AdvisorConfigOverlayComponent implements Component {
 	/** The model screen's catalogue and the advisor's current model among it (picker `current`). */
 	#modelItems: ModelBrowserItem[] = [];
 	#modelCurrent: string | undefined;
-	/** Picker sheet options of the current list screen (thinking, review mode, sync backlog, tools). */
+	/** Picker sheet options of the current list screen (thinking, review mode, sync backlog, tools, owns, owner). */
 	#sheetOptions: SelectPickerOptions | undefined;
 	readonly #editorSheet = new EditorSheet(event => this.#routeEditorPicker(event));
 	#screen: Screen = "list";
 	/** The interactive element for the current screen. */
 	#active: Component = new SelectList([], 1, getSelectListTheme());
 	#footerHint = "";
+	/** The text editor's card over the prefs page, for the current input screen. */
+	#fieldInfo: FieldCard | undefined;
 	#previewScroll = 0;
 	#nativeHints: { screen: Screen; node: NativeNode | undefined } | undefined;
 	#nativePreview: { json: string; node: NativeNode } | undefined;
@@ -485,8 +640,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 
 	/**
 	 * The native settings page (`prefs`) when the terminal draws it: a page per
-	 * advisor plus the shared instructions, the advisor's fields as typed rows,
-	 * the file actions, and the model/tools/instructions editors over the page.
+	 * advisor plus the shared settings and the categories, their fields as typed
+	 * rows, the file actions, and the field editors over the page.
 	 * Otherwise the root card `omp.overlay.advisor`: on the roster screen a
 	 * sidebar (the active `SelectList`) beside the highlighted entry's preview;
 	 * every other screen shows its editor component alone. Key hints close the
@@ -497,26 +652,47 @@ export class AdvisorConfigOverlayComponent implements Component {
 		return this.#describeCard();
 	}
 
-	/** The advisor index a page shows: the detail's, else the roster's highlighted advisor, else the first. */
+	/**
+	 * The advisor index a page shows: the detail's; -1 under the shared and
+	 * taxonomy editors; else the roster's highlighted advisor, -1 on the shared
+	 * and categories rows, else the first.
+	 */
 	#pageIndex(): number {
 		if (this.#detailIndex >= 0) return this.#detailIndex;
+		if (this.#screen !== "list") return -1;
 		const value = this.#active instanceof SelectList ? (this.#active.getSelectedItem()?.value ?? "") : "";
 		const match = /^advisor:(\d+)$/.exec(value);
-		return match ? Number(match[1]) : value === "shared" ? -1 : 0;
+		if (match) return Number(match[1]);
+		return value === "shared" || value === "sharedMaxNotes" || value === "categories" ? -1 : 0;
+	}
+
+	/** The prefs page shown: `advisor:<n>`, `categories`, or `shared`. */
+	#pageId(): string {
+		const index = this.#pageIndex();
+		if (index >= 0) return `advisor:${index}`;
+		if (CATEGORY_SCREENS[this.#screen]) return "categories";
+		const value =
+			this.#screen === "list" && this.#active instanceof SelectList
+				? (this.#active.getSelectedItem()?.value ?? "")
+				: "";
+		return value === "categories" ? "categories" : "shared";
 	}
 
 	#describePrefs(): NativeNode {
 		const doc = this.#doc;
+		const page = this.#pageId();
 		const index = this.#pageIndex();
-		const shared = index < 0;
-		const advisor = shared ? undefined : doc.advisors[index];
+		const advisor = index >= 0 ? doc.advisors[index] : undefined;
 		const pages: TspPrefsProps["pages"][number][] = doc.advisors.map((a, i) => ({
 			id: `advisor:${i}`,
 			label: a.name || "(unnamed)",
 			icon: "advisor",
 			group: "Advisors",
 		}));
-		pages.push({ id: "shared", label: "Shared instructions", icon: "doc", group: "All advisors" });
+		pages.push(
+			{ id: "shared", label: "Shared settings", icon: "doc", group: "All advisors" },
+			{ id: "categories", label: "Categories", icon: "list", group: "All advisors" },
+		);
 
 		const sections: TspPrefsProps["sections"][number][] = [];
 		if (doc.warnings?.length) {
@@ -589,6 +765,25 @@ export class AdvisorConfigOverlayComponent implements Component {
 					},
 				},
 				{
+					id: "maxNotesPerUpdate",
+					label: "Notes per update",
+					hint: `Non-blocker notes accepted per update (1–32); reset inherits ${this.#inheritedMaxNotesLabel()}.`,
+					changed: advisor.maxNotesPerUpdate !== undefined ? true : undefined,
+					control: {
+						k: "number",
+						value: advisor.maxNotesPerUpdate ?? this.#inheritedMaxNotes(),
+						min: MAX_NOTES_MIN,
+						max: MAX_NOTES_MAX,
+						step: 1,
+					},
+				},
+				{
+					id: "owns",
+					label: "Owns categories",
+					hint: "Claims these categories when they name no owner.",
+					control: { k: "multi", values: advisor.owns ?? [], options: this.#ownsOptions(advisor.owns) },
+				},
+				{
 					id: "tools",
 					label: "Tools",
 					hint: "None means no tools; read, grep and glob are the default.",
@@ -607,16 +802,32 @@ export class AdvisorConfigOverlayComponent implements Component {
 				{ id: "delete", label: "Delete this advisor", control: { k: "action", label: "Delete", act: "delete" } },
 			];
 			sections.push({ id: "advisor", title: advisor.name || "Advisor", rows });
+		} else if (page === "categories") {
+			sections.push(...this.#categorySections());
 		} else {
+			const inherited = this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT;
 			sections.push({
 				id: "shared",
-				title: "Shared instructions",
+				title: "Shared settings",
 				rows: [
 					{
 						id: "shared",
 						label: "Instructions",
 						hint: previewLineOrNone(doc.instructions),
 						control: { k: "action", label: "Edit…", act: "edit" },
+					},
+					{
+						id: "sharedMaxNotes",
+						label: "Notes per update",
+						hint: `Non-blocker notes each advisor may add per update (1–32) unless it sets its own; reset inherits advisor.maxNotesPerUpdate (${inherited}).`,
+						changed: doc.maxNotesPerUpdate !== undefined ? true : undefined,
+						control: {
+							k: "number",
+							value: doc.maxNotesPerUpdate ?? inherited,
+							min: MAX_NOTES_MIN,
+							max: MAX_NOTES_MAX,
+							step: 1,
+						},
 					},
 				],
 			});
@@ -652,15 +863,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 		const editing = input
 			? { row: "name", draft: input.getValue(), cursor: Number(input.debugState().cursor) }
 			: null;
-		const overlay =
-			this.#screen === "model" ||
-			this.#screen === "thinking" ||
-			this.#screen === "review-mode" ||
-			this.#screen === "review-interval" ||
-			this.#screen === "sync-backlog" ||
-			this.#screen === "tools" ||
-			this.#screen === "instructions";
-		const editor = overlay ? this.#prefsEditor() : undefined;
+		const editor = PREFS_EDITOR_SCREENS[this.#screen] ? this.#prefsEditor() : undefined;
 		const focus =
 			this.#screen === "detail" && this.#active instanceof SelectList
 				? (this.#active.getSelectedItem()?.value ?? null)
@@ -668,10 +871,13 @@ export class AdvisorConfigOverlayComponent implements Component {
 		const props: TspPrefsProps = {
 			title: this.#dirty ? "Advisors · unsaved" : "Advisors",
 			pages,
-			page: shared ? "shared" : `advisor:${index}`,
-			lead: shared
-				? "Instructions every advisor gets before its own."
-				: "An advisor watches the session and leaves notes; set its model, tools and instructions here.",
+			page,
+			lead:
+				page === "shared"
+					? "Settings every advisor in this file gets before its own."
+					: page === "categories"
+						? "The finding taxonomy: each category's id, description, owner and precedence."
+						: "An advisor watches the session and leaves notes; set its model, tools and instructions here.",
 			sections,
 			focus,
 			editing,
@@ -718,7 +924,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			const props = selectListPicker(active, options);
 			const sheet = node(
 				"picker",
-				this.#screen === "tools"
+				this.#screen === "tools" || this.#screen === "owns"
 					? {
 							...props,
 							items: props.items?.filter(item => item.id !== TOOLS_DONE),
@@ -733,7 +939,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 			return sheet;
 		}
 		if (memo && sameDeps(memo.deps, [active])) return memo.node;
-		const content = this.#screen === "review-interval" ? this.#intervalCard(active) : active;
+		const field = this.#fieldInfo;
+		const content = field && active instanceof Input ? this.#fieldCard(active, field) : active;
 		const card = col([content], { role: "omp.prefs.editor" });
 		this.#nativeEditor = { deps: [active], node: card };
 		return card;
@@ -777,13 +984,10 @@ export class AdvisorConfigOverlayComponent implements Component {
 		);
 	}
 
-	/** The review-interval field as a titled card: what the number means, the field, Cancel and Save. */
-	#intervalCard(input: Component): NativeNode {
-		const name = this.#doc.advisors[this.#detailIndex]?.name || "this advisor";
-		return overlayCard("omp.overlay.advisor.interval", `Review interval · ${name}`, [
-			text([span("Review every Nth eligible update; skipped updates join the next review.", "muted")], {
-				wrap: "word",
-			}),
+	/** A text field as a titled card: what the value means, the field, Cancel and Save. */
+	#fieldCard(input: Component, field: FieldCard): NativeNode {
+		return overlayCard(field.role, field.title, [
+			text([span(field.hint, "muted")], { wrap: "word" }),
 			input,
 			actionBar([
 				null,
@@ -812,12 +1016,12 @@ export class AdvisorConfigOverlayComponent implements Component {
 
 	/**
 	 * Native page events, each through the roster/detail selections the keys
-	 * make: a page opens that advisor (or the shared instructions), a field
-	 * change or button runs the field's detail action, and closing an editor
-	 * or the page cancels like Esc.
+	 * make: a page opens that advisor, the shared settings, or the categories;
+	 * a field change or button runs the field's detail action; and closing an
+	 * editor or the page cancels like Esc.
 	 */
 	handleNativeEvent(event: NativeUiEvent): void {
-		// The review-interval card's buttons, on its Enter and Esc paths.
+		// A field card's buttons, on its Enter and Esc paths.
 		if (event.type === "action" && (event.act === "field-save" || event.act === "field-cancel")) {
 			const input = this.#active;
 			if (!(input instanceof Input)) return;
@@ -832,9 +1036,10 @@ export class AdvisorConfigOverlayComponent implements Component {
 				if (event.act === "page" && event.value) {
 					const match = /^advisor:(\d+)$/.exec(event.value);
 					if (match) this.#showDetail(Number(match[1]));
-					else if (event.value === "shared") this.#showInstructionsEditor(-1);
+					else if (event.value === "shared" || event.value === "categories") this.#showList(event.value);
 					return;
 				}
+				if (this.#onTaxonomyAction(event.act)) return;
 				if (event.act === "close") {
 					if (event.value !== undefined) this.#active.handleInput?.("\x1b");
 					else this.#cb.close();
@@ -847,11 +1052,26 @@ export class AdvisorConfigOverlayComponent implements Component {
 					return;
 				}
 				if (event.value === "shared") this.#showInstructionsEditor(-1);
+				else if (event.value && this.#onTaxonomyAction(event.value)) return;
 				else if (index >= 0 && event.value)
 					this.#onDetailSelect(index, event.act === "delete" ? "delete" : event.value);
 				return;
 			}
 			case "change": {
+				const categoryField = /^category:(\d+):(id|description|owner|precedence)$/.exec(event.item);
+				if (categoryField) {
+					this.#changeCategory(Number(categoryField[1]), categoryField[2], event.value);
+					return;
+				}
+				if (
+					event.item === "sharedMaxNotes" &&
+					(event.value === null || (typeof event.value === "number" && isMaxNotesBudget(event.value)))
+				) {
+					this.#doc.maxNotesPerUpdate = event.value ?? undefined;
+					this.#dirty = true;
+					this.#showList("sharedMaxNotes");
+					return;
+				}
 				if (index < 0) return;
 				const advisor = this.#doc.advisors[index];
 				if (!advisor) return;
@@ -883,11 +1103,23 @@ export class AdvisorConfigOverlayComponent implements Component {
 					advisor.syncBacklog = ADVISOR_SYNC_BACKLOG_MODES.find(mode => mode === event.value);
 					this.#dirty = true;
 					this.#showDetail(index);
+				} else if (
+					event.item === "maxNotesPerUpdate" &&
+					(event.value === null || (typeof event.value === "number" && isMaxNotesBudget(event.value)))
+				) {
+					advisor.maxNotesPerUpdate = event.value ?? undefined;
+					this.#dirty = true;
+					this.#showDetail(index);
+				} else if (event.item === "owns" && Array.isArray(event.value)) {
+					advisor.owns = commitOwns(new Set(event.value), this.#ownsOrder(advisor.owns));
+					this.#dirty = true;
+					this.#showDetail(index);
 				}
 				return;
 			}
 			case "activate":
 				if (event.item === "shared") this.#showInstructionsEditor(-1);
+				else if (this.#onTaxonomyAction(event.item)) return;
 				else if (index >= 0) this.#onDetailSelect(index, event.item);
 				return;
 			case "select":
@@ -969,6 +1201,27 @@ export class AdvisorConfigOverlayComponent implements Component {
 				text([span("Shared instructions", "strong")]),
 				instructions ? text(instructions, { wrap: "word" }) : text([span("(none)", "muted")]),
 			);
+		} else if (value === "sharedMaxNotes") {
+			children.push(text([span(this.#sharedMaxNotesHelp(), "muted")], { wrap: "word" }));
+		} else if (value === "categories") {
+			const taxonomy = this.#taxonomyPreview();
+			children.push(
+				text([span(taxonomy.title, "strong")]),
+				...taxonomy.rows.map(row => text(row, { wrap: "word" })),
+			);
+			if (taxonomy.warnings.length > 0) {
+				children.push(
+					node(
+						"col",
+						{ tone: "warning" },
+						[
+							text([span("⚠ Taxonomy problems:", "warning")]),
+							...taxonomy.warnings.map(warning => text([span(warning, "warning")], { wrap: "word" })),
+						],
+						"taxonomy-warnings",
+					),
+				);
+			}
 		} else {
 			const help =
 				value === "add"
@@ -1001,6 +1254,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 					{ k: "Tools", v: formatAdvisorTools(advisor.tools, "no tools") },
 					{ k: "Review", v: formatReviewCadence(advisor) },
 					{ k: "Sync backlog", v: this.#syncBacklogLabel(advisor) },
+					{ k: "Notes per update", v: this.#maxNotesLabel(advisor.maxNotesPerUpdate) },
+					{ k: "Owns", v: formatOwns(advisor.owns) },
 				],
 			}),
 			text([span("Instructions:", "dim")]),
@@ -1118,6 +1373,26 @@ export class AdvisorConfigOverlayComponent implements Component {
 			lines.push(...(text ? wrap(text, bodyWidth) : [theme.fg("muted", "(none)")]));
 			return lines.map(line => truncateToWidth(line, bodyWidth));
 		}
+		if (value === "sharedMaxNotes") {
+			return [
+				...warnings,
+				...wrap(this.#sharedMaxNotesHelp(), bodyWidth).map(line =>
+					truncateToWidth(theme.fg("muted", line), bodyWidth),
+				),
+			];
+		}
+		if (value === "categories") {
+			const taxonomy = this.#taxonomyPreview();
+			const lines = [...warnings, theme.bold(taxonomy.title), ""];
+			for (const row of taxonomy.rows) lines.push(...wrap(row, bodyWidth));
+			if (taxonomy.warnings.length > 0) {
+				lines.push("", theme.fg("warning", "⚠ Taxonomy problems:"));
+				for (const warning of taxonomy.warnings) {
+					lines.push(...wrap(warning, bodyWidth).map(line => theme.fg("warning", line)));
+				}
+			}
+			return lines.map(line => truncateToWidth(line, bodyWidth));
+		}
 		const help =
 			value === "add"
 				? "Create a new advisor entry, then edit its model, tools, and instructions."
@@ -1143,6 +1418,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 			`${theme.fg("dim", "Tools:")} ${tools}`,
 			`${theme.fg("dim", "Review:")} ${formatReviewCadence(advisor)}`,
 			`${theme.fg("dim", "Sync backlog:")} ${syncBacklog}`,
+			`${theme.fg("dim", "Notes per update:")} ${this.#maxNotesLabel(advisor.maxNotesPerUpdate)}`,
+			`${theme.fg("dim", "Owns:")} ${formatOwns(advisor.owns)}`,
 			"",
 			theme.fg("dim", "Instructions:"),
 		];
@@ -1185,11 +1462,21 @@ export class AdvisorConfigOverlayComponent implements Component {
 
 	// ───────────────────────────── screens ───────────────────────────
 
-	/** `sheet`: how a list screen describes as a picker over the prefs page. */
-	#setScreen(screen: Screen, active: Component, footerHint: string, sheet?: SelectPickerOptions): void {
+	/**
+	 * `sheet`: how a list screen describes as a picker over the prefs page;
+	 * `field`: the card an input screen describes as over it.
+	 */
+	#setScreen(
+		screen: Screen,
+		active: Component,
+		footerHint: string,
+		sheet?: SelectPickerOptions,
+		field?: FieldCard,
+	): void {
 		this.#screen = screen;
 		this.#active = active;
 		this.#sheetOptions = sheet;
+		this.#fieldInfo = field;
 		this.#footerHint = footerHint;
 		this.#previewScroll = 0;
 		this.#cb.requestRender();
@@ -1231,7 +1518,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 		return advisor.syncBacklog ?? `${this.#deps.syncBacklog ?? "off"} (inherited)`;
 	}
 
-	#showList(): void {
+	/** `selectValue`: the roster row to highlight, by item value. */
+	#showList(selectValue?: string): void {
 		this.#detailIndex = -1;
 		this.#ensureRosterVisible();
 		const items: SelectItem[] = this.#doc.advisors.map((advisor, index) => ({
@@ -1245,12 +1533,19 @@ export class AdvisorConfigOverlayComponent implements Component {
 			label: "Shared instructions",
 			description: previewLineOrNone(this.#doc.instructions),
 		});
+		items.push({
+			value: "sharedMaxNotes",
+			label: "Notes per update",
+			description: `all advisors: ${this.#doc.maxNotesPerUpdate ?? `inherit (${this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT})`}`,
+		});
+		items.push({ value: "categories", label: "Categories", description: this.#taxonomyPreview().title });
 		items.push({ value: "scope", label: `Scope: ${this.#scope}`, description: `→ ${this.#otherScope()}` });
 		items.push({ value: "save", label: "Save & apply" });
 		items.push({ value: "close", label: "Close" });
 
 		// Show every row (no internal overflow-search); the split frame supplies height.
 		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		if (selectValue !== undefined) list.setSelectedValue(selectValue);
 		list.onSelectionChange = () => {
 			this.#previewScroll = 0;
 			this.#cb.requestRender();
@@ -1278,6 +1573,14 @@ export class AdvisorConfigOverlayComponent implements Component {
 			this.#showInstructionsEditor(-1);
 			return;
 		}
+		if (value === "sharedMaxNotes") {
+			this.#showMaxNotesEditor(-1);
+			return;
+		}
+		if (value === "categories") {
+			this.#showCategories();
+			return;
+		}
 		if (value === "scope") {
 			if (this.#dirty) {
 				this.#cb.notify('Unsaved changes — "Save & apply" or Close before switching scope.');
@@ -1300,12 +1603,24 @@ export class AdvisorConfigOverlayComponent implements Component {
 			return;
 		}
 		if (value === "save") {
-			const doc = this.#hasSyntheticDefaultAdvisor(this.#doc) ? { ...this.#doc, advisors: [] } : this.#doc;
+			let doc = this.#hasSyntheticDefaultAdvisor(this.#doc) ? { ...this.#doc, advisors: [] } : this.#doc;
+			let dropped: string[] = [];
+			if (doc.categories !== undefined) {
+				const valid = validAdvisorCategories(doc.categories);
+				dropped = valid.warnings;
+				doc = { ...doc, categories: valid.categories };
+			}
 			await this.#cb.save(this.#scope, doc);
 			// The saved file contains only the normalized entries, so the load-time
 			// warnings no longer apply to it. (On failure the throw skips this.)
 			this.#doc.warnings = undefined;
+			this.#doc.categories = doc.categories;
 			this.#dirty = false;
+			if (dropped.length > 0) {
+				const message = `WATCHDOG.yml: ${sanitizeDisplayWarnings(dropped).join("; ")}`;
+				if (this.#cb.warn) this.#cb.warn(message);
+				else this.#cb.notify(message);
+			}
 			this.#showList();
 			return;
 		}
@@ -1343,6 +1658,12 @@ export class AdvisorConfigOverlayComponent implements Component {
 				label: "Sync backlog",
 				description: this.#syncBacklogLabel(advisor),
 			},
+			{
+				value: "maxNotesPerUpdate",
+				label: "Notes per update",
+				description: this.#maxNotesLabel(advisor.maxNotesPerUpdate),
+			},
+			{ value: "owns", label: "Owns categories", description: formatOwns(advisor.owns) },
 		];
 		if (advisor.model?.trim()) {
 			items.push({ value: "resetModel", label: "Reset model to advisor-role default" });
@@ -1388,6 +1709,12 @@ export class AdvisorConfigOverlayComponent implements Component {
 				return;
 			case "syncBacklog":
 				this.#showSyncBacklogPicker(index);
+				return;
+			case "maxNotesPerUpdate":
+				this.#showMaxNotesEditor(index);
+				return;
+			case "owns":
+				this.#showOwnsEditor(index, new Set(this.#doc.advisors[index].owns ?? []), 0);
 				return;
 			case "tools":
 				this.#showToolsEditor(index, new Set(this.#doc.advisors[index].tools ?? this.#deps.defaultToolNames), 0);
@@ -1574,6 +1901,678 @@ export class AdvisorConfigOverlayComponent implements Component {
 			"review-interval",
 			input,
 			`Type a positive integer · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.interval",
+				title: `Review interval · ${advisor.name || "this advisor"}`,
+				hint: "Review every Nth eligible update; skipped updates join the next review.",
+			},
+		);
+	}
+
+	/** `index === -1` edits the file's top-level budget; otherwise advisor[index]'s. */
+	#showMaxNotesEditor(index: number): void {
+		const advisor = index >= 0 ? this.#doc.advisors[index] : undefined;
+		if (index >= 0 && !advisor) {
+			this.#showList();
+			return;
+		}
+		this.#detailIndex = index;
+		const back = (): void => {
+			if (advisor) this.#showDetail(index);
+			else this.#showList("sharedMaxNotes");
+		};
+		const current = advisor ? advisor.maxNotesPerUpdate : this.#doc.maxNotesPerUpdate;
+		const input = new Input();
+		input.setValue(current === undefined ? "inherit" : String(current));
+		input.onSubmit = value => {
+			const budget = parseMaxNotes(value);
+			if (budget === undefined) {
+				this.#cb.notify(
+					`Notes per update must be an integer from ${MAX_NOTES_MIN} to ${MAX_NOTES_MAX}, or inherit.`,
+				);
+				return;
+			}
+			if (advisor) advisor.maxNotesPerUpdate = budget ?? undefined;
+			else this.#doc.maxNotesPerUpdate = budget ?? undefined;
+			this.#dirty = true;
+			back();
+		};
+		input.onEscape = back;
+		const inherits = advisor
+			? this.#inheritedMaxNotesLabel()
+			: `advisor.maxNotesPerUpdate (${this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT})`;
+		this.#setScreen(
+			"max-notes",
+			input,
+			`Type ${MAX_NOTES_MIN}–${MAX_NOTES_MAX} or inherit · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.field",
+				title: `Notes per update · ${advisor ? advisor.name || "this advisor" : "all advisors"}`,
+				hint: `Non-blocker notes accepted per update, ${MAX_NOTES_MIN}–${MAX_NOTES_MAX}; blockers are exempt. inherit uses ${inherits}.`,
+			},
+		);
+	}
+
+	/** The budget an advisor without its own inherits: the file's top-level value, else the setting. */
+	#inheritedMaxNotes(): number {
+		return this.#doc.maxNotesPerUpdate ?? this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT;
+	}
+
+	#inheritedMaxNotesLabel(): string {
+		return this.#doc.maxNotesPerUpdate !== undefined
+			? `the file's top-level value (${this.#doc.maxNotesPerUpdate})`
+			: `advisor.maxNotesPerUpdate (${this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT})`;
+	}
+
+	/** An advisor's own budget, else what it inherits. */
+	#maxNotesLabel(budget: number | undefined): string {
+		return budget !== undefined ? String(budget) : `inherit (${this.#inheritedMaxNotes()})`;
+	}
+
+	#sharedMaxNotesHelp(): string {
+		const budget =
+			this.#doc.maxNotesPerUpdate ??
+			`inherit (advisor.maxNotesPerUpdate, ${this.#deps.maxNotesPerUpdate ?? MAX_NOTES_DEFAULT})`;
+		return `Non-blocker notes each advisor in this file may add per update: ${budget}. An advisor's own value overrides it.`;
+	}
+
+	#showOwnsEditor(index: number, selected: Set<string>, cursor: number): void {
+		const advisor = this.#doc.advisors[index];
+		if (!advisor) {
+			this.#showList();
+			return;
+		}
+		const order = this.#ownsOrder(advisor.owns);
+		const options = this.#ownsOptions(advisor.owns);
+		const items: SelectItem[] = options.map(option => ({
+			value: option.value,
+			label: `${selected.has(option.value) ? "[x]" : "[ ]"} ${option.value}`,
+			description: option.detail,
+		}));
+		items.push({ value: TOOLS_DONE, label: "Done" });
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		list.setSelectedIndex(cursor);
+		let cursorIndex = cursor;
+		list.onSelectionChange = item => {
+			cursorIndex = items.findIndex(i => i.value === item.value);
+		};
+		const apply = (): void => {
+			advisor.owns = commitOwns(selected, order);
+			this.#dirty = true;
+			this.#showDetail(index);
+		};
+		list.onSelect = item => {
+			if (item.value === TOOLS_DONE) {
+				apply();
+				return;
+			}
+			if (selected.has(item.value)) selected.delete(item.value);
+			else selected.add(item.value);
+			this.#showOwnsEditor(index, selected, cursorIndex);
+		};
+		list.onCancel = apply;
+		this.#setScreen(
+			"owns",
+			list,
+			`${editorKey("tui.select.confirm")} / click toggle · select Done or ${editorKey("tui.select.cancel")} to apply`,
+			{
+				title: "Owned categories",
+				subtitle: `Categories ${advisor.name || "the advisor"} claims when they name no owner.`,
+				icon: "list",
+				noun: "categories",
+				current: [...selected],
+				decorate: item => ({ label: item.value }),
+			},
+		);
+	}
+
+	/** Owns choices: the active category ids, then owned ids outside them. */
+	#ownsOrder(owns: readonly string[] | undefined): string[] {
+		const ids = this.#activeCategories().map(category => category.id);
+		return [...ids, ...(owns ?? []).filter(id => !ids.includes(id))];
+	}
+
+	#ownsOptions(owns: readonly string[] | undefined): { value: string; label: string; detail: string }[] {
+		const descriptions = new Map(this.#activeCategories().map(category => [category.id, category.description]));
+		return this.#ownsOrder(owns).map(id => {
+			const description = descriptions.get(id);
+			return {
+				value: id,
+				label: id,
+				detail: description === undefined ? "Not in this file's taxonomy" : previewLineOrNone(description),
+			};
+		});
+	}
+
+	// ─────────────────────────── categories ──────────────────────────
+
+	/** The taxonomy in effect for this file: its declared categories, else the bundled defaults with owners the roster has. */
+	#activeCategories(): AdvisorDefaultCategory[] {
+		const declared = this.#doc.categories;
+		if (declared !== undefined) return Object.entries(declared).map(([id, category]) => ({ id, ...category }));
+		const roster = new Map(this.#doc.advisors.map(advisor => [slugify(advisor.name), advisor.name]));
+		return (this.#deps.defaultCategories ?? []).map(({ id, description, owner, precedence }) => {
+			const category: AdvisorDefaultCategory = { id, description };
+			const rosterOwner = owner === undefined ? undefined : roster.get(slugify(owner));
+			if (rosterOwner !== undefined) category.owner = rosterOwner;
+			if (precedence !== undefined) category.precedence = precedence;
+			return category;
+		});
+	}
+
+	#categoryEntries(): [string, AdvisorCategoryConfig][] {
+		return Object.entries(this.#doc.categories ?? {});
+	}
+
+	/** Dropped-entry and owner-resolution warnings for this file's taxonomy, worded as discovery reports them. */
+	#taxonomyWarnings(): string[] {
+		const declared = this.#doc.categories;
+		const valid = declared === undefined ? undefined : validAdvisorCategories(declared);
+		const resolved = this.#deps.resolveCategoryWarnings?.({ ...this.#doc, categories: valid?.categories }) ?? [];
+		return [...(valid?.warnings ?? []), ...resolved];
+	}
+
+	/** The taxonomy summary: a title, one sanitized line per category, and sanitized warnings. */
+	#taxonomyPreview(): { title: string; rows: string[]; warnings: string[] } {
+		const declared = this.#doc.categories !== undefined;
+		const categories = this.#activeCategories();
+		const title = !declared
+			? `Bundled defaults (${categories.length})`
+			: categories.length === 0
+				? "Declared empty"
+				: `${categories.length} declared in this file`;
+		return {
+			title,
+			rows: categories.map(category =>
+				sanitizeDisplayWarning(`${category.id} — ${formatCategorySummary(category)}`),
+			),
+			warnings: sanitizeDisplayWarnings(this.#taxonomyWarnings()),
+		};
+	}
+
+	/** The prefs categories page: problems, one section per category (or the defaults), and the taxonomy actions. */
+	#categorySections(): TspPrefsProps["sections"][number][] {
+		const sections: TspPrefsProps["sections"][number][] = [];
+		const warnings = sanitizeDisplayWarnings(this.#taxonomyWarnings());
+		if (warnings.length > 0) {
+			sections.push({
+				id: "taxonomy-warnings",
+				title: "Taxonomy problems",
+				rows: warnings.map((warning, i) => ({
+					id: `taxonomy-warning:${i}`,
+					label: "Taxonomy",
+					warning,
+					control: { k: "action", label: "Save & apply", act: "save" },
+				})),
+			});
+		}
+		const declared = this.#doc.categories !== undefined;
+		if (declared) {
+			for (const [i, [id, category]] of this.#categoryEntries().entries()) {
+				sections.push({
+					id: `category:${i}`,
+					title: id,
+					rows: [
+						{
+							id: `category:${i}:id`,
+							label: "Id",
+							hint: "Lower-kebab: a-z and 0-9 words joined by single hyphens.",
+							control: { k: "text", value: id, mono: true },
+						},
+						{
+							id: `category:${i}:description`,
+							label: "Description",
+							warning: category.description.trim()
+								? undefined
+								: "Required; saving drops a category without one.",
+							control: { k: "text", value: category.description },
+						},
+						{
+							id: `category:${i}:owner`,
+							label: "Owner",
+							hint: "Its owner wins over a conflicting advisor owns.",
+							control: {
+								k: "choice",
+								value: category.owner ?? CATEGORY_OWNER_NONE,
+								options: this.#ownerOptions(category.owner),
+								style: "menu",
+							},
+						},
+						{
+							id: `category:${i}:precedence`,
+							label: "Precedence",
+							hint: "Higher leads among categories competing for one finding; reset leaves it unranked.",
+							changed: category.precedence !== undefined ? true : undefined,
+							control: { k: "number", value: category.precedence ?? 0, step: 1 },
+						},
+						{
+							id: `category:${i}:delete`,
+							label: "Remove this category",
+							control: { k: "action", label: "Remove", act: "delete" },
+						},
+					],
+				});
+			}
+		} else {
+			sections.push({
+				id: "defaults",
+				title: "Bundled defaults",
+				rows: this.#activeCategories().map((category, i) => ({
+					id: `default:${i}`,
+					label: category.id,
+					hint: formatCategorySummary(category),
+					control: { k: "action", label: "Customize", act: "copy-defaults" },
+				})),
+			});
+		}
+		sections.push({
+			id: "taxonomy",
+			title: "Taxonomy",
+			rows: [
+				{
+					id: "add-category",
+					label: "Add category",
+					hint: declared
+						? "Create a category, then set its description, owner and precedence."
+						: "Copies the bundled defaults into this file, then adds the category.",
+					control: { k: "action", label: "Add", act: "add-category" },
+				},
+				declared
+					? {
+							id: "use-defaults",
+							label: "Use bundled defaults",
+							hint: "Remove this file's categories.",
+							control: { k: "action", label: "Use defaults", act: "use-defaults" },
+						}
+					: {
+							id: "copy-defaults",
+							label: "Customize the bundled defaults",
+							hint: "Copy them into this file to edit.",
+							control: { k: "action", label: "Customize", act: "copy-defaults" },
+						},
+			],
+		});
+		return sections;
+	}
+
+	/** Owner choices: none, each roster advisor, and a current owner the roster lacks. */
+	#ownerOptions(owner: string | undefined): { value: string; label: string; detail?: string }[] {
+		const names = [...new Set(this.#doc.advisors.map(advisor => advisor.name.trim()).filter(name => name))];
+		const options: { value: string; label: string; detail?: string }[] = [
+			{ value: CATEGORY_OWNER_NONE, label: "none", detail: "Advisors claim it through owns." },
+			...names.map(name => ({ value: name, label: name })),
+		];
+		if (owner !== undefined && !names.includes(owner)) {
+			options.push({ value: owner, label: owner, detail: "Not a configured advisor" });
+		}
+		return options;
+	}
+
+	/** Runs a taxonomy row or action by id; returns whether `id` named one. */
+	#onTaxonomyAction(id: string): boolean {
+		if (id === "add-category") {
+			this.#showCategoryIdEditor(-1);
+			return true;
+		}
+		const defaultRow = /^default:(\d+)$/.exec(id);
+		if (id === "copy-defaults" || defaultRow) {
+			this.#copyDefaultCategories();
+			if (defaultRow && this.#screen === "categories") this.#showCategory(Number(defaultRow[1]));
+			else this.#refreshCategories();
+			return true;
+		}
+		if (id === "use-defaults") {
+			this.#doc.categories = undefined;
+			this.#dirty = true;
+			this.#refreshCategories();
+			return true;
+		}
+		const row = /^category:(\d+)(?::(\w+))?$/.exec(id);
+		if (row) {
+			if (row[2] === "delete") {
+				this.#deleteCategory(Number(row[1]));
+				this.#refreshCategories();
+			} else if (row[2] === undefined) {
+				this.#showCategory(Number(row[1]));
+			}
+			return true;
+		}
+		return id.startsWith("taxonomy-warning:");
+	}
+
+	/** Re-shows the categories where they are: the roster's categories row, else the categories list. */
+	#refreshCategories(): void {
+		if (this.#screen === "list") this.#showList("categories");
+		else this.#showCategories();
+	}
+
+	/** Declares the bundled taxonomy in this file, keeping only owners the roster has. */
+	#copyDefaultCategories(): void {
+		const categories: Record<string, AdvisorCategoryConfig> = {};
+		for (const { id, description, owner, precedence } of this.#activeCategories()) {
+			const category: AdvisorCategoryConfig = { description };
+			if (owner !== undefined) category.owner = owner;
+			if (precedence !== undefined) category.precedence = precedence;
+			categories[id] = category;
+		}
+		this.#doc.categories = categories;
+		this.#dirty = true;
+	}
+
+	/** Why `id` cannot name a new category in the active taxonomy, if it cannot. */
+	#categoryIdError(id: string): string | undefined {
+		if (!CATEGORY_ID_PATTERN.test(id))
+			return "Category ids are lower-kebab: a-z and 0-9 words joined by single hyphens.";
+		if (this.#activeCategories().some(category => category.id === id)) return `Category "${id}" already exists.`;
+		return undefined;
+	}
+
+	/**
+	 * Adds an empty category `id`; a file without `categories` first declares
+	 * the bundled taxonomy, so adding never drops it. Returns the rejection.
+	 */
+	#addCategory(id: string): string | undefined {
+		const error = this.#categoryIdError(id);
+		if (error !== undefined) return error;
+		if (this.#doc.categories === undefined) this.#copyDefaultCategories();
+		this.#doc.categories = { ...this.#doc.categories, [id]: { description: "" } };
+		this.#dirty = true;
+		return undefined;
+	}
+
+	/** Renames category `index` in place and in every advisor's `owns`; returns the rejection. */
+	#renameCategory(index: number, id: string): string | undefined {
+		const entries = this.#categoryEntries();
+		const entry = entries[index];
+		if (!entry) return "Category not found.";
+		const [oldId, category] = entry;
+		if (id === oldId) return undefined;
+		const error = this.#categoryIdError(id);
+		if (error !== undefined) return error;
+		entries[index] = [id, category];
+		this.#doc.categories = Object.fromEntries(entries);
+		for (const advisor of this.#doc.advisors) {
+			if (advisor.owns?.includes(oldId)) advisor.owns = advisor.owns.map(owned => (owned === oldId ? id : owned));
+		}
+		this.#dirty = true;
+		return undefined;
+	}
+
+	/** Removes category `index` from the file and from every advisor's `owns`. */
+	#deleteCategory(index: number): void {
+		const entries = this.#categoryEntries();
+		const entry = entries[index];
+		if (!entry) return;
+		const [id] = entry;
+		this.#doc.categories = Object.fromEntries(entries.filter((_, i) => i !== index));
+		for (const advisor of this.#doc.advisors) {
+			if (!advisor.owns?.includes(id)) continue;
+			const owns = advisor.owns.filter(owned => owned !== id);
+			advisor.owns = owns.length > 0 ? owns : undefined;
+		}
+		this.#dirty = true;
+	}
+
+	/** A prefs field change on category `index`. */
+	#changeCategory(index: number, field: string, value: unknown): void {
+		const entry = this.#categoryEntries()[index];
+		if (!entry) return;
+		const [, category] = entry;
+		if (field === "id") {
+			if (typeof value !== "string") return;
+			const error = this.#renameCategory(index, value.trim());
+			if (error !== undefined) {
+				this.#cb.notify(error);
+				return;
+			}
+		} else if (field === "description") {
+			if (typeof value !== "string" || !value.trim()) {
+				this.#cb.notify("A category needs a description.");
+				return;
+			}
+			category.description = value.trim();
+		} else if (field === "owner") {
+			if (typeof value !== "string" && value !== null) return;
+			category.owner = value || undefined;
+		} else if (field === "precedence") {
+			if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) return;
+			category.precedence = value ?? undefined;
+		}
+		this.#dirty = true;
+		this.#refreshCategories();
+	}
+
+	#showCategories(selectValue?: string): void {
+		this.#detailIndex = -1;
+		const declared = this.#doc.categories !== undefined;
+		const items: SelectItem[] = this.#activeCategories().map((category, i) => ({
+			value: declared ? `category:${i}` : `default:${i}`,
+			label: declared ? category.id : `${category.id} (default)`,
+			description: formatCategorySummary(category),
+		}));
+		for (const [i, warning] of sanitizeDisplayWarnings(this.#taxonomyWarnings()).entries()) {
+			items.push({ value: `taxonomy-warning:${i}`, label: `⚠ ${warning}` });
+		}
+		items.push(
+			declared
+				? { value: "add-category", label: "+ Add category" }
+				: {
+						value: "add-category",
+						label: "+ Add category",
+						description: "Copies the bundled defaults into this file, then adds the category",
+					},
+			declared
+				? { value: "use-defaults", label: "Use bundled defaults", description: "Remove this file's categories" }
+				: {
+						value: "copy-defaults",
+						label: "Customize the bundled defaults",
+						description: "Copy them into this file",
+					},
+			{ value: "back", label: "Back" },
+		);
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		if (selectValue !== undefined) list.setSelectedValue(selectValue);
+		list.onSelect = item => {
+			if (item.value === "back") this.#showList("categories");
+			else this.#onTaxonomyAction(item.value);
+		};
+		list.onCancel = () => this.#showList("categories");
+		this.#setScreen(
+			"categories",
+			list,
+			`Categories · ${editorKey("tui.select.confirm")} / click edit · ${editorKey("tui.select.cancel")} back`,
+		);
+	}
+
+	#showCategory(index: number): void {
+		const entry = this.#categoryEntries()[index];
+		if (!entry) {
+			this.#showCategories();
+			return;
+		}
+		this.#detailIndex = -1;
+		const [id, category] = entry;
+		const items: SelectItem[] = [
+			{ value: "id", label: "Id", description: id },
+			{
+				value: "description",
+				label: "Description",
+				description: category.description.trim() ? previewLineOrNone(category.description) : "(required)",
+			},
+			{ value: "owner", label: "Owner", description: category.owner ?? "none" },
+			{
+				value: "precedence",
+				label: "Precedence",
+				description: category.precedence === undefined ? "none" : String(category.precedence),
+			},
+			{ value: "delete", label: "Remove this category" },
+			{ value: "back", label: "Back" },
+		];
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		list.onSelect = item => {
+			switch (item.value) {
+				case "id":
+					this.#showCategoryIdEditor(index);
+					return;
+				case "description":
+					this.#showCategoryDescriptionEditor(index);
+					return;
+				case "owner":
+					this.#showCategoryOwnerPicker(index);
+					return;
+				case "precedence":
+					this.#showCategoryPrecedenceEditor(index);
+					return;
+				case "delete":
+					this.#deleteCategory(index);
+					this.#showCategories();
+					return;
+				default:
+					this.#showCategories(`category:${index}`);
+			}
+		};
+		list.onCancel = () => this.#showCategories(`category:${index}`);
+		this.#setScreen(
+			"category",
+			list,
+			`Editing category "${id}" · ${editorKey("tui.select.confirm")} / click edit field · ${editorKey("tui.select.cancel")} back`,
+		);
+	}
+
+	/** `index === -1` adds a category; otherwise renames category `index`. */
+	#showCategoryIdEditor(index: number): void {
+		const current = index >= 0 ? this.#categoryEntries()[index]?.[0] : undefined;
+		if (index >= 0 && current === undefined) {
+			this.#showCategories();
+			return;
+		}
+		const input = new Input();
+		input.setValue(current ?? "");
+		input.onSubmit = value => {
+			const id = value.trim();
+			const error = index >= 0 ? this.#renameCategory(index, id) : this.#addCategory(id);
+			if (error !== undefined) {
+				this.#cb.notify(error);
+				return;
+			}
+			this.#showCategory(this.#categoryEntries().findIndex(([other]) => other === id));
+		};
+		input.onEscape = () => {
+			if (index >= 0) this.#showCategory(index);
+			else this.#showCategories();
+		};
+		this.#setScreen(
+			"category-id",
+			input,
+			`Type a lower-kebab id · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.field",
+				title: current === undefined ? "New category" : `Category id · ${current}`,
+				hint: "Lower-kebab: a-z and 0-9 words joined by single hyphens. Renaming updates every advisor's owns.",
+			},
+		);
+	}
+
+	#showCategoryDescriptionEditor(index: number): void {
+		const entry = this.#categoryEntries()[index];
+		if (!entry) {
+			this.#showCategories();
+			return;
+		}
+		const [id, category] = entry;
+		const input = new Input();
+		input.setValue(category.description);
+		input.onSubmit = value => {
+			const description = value.trim();
+			if (!description) {
+				this.#cb.notify("A category needs a description.");
+				return;
+			}
+			category.description = description;
+			this.#dirty = true;
+			this.#showCategory(index);
+		};
+		input.onEscape = () => this.#showCategory(index);
+		this.#setScreen(
+			"category-description",
+			input,
+			`Type a description · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.field",
+				title: `Description · ${id}`,
+				hint: "What findings in this category cover; advisors read it in the advise tool.",
+			},
+		);
+	}
+
+	#showCategoryOwnerPicker(index: number): void {
+		const entry = this.#categoryEntries()[index];
+		if (!entry) {
+			this.#showCategories();
+			return;
+		}
+		const [id, category] = entry;
+		const items: SelectItem[] = this.#ownerOptions(category.owner).map(option => ({
+			value: option.value,
+			label: option.label,
+			description: option.detail,
+		}));
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		list.setSelectedValue(category.owner ?? CATEGORY_OWNER_NONE);
+		list.onSelect = item => {
+			category.owner = item.value || undefined;
+			this.#dirty = true;
+			this.#showCategory(index);
+		};
+		list.onCancel = () => this.#showCategory(index);
+		this.#setScreen(
+			"category-owner",
+			list,
+			`${editorKey("tui.select.confirm")} / click choose owner · ${editorKey("tui.select.cancel")} back`,
+			{
+				title: "Category owner",
+				subtitle: `The advisor that owns "${id}".`,
+				icon: "users",
+				noun: "advisors",
+				current: [category.owner ?? CATEGORY_OWNER_NONE],
+			},
+		);
+	}
+
+	#showCategoryPrecedenceEditor(index: number): void {
+		const entry = this.#categoryEntries()[index];
+		if (!entry) {
+			this.#showCategories();
+			return;
+		}
+		const [id, category] = entry;
+		const input = new Input();
+		input.setValue(category.precedence === undefined ? "none" : String(category.precedence));
+		input.onSubmit = value => {
+			const precedence = parsePrecedence(value);
+			if (precedence === undefined) {
+				this.#cb.notify("Precedence must be a number, or none.");
+				return;
+			}
+			category.precedence = precedence ?? undefined;
+			this.#dirty = true;
+			this.#showCategory(index);
+		};
+		input.onEscape = () => this.#showCategory(index);
+		this.#setScreen(
+			"category-precedence",
+			input,
+			`Type a number or none · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.field",
+				title: `Precedence · ${id}`,
+				hint: "Ranks categories competing for one finding; higher leads. none leaves it unranked.",
+			},
 		);
 	}
 

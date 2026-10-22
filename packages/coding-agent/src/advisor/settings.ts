@@ -57,6 +57,10 @@ export const cfgAdvisorImmuneTurns = register({
 			{ value: "3", label: "3 steps", description: "Default." },
 			{ value: "4", label: "4 steps" },
 			{ value: "5", label: "5 steps" },
+			{ value: "8", label: "8 steps" },
+			{ value: "10", label: "10 steps" },
+			{ value: "15", label: "15 steps" },
+			{ value: "20", label: "20 steps" },
 		],
 		condition: "advisorEnabled",
 	},
@@ -118,8 +122,12 @@ export const cfgAdvisorReviewInterval = register({
 			{ value: "1", label: "Every eligible update", description: "Default." },
 			{ value: "2", label: "Every 2nd" },
 			{ value: "3", label: "Every 3rd" },
+			{ value: "4", label: "Every 4th" },
 			{ value: "5", label: "Every 5th" },
+			{ value: "8", label: "Every 8th" },
 			{ value: "10", label: "Every 10th" },
+			{ value: "15", label: "Every 15th" },
+			{ value: "20", label: "Every 20th" },
 		],
 		condition: "advisorEnabled",
 	},
@@ -134,14 +142,20 @@ export const cfgAdvisorMaxNotesPerUpdate = register({
 		tab: "model",
 		group: "Advisor",
 		label: "Advisor Max Notes Per Update",
-		description:
-			"Maximum non-blocker advice notes accepted per advisor prompt update (1–32; UI offers 1–5 quick picks). Blockers are exempt.",
+		description: "Maximum non-blocker advice notes accepted per advisor prompt update (1–32). Blockers are exempt.",
 		options: [
 			{ value: "1", label: "1 note", description: "Anti-flood (strict)." },
 			{ value: "2", label: "2 notes" },
 			{ value: "3", label: "3 notes" },
 			{ value: "4", label: "4 notes", description: "Frontier reasoning models. Default." },
 			{ value: "5", label: "5 notes" },
+			{ value: "6", label: "6 notes" },
+			{ value: "8", label: "8 notes" },
+			{ value: "10", label: "10 notes" },
+			{ value: "12", label: "12 notes" },
+			{ value: "16", label: "16 notes" },
+			{ value: "24", label: "24 notes" },
+			{ value: "32", label: "32 notes", description: "Maximum." },
 		],
 		condition: "advisorEnabled",
 	},
@@ -197,6 +211,14 @@ export const cfgAdvisorAggregationJudgeModel = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "string",
 	default: "@judge",
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Findings Judge Model",
+		description: "Model that judges advisor findings. Only @judge (the 'judge' model role chain) is supported.",
+		options: [{ value: "@judge", label: "@judge", description: "The 'judge' model role chain. Default." }],
+		condition: "advisorEnabled",
+	},
 });
 
 export const cfgAdvisorAggregationJudgeTimeoutMs = register({
@@ -204,6 +226,21 @@ export const cfgAdvisorAggregationJudgeTimeoutMs = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "number",
 	default: 10_000,
+	ui: {
+		tab: "model",
+		group: "Advisor",
+		label: "Advisor Findings Judge Timeout",
+		description:
+			"Deadline of one anchor group's judgment, fallback candidates included; on timeout the findings stay as recorded.",
+		options: [
+			{ value: "5000", label: "5 seconds" },
+			{ value: "10000", label: "10 seconds", description: "Default." },
+			{ value: "20000", label: "20 seconds" },
+			{ value: "30000", label: "30 seconds" },
+			{ value: "60000", label: "60 seconds" },
+		],
+		condition: "advisorEnabled",
+	},
 });
 
 export const cfgAdvisorAggregationJudgeAllowCrossDomain = register({

@@ -49,6 +49,7 @@ import {
 	ADVISOR_MAX_BUDGET_PER_UPDATE,
 	ADVISOR_SYNC_BACKLOG_MODES,
 	AdviseTool,
+	advisorCategoryWarnings,
 	type AdvisorAdvice,
 	type AdvisorAgent,
 	type AdvisorCategory,
@@ -95,6 +96,7 @@ import {
 	resolveAnchorIdentity,
 	slugifyAdvisorName,
 } from "../advisor";
+import { sanitizeDisplayWarning, sanitizeDisplayWarnings } from "@oh-my-pi/pi-tui/render/render-utils";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
 import type { ModelRegistry } from "../config/model-registry";
 import {
@@ -607,6 +609,15 @@ export interface AdvisorStatusOverviewEntry {
 	name: string;
 	status: AdvisorRuntimeStatus;
 	yielded: boolean;
+}
+
+/** The `/advisor status` taxonomy section; text is sanitized for display. */
+export interface AdvisorTaxonomyStatus {
+	heading: string;
+	/** One per category: id, owner and liveness, precedence, source. */
+	rows: string[];
+	/** Owner-resolution warnings. */
+	warnings: string[];
 }
 
 /** Owns advisor runtimes, delivery policy, context maintenance, and status reporting. */
@@ -3475,8 +3486,10 @@ export class SessionAdvisors {
 			if (s.tokens.cacheRead > 0) spendParts.push(`${s.tokens.cacheRead.toLocaleString()} cache read`);
 			if (s.tokens.cacheWrite > 0) spendParts.push(`${s.tokens.cacheWrite.toLocaleString()} cache write`);
 			const spendLine = `Spend: ${spendParts.join(", ")}, $${stats.cost.toFixed(4)}`;
-			if (!s.model || s.status !== "running") return `Advisor "${s.name}" is ${s.status.replace("_", " ")}.`;
-			return `Advisor is enabled (${s.model.provider}/${s.model.id}). ${contextLine}. ${spendLine}.`;
+			const taxonomy = this.#formatAdvisorTaxonomyLines().join("\n");
+			if (!s.model || s.status !== "running")
+				return `Advisor "${s.name}" is ${s.status.replace("_", " ")}.\n${taxonomy}`;
+			return `Advisor is enabled (${s.model.provider}/${s.model.id}). ${contextLine}. ${spendLine}.\n${taxonomy}`;
 		}
 		const lines = [`Advisors enabled (${stats.advisors.length}):`];
 		for (const s of stats.advisors) {
@@ -3490,8 +3503,40 @@ export class SessionAdvisors {
 		}
 		lines.push(
 			`Totals: ${stats.tokens.input.toLocaleString()} input, ${stats.tokens.output.toLocaleString()} output, $${stats.cost.toFixed(4)}.`,
+			...this.#formatAdvisorTaxonomyLines(),
 		);
 		return lines.join("\n");
+	}
+
+	/**
+	 * The active finding taxonomy for `/advisor status`: a heading, one row
+	 * per category (id, owner and whether it is live, precedence, `default`
+	 * for the bundled taxonomy or `declared`), and the owner-resolution
+	 * warnings. `WATCHDOG.yml` text is sanitized for display.
+	 */
+	getAdvisorTaxonomyStatus(): AdvisorTaxonomyStatus {
+		const categories = this.#advisorCategories;
+		const heading =
+			categories.length === 0
+				? "Categories: none (declared empty)."
+				: `Categories (${categories.length}, ${categories[0]?.bundled ? "bundled defaults" : "declared"}):`;
+		const rows = categories.map(category => {
+			const owner =
+				category.owner === undefined
+					? "owner none"
+					: `owner ${sanitizeDisplayWarning(category.owner)} (${this.advisorCategoryHasLiveOwner(category.id) ? "live" : "not live"})`;
+			return `${sanitizeDisplayWarning(category.id)}: ${owner}, precedence ${category.precedence ?? "none"}, ${category.bundled ? "default" : "declared"}`;
+		});
+		const warnings = sanitizeDisplayWarnings(advisorCategoryWarnings(categories, this.#advisorConfigs ?? []));
+		return { heading, rows, warnings };
+	}
+
+	/** {@link getAdvisorTaxonomyStatus} as plain text lines. */
+	#formatAdvisorTaxonomyLines(): string[] {
+		const { heading, rows, warnings } = this.getAdvisorTaxonomyStatus();
+		const lines = [heading, ...rows.map(row => `  • ${row}`)];
+		if (warnings.length > 0) lines.push("Category warnings:", ...warnings.map(warning => `  ! ${warning}`));
+		return lines;
 	}
 
 	/**

@@ -4,27 +4,31 @@
 
 ### Added
 
-- OpenRouter credit balances include a projected exhaustion timestamp and daily spending rate from this key's UTC weekly usage, or monthly usage during the first day of the week
-- Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries
+- Added provider billing evidence (`ProviderBilling`, `BillingSnapshot`, `BillingSource`, exact `Money` amounts with their currency) read from usage reports, with readers for Claude, Codex, Copilot, Cursor, Factory Droid, Charm Hyper, CommandCode, Synthetic, Gemini, Google Antigravity, Kimi, OpenCode Go, xAI, Z.AI, OpenRouter, Devin, DeepSeek, Moonshot (including the China balance in CNY), Novita, AIMLAPI, NanoGPT, Vercel AI Gateway, Venice, SiliconFlow (including China), and DeepInfra; subscriptions read available or exhausted from account-wide plan windows, an active NanoGPT token trial reads as free, and LM Studio, llama.cpp, and vLLM on a loopback address read as free
+- Added OpenRouter usage details: the paid key's remaining USD credit balance (fetched alongside the key limits with its own three-second deadline), when the key limit resets, the daily free-model counter, and a projected run-out time and daily spending rate from this key's UTC weekly usage
+- Added account names and exclusive account pins to the auth storage: a named `auth.accountPolicies` entry can be pinned per session, per project, or per pool member, and API keys are matched by a 16-hex-digit SHA-256 fingerprint
+- Added account draining (`drain`, `returnMargin`, `returnCooldownMs`, `spend`, `returnWhen`) and per-pool account order, drain, and spend overrides; drain state and `/session drain` overrides persist in `agent.db` and are shared between auth broker clients through the broker's new `/v1/cache` routes
+- Added account limits on spend, requests, tokens, provider-reported usage, credits, or paid extra usage, which the auth gateway enforces with a 429 while still serving polls and downloads of an existing video job; usage reported to the broker names its account, and the new `GET /v1/usage/accounts` returns fleet-wide per-account totals
+- Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries; reset-only policies do not enable usage-reserve routing, and API-key policies reject both
 - Added user-disabled credentials: `credentials.setEnabled()` stores the state in a new `user_disabled_at` column of `agent.db` (schema 9) or through the auth broker's new `POST /v1/credential/:id/enabled`; a disabled credential stays stored, is listed by `credentials.listUserDisabled()`, `credentials.listDisabled()`, and `sessions.accounts()` without a session, and is never selected
-- Added `workspaceId` to stored API-key credentials (`ApiKeyCredential`, `OAuthRequestIdentity`): `login "api-key"` rules with `workspace-prompt` store the entered ID through `OAuthController.onWorkspaceId`, and the Anthropic provider sends it as `anthropic-workspace-id`
-- Added Anthropic Console API-key accounts: `/usage` shows each stored key's per-minute request and token limits from its responses, and its billing reads as metered spend of unknown state
+- Added Anthropic Console API-key accounts: a typed `SPEND_LIMIT_REACHED` error, per-minute request and token limits from each key's responses in `/usage`, metered billing of unknown state, and an optional `workspaceId` (`ApiKeyCredential`, `OAuthRequestIdentity`, `OAuthController.onWorkspaceId`) sent as `anthropic-workspace-id`
+- Added `StreamOptions.transformHeaders`, which rewrites a provider request's assembled headers for the OpenAI, Azure OpenAI, Anthropic, and Bedrock APIs
+- Added model `samplingParams` and `samplingParamsByThinkingLevel`, merged into `stream()` and `streamSimple()` requests for OpenAI-compatible APIs
+- Added `AssistantMessage.requestedModel`, set when a provider fallback served the turn on another model
 
 ### Fixed
 
-- Exhausted Anthropic spend limits show the earliest local and relative unblock time, Console and login recovery actions, and the original provider message
-- Spend-limit failures block the whole credential across model tiers
-- OpenRouter fetches key limits and credits concurrently, preserving key limits when the independent three-second credits deadline expires
-- Reset-only account policies do not enable usage-reserve routing, and API-key policies reject `resetOn` and `autoRedeem`
+- Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes on one model tier; requests move to a sibling key, the spent key stays blocked across tiers until the time Anthropic states (or the first of the next month for the tier cap), and when every key is spent the error names the earliest unblock time and how to recover
 - Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
-- Subscription billing reports available or exhausted from account-wide plan windows; Antigravity billing reports available when every counter has room
-- Paid OpenRouter billing reports the real remaining USD credit balance; keys refused access to the credits endpoint report permission-denied billing evidence
+- Fixed a Codex request in flight or still connecting being retried as a transport error when its session closed the provider state (model switch, session reset, or dispose); it now ends as an abort
 - Fixed an OAuth login deleting the API keys you had stored for the same provider with `/login`; only keys stored without a login are replaced
-- Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes; requests move to a sibling key and the spent key stays blocked until the time Anthropic states, or the first of the next month for the tier cap
 - Fixed an OpenRouter `:free` model hitting its daily free-model quota or rate limit blocking paid models on the same key; `:free` requests now move to another key until the quota resets at midnight UTC while paid models keep using it; `openrouter/free` counts as a free model
-- Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time. A rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too
+- Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time; a rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too
 - Fixed a usage report kept from before a quota reset blocking the account again for a minute when the usage endpoint is unreachable after the reset
-- Fixed a retired session account pool lifting once more than 256 other pools were retired, so a deferred lookup under its session id could use any account or API key; a retired pool now holds for 24 hours
+- Fixed released pooled sessions and finished security scans lifting their account restriction, so a later lookup under their session id could use any account or API key; the restriction now holds for 24 hours after release
+- Fixed a session restricted to an account pool reaching accounts outside it through OAuth reads, drain state, account listings, saved-reset credits, health checks, pin lookups, and saved security scan plans
+- Fixed `streamSimple()` dropping `frequencyPenalty` before it reached the provider
+- Fixed client-local stream options (`usageRecorded`, `cacheWarm`, `waitForTerminalDrain`) being sent in pi-native gateway request bodies
 
 ## [18.12.5] - 2026-10-21
 

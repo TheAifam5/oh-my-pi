@@ -1323,6 +1323,43 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.advisorCategoryHasLiveOwner("security")).toBe(false);
 	});
 
+	it("reports the effective taxonomy with live owners, sources, and owner-resolution warnings in /advisor status", () => {
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisors = [
+			{ name: "Security", owns: ["misc", "perf"] },
+			{ name: "Paused", enabled: false, owns: ["nope"] },
+		];
+		const declared = new Map([
+			["security", { description: "Trust boundaries.", owner: "Security", precedence: 2 }],
+			["perf", { description: "Hot paths.", owner: "Ghost" }],
+			["misc", { description: "Everything else." }],
+		]);
+		session.applyAdvisorConfigs(
+			advisors,
+			undefined,
+			undefined,
+			advisorModule.resolveAdvisorCategories(declared, advisors).categories,
+		);
+		const status = session.formatAdvisorStatus().split("\n");
+		expect(status.slice(status.indexOf("Categories (3, declared):"))).toEqual([
+			"Categories (3, declared):",
+			"  • security: owner Security (live), precedence 2, declared",
+			"  • perf: owner Ghost (not live), precedence none, declared",
+			"  • misc: owner Security (live), precedence none, declared",
+			"Category warnings:",
+			'  ! category "perf": owner "Ghost" is not a configured advisor',
+			'  ! advisor "Security": category "perf" is owned by "Ghost" — ownership kept',
+			'  ! advisor "Paused": owns unknown category "nope" — ignored',
+		]);
+
+		session.applyAdvisorConfigs([{ name: "Security" }], undefined);
+		const defaults = session.formatAdvisorStatus();
+		expect(defaults).toContain("Categories (10, bundled defaults):");
+		expect(defaults).toContain("  • security: owner Security (live), precedence 1, default");
+		expect(defaults).toContain("  • logic: owner none, precedence none, default");
+		expect(defaults).not.toContain("Category warnings:");
+	});
+
 	for (const [status, failure] of [
 		["quota_exhausted", () => new AIError.ProviderHttpError("quota", 429, { code: "insufficient_quota" })],
 		["error", () => new Error("advisor backend unavailable")],
