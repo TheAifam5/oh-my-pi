@@ -784,6 +784,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				],
 			};
 		});
+		const count = rows.length;
 		rows.push({
 			id: LIMITS_NEW_ROW,
 			provider: "",
@@ -801,7 +802,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				},
 			],
 		});
-		return { id: "limits", label: "Global limits", empty: "No global limits.", rows };
+		return { id: "limits", label: "Global limits", empty: "No global limits.", rows, count };
 	};
 
 	const pinsPage = (): AccountManagerPage => {

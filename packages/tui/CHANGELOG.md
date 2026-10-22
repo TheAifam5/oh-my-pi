@@ -27,9 +27,15 @@
 - Added optional `finding`, `category`, `owner`, `reporters`, and `relation` to `AdvisorNote`; advisor cards group notes by finding and label each with its finding, category, and reporter count
 - Added per-advisor and file-level "Notes per update" (1–32, inherit clears), per-advisor owned-category selection, and a categories editor (lower-kebab ids, description, roster owner, precedence) to `/advisor configure`; saving drops categories without a description with a warning
 
+### Changed
+
+- Model hub pool rows show compact routing badges with full routing and refused-edit messages in a detail block
+- Model hub key hints page with `?` at narrow widths
+
 ### Fixed
 
 - Fixed the status line's usage timeout cancelling the host's background usage fetch; it now bounds only its own wait
+- Advisor category and owns descriptions truncate with an ellipsis
 
 ## [18.12.4] - 2026-10-20
 

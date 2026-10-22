@@ -46,7 +46,7 @@ import { plainText } from "../native/spans";
 import { isNativeRendering } from "../native/state";
 import { Input } from "../components/input";
 import { routeSgrMouseInput, type SgrMouseEvent } from "../mouse";
-import { truncateToWidth, visibleWidth } from "../utils";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils";
 import type {
 	ModelBrowserSource,
 	ModelBrowserRegistry,
@@ -718,6 +718,8 @@ export class ModelHubComponent implements Component {
 	 */
 	#poolStatus: { text: string; tone: "error" | "warning" } | undefined;
 	#roleIndex = 0;
+	/** Footer hint page `?` selected for the pool row at `index`; page 0 elsewhere. */
+	#poolHintPage: { index: number; page: number } | undefined;
 	#roleHover: number | null = null;
 	/** First roles row drawn in the scroll window; follows the cursor and clamps to the list. */
 	#roleScrollStart = 0;
@@ -2966,7 +2968,10 @@ export class ModelHubComponent implements Component {
 
 	// ─── Pool display ───────────────────────────────────────────────────────
 
-	/** One-line pool summary: members, strategy, funding order, routing, and why it is read-only. */
+	/**
+	 * One-line pool summary: source, members, strategy, a badge per configured routing section,
+	 * and why it is read-only. {@link #poolFacts} carries the full routing.
+	 */
 	#poolSummary(pool: ModelHubPool | undefined): string {
 		if (!pool) return "invalid pool · fix it in config";
 		if (pool.invalid !== undefined) return sanitizeDisplayLine(`invalid pool · skipped · ${pool.invalid}`);
@@ -2975,19 +2980,41 @@ export class ModelHubComponent implements Component {
 				? `pool +${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`
 				: "pool";
 		const count = pool.members.length;
+		const badges = [
+			pool.quota ? "quota" : undefined,
+			pool.accounts ? "accounts" : undefined,
+			pool.cache ? "cache" : undefined,
+			pool.funding.includes("metered") || pool.spending ? "metered" : undefined,
+			pool.limits ? "limits" : undefined,
+		].filter(badge => badge !== undefined);
 		const parts = [
 			source,
 			`${count} model${count === 1 ? "" : "s"}`,
 			pool.strategy,
-			pool.funding.length > 0 ? `funding ${pool.funding.join(" → ")}` : undefined,
-			pool.spending ? `spending ${pool.spending}` : undefined,
-			pool.limits ? `limits ${pool.limits}` : undefined,
-			pool.quota ? `quota ${pool.quota}` : undefined,
-			pool.accounts ? `accounts ${pool.accounts}` : undefined,
-			pool.cache ? `cache ${pool.cache}` : undefined,
+			badges.length > 0 ? badges.join(" ") : undefined,
 			pool.readOnly ? `read-only: ${pool.readOnly}` : undefined,
 		];
 		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
+	}
+
+	/** A pool's labelled facts: strategy, funding, group, spending, limits, quota, accounts, cache, read-only reason. */
+	#poolFacts(pool: ModelHubPool): { key: string; value: string }[] {
+		const facts = [
+			{ key: "Strategy", value: pool.strategy || "—" },
+			{ key: "Funding", value: pool.funding.length > 0 ? pool.funding.join(" → ") : "not configured" },
+			pool.source.kind === "ref"
+				? { key: "Group", value: `${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}` }
+				: undefined,
+			pool.spending ? { key: "Spending", value: pool.spending } : undefined,
+			pool.limits ? { key: "Limits", value: pool.limits } : undefined,
+			pool.quota ? { key: "Quota", value: pool.quota } : undefined,
+			pool.accounts ? { key: "Accounts", value: pool.accounts } : undefined,
+			pool.cache ? { key: "Cache", value: pool.cache } : undefined,
+			pool.readOnly ? { key: "Read-only", value: pool.readOnly } : undefined,
+		];
+		return facts
+			.filter(fact => fact !== undefined)
+			.map(fact => ({ key: fact.key, value: sanitizeDisplayLine(fact.value) }));
 	}
 
 	/** A member's state facts: effort, weight, catalog presence, billing. */
@@ -3493,6 +3520,11 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 		const printable = extractPrintableText(data);
+		if (printable === "?" && this.#poolRowHints(this.#rolesRows[this.#roleIndex])) {
+			const page = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page + 1 : 1;
+			this.#poolHintPage = { index: this.#roleIndex, page };
+			return;
+		}
 		if (printable !== undefined && Object.hasOwn(ROLES_ACTION_KEYS, printable)) {
 			this.#runRolesAction(ROLES_ACTION_KEYS[printable]!);
 		}
@@ -3973,6 +4005,40 @@ export class ModelHubComponent implements Component {
 		return out;
 	}
 
+	/**
+	 * The Roles view's detail rows, at most `maxLines`: an open field's refusal or the pool status
+	 * error in full, then the selected pool's facts, values wrapped under their column.
+	 */
+	#rolesDetail(width: number, maxLines: number): string[] {
+		if (maxLines <= 0) return [];
+		const lines: string[] = [];
+		const strip = this.#strip;
+		const error =
+			strip?.kind === "field" ? strip.error : this.#poolStatus?.tone === "error" ? this.#poolStatus.text : undefined;
+		if (error !== undefined) {
+			for (const line of wrapTextWithAnsi(error, Math.max(1, width - 2))) {
+				lines.push(truncateToWidth(`  ${theme.fg("error", line)}`, width));
+			}
+		}
+		const target = this.#rowPoolTarget(this.#rolesRows[this.#roleIndex]);
+		const pool = target ? this.#pool(target) : undefined;
+		if (pool && pool.invalid === undefined) {
+			const facts = this.#poolFacts(pool);
+			const keyWidth = Math.max(...facts.map(fact => visibleWidth(fact.key)));
+			const valueWidth = Math.max(1, width - keyWidth - 4);
+			for (const fact of facts) {
+				wrapTextWithAnsi(fact.value, valueWidth).forEach((part, index) => {
+					const key = index === 0 ? theme.fg("muted", fact.key.padEnd(keyWidth)) : " ".repeat(keyWidth);
+					lines.push(truncateToWidth(`  ${key}  ${part}`, width));
+				});
+			}
+		}
+		if (lines.length <= maxLines) return lines;
+		const kept = lines.slice(0, maxLines);
+		kept[maxLines - 1] = truncateToWidth(`${kept[maxLines - 1]} …`, width);
+		return kept;
+	}
+
 	#renderRolesView(width: number, rows: number): string[] {
 		const lines: string[] = [];
 		lines.push(this.#renderRoleTabs(width));
@@ -3992,7 +4058,8 @@ export class ModelHubComponent implements Component {
 		// Window the list around the cursor so entries past the panel height stay
 		// reachable; the trailing indicator line steals one row when clipped.
 		const total = this.#rolesRows.length;
-		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart);
+		const detail = this.#rolesDetail(width, Math.floor(Math.max(0, rows - 2 - this.#rolesRowStart) / 2));
+		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart - detail.length);
 		const overflow = total > capacity;
 		const viewHeight = overflow ? Math.max(0, capacity - 1) : capacity;
 		this.#roleScrollStart = this.#ensureRoleVisible(viewHeight, total);
@@ -4133,6 +4200,9 @@ export class ModelHubComponent implements Component {
 			lines.push(truncateToWidth(theme.fg("dim", `   ${parts.join("   ")}`), width));
 		}
 
+		// The selected pool's facts and the last refusal sit above the cycle row.
+		while (lines.length < rows - 1 - detail.length) lines.push("");
+		lines.push(...detail);
 		// Live preview of the quick-switch cycle, rendered with the exact
 		// segment track the ctrl+p status uses; the selected role's chip fills.
 		while (lines.length < rows - 1) lines.push("");
@@ -4199,7 +4269,7 @@ export class ModelHubComponent implements Component {
 		return lines.slice(0, rows);
 	}
 
-	#footerHint(): string {
+	#footerHint(width: number): string {
 		const enter = formatKeyHint("enter");
 		const cancel = editorKey("tui.select.cancel");
 		const upDown = editorKeys("tui.select.up", "tui.select.down");
@@ -4263,7 +4333,7 @@ export class ModelHubComponent implements Component {
 			const poolHints = this.#poolRowHints(row);
 			if (poolHints) {
 				const parts = poolHints.map(hint => `${formatKeyHints(hint.keys)} ${hint.label}`);
-				return [`${upDown} rows`, ...parts, `${left} providers`].join(" · ");
+				return this.#pagedHints([`${upDown} rows`, ...parts, `${left} providers`], width);
 			}
 			const convert = `${this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : ""}${
 				this.#groupsAvailable(row) ? ` · ${formatKeyHint("shift+g")} group` : ""
@@ -4304,11 +4374,35 @@ export class ModelHubComponent implements Component {
 		return `${enter} assign roles · ${upDown} models · ${left} providers · type to search · ${altLeftRight} kind${refresh} · ${cancel} close`;
 	}
 
+	/**
+	 * `parts` joined by ` · `; past `width`, split into pages that end with a `? more keys` hint,
+	 * showing the page `?` selected for the current row.
+	 */
+	#pagedHints(parts: readonly string[], width: number): string {
+		const separator = " · ";
+		const all = parts.join(separator);
+		if (visibleWidth(all) <= width) return all;
+		const more = `${formatKeyHint("?")} more keys`;
+		const room = width - visibleWidth(separator + more);
+		const pages: string[][] = [];
+		let page: string[] = [];
+		for (const part of parts) {
+			if (page.length > 0 && visibleWidth([...page, part].join(separator)) > room) {
+				pages.push(page);
+				page = [];
+			}
+			page.push(part);
+		}
+		pages.push(page);
+		const selected = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page % pages.length : 0;
+		return [...pages[selected]!, more].join(separator);
+	}
+
 	#renderFooter(width: number): string {
 		const strip = this.#strip;
 		return this.#frame.renderFooter(
 			width,
-			this.#footerHint(),
+			this.#footerHint(width),
 			strip ? () => this.#renderStrip(width, strip) : undefined,
 		);
 	}
@@ -5537,20 +5631,8 @@ export class ModelHubComponent implements Component {
 					: `This pool is invalid and is skipped: ${sanitizeDisplayLine(pool.invalid)}. Fix it in config, or clear it with x.`;
 			return [text([span(message, "warning")], { wrap: "word" })];
 		}
-		const row = (key: string, value: string) => ({ k: [span(key, "muted")], v: sanitizeDisplayLine(value) });
-		const facts = [
-			row("Strategy", pool.strategy || "—"),
-			row("Funding", pool.funding.length > 0 ? pool.funding.join(" → ") : "not configured"),
-			pool.source.kind === "ref"
-				? row("Group", `${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`)
-				: undefined,
-			pool.spending ? row("Spending", pool.spending) : undefined,
-			pool.limits ? row("Limits", pool.limits) : undefined,
-			pool.quota ? row("Quota", pool.quota) : undefined,
-			pool.accounts ? row("Accounts", pool.accounts) : undefined,
-			pool.cache ? row("Cache", pool.cache) : undefined,
-			pool.readOnly ? row("Read-only", pool.readOnly) : undefined,
-		];
+		const row = (key: string, value: string) => ({ k: [span(key, "muted")], v: value });
+		const facts = this.#poolFacts(pool).map(fact => row(fact.key, fact.value));
 		const members = pool.members.map(member => {
 			const details = [
 				member.model,
@@ -5558,11 +5640,14 @@ export class ModelHubComponent implements Component {
 				member.weight !== undefined ? `weight ${member.weight}` : undefined,
 				this.#billingFact(member.model),
 			];
-			return row(sanitizeDisplayLine(member.alias), details.filter(detail => detail !== undefined).join(" · "));
+			return row(
+				sanitizeDisplayLine(member.alias),
+				sanitizeDisplayLine(details.filter(detail => detail !== undefined).join(" · ")),
+			);
 		});
 		return [
 			node("section", { head }, [
-				node("kv", { items: compact(facts) }),
+				node("kv", { items: facts }),
 				...(members.length > 0 ? [node("kv", { items: members })] : []),
 			]),
 		];

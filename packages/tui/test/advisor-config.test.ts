@@ -364,7 +364,7 @@ describe("advisor taxonomy and notes budget editing", () => {
 		press(overlay, "\r"); // Notes per update ("inherit").
 		type(overlay, "2", "inherit".length);
 		press(overlay, "\r");
-		press(overlay, down, 7);
+		press(overlay, down); // Detail keeps Notes per update selected; Owns is next.
 		press(overlay, "\r"); // Owns: logic, security, perf-hot, empty-one, Done.
 		press(overlay, "\r"); // Toggle logic.
 		press(overlay, down, 2);
@@ -503,5 +503,54 @@ describe("advisor taxonomy and notes budget editing", () => {
 		expect(props.sections.find(section => section.id === "taxonomy-warnings")?.rows[0]?.warning).toBe(
 			'advisor "Security": owns unknown category "nope" — ignored',
 		);
+	});
+
+	const strip = (lines: readonly string[]): string => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+
+	it("keeps the edited field selected when the detail screen rebuilds", () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] };
+		const overlay = open({ advisors: [{ name: "Reviewer" }] }, sink);
+		press(overlay, "\r"); // Reviewer detail.
+		press(overlay, down, 6);
+		press(overlay, "\r"); // Notes per update.
+		type(overlay, "6", "inherit".length);
+		press(overlay, "\r");
+		press(overlay, "\r"); // Notes per update again, not Name.
+		expect(strip(overlay.render(120))).toContain('Notes per update · advisor "Reviewer"');
+		press(overlay, "\x1b");
+		press(overlay, down);
+		press(overlay, "\r"); // Owns, the row after Notes per update.
+		expect(strip(overlay.render(120))).toContain("[ ] logic");
+	});
+
+	it("titles the notes budget editors with the field and its scope", () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] };
+		const overlay = open({ advisors: [{ name: "Reviewer" }] }, sink);
+		press(overlay, down, 3);
+		press(overlay, "\r"); // Shared notes per update.
+		const text = strip(overlay.render(120));
+		expect(text).toContain("Notes per update · file-level default · project WATCHDOG.yml");
+		expect(text).toContain("blockers are exempt");
+	});
+
+	it("ellipsizes long category and owns descriptions at 80 columns", () => {
+		const sink = { notices: [] as string[], warnings: [] as string[] };
+		const description = "Trust boundaries, injection, secrets, permissions, and every other security concern.";
+		const overlay = open({ categories: { security: { description } }, advisors: [{ name: "Reviewer" }] }, sink);
+		press(overlay, down, 4);
+		press(overlay, "\r"); // Categories.
+		const categories = strip(overlay.render(80))
+			.split("\n")
+			.find(line => line.includes("security"));
+		expect(categories).toContain("…");
+		press(overlay, "\x1b");
+		press(overlay, "\x1b[A", 4);
+		press(overlay, "\r"); // Reviewer detail.
+		press(overlay, down, 7);
+		press(overlay, "\r"); // Owns.
+		const owns = strip(overlay.render(80))
+			.split("\n")
+			.find(line => line.includes("[ ] security"));
+		expect(owns).toContain("…");
 	});
 });

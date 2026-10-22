@@ -161,12 +161,13 @@ describe("AccountManager", () => {
 			details: [{ label: "limit", value: "0.00 / 20 USD per month" }],
 			fields: [{ id: "limit:add", label: "add", key: "a", value: "", input: { initial: "", hint: "a limit" } }],
 		});
+		const addScope = account("limits:new", "", { name: "(add scope)", identity: "limits for a scope" });
 		const manager = new AccountManagerComponent(
 			tuiStub,
 			{
 				load: () => [account("a", "anthropic")],
 				pages: () => [
-					{ id: "limits", label: "Global limits", empty: "No global limits.", rows: [limit] },
+					{ id: "limits", label: "Global limits", empty: "No global limits.", rows: [limit, addScope], count: 1 },
 					{ id: "pins", label: "Project \x1b[2Jpins", empty: "No project pins.", rows: [] },
 				],
 				apply: async (rowId, actionId, value) => {

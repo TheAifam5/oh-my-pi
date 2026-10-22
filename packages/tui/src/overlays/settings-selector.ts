@@ -75,6 +75,8 @@ const PREFS_EDITOR_ROLE = "omp.prefs.editor";
 const PREFS_MENU_MAX = 12;
 /** Text settings whose values are paths, ids or commands (drawn in mono). */
 const MONO_TEXT_SETTING = /(path|dir|url|endpoint|host|command|model|id)$/i;
+/** Submenus whose rows show the selected option's label rather than the stored value. */
+const OPTION_LABEL_SETTINGS = new Set(["advisor.aggregation.judge.timeoutMs"]);
 /** Submenus whose choices preview live while highlighted (the branches of `#createSubmenu`). */
 const PREVIEWED_SETTINGS = new Set([
 	"theme.dark",
@@ -1489,12 +1491,17 @@ export class SettingsSelectorComponent implements Component {
 			case "enum":
 				return { ...item, currentValue: String(currentValue ?? ""), values: [...def.values] };
 
-			case "submenu":
+			case "submenu": {
+				const raw = this.#getSubmenuCurrentValue(def.path, currentValue);
+				const shown = OPTION_LABEL_SETTINGS.has(def.path)
+					? (this.#submenuOptions(def).find(option => option.value === raw)?.label ?? raw)
+					: raw;
 				return {
 					...item,
-					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
-					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
+					currentValue: shown,
+					submenu: (_cv, done) => this.#createSubmenu(def, raw, done),
 				};
+			}
 
 			case "text":
 				return {

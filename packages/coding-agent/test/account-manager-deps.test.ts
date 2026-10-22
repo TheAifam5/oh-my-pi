@@ -401,6 +401,7 @@ describe("account manager deps", () => {
 			["openai", "calls to this provider"],
 			["(add scope)", "limits for a provider/model, a provider, or * (every call)"],
 		]);
+		expect(page().count).toBe(2);
 		const [all, openai, add] = page().rows;
 		expect(openai!.fields[0]!.readOnly).toBe('limits["openai"] is set in the runtime layer');
 		expect((await deps.apply(openai!.id, "limit:add", "usd 1 day")).error).toContain("runtime layer");

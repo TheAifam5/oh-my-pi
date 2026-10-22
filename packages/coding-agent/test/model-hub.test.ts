@@ -2211,9 +2211,58 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 				const rendered = normalize(hub.render(400));
-				expect(rendered).toContain("quota reserve 0.1, max age 15m, unknown exclude");
-				expect(rendered).toContain("accounts order work → home, drain work, spend plan+credits, return reset");
-				expect(rendered).toContain("cache affinity, pricing off");
+				expect(rendered).toContain("SMOL pool · 1 model · quota · quota accounts cache metered");
+				expect(rendered).toContain("Quota reserve 0.1, max age 15m, unknown exclude");
+				expect(rendered).toContain("Accounts order work → home, drain work, spend plan+credits, return reset");
+				expect(rendered).toContain("Cache affinity, pricing off");
+			});
+
+			test("a pooled row stays compact and the selected pool's routing shows in full below the rows", () => {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: ["quota", "priority"],
+					strategyOptions: { order: ["a", "b", "c"] },
+					models: {
+						a: { model: "test/model-a" },
+						b: { model: "test/model-b" },
+						c: { model: "test/model-a" },
+					},
+					routing: {
+						quota: { reserveFraction: 0.1, unknown: "allow" },
+						accounts: { order: ["work", "home"], drain: "work", spend: ["plan"], returnWhen: "reset" },
+						cache: { affinity: true, pricing: true },
+					},
+				});
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				const wide = hub.render(140).map(line => stripVTControlCharacters(line));
+				const row = wide.find(line => line.includes("SMOL")) ?? "";
+				expect(row).toContain("pool · 3 models · quota → priority · quota accounts cache");
+				expect(row).not.toContain("…");
+				const text = normalize(wide);
+				expect(text).toContain("Quota reserve 0.1, unknown allow");
+				expect(text).toContain("Accounts order work → home, drain work, spend plan, return reset");
+				expect(text).toContain("Cache affinity, pricing");
+			});
+
+			test("at 80 columns the pool row's footer pages its keys with ?", () => {
+				const settings = pooledSettings();
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				const before = structuredClone(smolGroup(settings));
+				const pages: string[] = [];
+				for (let i = 0; i < 6; i++) {
+					pages.push(footerLine(hub.render(80)));
+					hub.handleInput("?");
+				}
+				for (const page of pages) expect(page).toContain("? more keys");
+				const all = pages.join(" ");
+				for (const hint of ["u quota unknown", "r quota reserve", "e routing", "a cache affinity"]) {
+					expect(all).toContain(hint);
+				}
+				expect(smolGroup(settings)).toEqual(before);
 			});
 
 			test("a and h toggle cache affinity and pricing; u and r cycle the quota unknown handling and reserve", () => {
@@ -2423,6 +2472,12 @@ describe("ModelHub", () => {
 				hub.handleInput("\n");
 				expect(footerLine(hub.render(220))).toContain("must be a number in (0, 0.5]");
 				expect(smol().strategyOptions).toEqual({ order: ["a", "b"], tolerance: 0.2 });
+				const body = hub
+					.render(140)
+					.slice(0, -2)
+					.map(line => stripVTControlCharacters(line))
+					.join("\n");
+				expect(body).toContain("must be a number in (0, 0.5]");
 			});
 
 			test("the picker shows a pool editor as its strip with toggle actions", () => {

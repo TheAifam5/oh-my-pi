@@ -396,9 +396,7 @@ test("pools render inside the roles picker and their actions edit only what the 
 	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
 	let p = props(hub.describe(withPicker));
 	const item = (id: string) => p.items?.find(entry => entry.id === id);
-	expect(item("role:smol")?.facts?.model).toBe(
-		"pool · 2 models · priority · funding included → metered · spending provider-managed",
-	);
+	expect(item("role:smol")?.facts?.model).toBe("pool · 2 models · priority · metered");
 	expect(item("member:role:smol:opus")).toMatchObject({ label: "anthropic/claude-opus-5", depth: 1 });
 	expect(item("member:role:smol:opus")?.facts?.thinking).toBe("high");
 	expect(item("pooled:default")?.label).toContain("read-only: edit modelGroups.fast in config");

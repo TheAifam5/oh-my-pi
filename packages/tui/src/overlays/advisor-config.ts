@@ -25,6 +25,7 @@ import {
 	routeSgrMouseInput,
 	type SelectItem,
 	SelectList,
+	type SelectListLayoutOptions,
 	type SgrMouseEvent,
 	type TUI,
 	truncateToWidth,
@@ -252,6 +253,9 @@ const SYNC_BACKLOG_INHERIT = "inherit";
 
 /** The tools list's terminal-only "Done" row; the picker applies with its own action instead. */
 const TOOLS_DONE = "__done";
+
+/** Category and owns rows: one description row, ellipsized when it overflows. */
+const ONE_ROW_DESCRIPTIONS: SelectListLayoutOptions = { wrapDescription: true, maxDescriptionRows: 1 };
 
 /** Inclusive bounds of a `maxNotesPerUpdate` budget. */
 const MAX_NOTES_MIN = 1;
@@ -515,6 +519,8 @@ export class AdvisorConfigOverlayComponent implements Component {
 
 	/** The advisor the detail screen (and its editors) edits; -1 on the roster, the shared settings, or the categories. */
 	#detailIndex = -1;
+	/** The detail field last edited or highlighted, restored when that advisor's detail screen rebuilds. */
+	#detailField: string | undefined;
 	#nativePrefs: { signature: string; editor: NativeNode | undefined; node: NativeNode } | undefined;
 	/** The editor over the prefs page, rebuilt only when one of `deps` changes identity. */
 	#nativeEditor: { deps: readonly unknown[]; node: NativeNode } | undefined;
@@ -551,7 +557,15 @@ export class AdvisorConfigOverlayComponent implements Component {
 	#bodyRowsLast = 3;
 	#renderActivePane = (width: number, height: number | undefined): readonly string[] => {
 		const rows = Math.max(0, Math.floor(height ?? this.#bodyRowsLast));
-		const lines = [...this.#active.render(width)];
+		const field = this.#fieldInfo;
+		const header = field
+			? [
+					truncateToWidth(theme.bold(field.title), width),
+					...wrap(field.hint, width).map(line => truncateToWidth(theme.fg("muted", line), width)),
+					"",
+				]
+			: [];
+		const lines = [...header, ...this.#active.render(width)];
 		while (lines.length < rows) lines.push("");
 		return lines.slice(0, rows);
 	};
@@ -1075,6 +1089,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 				if (index < 0) return;
 				const advisor = this.#doc.advisors[index];
 				if (!advisor) return;
+				this.#detailField = event.item;
 				if (event.item === "toggleEnabled" && typeof event.value === "boolean") {
 					if (event.value !== (advisor.enabled !== false)) this.#onDetailSelect(index, "toggleEnabled");
 				} else if (event.item === "tools" && Array.isArray(event.value)) {
@@ -1124,6 +1139,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 				return;
 			case "select":
 				if (this.#screen === "detail" && this.#active instanceof SelectList) {
+					this.#detailField = event.item;
 					this.#active.setSelectedValue(event.item);
 					this.#cb.requestRender();
 				}
@@ -1638,6 +1654,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			this.#showList();
 			return;
 		}
+		const focus = this.#detailIndex === index ? this.#detailField : undefined;
 		this.#detailIndex = index;
 		const modelDescription = advisor.model?.trim() || this.#defaultModelLabel || "advisor role default";
 		const toolsDescription = formatAdvisorTools(advisor.tools, "no tools");
@@ -1675,6 +1692,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			{ value: "back", label: "Back" },
 		);
 		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		if (focus) list.setSelectedValue(focus);
 		list.onSelect = item => this.#onDetailSelect(index, item.value);
 		list.onCancel = () => this.#showList();
 		this.#setScreen(
@@ -1687,6 +1705,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 	#onDetailSelect(index: number, field: string): void {
 		// Editors opened straight from the prefs page edit this advisor too.
 		this.#detailIndex = index;
+		this.#detailField = field;
 		switch (field) {
 			case "toggleEnabled": {
 				const a = this.#doc.advisors[index];
@@ -1949,7 +1968,9 @@ export class AdvisorConfigOverlayComponent implements Component {
 			undefined,
 			{
 				role: "omp.overlay.advisor.field",
-				title: `Notes per update · ${advisor ? advisor.name || "this advisor" : "all advisors"}`,
+				title: advisor
+					? `Notes per update · advisor "${advisor.name || "unnamed"}"`
+					: `Notes per update · file-level default · ${this.#scope} WATCHDOG.yml`,
 				hint: `Non-blocker notes accepted per update, ${MAX_NOTES_MIN}–${MAX_NOTES_MAX}; blockers are exempt. inherit uses ${inherits}.`,
 			},
 		);
@@ -1992,7 +2013,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			description: option.detail,
 		}));
 		items.push({ value: TOOLS_DONE, label: "Done" });
-		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), ONE_ROW_DESCRIPTIONS);
 		list.setSelectedIndex(cursor);
 		let cursorIndex = cursor;
 		list.onSelectionChange = item => {
@@ -2372,7 +2393,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 					},
 			{ value: "back", label: "Back" },
 		);
-		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), ONE_ROW_DESCRIPTIONS);
 		if (selectValue !== undefined) list.setSelectedValue(selectValue);
 		list.onSelect = item => {
 			if (item.value === "back") this.#showList("categories");
@@ -2410,7 +2431,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 			{ value: "delete", label: "Remove this category" },
 			{ value: "back", label: "Back" },
 		];
-		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme());
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), ONE_ROW_DESCRIPTIONS);
 		list.onSelect = item => {
 			switch (item.value) {
 				case "id":

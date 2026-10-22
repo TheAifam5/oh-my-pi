@@ -83,6 +83,9 @@
 - Fixed usage headers of a model with its own base URL being read against the provider's default URL
 - Fixed the image URL service keeping its session alive after the session ended
 - Fixed usage fetches that finish after the status line's two-second wait never updating the session's usage reports
+- /settings shows the advisor judge timeout in seconds and aligns advisor row values
+- /account Global limits counts only configured scopes
+- /advisor configure keeps the edited field selected after save and titles notes-per-update editors by scope
 
 ## [18.12.5] - 2026-10-21
 

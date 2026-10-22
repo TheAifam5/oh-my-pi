@@ -101,6 +101,8 @@ export interface AccountManagerPage {
 	/** Text shown in place of the rows when there are none. */
 	empty: string;
 	rows: AccountManagerAccount[];
+	/** Configured entries the sidebar counts; omitted counts every row. */
+	count?: number;
 }
 
 /** Host-owned account listing and persistence. */
@@ -272,7 +274,7 @@ export class AccountManagerComponent implements Component {
 				kind: "page",
 				label: page.label,
 				page,
-				annotation: String(page.rows.length),
+				annotation: String(page.count ?? page.rows.length),
 			});
 		}
 		this.#entries = entries;
@@ -566,7 +568,8 @@ export class AccountManagerComponent implements Component {
 		const entry = this.#activeEntry();
 		const scope =
 			entry.kind === "provider" ? `${entry.label} accounts` : entry.kind === "page" ? entry.label : "All accounts";
-		return { text: `${scope} · ${this.#rows.length}`, tone: "muted" };
+		const count = entry.page?.count ?? this.#rows.length;
+		return { text: `${scope} · ${count}`, tone: "muted" };
 	}
 
 	#accountTitle(account: AccountManagerAccount): string {

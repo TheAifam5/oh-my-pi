@@ -1,8 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
+import { cfgAdvisorAggregationJudgeTimeoutMs, cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
+import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
 import { getSettingsForTab, type SettingDef } from "@oh-my-pi/pi-tui/overlays/settings-defs";
+import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+
+beforeAll(async () => {
+	await initTheme();
+});
 
 beforeEach(async () => {
 	resetSettingsForTest();
@@ -102,5 +110,40 @@ describe("settings panel advisor rows", () => {
 		expect([def.type, def.group, def.condition]).toEqual(["boolean", "Retry & Fallback", undefined]);
 		host.set("allowProjectMeteredPools", true);
 		expect(Settings.instance.getGlobalSettings().allowProjectMeteredPools).toBe(true);
+	});
+
+	it("keeps every advisor label within the settings list's 30-column label column", () => {
+		const advisorDefs = getSettingsForTab(createSettingsHost().entries, "model").filter(
+			def => def.group === "Advisor",
+		);
+		expect(advisorDefs.filter(def => def.label.length > 30).map(def => def.label)).toEqual([]);
+	});
+
+	it("shows the judge timeout row in seconds and picks from its stored value", () => {
+		cfgAdvisorEnabled.set(Settings.instance, true);
+		const selector = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: ["dark"],
+				providers: [],
+				settings: createSettingsHost(),
+				plugins: createPluginSettingsHost(process.cwd()),
+			},
+			{ onChange: () => {}, onCancel: () => {} },
+		);
+		for (const char of "judge timeout") selector.handleInput(char);
+		const row = () =>
+			selector
+				.render(120)
+				.map(line => stripVTControlCharacters(line))
+				.find(line => line.includes("Advisor Findings Judge Timeout")) ?? "";
+		expect(row()).toMatch(/Timeout\s+10 seconds/);
+		expect(row()).not.toContain("10000");
+		selector.handleInput("\r"); // Picker opens on the stored 10 seconds.
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\r"); // 20 seconds.
+		expect(cfgAdvisorAggregationJudgeTimeoutMs.get(Settings.instance)).toBe(20_000);
+		expect(row()).toMatch(/Timeout\s+20 seconds/);
 	});
 });

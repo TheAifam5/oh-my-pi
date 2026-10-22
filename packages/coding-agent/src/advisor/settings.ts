@@ -251,7 +251,7 @@ export const cfgAdvisorAggregationJudgeAllowCrossDomain = register({
 	ui: {
 		tab: "model",
 		group: "Advisor",
-		label: "Advisor Findings Judge Cross-Domain",
+		label: "Advisor Judge Cross-Domain",
 		description:
 			"Off by default. When enabled, advisor finding text (anchors, defects, impact, fix) is sent to a judge on a different provider, base URL or account than the reporting advisors.",
 		condition: "advisorEnabled",
