@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { isUsageLimitOutcome, parseRateLimitReason, type RateLimitReason } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
@@ -21,6 +22,7 @@ import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
 import type {
 	AuthCredential,
+	ConfirmServedOptions,
 	CredentialRotation,
 	InvalidateCredentialMatchingOptions,
 	LimitsApi,
@@ -363,6 +365,10 @@ export class RateLimits implements LimitsApi {
 		return this.#deps.entitlements.recordDenial(provider, target.index, options.modelId, options.ttlMs);
 	}
 
+	confirmServed(provider: string, options: ConfirmServedOptions): number {
+		return this.#deps.entitlements.confirmServed(provider, options.credentialId, options.modelId);
+	}
+
 	#extractStructuredApiKeyToken(apiKey: string): string | undefined {
 		if (!apiKey.startsWith("{")) return undefined;
 		try {
@@ -442,6 +448,10 @@ export class RateLimits implements LimitsApi {
 	 * - exact model-entitlement denial (Codex ChatGPT account or Cursor plan) →
 	 *   record the account as not entitled to the requested model, temporarily
 	 *   block only that model, then rotate.
+	 * - Anthropic `404 not_found_error` naming the requested model → hold the
+	 *   credential off that model in memory (see {@link ModelEntitlements.holdModelNotFound})
+	 *   and rotate through entitled siblings; with none left, drop every hold
+	 *   for the model and report no switch.
 	 * - other account-scoped policy denial → with a requested model and unless
 	 *   the organization refuses OAuth outright, record the same entitlement
 	 *   denial; temporarily block that account without marking its credential
@@ -506,6 +516,9 @@ export class RateLimits implements LimitsApi {
 				});
 			}
 			return { switched: false };
+		}
+		if (AIError.isAnthropicModelNotFoundError(error, provider, options?.modelId)) {
+			return this.#rotateModelNotFound(provider, sessionId, options);
 		}
 		if (usageLimit) {
 			// Thread the provider-specified reset window (e.g. Devin "Your limit
@@ -627,6 +640,60 @@ export class RateLimits implements LimitsApi {
 		}
 
 		return { switched: hasSibling };
+	}
+
+	/** {@link rotate} after Anthropic's `404 not_found_error` naming `options.modelId`. */
+	async #rotateModelNotFound(
+		provider: string,
+		sessionId: string | undefined,
+		options: RotateCredentialOptions | undefined,
+	): Promise<CredentialRotation> {
+		const modelId = options?.modelId;
+		const target = await this.#resolveCredentialTarget(provider, sessionId, {
+			credentialId: options?.credentialId,
+			apiKey: options?.apiKey,
+			allowStaleOAuthBearer: true,
+		});
+		if (!target || !this.#deps.entitlements.holdModelNotFound(provider, target.index, modelId)) {
+			return { switched: false };
+		}
+		logger.debug("Holding credential off model after model-not-found", {
+			provider,
+			credentialId: this.#deps.pool.entries(provider)[target.index]?.id,
+			modelId,
+		});
+		const sticky = this.#deps.affinity.get(provider, sessionId);
+		if (!target.explicit || (sticky?.type === target.type && sticky.index === target.index)) {
+			this.#deps.affinity.clear(provider, sessionId);
+		}
+		const entitled = this.#deps.entitlements.entitled(provider, modelId, options?.accountIds);
+		const routing = this.#credentialBlockRouting(provider, target.type, modelId);
+		const credentials = this.#deps.pool.credentials(provider);
+		let hasSibling = false;
+		let retryAtMs: number | undefined;
+		for (let index = 0; index < credentials.length; index++) {
+			const credential = credentials[index];
+			if (!credential || credential.type !== target.type || index === target.index || !entitled(index)) continue;
+			if (!this.#deps.affinity.allows(provider, sessionId, credential)) continue;
+			hasSibling = true;
+			const blockedUntil = this.#deps.blocks.blockedUntil(
+				provider,
+				routing.providerKey,
+				index,
+				routing.siblingBlockScopes,
+			);
+			if (blockedUntil === undefined) return { switched: true };
+			if (retryAtMs === undefined || blockedUntil < retryAtMs) retryAtMs = blockedUntil;
+		}
+		if (!hasSibling) {
+			this.#deps.entitlements.releaseModelNotFound(provider, modelId);
+			logger.info("Every credential refused the model as not found; no entitlement denial recorded", {
+				provider,
+				modelId,
+			});
+			return { switched: false };
+		}
+		return awaitSiblingUnblock({ switched: false, retryAtMs }, options?.signal);
 	}
 }
 

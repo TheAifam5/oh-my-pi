@@ -1,6 +1,6 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { $env, $envExact, logger } from "@oh-my-pi/pi-utils";
-import { type ApiKeyResolver, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
+import { type ApiKeyResolver, confirmServedOnSuccess, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
 import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
 import * as AIError from "../error";
 import { isUsageLimitOutcome } from "../error/rate-limit";
@@ -154,6 +154,8 @@ export interface KeyCascadeDeps {
 	affinity: SessionAffinity;
 	/** LimitsApi.rotate, injected to avoid a cascade↔rotation import cycle. */
 	rotate: LimitsApi["rotate"];
+	/** LimitsApi.confirmServed, injected for the same reason. */
+	confirmServed: LimitsApi["confirmServed"];
 	sourceLabel?: string;
 }
 
@@ -612,13 +614,21 @@ export class KeyCascade implements KeysApi {
 	 */
 	resolver(provider: string, options?: { sessionId?: string; baseUrl?: string; modelId?: string }): ApiKeyResolver {
 		const { sessionId, baseUrl, modelId } = options ?? {};
-		return async ({ lastChance, error, signal, previousKey }) => {
-			if (error === undefined) {
-				return this.getWithCredential(provider, sessionId, {
+		const resolve = async (keyOptions: AuthApiKeyOptions) =>
+			confirmServedOnSuccess(
+				await this.getWithCredential(provider, sessionId, {
+					...keyOptions,
 					baseUrl,
 					modelId,
-					signal,
-				});
+					refuseBlockedEntitled: true,
+				}),
+				this.#deps,
+				provider,
+				modelId,
+			);
+		return async ({ lastChance, error, signal, previousKey }) => {
+			if (error === undefined) {
+				return resolve({ signal });
 			}
 			if (lastChance) {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
@@ -635,16 +645,10 @@ export class KeyCascade implements KeysApi {
 					// because a peer may have refreshed the failed bearer.
 					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
 				}
-				const resolved = await this.getWithCredential(provider, sessionId, {
-					baseUrl,
-					modelId,
-					signal,
-				});
+				const resolved = await resolve({ signal });
 				return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
 			}
-			return this.getWithCredential(provider, sessionId, {
-				baseUrl,
-				modelId,
+			return resolve({
 				forceRefresh: true,
 				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
 				signal,

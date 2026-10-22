@@ -51,6 +51,15 @@ export const Flag = {
 	 * status value, so no raw status id can set it.
 	 */
 	CacheControlUnsupported: 0x0000_0800,
+	/**
+	 * Anthropic `404 not_found_error` whose message names the requested model
+	 * (`model: <id>`): this credential cannot serve the model, which another
+	 * credential of the provider may still serve.
+	 *
+	 * Like {@link Flag.CacheControlUnsupported} this claims a low bit; 0x400 is
+	 * 1024, above every HTTP status value, so no raw status id can set it.
+	 */
+	ModelNotFound: 0x0000_0400,
 	/** HTTP 413 byte/media rejection — token compaction cannot shrink bytes or media budgets (#9235). */
 	PayloadRejected: 0x8000_0000,
 } as const;
@@ -77,6 +86,7 @@ const KIND_MASK =
 	Flag.Grammar |
 	Flag.FastModeUnsupported |
 	Flag.CacheControlUnsupported |
+	Flag.ModelNotFound |
 	Flag.OAuthExpiry;
 
 const RETRIABLE_KINDS =
@@ -244,6 +254,30 @@ export function isAnthropicAccountPolicyText(text: string, provider?: string, st
 	const statusCandidate = statusArg ?? (text ? status({ message: text }) : undefined);
 	if (statusCandidate !== undefined && statusCandidate !== 403) return false;
 	return ANTHROPIC_ACCOUNT_POLICY_PATTERN.test(text);
+}
+
+const ANTHROPIC_NOT_FOUND_ERROR_PATTERN = /\bnot_found_error\b/;
+const ANTHROPIC_MODEL_NOT_FOUND_MESSAGE_PATTERN = /\\?"message\\?"\s*:\s*\\?"model:\s*([^"\\\r\n]+?)\s*\\?"/;
+const LEADING_404_PATTERN = /^\s*404\b/;
+
+/**
+ * Whether `text` is Anthropic's `404 not_found_error` naming `modelId` as the
+ * missing model. A refusal naming another model, another status, or another
+ * provider does not match.
+ */
+function isAnthropicModelNotFoundText(
+	text: string,
+	provider: string | undefined,
+	modelId: string | undefined,
+	statusArg: number | undefined,
+): boolean {
+	if (provider !== "anthropic" || !ANTHROPIC_NOT_FOUND_ERROR_PATTERN.test(text)) return false;
+	const statusCandidate = statusArg ?? status({ message: text }) ?? (LEADING_404_PATTERN.test(text) ? 404 : undefined);
+	if (statusCandidate !== 404) return false;
+	const deniedIdentity = normalizeCodexChatGPTAccountPolicyModel(
+		ANTHROPIC_MODEL_NOT_FOUND_MESSAGE_PATTERN.exec(text)?.[1],
+	);
+	return deniedIdentity !== undefined && deniedIdentity === normalizeCodexChatGPTAccountPolicyModel(modelId);
 }
 
 const IMMUTABLE_LATEST_THINKING_PATTERN =
@@ -462,6 +496,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.EmptyResponse, "empty-response"],
 	[Flag.ContentBlocked, "content-blocked"],
 	[Flag.AccountPolicy, "account-policy"],
+	[Flag.ModelNotFound, "model-not-found"],
 	[Flag.ContextOverflow, "context-overflow"],
 	[Flag.PayloadRejected, "payload-rejected"],
 	[Flag.AuthFailed, "auth-failed"],
@@ -658,6 +693,9 @@ function classifyText(
 		}
 		if (isAnthropicAccountPolicyText(errorMessage, provider, statusClean)) {
 			kinds |= Flag.AccountPolicy;
+		}
+		if (isAnthropicModelNotFoundText(errorMessage, provider, modelId, statusClean)) {
+			kinds |= Flag.ModelNotFound;
 		}
 		if (isAuthFailureText(errorMessage)) kinds |= Flag.AuthFailed;
 		const cleanMessage = errorMessage;
@@ -913,6 +951,36 @@ export function isCursorPlanAccountPolicyError(error: unknown, provider: string,
 	}
 	if ("message" in error && typeof error.message === "string" && isCursorPlanPolicyText(error.message)) return true;
 	return "cause" in error && isCursorPlanAccountPolicyError(error.cause, provider, depth + 1);
+}
+
+/**
+ * Whether `error` (a message string, an error, or an assistant message, through
+ * its `cause` chain) is Anthropic's `404 not_found_error` naming `modelId`.
+ * Detection needs the requesting provider and model, so this is the accessor
+ * for {@link Flag.ModelNotFound} wherever the error itself does not carry them.
+ */
+export function isAnthropicModelNotFoundError(
+	error: unknown,
+	provider: string,
+	modelId: string | undefined,
+	depth = 0,
+): boolean {
+	if (provider !== "anthropic" || depth > 6) return false;
+	if (typeof error === "string") return isAnthropicModelNotFoundText(error, provider, modelId, undefined);
+	if (!error || typeof error !== "object") return false;
+	const linkStatus = status(error);
+	for (const field of ["errorMessage", "message"] as const) {
+		const value = field in error ? (error as Record<string, unknown>)[field] : undefined;
+		if (typeof value === "string" && isAnthropicModelNotFoundText(value, provider, modelId, linkStatus)) {
+			return true;
+		}
+	}
+	return "cause" in error && isAnthropicModelNotFoundError(error.cause, provider, modelId, depth + 1);
+}
+
+/** Whether a classified error id carries {@link Flag.ModelNotFound}. */
+export function isModelNotFoundId(id: number | undefined): boolean {
+	return isClassified(id) && is(id, Flag.ModelNotFound);
 }
 
 const ORGANIZATION_OAUTH_DENIAL_PATTERN =

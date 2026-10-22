@@ -2,7 +2,7 @@ import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import type { LimitsApi, OAuthAccess, OAuthApi, OAuthRequestIdentity } from "./auth/types";
 import * as AIError from "./error";
 import { isAuthRetryableError, isInvalidatedOAuthTokenError } from "./error/auth-classify";
-import { isAccountPolicyError, isUsageLimit } from "./error/flags";
+import { classify, isAccountPolicyError, isModelNotFoundId, isUsageLimit } from "./error/flags";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
 
 /**
@@ -50,6 +50,8 @@ export interface ResolvedApiKey {
 	afterSiblingWait?: boolean;
 	/** Non-secret request scope belonging to this bearer, replaced on account rotation. */
 	oauthIdentity?: OAuthRequestIdentity;
+	/** Called once when a request sent with this bearer completes without error. */
+	onServed?: () => void;
 }
 
 export type ApiKeyResolution = string | ResolvedApiKey | undefined;
@@ -72,6 +74,22 @@ export function markAfterSiblingWait(resolved: ApiKeyResolution): ApiKeyResoluti
 	return typeof resolved === "string"
 		? { apiKey, afterSiblingWait: true }
 		: { ...resolved, apiKey, afterSiblingWait: true };
+}
+
+/**
+ * Attach {@link ResolvedApiKey.onServed} reporting the resolved stored credential as having served
+ * `modelId` (see {@link LimitsApi.confirmServed}). Resolutions without a credential id or model
+ * pass through unchanged.
+ */
+export function confirmServedOnSuccess(
+	resolved: ApiKeyResolution,
+	limits: Pick<LimitsApi, "confirmServed">,
+	provider: string,
+	modelId: string | undefined,
+): ApiKeyResolution {
+	if (modelId === undefined || typeof resolved !== "object" || resolved.credentialId === undefined) return resolved;
+	const credentialId = resolved.credentialId;
+	return { ...resolved, onServed: () => limits.confirmServed(provider, { modelId, credentialId }) };
 }
 
 /** A static bearer string, or a {@link ApiKeyResolver} that mints/rotates one. */
@@ -135,7 +153,7 @@ export const AUTH_RETRY_STEPS: readonly boolean[] = [false, true];
 export const AUTH_RETRY_MAX_ATTEMPTS = 64;
 
 function isDirectCredentialRotationError(error: unknown): boolean {
-	if (isAccountPolicyError(error)) return true;
+	if (isAccountPolicyError(error) || isModelNotFoundId(classify(error))) return true;
 	if (isUsageLimit(error) || isInvalidatedOAuthTokenError(error)) return true;
 	const status = AIError.status(error);
 	const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;

@@ -1651,6 +1651,13 @@ export class TurnRecovery {
 	#isUsagePreflightBlocked(message: AssistantMessage): boolean {
 		return message.errorMessage?.startsWith(USAGE_PREFLIGHT_BLOCKED_PREFIX) === true;
 	}
+
+	/** Anthropic's 404 naming the active model: this account may lack the model while a sibling serves it. */
+	#isModelNotFound(message: AssistantMessage, id: number): boolean {
+		if (AIError.isModelNotFoundId(id)) return true;
+		const model = this.#host.model();
+		return model !== undefined && AIError.isAnthropicModelNotFoundError(message, model.provider, model.id);
+	}
 	/**
 	 * Retry an empty, reason-less provider abort: a turn with no content that
 	 * carries the generic sentinel (bare `abort()`), whether the provider
@@ -1769,7 +1776,13 @@ export class TurnRecovery {
 				AIError.retriable(id)) &&
 			this.#unexecutedToolCallsReplaySafe(message);
 		if (this.#hasReplayUnsafeOutput(message) && !replaySafeUnexecutedTools) return false;
-		if (AIError.is(id, AIError.Flag.AccountPolicy) || this.isClassifierRefusal(message)) return true;
+		if (
+			AIError.is(id, AIError.Flag.AccountPolicy) ||
+			this.#isModelNotFound(message, id) ||
+			this.isClassifierRefusal(message)
+		) {
+			return true;
+		}
 		return AIError.retriable(id);
 	}
 
@@ -3507,6 +3520,7 @@ export class TurnRecovery {
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
+		const modelNotFound = this.#isModelNotFound(message, id);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
@@ -3654,7 +3668,7 @@ export class TurnRecovery {
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
-		if (accountPolicyDenial && currentModel) {
+		if ((accountPolicyDenial || modelNotFound) && currentModel) {
 			// `rotate` may sleep out a sibling's short block; register its signal
 			// as the retry controller so `abortRetry()` cancels that wait exactly
 			// like the backoff sleep below.
@@ -3664,7 +3678,7 @@ export class TurnRecovery {
 			try {
 				switchedCredential = (
 					await this.#host.modelRegistry.authStorage.limits.rotate(currentModel.provider, this.#host.sessionId(), {
-						error: errorMessage,
+						error: modelNotFound ? message : errorMessage,
 						modelId: currentModel.id,
 						signal: rotateAbortController.signal,
 					})
@@ -3861,7 +3875,7 @@ export class TurnRecovery {
 			// same-route budget: every distinct account must be tried first.
 			if (switchedModel) this.#retryAttempt = 1;
 		}
-		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
+		if ((classifierRefusal || accountPolicyDenial || modelNotFound) && !switchedCredential && !switchedModel) {
 			// A prior attempt in this saga already announced `auto_retry_start`
 			// (retryAttempt was incremented for each call to this method, so > 1
 			// means at least one earlier attempt started the loop) but this

@@ -84,6 +84,30 @@ export class AccountLimitError extends Error {
 	}
 }
 
+/**
+ * Every stored account entitled to a model whose access is restricted to some of the provider's
+ * accounts is blocked, so no request is sent. Classified as a usage limit; the message carries
+ * the earliest unblock as `retry-after-ms=`.
+ */
+export class EntitledAccountsBlockedError extends Error {
+	readonly provider: string;
+	readonly modelId: string;
+	/** Epoch ms at which the earliest entitled account unblocks. */
+	readonly blockedUntilMs: number;
+
+	constructor(provider: string, modelId: string, blockedUntilMs: number) {
+		const retryAfterMs = Math.max(1_000, Math.ceil(blockedUntilMs - Date.now()));
+		super(
+			`Usage limit reached on every ${provider} account entitled to ${modelId}; earliest unblock ${new Date(blockedUntilMs).toISOString()} retry-after-ms=${retryAfterMs}`,
+		);
+		this.name = "EntitledAccountsBlockedError";
+		this.provider = provider;
+		this.modelId = modelId;
+		this.blockedUntilMs = blockedUntilMs;
+		attach(this, create(Flag.UsageLimit));
+	}
+}
+
 /** A user-facing login flow required an `onPrompt` callback that was not supplied. */
 export class OnPromptRequiredError extends Error {
 	constructor(providerLabel: string) {

@@ -256,6 +256,7 @@ export class AuthStorage {
 			selector,
 			affinity,
 			rotate: (provider, sessionId, rotateOptions) => limits.rotate(provider, sessionId, rotateOptions),
+			confirmServed: (provider, servedOptions) => limits.confirmServed(provider, servedOptions),
 			sourceLabel,
 		});
 		const oauth = new OAuthAccounts({ pool, overrides, policies, selector, affinity, refresher });

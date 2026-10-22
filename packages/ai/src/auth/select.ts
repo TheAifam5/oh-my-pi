@@ -51,6 +51,7 @@ import {
 	DEFAULT_DRAIN_RETURN_MARGIN_PCT,
 	type DrainReturnTrigger,
 	type DrainSpendClass,
+	maskedAccountLabel,
 	type OAuthCredential,
 	type StoredAuthCredential,
 } from "./types";
@@ -1083,9 +1084,13 @@ export class CredentialSelector {
 		// or spend a usage read on it. Accounts not entitled to the model are dropped
 		// the same way, so no relaxed pass can return them.
 		const entitled = this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds);
-		const allowed = stored.filter(
-			entry => entitled(entry.index) && this.#deps.affinity.allows(provider, sessionId, entry.credential),
-		);
+		const sessionAllowed = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
+		const allowed = sessionAllowed.filter(entry => entitled(entry.index));
+		// A model restricted to some of the session's accounts never falls back to a blocked one.
+		const refuseBlocked =
+			options?.refuseBlockedEntitled === true &&
+			options.modelId !== undefined &&
+			allowed.length < sessionAllowed.length;
 		// An account over a local limit is never selected, not even as a last resort.
 		const refusals = await Promise.all(
 			allowed.map(entry => this.accountRefusal(provider, entry.index, options, memo)),
@@ -1496,6 +1501,16 @@ export class CredentialSelector {
 			: candidates;
 
 		for (const pass of passes) {
+			if (pass.allowBlocked && refuseBlocked && explicitPin === undefined) {
+				this.#refuseBlockedEntitled(
+					provider,
+					sessionId,
+					options,
+					candidates.filter(candidate => !preflightFailures.has(candidate)),
+					providerKey,
+					blockScopes,
+				);
+			}
 			for (const candidate of pass.allowBlocked ? lastResortCandidates : candidates) {
 				if (preflightFailures.has(candidate)) continue;
 				const resolved = await this.tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
@@ -1520,6 +1535,51 @@ export class CredentialSelector {
 			throw new AIError.OAuthRefreshUnavailableError(provider, transientRefreshFailure);
 		}
 		return undefined;
+	}
+
+	/**
+	 * Throw {@link AIError.EntitledAccountsBlockedError} when every one of `candidates` (the
+	 * accounts entitled to a restricted model) is blocked, recording the soonest-unblocking one as
+	 * the session's credential so usage-limit handling applies to it. Returns when any candidate is
+	 * unblocked or there is none.
+	 */
+	#refuseBlockedEntitled(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		candidates: readonly OAuthCandidate[],
+		providerKey: string,
+		blockScopes: readonly string[],
+	): void {
+		const modelId = options?.modelId;
+		if (modelId === undefined || candidates.length === 0) return;
+		const entries = this.#deps.pool.entries(provider);
+		const blocked: { index: number; until: number }[] = [];
+		for (const candidate of candidates) {
+			const until = this.#deps.blocks.blockedUntil(provider, providerKey, candidate.selection.index, blockScopes);
+			if (until === undefined) return;
+			blocked.push({ index: candidate.selection.index, until });
+		}
+		blocked.sort((left, right) => left.until - right.until);
+		const soonest = blocked[0]!;
+		logger.warn("Every account entitled to the model is blocked; not sending the request", {
+			provider,
+			modelId,
+			accounts: blocked.map(({ index, until }) => {
+				const entry = entries[index];
+				const credential = entry?.credential;
+				return {
+					account: maskedAccountLabel({
+						credentialId: entry?.id ?? -1,
+						type: credential?.type ?? "oauth",
+						email: credential?.type === "oauth" ? credential.email : undefined,
+					}),
+					blockedUntil: new Date(until).toISOString(),
+				};
+			}),
+		});
+		if (options?.recordAffinity !== false) this.#deps.affinity.record(provider, sessionId, "oauth", soonest.index);
+		throw new AIError.EntitledAccountsBlockedError(provider, modelId, soonest.until);
 	}
 
 	/**

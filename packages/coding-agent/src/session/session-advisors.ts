@@ -2411,9 +2411,15 @@ export class SessionAdvisors {
 		};
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
-		if (accountPolicyDenial) {
+		// Anthropic's 404 naming this model may refuse only this account; another may serve it.
+		const modelNotFound = AIError.isAnthropicModelNotFoundError(
+			assistantFailure ?? error,
+			currentModel.provider,
+			currentModel.id,
+		);
+		if (accountPolicyDenial || modelNotFound) {
 			const rotation = await authStorage.limits.rotate(currentModel.provider, advisor.providerSessionId, {
-				error: message,
+				error: modelNotFound ? (assistantFailure ?? error) : message,
 				modelId: currentModel.id,
 				signal,
 			});
@@ -2479,7 +2485,7 @@ export class SessionAdvisors {
 			});
 			if (switchCredential(outcome.switched)) return true;
 		}
-		if (!assistantFailure && !accountPolicyDenial && !usageLimit && !capacityFailure) return false;
+		if (!assistantFailure && !accountPolicyDenial && !modelNotFound && !usageLimit && !capacityFailure) return false;
 
 		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
 		// A usage-limit error with no sibling credential and no usable model

@@ -15,10 +15,13 @@
 - Added `StreamOptions.transformHeaders`, which rewrites a provider request's assembled headers for the OpenAI, Azure OpenAI, Anthropic, and Bedrock APIs
 - Added model `samplingParams` and `samplingParamsByThinkingLevel`, merged into `stream()` and `streamSimple()` requests for OpenAI-compatible APIs
 - Added `AssistantMessage.requestedModel`, set when a provider fallback served the turn on another model
+- Added `LimitsApi.confirmServed()`, `ResolvedApiKey.onServed`, `AuthApiKeyOptions.refuseBlockedEntitled`, `EntitledAccountsBlockedError`, and the `ModelNotFound` error flag (`isAnthropicModelNotFoundError()`, `isModelNotFoundId()`)
 
 ### Fixed
 
 - Fixed model selection and credential rotation using accounts without model access, including immediately after catalog loading; account-specific model denials persist for seven days and remain excluded after quota resets
+- Fixed an Anthropic `404 not_found_error` for the requested model on one account ending the request instead of trying the provider's other accounts; the refusing account is excluded from that model only after another account serves it, and nothing is recorded when every account refuses
+- Fixed requests to a model limited to some accounts going to a blocked entitled account; when every entitled account is blocked, no request is sent and it fails as a usage limit naming the earliest unblock
 - Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes on one model tier; requests move to a sibling key, the spent key stays blocked across tiers until the time Anthropic states (or the first of the next month for the tier cap), and when every key is spent the error names the earliest unblock time and how to recover
 - Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
 - Fixed a Codex request in flight or still connecting being retried as a transport error when its session closed the provider state (model switch, session reset, or dispose); it now ends as an abort

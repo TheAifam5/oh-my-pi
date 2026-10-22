@@ -1,4 +1,9 @@
-import { type ApiKeyResolution, type ApiKeyResolver, markAfterSiblingWait } from "@oh-my-pi/pi-ai/auth-retry";
+import {
+	type ApiKeyResolution,
+	type ApiKeyResolver,
+	confirmServedOnSuccess,
+	markAfterSiblingWait,
+} from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isUsageLimitOutcome } from "@oh-my-pi/pi-ai/error/rate-limit";
 import type { AuthApiKeyOptions, AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
@@ -57,19 +62,25 @@ export function createApiKeyResolver(
 	options: ApiKeyResolverOptions = {},
 ): ApiKeyResolver {
 	const { sessionId, baseUrl, modelId, accountIds } = options;
-	const resolveKey = (
+	const resolveKey = async (
 		forceRefresh: boolean | undefined,
 		signal?: AbortSignal,
 		refreshReason?: AuthApiKeyOptions["refreshReason"],
 	): Promise<ApiKeyResolution> =>
-		registry.getApiKeyWithCredentialForProvider(provider, sessionId, {
-			baseUrl,
+		confirmServedOnSuccess(
+			await registry.getApiKeyWithCredentialForProvider(provider, sessionId, {
+				baseUrl,
+				modelId,
+				accountIds,
+				forceRefresh,
+				signal,
+				refreshReason,
+				refuseBlockedEntitled: true,
+			}),
+			registry.authStorage.limits,
+			provider,
 			modelId,
-			accountIds,
-			forceRefresh,
-			signal,
-			refreshReason,
-		});
+		);
 	return async ({ lastChance, error, signal, previousKey }) => {
 		if (error === undefined) {
 			return resolveKey(undefined);

@@ -50,6 +50,8 @@
 
 ### Fixed
 
+- Fixed main turns and advisors falling back to another model when Anthropic answered a `404` for the model on one account; they now try the provider's other accounts first
+- Fixed main turns and advisors sending a request to a blocked account when it was the only account entitled to the model; they now go straight to the fallback model, and the log names the masked account and when its block ends
 - Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
 - Fixed a project-level `null` setting clearing values from the global config; it is now ignored with a warning, and a `__proto__` key no longer changes how settings merge
 - Fixed settings changes rewriting the cached system prompt or tool definitions of prefix-bound models (such as Claude Sonnet 5.5 and Opus 5.5) after the first request: changes to skills, commands, workspace roots, tool gates, MCP tools, and memory recall now apply at the next model switch or `/new` with a notice

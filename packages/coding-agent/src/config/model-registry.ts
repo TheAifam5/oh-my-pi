@@ -3403,6 +3403,7 @@ export class ModelRegistry {
 			forceRefresh: options?.forceRefresh,
 			refreshReason: options?.refreshReason,
 			signal: options?.signal,
+			refuseBlockedEntitled: options?.refuseBlockedEntitled,
 		});
 	}
 

@@ -1111,6 +1111,8 @@ function isRetryableUpstreamError(
 	// classify as RATE_LIMIT_EXCEEDED in `parseRateLimitReason` and stay in the
 	// provider's own backoff layer instead of burning siblings.
 	if (AIError.isCodexChatGPTAccountPolicyError(error, model.provider, model.id)) return true;
+	// Anthropic's 404 naming the requested model can be account-specific: a sibling may serve it.
+	if (AIError.isAnthropicModelNotFoundError(error, model.provider, model.id)) return true;
 	if (status === 401 || (status === 403 && !isConcurrencyCapExclusion(status, message))) return true;
 	return isUsageLimitOutcome(status, message);
 }
@@ -1126,14 +1128,14 @@ function createAssistantAuthError(message: AssistantMessage): Error {
 }
 
 function contextualizeAuthRetryError(model: Model<Api>, error: unknown): unknown {
-	if (
-		!error ||
-		typeof error !== "object" ||
-		!AIError.isCodexChatGPTAccountPolicyError(error, model.provider, model.id)
-	) {
-		return error;
+	if (!error || typeof error !== "object") return error;
+	if (AIError.isCodexChatGPTAccountPolicyError(error, model.provider, model.id)) {
+		return AIError.attach(error, AIError.create(AIError.Flag.AccountPolicy | AIError.Flag.ContentBlocked));
 	}
-	return AIError.attach(error, AIError.create(AIError.Flag.AccountPolicy | AIError.Flag.ContentBlocked));
+	if (AIError.isAnthropicModelNotFoundError(error, model.provider, model.id)) {
+		return AIError.attach(error, AIError.create(AIError.Flag.ModelNotFound));
+	}
+	return error;
 }
 
 function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
@@ -1332,12 +1334,20 @@ function streamSimpleRequest<TApi extends Api>(
 			apiKey?: string,
 			credentialId?: number,
 			oauthIdentity?: OAuthRequestIdentity,
+			onServed?: () => void,
 		): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
 			const flushBuffered = (): void => {
 				emitBufferedEvents(outer, bufferedEvents);
 				bufferedEvents.length = 0;
+			};
+			const reportServed = (): void => {
+				try {
+					onServed?.();
+				} catch (error) {
+					logger.warn("Failed to report a served request", { provider: model.provider, error: String(error) });
+				}
 			};
 
 			try {
@@ -1371,6 +1381,7 @@ function streamSimpleRequest<TApi extends Api>(
 					}
 					flushBuffered();
 					emittedReplayUnsafeEvent = true;
+					if (event.type === "done") reportServed();
 					outer.push(event);
 					if (outer.done) return undefined;
 				}
@@ -1378,6 +1389,7 @@ function streamSimpleRequest<TApi extends Api>(
 				if (!outer.done) {
 					const result = await inner.result();
 					if (credentialId !== undefined) result.credentialId = credentialId;
+					if (result.stopReason !== "error" && result.stopReason !== "aborted") reportServed();
 					outer.end(result);
 				}
 			} catch (error) {
@@ -1410,11 +1422,13 @@ function streamSimpleRequest<TApi extends Api>(
 			let lastKey: string | undefined;
 			let credentialId: number | undefined;
 			let oauthIdentity: OAuthRequestIdentity | undefined;
+			let onServed: (() => void) | undefined;
 			try {
 				const resolved = await apiKeyResolver({ lastChance: false, error: undefined, signal });
 				lastKey = resolvedApiKeyBearer(resolved);
 				credentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
 				oauthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+				onServed = typeof resolved === "string" ? undefined : resolved?.onServed;
 			} catch (error) {
 				// A thrown resolver is a broker/OAuth/network failure, not a missing
 				// key — surface the cause instead of masking it as "No API key".
@@ -1436,7 +1450,7 @@ function streamSimpleRequest<TApi extends Api>(
 				return;
 			}
 			const retryState = createAuthRetryKeyState(lastKey);
-			let failure = await runAttempt(lastKey, credentialId, oauthIdentity);
+			let failure = await runAttempt(lastKey, credentialId, oauthIdentity, onServed);
 			if (!failure) return;
 			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
@@ -1444,6 +1458,7 @@ function streamSimpleRequest<TApi extends Api>(
 				if (signal?.aborted) break;
 				let nextCredentialId: number | undefined;
 				let nextOAuthIdentity: OAuthRequestIdentity | undefined;
+				let nextOnServed: (() => void) | undefined;
 				const nextKey = await resolveNextAuthRetryKey(
 					retryState,
 					apiKeyResolver,
@@ -1452,10 +1467,11 @@ function streamSimpleRequest<TApi extends Api>(
 					resolved => {
 						nextCredentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
 						nextOAuthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+						nextOnServed = typeof resolved === "string" ? undefined : resolved?.onServed;
 					},
 				);
 				if (nextKey === undefined) break;
-				const next = await runAttempt(nextKey, nextCredentialId, nextOAuthIdentity);
+				const next = await runAttempt(nextKey, nextCredentialId, nextOAuthIdentity, nextOnServed);
 				if (!next) return;
 				failure = next;
 			}

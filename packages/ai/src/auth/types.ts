@@ -628,6 +628,13 @@ export type AuthApiKeyOptions = {
 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
 	recordAffinity?: boolean;
 	/**
+	 * Request path: when stored OAuth accounts are excluded from `modelId` (catalog account access,
+	 * a recorded denial, or a model-not-found hold) and every account still entitled to it is
+	 * blocked, reject with an `EntitledAccountsBlockedError` instead of returning a
+	 * blocked account. Without it the blocked account is returned as a last resort.
+	 */
+	refuseBlockedEntitled?: boolean;
+	/**
 	 * The call serves work already paid for (polling or downloading a submitted job): no account
 	 * policy limit refuses it, neither those the {@link AccountLimitSource} counts nor those on
 	 * provider evidence (`usage`, `credits`, `extra-usd`).
@@ -924,6 +931,12 @@ export type RecordModelDenialOptions = {
 	apiKey?: string;
 	/** Exclusion lifetime; defaults to seven days. */
 	ttlMs?: number;
+};
+
+/** Identify the stored credential that served a model ({@link LimitsApi.confirmServed}). */
+export type ConfirmServedOptions = {
+	modelId: string;
+	credentialId: number;
 };
 
 /**
@@ -1385,6 +1398,21 @@ export interface AuthAccountSummary {
 	disabled?: boolean;
 }
 
+/**
+ * Log-safe identity of a stored account: `#<credential id>` plus the email with
+ * its local part masked (`#14 ***@example.com`), or the non-secret key
+ * fingerprint of an API key.
+ */
+export function maskedAccountLabel(
+	account: Pick<AuthAccountSummary, "credentialId" | "type" | "email" | "keyFingerprint">,
+): string {
+	const id = `#${account.credentialId}`;
+	if (account.type === "api_key") return account.keyFingerprint ? `${id} key ${account.keyFingerprint}` : id;
+	const email = account.email;
+	const at = email?.lastIndexOf("@") ?? -1;
+	return email && at >= 0 ? `${id} ***${email.slice(at)}` : id;
+}
+
 /** Session credential affinity operations. */
 export interface SessionsApi {
 	/**
@@ -1707,6 +1735,12 @@ export interface LimitsApi {
 	 *   record the account as not entitled to the requested model (see
 	 *   {@link LimitsApi.recordModelDenial}), temporarily block only that model,
 	 *   then rotate.
+	 * - Anthropic `404 not_found_error` naming the requested model → hold that
+	 *   credential off the model in memory, without recording a denial, and
+	 *   rotate through entitled siblings. The hold becomes a denial only when
+	 *   another credential serves the model (see {@link LimitsApi.confirmServed});
+	 *   when no sibling is left every hold for the model is dropped and the
+	 *   result is `{ switched: false }`.
 	 * - other account-scoped policy denial → with a requested model and unless
 	 *   the organization refuses OAuth outright, record the same model
 	 *   entitlement denial; temporarily block that account without marking its
@@ -1746,6 +1780,13 @@ export interface LimitsApi {
 		sessionId: string | undefined,
 		options: RecordModelDenialOptions,
 	): Promise<boolean>;
+	/**
+	 * The stored credential `options.credentialId` served `options.modelId`.
+	 * Every other credential of `provider` holding an unconfirmed
+	 * model-not-found refusal of that model gets a model-entitlement denial
+	 * (see {@link LimitsApi.recordModelDenial}). Returns how many were recorded.
+	 */
+	confirmServed(provider: string, options: ConfirmServedOptions): number;
 }
 
 /** Saved reset-credit listing and redemption. */
