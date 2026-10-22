@@ -75,6 +75,7 @@ import {
 	describeHubSidebar,
 	HubFrame,
 	moveStripSelection,
+	pagedHints,
 	type SidebarEntry as HubSidebarEntry,
 	type SidebarStyle,
 	type StripChip as HubStripChip,
@@ -4333,7 +4334,8 @@ export class ModelHubComponent implements Component {
 			const poolHints = this.#poolRowHints(row);
 			if (poolHints) {
 				const parts = poolHints.map(hint => `${formatKeyHints(hint.keys)} ${hint.label}`);
-				return this.#pagedHints([`${upDown} rows`, ...parts, `${left} providers`], width);
+				const page = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page : 0;
+				return pagedHints([`${upDown} rows`, ...parts, `${left} providers`], width, page);
 			}
 			const convert = `${this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : ""}${
 				this.#groupsAvailable(row) ? ` · ${formatKeyHint("shift+g")} group` : ""
@@ -4374,30 +4376,6 @@ export class ModelHubComponent implements Component {
 		return `${enter} assign roles · ${upDown} models · ${left} providers · type to search · ${altLeftRight} kind${refresh} · ${cancel} close`;
 	}
 
-	/**
-	 * `parts` joined by ` · `; past `width`, split into pages that end with a `? more keys` hint,
-	 * showing the page `?` selected for the current row.
-	 */
-	#pagedHints(parts: readonly string[], width: number): string {
-		const separator = " · ";
-		const all = parts.join(separator);
-		if (visibleWidth(all) <= width) return all;
-		const more = `${formatKeyHint("?")} more keys`;
-		const room = width - visibleWidth(separator + more);
-		const pages: string[][] = [];
-		let page: string[] = [];
-		for (const part of parts) {
-			if (page.length > 0 && visibleWidth([...page, part].join(separator)) > room) {
-				pages.push(page);
-				page = [];
-			}
-			page.push(part);
-		}
-		pages.push(page);
-		const selected = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page % pages.length : 0;
-		return [...pages[selected]!, more].join(separator);
-	}
-
 	#renderFooter(width: number): string {
 		const strip = this.#strip;
 		return this.#frame.renderFooter(
@@ -4431,13 +4409,13 @@ export class ModelHubComponent implements Component {
 			return truncateToWidth(`${label} ${inputLine} ${hint}`, width);
 		}
 		if (strip.kind === "field") {
-			const inputWidth = Math.max(8, Math.min(40, width - visibleWidth(strip.label) - 24));
-			const inputLine = strip.input.render(inputWidth)[0] ?? "";
-			const hint =
+			const message =
 				strip.error !== undefined
 					? theme.fg("error", strip.error)
 					: theme.fg("dim", sanitizeDisplayLine(strip.hint));
-			return truncateToWidth(`${theme.fg("accent", strip.label)} ${inputLine} ${hint}`, width);
+			const inputWidth = Math.max(16, Math.min(40, width - visibleWidth(strip.label) - visibleWidth(message) - 2));
+			const inputLine = strip.input.render(inputWidth)[0] ?? "";
+			return truncateToWidth(`${theme.fg("accent", strip.label)} ${inputLine} ${message}`, width);
 		}
 
 		let prefix: string;

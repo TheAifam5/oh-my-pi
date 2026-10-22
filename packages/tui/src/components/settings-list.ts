@@ -777,9 +777,11 @@ export class SettingsList implements Component {
 		const labelPad = padding(Math.max(0, maxLabelWidth - visibleWidth(labelPlain)));
 		const separator = "  ";
 		const valueMaxWidth = rowWidth - prefixWidth - maxLabelWidth - visibleWidth(separator) - 2;
-		const badge = item.provenance
-			? `${truncateToWidth(`[${sanitizeSingleLine(item.provenance)}]`, Math.max(0, Math.floor(valueMaxWidth / 2)))} `
-			: "";
+		const badgeWidth = Math.floor(valueMaxWidth / 2);
+		const badge =
+			item.provenance && badgeWidth >= 3
+				? `[${truncateToWidth(sanitizeSingleLine(item.provenance), badgeWidth - 2)}] `
+				: "";
 		const valuePlain =
 			badge +
 			truncateToWidth(

@@ -23,6 +23,7 @@ import {
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../index";
 import { col, node, row, span, text } from "../native/describe";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
@@ -38,11 +39,15 @@ import {
 	describeHubSidebar,
 	HubFrame,
 	moveStripSelection,
+	pagedHints,
 	type SidebarEntry as HubSidebarEntry,
 	type SidebarStyle,
 	type StripChip as HubStripChip,
 	type StripState as HubStripState,
 } from "./hub-frame";
+
+/** Most body lines the status or notice wraps to before it is cut with an ellipsis. */
+const MAX_STATUS_LINES = 3;
 
 /** One edit the host can apply to an account, addressed by `id`. */
 export interface AccountManagerAction {
@@ -189,6 +194,8 @@ export class AccountManagerComponent implements Component {
 	#strip: StripState | null = null;
 	#notice: Notice | null = null;
 	#busy = false;
+	/** Footer hint page `?` selected for the account row `id`; page 0 elsewhere. */
+	#hintPage: { id: string; page: number } | undefined;
 	/** Set once the overlay closed; a late apply or refresh result is dropped. */
 	#closed = false;
 
@@ -484,7 +491,12 @@ export class AccountManagerComponent implements Component {
 			const field = account?.fields.find(
 				candidate => candidate.key !== undefined && matchesKey(data, candidate.key),
 			);
-			if (account && field) this.#activate(account, field);
+			if (account && field) {
+				this.#activate(account, field);
+			} else if (account && data === "?") {
+				const page = this.#hintPage?.id === account.id ? this.#hintPage.page + 1 : 1;
+				this.#hintPage = { id: account.id, page };
+			}
 		}
 		this.#requestRender();
 	}
@@ -578,10 +590,30 @@ export class AccountManagerComponent implements Component {
 
 	#renderBody(width: number, rows: number): string[] {
 		const status = this.#statusText();
-		const lines: string[] = [truncateToWidth(theme.fg(status.tone, ` ${status.text}`), width), ""];
+		const statusLines = wrapTextWithAnsi(status.text, Math.max(1, width - 1));
+		if (statusLines.length > MAX_STATUS_LINES) {
+			statusLines.length = MAX_STATUS_LINES;
+			statusLines[MAX_STATUS_LINES - 1] = truncateToWidth(`${statusLines[MAX_STATUS_LINES - 1]}…`, width - 1);
+		}
+		const lines: string[] = [...statusLines.map(line => theme.fg(status.tone, ` ${line}`)), ""];
 		this.#listRowStart = lines.length;
 		const selected = this.#selected();
-		const detailRows = selected ? Math.min(selected.details.length + 2, Math.max(0, rows - 6)) : 2;
+		const detailLines: string[] = [];
+		if (selected) {
+			let labelWidth = 0;
+			for (const detail of selected.details) labelWidth = Math.max(labelWidth, visibleWidth(detail.label));
+			const valueWidth = Math.max(1, width - labelWidth - 3);
+			for (const detail of selected.details) {
+				const wrapped = wrapTextWithAnsi(sanitizeDisplaySingleLine(detail.value), valueWidth);
+				wrapped.forEach((value, index) => {
+					const label = index === 0 ? theme.fg("muted", detail.label.padEnd(labelWidth)) : " ".repeat(labelWidth);
+					detailLines.push(
+						truncateToWidth(` ${label}  ${detail.tone ? theme.fg(detail.tone, value) : value}`, width),
+					);
+				});
+			}
+		}
+		const detailRows = selected ? Math.min(detailLines.length + 2, Math.max(0, rows - 6)) : 2;
 		const visibleRows = Math.max(1, rows - lines.length - detailRows);
 		if (this.#rowIndex < this.#listScroll) this.#listScroll = this.#rowIndex;
 		else if (this.#rowIndex >= this.#listScroll + visibleRows) this.#listScroll = this.#rowIndex - visibleRows + 1;
@@ -608,9 +640,8 @@ export class AccountManagerComponent implements Component {
 		}
 		if (this.#rows.length === 0) {
 			const entry = this.#activeEntry();
-			const empty =
-				entry.kind === "page" ? ` ${entry.page?.empty ?? ""}` : " No stored accounts. Log in with /login.";
-			lines.push(theme.fg("dim", empty));
+			const empty = entry.kind === "page" ? (entry.page?.empty ?? "") : "No stored accounts. Log in with /login.";
+			for (const line of wrapTextWithAnsi(empty, Math.max(1, width - 1))) lines.push(theme.fg("dim", ` ${line}`));
 		}
 		while (lines.length < rows - detailRows) lines.push("");
 		lines.push(theme.fg("border", "─".repeat(Math.max(1, width))));
@@ -621,17 +652,7 @@ export class AccountManagerComponent implements Component {
 					width,
 				),
 			);
-			let labelWidth = 0;
-			for (const detail of selected.details) labelWidth = Math.max(labelWidth, visibleWidth(detail.label));
-			for (const detail of selected.details) {
-				const value = sanitizeDisplaySingleLine(detail.value);
-				lines.push(
-					truncateToWidth(
-						` ${theme.fg("muted", detail.label.padEnd(labelWidth))}  ${detail.tone ? theme.fg(detail.tone, value) : value}`,
-						width,
-					),
-				);
-			}
+			lines.push(...detailLines);
 		} else {
 			lines.push(theme.fg("dim", " Select an account to inspect"));
 		}
@@ -639,29 +660,27 @@ export class AccountManagerComponent implements Component {
 		return lines.slice(0, rows);
 	}
 
-	#footerHint(): string {
+	#footerHint(width: number): string {
 		const enter = formatKeyHint("enter");
 		const cancel = editorKey("tui.select.cancel");
-		const strip = this.#strip;
-		if (strip?.kind === "input") return `${strip.action.input?.hint ?? ""} · ${enter} apply · ${cancel} back`;
-		if (strip) {
-			return `${formatKeyHints(["left", "right"])} choose · ${enter} ${strip.field ? "apply" : "open"} · ${cancel} back`;
-		}
 		const upDown = editorKeys("tui.select.up", "tui.select.down");
 		if (this.#focus === "scope")
 			return `${upDown} providers · ${formatKeyHints(["right", "enter"])} accounts · ${cancel} close`;
-		const shortcuts = (this.#selected()?.fields ?? [])
-			.filter(field => field.key)
-			.map(field => `${field.key} ${field.label}`)
-			.join(" · ");
-		return `${enter} edit · ${shortcuts}${shortcuts ? " · " : ""}${upDown} rows · ${formatKeyHint("ctrl+r")} reload · ${cancel} close`;
+		const account = this.#selected();
+		const shortcuts = (account?.fields ?? []).flatMap(field => (field.key ? [`${field.key} ${field.label}`] : []));
+		const page = account && this.#hintPage?.id === account.id ? this.#hintPage.page : 0;
+		return pagedHints(
+			[`${enter} edit`, ...shortcuts, `${upDown} rows`, `${formatKeyHint("ctrl+r")} reload`, `${cancel} close`],
+			width,
+			page,
+		);
 	}
 
 	#renderFooter(width: number): string {
 		const strip = this.#strip;
 		return this.#frame.renderFooter(
 			width,
-			this.#footerHint(),
+			this.#footerHint(width),
 			strip ? () => this.#renderStrip(width, strip) : undefined,
 		);
 	}
@@ -676,8 +695,12 @@ export class AccountManagerComponent implements Component {
 	#renderStrip(width: number, strip: StripState): string {
 		const prefix = this.#stripPrefix(strip);
 		if (strip.kind === "input") {
-			const inputWidth = Math.max(8, Math.min(48, width - visibleWidth(prefix) - 4));
-			return truncateToWidth(`${theme.fg("accent", prefix)} ${strip.input.render(inputWidth)[0] ?? ""}`, width);
+			const hint = theme.fg("dim", sanitizeDisplaySingleLine(strip.action.input?.hint ?? ""));
+			const inputWidth = Math.max(16, Math.min(48, width - visibleWidth(prefix) - visibleWidth(hint) - 2));
+			return truncateToWidth(
+				`${theme.fg("accent", prefix)} ${strip.input.render(inputWidth)[0] ?? ""} ${hint}`,
+				width,
+			);
 		}
 		return this.#frame.renderChips(width, `${theme.fg("accent", prefix)} `, strip);
 	}

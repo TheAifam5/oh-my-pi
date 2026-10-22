@@ -54,6 +54,7 @@
 
 ### Fixed
 
+- Fixed the model hub's account order and drain editors offering account names defined only in project settings and writing them into the global pool routing; they now offer only names from settings layers other than the project
 - Fixed main turns and advisors falling back to another model when Anthropic answered a `404` for the model on one account; they now try the provider's other accounts first
 - Fixed main turns and advisors sending a request to a blocked account when it was the only account entitled to the model; they now go straight to the fallback model, and the log names the masked account and when its block ends
 - Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run

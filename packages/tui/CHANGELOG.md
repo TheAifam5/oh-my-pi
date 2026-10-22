@@ -24,11 +24,15 @@
 
 - Model hub pool rows show compact routing badges with full routing and refused-edit messages in a detail block
 - Model hub key hints page with `?` at narrow widths
+- `/account` key hints page with `?` at narrow widths, and its notices, detail values, and empty-page guidance wrap instead of being cut off
 
 ### Fixed
 
 - Fixed the status line's usage timeout cancelling the host's background usage fetch; it now bounds only its own wait
 - Advisor category and owns descriptions truncate with an ellipsis
+- Fixed `/account` input fields not showing their syntax hint
+- Fixed model hub pool field hints and errors being cut off at 80 columns
+- Fixed the settings provenance badge losing its closing bracket when shortened
 
 ## [18.12.6] - 2026-10-21
 

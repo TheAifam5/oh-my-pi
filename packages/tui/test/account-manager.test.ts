@@ -4,7 +4,8 @@
  * edit shown with nothing else changed, and read-only fields never applied.
  */
 import { beforeAll, describe, expect, test } from "bun:test";
-import type { TUI } from "../src/index";
+import { type TUI, visibleWidth } from "../src/index";
+import type { KeyId } from "../src/keys";
 import {
 	type AccountManagerAccount,
 	AccountManagerComponent,
@@ -201,5 +202,102 @@ describe("AccountManager", () => {
 		manager.handleInput("\x1b[B"); // Project pins
 		expect(screen()).toContain("No project pins.");
 		expect(screen()).not.toContain("No stored accounts");
+	});
+
+	describe("at 80 columns", () => {
+		const narrow = (manager: AccountManagerComponent) =>
+			manager.render(80).map(line => line.replace(ANSI_PATTERN, ""));
+		const footer = (lines: readonly string[]) => lines[lines.length - 2] ?? "";
+		/** Body column text (right of the sidebar) joined into one whitespace-normalized string. */
+		const flat = (lines: readonly string[]) =>
+			lines
+				.map(line => line.split("│")[2] ?? "")
+				.join(" ")
+				.replace(/\s+/g, " ");
+		const keyed = (key: KeyId, label: string) => ({ id: label, label, key, value: "off", on: false });
+		const manyFields = [
+			keyed("n", "name"),
+			keyed("p", "priority"),
+			keyed("r", "reserve"),
+			keyed("d", "drain"),
+			keyed("f", "spend"),
+			keyed("t", "return"),
+			keyed("w", "resets on"),
+			keyed("a", "auto-redeem"),
+			keyed("s", "session pin"),
+			keyed("j", "project pin"),
+			keyed("l", "limits"),
+		];
+
+		test("pages field shortcuts behind ? so every key and close stay visible", () => {
+			const { manager } = createManager([account("a", "anthropic", { fields: manyFields })]);
+			const seen: string[] = [];
+			for (let page = 0; page < 4; page++) {
+				const lines = narrow(manager);
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+				expect(footer(lines)).toContain("? more keys");
+				expect(footer(lines)).not.toContain("…");
+				seen.push(footer(lines));
+				manager.handleInput("?");
+			}
+			const all = seen.join(" ");
+			for (const field of manyFields) expect(all).toContain(`${field.key} ${field.label}`);
+			expect(all).toContain("close");
+			expect(all).toContain("reload");
+		});
+
+		test("wraps a long notice and detail value instead of cutting them", async () => {
+			const reason =
+				"auth.accountPolicies is set in the project layer (.omp/config.yml); edit it there or remove it to name accounts here";
+			const { manager } = createManager([
+				account("a", "anthropic", {
+					details: [{ label: "policy", value: reason }],
+					fields: [{ id: "limits", label: "limits", key: "l", value: "0", readOnly: reason }],
+				}),
+			]);
+			expect(flat(narrow(manager))).toContain(`policy ${reason}`);
+			manager.handleInput("l");
+			await settle();
+			const lines = narrow(manager);
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+			expect(flat(lines)).toContain(`limits: ${reason}`);
+		});
+
+		test("wraps an empty page's guidance", () => {
+			const empty = "No project pins. Pin the current project from an account (j).";
+			const manager = new AccountManagerComponent(
+				tuiStub,
+				{
+					load: () => [account("a", "anthropic")],
+					pages: () => [{ id: "pins", label: "Project pins", empty, rows: [] }],
+					apply: async () => ({}),
+				},
+				{ onCancel: () => {} },
+			);
+			manager.handleInput("\x1b[D"); // focus the sidebar
+			manager.handleInput("\x1b[B"); // anthropic
+			manager.handleInput("\x1b[B"); // Project pins, past the separator
+			const lines = narrow(manager);
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+			expect(flat(lines)).toContain(empty);
+		});
+
+		test("shows an input field's syntax hint beside the input", () => {
+			const { manager } = createManager([
+				account("a", "anthropic", {
+					fields: [
+						{
+							id: "limit:add",
+							label: "add",
+							key: "a",
+							value: "limit",
+							input: { initial: "", hint: "<usd|requests> <max> <day|week>" },
+						},
+					],
+				}),
+			]);
+			manager.handleInput("a");
+			expect(footer(narrow(manager))).toContain("<usd|requests> <max> <day|week>");
+		});
 	});
 });

@@ -1,3 +1,4 @@
+import { formatKeyHint } from "../app-keybindings";
 import { bottomBorder, dividerSplit, PanelRows, row, topBorderSplit } from "../chrome/overlay-box";
 import { SplitPane } from "../components/layout/split-pane";
 import { Stack } from "../components/layout/stack";
@@ -134,6 +135,29 @@ export function describeHubFrame(
 		node("rule", undefined, undefined, "divider"),
 		footer,
 	]);
+}
+
+/**
+ * Footer hint `parts` joined by ` · `. Past `width`, they split into pages that each end with a
+ * `? more keys` hint, and page `page` (modulo the page count) is shown.
+ */
+export function pagedHints(parts: readonly string[], width: number, page: number): string {
+	const separator = " · ";
+	const all = parts.join(separator);
+	if (visibleWidth(all) <= width) return all;
+	const more = `${formatKeyHint("?")} more keys`;
+	const room = width - visibleWidth(separator + more);
+	const pages: string[][] = [];
+	let current: string[] = [];
+	for (const part of parts) {
+		if (current.length > 0 && visibleWidth([...current, part].join(separator)) > room) {
+			pages.push(current);
+			current = [];
+		}
+		current.push(part);
+	}
+	pages.push(current);
+	return [...pages[page % pages.length]!, more].join(separator);
 }
 
 /** Persistent fullscreen split frame, sidebar viewport, and footer chip renderer. */

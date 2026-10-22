@@ -22,7 +22,7 @@ import {
 } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import { type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import type { TspPickerProps } from "@oh-my-pi/pi-wire";
 
@@ -1601,6 +1601,49 @@ describe("ModelHub", () => {
 			return Settings.loadIsolated({ cwd: tmp.path(), agentDir });
 		}
 
+		test("the account order editor offers trusted-layer account names, never project-only ones", async () => {
+			const tmp = TempDir.createSync("@pi-model-hub-account-names-");
+			try {
+				await fs.mkdir(tmp.join(".omp"), { recursive: true });
+				await fs.writeFile(
+					tmp.join(".omp", "config.yml"),
+					"auth:\n  accountPolicies:\n    - provider: test\n      name: projonly\n      account: { email: p@example.com }\n",
+				);
+				const settings = await fileSettings(
+					tmp,
+					[
+						"auth:",
+						"  accountPolicies:",
+						"    - provider: test",
+						"      name: work",
+						"      account: { email: w@example.com }",
+						"modelRoles:",
+						"  default: test/model-a",
+						"  smol:",
+						"    strategy: random",
+						"    models:",
+						"      a: { model: test/model-a }",
+					].join("\n"),
+				);
+				expect(createModelBrowserSource(settings).accountNames).toEqual(["work"]);
+
+				const { hub } = createHub({ models: [makeModel("test", "model-a")], scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+				hub.handleInput("e");
+				hub.handleInput("\n"); // account order
+				const strip = footerLine(hub.render(220));
+				expect(strip).toContain("work");
+				expect(strip).not.toContain("projonly");
+				hub.handleInput("\n"); // toggle work
+				const roles = settings.getGlobalSettings().modelRoles as Record<string, { routing?: unknown }>;
+				expect(roles.smol?.routing).toEqual({ accounts: { order: ["work"] } });
+			} finally {
+				AgentStorage.close();
+				tmp.removeSync();
+			}
+		});
+
 		const INVALID_SMOL_POOL = [
 			"modelRoles:",
 			"  default: test/model-a",
@@ -2478,6 +2521,27 @@ describe("ModelHub", () => {
 					.map(line => stripVTControlCharacters(line))
 					.join("\n");
 				expect(body).toContain("must be a number in (0, 0.5]");
+			});
+
+			test("a pool field keeps its hint and error readable at 80 columns", () => {
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: "quota",
+					models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				});
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN); // SMOL
+
+				openRoutingEditor(hub, 7); // quota tolerance
+				const hint = footerLine(hub.render(80));
+				expect(hint).toContain("Quota tolerance:");
+				expect(hint).toContain("a number in (0, 0.5] · empty removes");
+				type(hub, "abc");
+				hub.handleInput("\n");
+				const error = hub.render(80);
+				expect(footerLine(error)).toContain("Tolerance must be a number in (0, 0.5]");
+				for (const line of error) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 			});
 
 			test("the picker shows a pool editor as its strip with toggle actions", () => {

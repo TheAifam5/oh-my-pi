@@ -160,7 +160,13 @@ export function createModelBrowserSource(
 		roleAcceptsPools: role => roleAcceptsGroups(role),
 		poolWriteBlocker: target => poolWriteBlocker(settings, target),
 		get accountNames() {
-			const names = cfgAuthAccountPolicies.get(settings).flatMap(policy => (policy.name ? [policy.name] : []));
+			// Names of the highest non-project `auth.accountPolicies` layer.
+			const policies = settings
+				.getLayerValues(cfgAuthAccountPolicies)
+				.findLast(layer => layer.source !== "project")?.value;
+			const names = (Array.isArray(policies) ? policies : []).flatMap(policy =>
+				isRecord(policy) && typeof policy.name === "string" ? [policy.name] : [],
+			);
 			return [...new Set(names)];
 		},
 		parseLimitSpec: spec => parsePoolLimitSpec(spec),

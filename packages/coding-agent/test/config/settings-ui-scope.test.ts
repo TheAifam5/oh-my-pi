@@ -138,6 +138,7 @@ it("shows a directory provenance badge and a shadow warning when Global is selec
 	for (const ch of "searxng endpoint") selector.handleInput(ch);
 	const lines = selector.render(80);
 	expect(lines.join("\n")).toContain("[directory ");
+	expect(lines.join("\n")).toMatch(/\[directory [^\]\n]*…\] /);
 	expect(host.shadowWarning?.("searxng.endpoint")).toContain(`directory ${cwd} layer`);
 	expect(lines.join("\n")).toContain("set in the directory");
 	expect(lines.every(line => visibleWidth(line) <= 80)).toBe(true);
