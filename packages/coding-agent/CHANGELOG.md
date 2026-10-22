@@ -27,6 +27,21 @@
 - Fixed the advisor prompt forbidding all repeated advice, including real escalations: advisors may now re-raise a prior nit or concern as a blocker once new evidence makes it one ([#13887](https://github.com/can1357/oh-my-pi/issues/13887), [#16484](https://github.com/can1357/oh-my-pi/pull/16484) by [@pjh890321](https://github.com/pjh890321))
 - Fixed Esc no longer interrupting in the TUI after a second MCP OAuth login replaced an unfinished first one ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
 
+### Added
+
+- Added finding categories: `WATCHDOG.yml` `categories` (`description`, `owner`, `precedence`) and per-advisor `owns`, layered user then project, with a bundled default taxonomy; `advise` requires a `category` from the session's taxonomy
+- Added the `advisor_findings` session entry persisting the findings ledger across advisor rebuilds and resume; findings expire after 50 untouched primary turns, compaction keeps open concern/blocker findings, and the ledger holds at most 256 findings
+- Added `advise` `relatesTo` + `relation` (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`) to relate a report to an open finding; a duplicate needs a matching anchor identity, only the finding's owner can resolve it (others count as `disputes`), and unknown ids are ignored
+- Added the `advisor.findingsDigest` setting (default on): each advisor review ends with an `<open-findings>` digest of up to 12 open findings (id, category, severity, owner, reporter count), showing a file anchor only when that advisor may read the file without a prompt, and marking the owner's findings whose anchored line changed as `possibly-fixed`
+- Added the advisor findings judge (`advisor.aggregation.judge`: `enabled` default off in interactive, RPC, and ACP sessions, `model` `@judge`, `timeoutMs` 10000, `allowCrossDomain` off): when enabled, open findings of different categories on one anchor that gained reports are judged `same`/`distinct` by the `judge` role, and `same` findings merge under the highest-precedence category keeping every report; report text reaches a judge candidate only when its disclosure domain (provider, resolved base URL origin, authentication source/account including auth-broker URL, local versus remote endpoint) matches every reporting advisor's, re-resolved per fallback candidate, and a failed or timed-out judgment leaves the findings unchanged
+- Added `/advisor findings [open|all]`, `/advisor findings resolve F<n>` and `/advisor findings reopen F<n>` in the TUI and ACP/text hosts; resolve and reopen persist in the `advisor_findings` session entry
+- `omp usage` and `/usage` show credit-balance spending rates and projected run-out countdowns
+- `auth.accountPolicies` entries take `resetOn` (`5h`, `7d`) and `autoRedeem` (`yes`, `no`, `unset`) for per-account Claude and Codex saved-reset redemption, set with `omp account reset <account> --on <windows> --auto <mode>` and shown by `omp account list` and `/account`
+- `omp account disable <account>` and `omp account enable <account>` (and `e` in `/account`) stop and resume using a stored account without logging it out; a disabled account is listed as disabled by `omp account list`, `/account`, and `omp usage`, and requests to a provider whose accounts are all disabled fail naming `omp account enable`
+- Added "Anthropic (Console API key)" to `/login` and `omp login`, so a Claude Console API key can be stored as an Anthropic account beside a Claude subscription; `omp account` accepts `anthropic-api-key/<fingerprint>`, and `omp auth-broker logout anthropic-api-key` removes only those keys, while other login aliases are refused instead of reporting a logout that removed nothing
+- Added strategy lists for model pools: `strategy: [quota, cheapest]` orders members by quota, then by price among ties, and `strategyOptions.tolerance` lets quota treat members with similar remaining quota as tied
+- Resumed pooled sessions (such as subagents restricted to an account pool) keep the pool account that served them under a remote auth broker, even when the pool overrides an account pinned with `/session pin`
+
 ### Changed
 
 - Changed `/account` to show each account's remaining quota, reset countdowns, balances and spending projections instead of billing classes; older numbers keep their fetched age
@@ -38,15 +53,20 @@
 - Changed advisor attachment delivery to a per-advisor, per-update cap equal to that advisor's budget: further reports on existing findings are recorded on the finding but not delivered
 - Changed the findings judge privacy gate to reject unknown authentication identities; explicitly keyless local endpoints may match without credentials only on the same normalized base URL
 - Changed advisor findings linking: the open-findings digest shows readable file anchors and `approach` topics and advisors are told to relate reports to listed findings, a `duplicate` between two `approach` anchors is accepted whatever the topics, and a relative file anchor resolves under the git worktree where the primary last edited or wrote that path instead of always the session cwd
+- `omp login anthropic-api-key` accepts Claude Console personal API keys (`sk-ant-usr…`) besides `sk-ant-api…` keys
+- `omp login anthropic-api-key` asks for an optional workspace ID (`wrkspc_…`) and sends it as `anthropic-workspace-id` with that key's requests, so keys not scoped to one workspace work
 
-### Added
+### Fixed
 
-- Added finding categories: `WATCHDOG.yml` `categories` (`description`, `owner`, `precedence`) and per-advisor `owns`, layered user then project, with a bundled default taxonomy; `advise` requires a `category` from the session's taxonomy
-- Added the `advisor_findings` session entry persisting the findings ledger across advisor rebuilds and resume; findings expire after 50 untouched primary turns, compaction keeps open concern/blocker findings, and the ledger holds at most 256 findings
-- Added `advise` `relatesTo` + `relation` (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`) to relate a report to an open finding; a duplicate needs a matching anchor identity, only the finding's owner can resolve it (others count as `disputes`), and unknown ids are ignored
-- Added the `advisor.findingsDigest` setting (default on): each advisor review ends with an `<open-findings>` digest of up to 12 open findings (id, category, severity, owner, reporter count), showing a file anchor only when that advisor may read the file without a prompt, and marking the owner's findings whose anchored line changed as `possibly-fixed`
-- Added the advisor findings judge (`advisor.aggregation.judge`: `enabled` default off in interactive, RPC, and ACP sessions, `model` `@judge`, `timeoutMs` 10000, `allowCrossDomain` off): when enabled, open findings of different categories on one anchor that gained reports are judged `same`/`distinct` by the `judge` role, and `same` findings merge under the highest-precedence category keeping every report; report text reaches a judge candidate only when its disclosure domain (provider, resolved base URL origin, authentication source/account including auth-broker URL, local versus remote endpoint) matches every reporting advisor's, re-resolved per fallback candidate, and a failed or timed-out judgment leaves the findings unchanged
-- Added `/advisor findings [open|all]`, `/advisor findings resolve F<n>` and `/advisor findings reopen F<n>` in the TUI and ACP/text hosts; resolve and reopen persist in the `advisor_findings` session entry
+- `omp account reset` rejects API-key accounts with the same OAuth-only error as account-policy validation
+- Anthropic Files API handles and concurrent uploads are isolated by workspace; existing unscoped cache entries remain reusable, and purge deletes files in their recorded workspace
+- Background usage reports finishing after the status line's two-second wait remain available to the model hub
+- The model hub shows available or exhausted subscription billing from account-wide plan windows
+- Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
+- Fixed startup failing when the default role's model pool has a funding or quota policy that excludes every member: the interactive TUI now starts with no model and a warning naming each skipped member and how to fix it, `--print` and RPC launches exit 1 with that one-line reason instead of a fatal stack trace, and a subagent reports only that reason as its task error
+- Fixed the model hub's `g` key never offering the `quota` strategy and refusing to change a pool that already used it; `quota` is now part of the strategy cycle, with or without a spending policy, and leaving it drops `strategyOptions.tolerance`
+- Fixed an invalid model pool in the global config (such as one missing `strategy`) showing as an unset role in the model hub, where `x` did nothing; the role now shows the validation problem, `x` removes the entry, and Enter replaces it with one model
+- Fixed `g` on a pool member row moving the cursor onto another member when the new strategy lists members in a different order
 
 ## [18.12.5] - 2026-10-21
 
@@ -61,22 +81,6 @@
 - Fixed `<path>:conflicts` on a file past the 10 MiB scan cap reporting no conflicts with no hint: it now names the line the scan stopped at and the ranged `read` that registers the blocks after it ([#16269](https://github.com/can1357/oh-my-pi/pull/16269))
 - Fixed the `ts-set-map` rule stalling tool-call streaming for seconds on a long single-line `Map` literal, and missing `Map` entries written `["key", value] as const` ([#16242](https://github.com/can1357/oh-my-pi/pull/16242))
 - Fixed the `ts-import-type` rule missing inline type imports whose member name is non-ASCII, such as `import("./units").温度` ([#16242](https://github.com/can1357/oh-my-pi/pull/16242))
-
-### Added
-
-- `omp usage` and `/usage` show credit-balance spending rates and projected run-out countdowns
-- `auth.accountPolicies` entries take `resetOn` (`5h`, `7d`) and `autoRedeem` (`yes`, `no`, `unset`) for per-account Claude and Codex saved-reset redemption, set with `omp account reset <account> --on <windows> --auto <mode>` and shown by `omp account list` and `/account`
-- `omp account disable <account>` and `omp account enable <account>` (and `e` in `/account`) stop and resume using a stored account without logging it out; a disabled account is listed as disabled by `omp account list`, `/account`, and `omp usage`, and requests to a provider whose accounts are all disabled fail naming `omp account enable`
-
-### Changed
-
-- `omp login anthropic-api-key` accepts Claude Console personal API keys (`sk-ant-usr…`) besides `sk-ant-api…` keys
-- `omp login anthropic-api-key` asks for an optional workspace ID (`wrkspc_…`) and sends it as `anthropic-workspace-id` with that key's requests, so keys not scoped to one workspace work
-
-### Fixed
-
-- `omp account reset` rejects API-key accounts with the same OAuth-only error as account-policy validation
-- Anthropic Files API handles and concurrent uploads are isolated by workspace; existing unscoped cache entries remain reusable, and purge deletes files in their recorded workspace
 
 ## [18.12.4] - 2026-10-20
 
@@ -147,27 +151,6 @@
 - Fixed supported Bedrock Claude models falling back to soft instead of remote compaction ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 - Fixed browser `tab.run(fn, [url])` and `browser.open("https://…")` failing with a bare "expects an options object"; the errors now say to pass `{ args: [...] }` and `browser.open({ url, name })` ([#16236](https://github.com/can1357/oh-my-pi/pull/16236) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed the built-in `ts-set-map`, `ts-import-type` and `ts-no-any` rules reminding you about code they allow: an empty or computed `Set`/`Map`, a runtime `await import()`, or the word "any" in a comment ([#16242](https://github.com/can1357/oh-my-pi/pull/16242) by [@will-bogusz](https://github.com/will-bogusz))
-
-### Added
-
-- Added "Anthropic (Console API key)" to `/login` and `omp login`, so a Claude Console API key can be stored as an Anthropic account beside a Claude subscription; `omp account` accepts `anthropic-api-key/<fingerprint>`, and `omp auth-broker logout anthropic-api-key` removes only those keys, while other login aliases are refused instead of reporting a logout that removed nothing
-
-- Added strategy lists for model pools: `strategy: [quota, cheapest]` orders members by quota, then by price among ties, and `strategyOptions.tolerance` lets quota treat members with similar remaining quota as tied
-- Resumed pooled sessions (such as subagents restricted to an account pool) keep the pool account that served them under a remote auth broker, even when the pool overrides an account pinned with `/session pin`
-
-### Fixed
-
-- Background usage reports finishing after the status line's two-second wait remain available to the model hub
-- The model hub shows available or exhausted subscription billing from account-wide plan windows
-- Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
-- Fixed startup failing when the default role's model pool has a funding or quota policy that excludes every member: the interactive TUI now starts with no model and a warning naming each skipped member and how to fix it, `--print` and RPC launches exit 1 with that one-line reason instead of a fatal stack trace, and a subagent reports only that reason as its task error
-- Fixed the model hub's `g` key never offering the `quota` strategy and refusing to change a pool that already used it; `quota` is now part of the strategy cycle, with or without a spending policy, and leaving it drops `strategyOptions.tolerance`
-- Fixed an invalid model pool in the global config (such as one missing `strategy`) showing as an unset role in the model hub, where `x` did nothing; the role now shows the validation problem, `x` removes the entry, and Enter replaces it with one model
-- Fixed `g` on a pool member row moving the cursor onto another member when the new strategy lists members in a different order
-
-### Fixed
-
-- Fixed `omp --restore` and `/retry` re-running a tool call that may already have run before a crash or failure (such as `bash` or a write): only calls that are safe to repeat or never started run again; otherwise the model continues from the failed results and a warning names the calls that were not re-run
 
 ## [18.12.3] - 2026-10-19
 

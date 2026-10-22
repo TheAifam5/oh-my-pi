@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- OpenRouter credit balances include a projected exhaustion timestamp and daily spending rate from this key's UTC weekly usage, or monthly usage during the first day of the week
+- Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries
+- Added user-disabled credentials: `credentials.setEnabled()` stores the state in a new `user_disabled_at` column of `agent.db` (schema 9) or through the auth broker's new `POST /v1/credential/:id/enabled`; a disabled credential stays stored, is listed by `credentials.listUserDisabled()`, `credentials.listDisabled()`, and `sessions.accounts()` without a session, and is never selected
+- Added `workspaceId` to stored API-key credentials (`ApiKeyCredential`, `OAuthRequestIdentity`): `login "api-key"` rules with `workspace-prompt` store the entered ID through `OAuthController.onWorkspaceId`, and the Anthropic provider sends it as `anthropic-workspace-id`
+- Added Anthropic Console API-key accounts: `/usage` shows each stored key's per-minute request and token limits from its responses, and its billing reads as metered spend of unknown state
+
+### Fixed
+
+- Exhausted Anthropic spend limits show the earliest local and relative unblock time, Console and login recovery actions, and the original provider message
+- Spend-limit failures block the whole credential across model tiers
+- OpenRouter fetches key limits and credits concurrently, preserving key limits when the independent three-second credits deadline expires
+- Reset-only account policies do not enable usage-reserve routing, and API-key policies reject `resetOn` and `autoRedeem`
+- Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
+- Subscription billing reports available or exhausted from account-wide plan windows; Antigravity billing reports available when every counter has room
+- Paid OpenRouter billing reports the real remaining USD credit balance; keys refused access to the credits endpoint report permission-denied billing evidence
+- Fixed an OAuth login deleting the API keys you had stored for the same provider with `/login`; only keys stored without a login are replaced
+- Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes; requests move to a sibling key and the spent key stays blocked until the time Anthropic states, or the first of the next month for the tier cap
+- Fixed an OpenRouter `:free` model hitting its daily free-model quota or rate limit blocking paid models on the same key; `:free` requests now move to another key until the quota resets at midnight UTC while paid models keep using it; `openrouter/free` counts as a free model
+- Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time. A rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too
+- Fixed a usage report kept from before a quota reset blocking the account again for a minute when the usage endpoint is unreachable after the reset
+- Fixed a retired session account pool lifting once more than 256 other pools were retired, so a deferred lookup under its session id could use any account or API key; a retired pool now holds for 24 hours
+
 ## [18.12.5] - 2026-10-21
 
 ### Added
@@ -11,21 +35,6 @@
 ### Fixed
 
 - Fixed every OpenAI Codex request failing with HTTP 404 `{"detail":"Not Found"}` on personal ChatGPT accounts whose token is not region-pinned ([#16493](https://github.com/can1357/oh-my-pi/issues/16493))
-
-### Added
-
-- OpenRouter credit balances include a projected exhaustion timestamp and daily spending rate from this key's UTC weekly usage, or monthly usage during the first day of the week
-- Added `resetOn` and `autoRedeem` to `auth.accountPolicies` entries
-- Added user-disabled credentials: `credentials.setEnabled()` stores the state in a new `user_disabled_at` column of `agent.db` (schema 9) or through the auth broker's new `POST /v1/credential/:id/enabled`; a disabled credential stays stored, is listed by `credentials.listUserDisabled()`, `credentials.listDisabled()`, and `sessions.accounts()` without a session, and is never selected
-- Added `workspaceId` to stored API-key credentials (`ApiKeyCredential`, `OAuthRequestIdentity`): `login "api-key"` rules with `workspace-prompt` store the entered ID through `OAuthController.onWorkspaceId`, and the Anthropic provider sends it as `anthropic-workspace-id`
-
-### Fixed
-
-- Exhausted Anthropic spend limits show the earliest local and relative unblock time, Console and login recovery actions, and the original provider message
-- Spend-limit failures block the whole credential across model tiers
-- OpenRouter fetches key limits and credits concurrently, preserving key limits when the independent three-second credits deadline expires
-- Reset-only account policies do not enable usage-reserve routing, and API-key policies reject `resetOn` and `autoRedeem`
-- Fixed Codex turns failing with `unsupported_native_inflight_message` again after a model switch, context rollover, compaction, or account switch: once the native turn lane refuses live steering, steering stays off for that model in that session until the session is released or closed
 
 ## [18.12.4] - 2026-10-20
 
@@ -54,22 +63,6 @@
 - Fixed the stream loop guard never stopping a model stuck repeating punctuation or symbols (`?!?!`, `✓✓✓`) until the output limit; such runs now trip once they repeat for 1 KB, while digit and whitespace runs such as padding and hexdumps are left alone ([#14436](https://github.com/can1357/oh-my-pi/pull/14436) by [@F0Rextasy](https://github.com/F0Rextasy))
 - Fixed native remote compaction for supported Bedrock Claude models without changing ordinary Converse turns; a custom non-AWS `baseUrl` needs `remoteCompaction.enabled: true` ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 - Fixed Anthropic compaction blocks dropping their signed `tool_changes`, which made the replayed block fail its signature ([#16343](https://github.com/can1357/oh-my-pi/pull/16343) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
-
-### Added
-
-- Added Anthropic Console API-key accounts: `/usage` shows each stored key's per-minute request and token limits from its responses, and its billing reads as metered spend of unknown state
-
-### Fixed
-
-- Subscription billing reports available or exhausted from account-wide plan windows; Antigravity billing reports available when every counter has room
-- Paid OpenRouter billing reports the real remaining USD credit balance; keys refused access to the credits endpoint report permission-denied billing evidence
-- Fixed an OAuth login deleting the API keys you had stored for the same provider with `/login`; only keys stored without a login are replaced
-- Fixed an Anthropic spend limit (the tier's monthly cap or a limit set in the Console) blocking a key for only 30 minutes; requests move to a sibling key and the spent key stays blocked until the time Anthropic states, or the first of the next month for the tier cap
-
-- Fixed an OpenRouter `:free` model hitting its daily free-model quota or rate limit blocking paid models on the same key; `:free` requests now move to another key until the quota resets at midnight UTC while paid models keep using it; `openrouter/free` counts as a free model
-- Fixed API keys (OpenRouter, Z.AI) staying blocked after their quota recovered: a fresh usage report showing a raised spending cap, bought credits, or a recovered Z.AI quota now makes the key selectable again before the block's reset time. A rate-limit error's retry wait is still honored in full, for Z.AI OAuth accounts too
-- Fixed a usage report kept from before a quota reset blocking the account again for a minute when the usage endpoint is unreachable after the reset
-- Fixed a retired session account pool lifting once more than 256 other pools were retired, so a deferred lookup under its session id could use any account or API key; a retired pool now holds for 24 hours
 
 ## [18.12.3] - 2026-10-19
 
