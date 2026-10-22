@@ -580,6 +580,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				extensionRunner: {
 					getCommand: (name: string) => (name === "queued-cmd" ? { name: "queued-cmd" } : undefined),
 					emitBeforeAgentStart: async () => undefined,
+					invalidate: () => {},
 				},
 			},
 		);
