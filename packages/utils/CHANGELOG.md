@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `encodeDirectoryName()` in `@oh-my-pi/pi-utils/directory-name`, which encodes a directory path with the session folder naming format (`-tmp…` under the temp root, `-…` under home, otherwise `--<absolute-path>--`)
+
 ## [18.12.6] - 2026-10-21
 
 ### Added
