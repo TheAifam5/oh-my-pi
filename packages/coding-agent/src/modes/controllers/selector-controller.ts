@@ -1174,7 +1174,9 @@ export class SelectorController {
 						if (refused !== undefined) return refused;
 						const name =
 							target.kind === "role" ? (getRoleInfo(target.key, settings)?.tag ?? target.key) : target.key;
-						const pool = `${name} ${target.kind === "role" ? "pool" : target.kind === "group" ? "model group" : "fallback pool"}`;
+						const kindLabel =
+							target.kind === "role" ? "pool" : target.kind === "group" ? "model group" : "fallback pool";
+						const pool = `${name} ${kindLabel}`;
 						this.ctx.showStatus(value === undefined ? `${pool} cleared` : `${pool} saved`);
 						return undefined;
 					} catch (error) {
