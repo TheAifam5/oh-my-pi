@@ -14,6 +14,8 @@ export interface ApiKeyResolverOptions {
 	baseUrl?: string;
 	/** Provider model id forwarded to model-scoped usage ranking/backoff. */
 	modelId?: string;
+	/** Accounts entitled to `modelId` ({@link AuthApiKeyOptions.accountIds}), forwarded to resolution and rotation. */
+	accountIds?: readonly string[];
 }
 
 /**
@@ -54,7 +56,7 @@ export function createApiKeyResolver(
 	provider: string,
 	options: ApiKeyResolverOptions = {},
 ): ApiKeyResolver {
-	const { sessionId, baseUrl, modelId } = options;
+	const { sessionId, baseUrl, modelId, accountIds } = options;
 	const resolveKey = (
 		forceRefresh: boolean | undefined,
 		signal?: AbortSignal,
@@ -63,6 +65,7 @@ export function createApiKeyResolver(
 		registry.getApiKeyWithCredentialForProvider(provider, sessionId, {
 			baseUrl,
 			modelId,
+			accountIds,
 			forceRefresh,
 			signal,
 			refreshReason,
@@ -81,6 +84,7 @@ export function createApiKeyResolver(
 			const rotation = await registry.authStorage.limits.rotate(provider, sessionId, {
 				error,
 				modelId,
+				accountIds,
 				signal,
 				apiKey: previousKey,
 			});

@@ -406,7 +406,18 @@ export class ModelRegistry {
 
 	/** Final pass over every published model list: catalog metrics, then implicit local providers last. */
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
+		this.#registerModelAccountAccess(models);
 		return this.#orderImplicitProvidersLast(applyCatalogMetrics(models, this.#catalogMetrics));
+	}
+
+	#registerModelAccountAccess(models: readonly Model<Api>[]): void {
+		for (const model of models) {
+			this.authStorage.setModelAccountAccess(
+				model.provider,
+				model.id,
+				model.accountAccess && Object.keys(model.accountAccess),
+			);
+		}
 	}
 
 	/**
@@ -1062,6 +1073,7 @@ export class ModelRegistry {
 		this.#cachedDiscoverableModels = logger.time("modelRegistry:loadDiscoverableModels", () =>
 			this.#applyHardcodedModelPolicies(this.#loadCachedDiscoverableModels()),
 		);
+		this.#registerModelAccountAccess(this.#cachedDiscoverableModels);
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
 	}
 
@@ -1985,7 +1997,10 @@ export class ModelRegistry {
 			}
 			this.#invalidateProviderModelCache(provider);
 		}
-		if (!this.#hasFullSnapshot) return;
+		if (!this.#hasFullSnapshot) {
+			this.#composeStaticModels(touchedProviders);
+			return;
+		}
 
 		let baseModels = this.#baseModels;
 		if (replacedProviderSet.size > 0) {
@@ -3379,11 +3394,12 @@ export class ModelRegistry {
 		if (this.isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
-		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
+		// Model account access registers with auth storage as the provider's rows compose.
+		if (options?.modelId) this.#modelsForProviderLookup(provider);
 		return this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
-			accountIds: accountAccess && Object.keys(accountAccess),
+			accountIds: options?.accountIds,
 			forceRefresh: options?.forceRefresh,
 			refreshReason: options?.refreshReason,
 			signal: options?.signal,
@@ -3402,8 +3418,10 @@ export class ModelRegistry {
 	resolver(target: string | ApiKeyResolverModel, optionsOrSessionId?: ApiKeyResolverOptions | string): ApiKeyResolver {
 		const options = typeof optionsOrSessionId === "string" ? { sessionId: optionsOrSessionId } : optionsOrSessionId;
 		if (typeof target === "string") {
+			if (options?.modelId) this.#modelsForProviderLookup(target);
 			return createApiKeyResolver(this, target, options);
 		}
+		this.#modelsForProviderLookup(target.provider);
 		return createApiKeyResolver(this, target.provider, {
 			...options,
 			baseUrl: target.baseUrl,

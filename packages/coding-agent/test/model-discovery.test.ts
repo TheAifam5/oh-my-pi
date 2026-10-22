@@ -652,6 +652,91 @@ describe("ModelRegistry runtime discovery", () => {
 		}
 	});
 
+	for (const strategy of ["online", "offline"] as const) {
+		test(`Codex ${strategy} catalog registers entitlement before any request key resolution`, async () => {
+			authStorage.close();
+			authStorage = await AuthStorage.create(":memory:", { usageProviderResolver: () => undefined });
+			const credentials = [
+				{
+					type: "oauth" as const,
+					access: "private-token",
+					refresh: "r1",
+					expires: Date.now() + 3_600_000,
+					accountId: "private",
+				},
+				{
+					type: "oauth" as const,
+					access: "work-token",
+					refresh: "r2",
+					expires: Date.now() + 3_600_000,
+					accountId: "work",
+				},
+			];
+			await authStorage.credentials.set("openai-codex", credentials);
+			let rosterExpanded = false;
+			let requests = 0;
+			const fetchMock: FetchImpl = async (_input, init) => {
+				requests++;
+				const privateAccount = new Headers(init?.headers).get("authorization") === "Bearer private-token";
+				return Response.json({
+					models:
+						privateAccount || rosterExpanded
+							? [
+									{
+										slug: "gpt-daybreak-blue-latest",
+										display_name: "Daybreak",
+										context_window: 272_000,
+										supported_in_api: true,
+										input_modalities: ["text"],
+									},
+								]
+							: [],
+				});
+			};
+			let registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await registry.refreshProvider("openai-codex", "online");
+			if (strategy === "offline") {
+				authStorage.close();
+				authStorage = await AuthStorage.create(":memory:", { usageProviderResolver: () => undefined });
+				await authStorage.credentials.set("openai-codex", credentials);
+				registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+				const previousRequests = requests;
+				await registry.refreshProvider("openai-codex", "offline");
+				expect(requests).toBe(previousRequests);
+			}
+			const account = authStorage.sessions.accounts("openai-codex").find(account => account.accountId === "private");
+			if (!account) throw new Error("expected private account");
+			authStorage.sessions.pin("openai-codex", "fresh", account.credentialId, { restoredAtMs: Date.now() });
+			const rotation = await authStorage.limits.rotate("openai-codex", "fresh", {
+				modelId: "gpt-daybreak-blue-latest",
+				error: "usage_limit_reached: The usage limit has been reached",
+			});
+			expect(registry.find("openai-codex", "gpt-daybreak-blue-latest")?.accountAccess).toEqual({ private: {} });
+			expect(rotation).toEqual({ switched: false });
+			const mark = await authStorage.limits.markReached("openai-codex", "fresh", {
+				modelId: "gpt-daybreak-blue-latest",
+				credentialId: account.credentialId,
+				retryAfterMs: 60_000,
+			});
+			expect(mark.switched).toBe(false);
+			const health = await authStorage.health.model("openai-codex", {
+				modelId: "gpt-daybreak-blue-latest",
+				reserveFraction: 0,
+			});
+			expect(health.state).toBe("depleted");
+			rosterExpanded = true;
+			await registry.refreshDiscoverableProviders(["openai-codex"], "online");
+			expect(
+				(
+					await authStorage.limits.rotate("openai-codex", "fresh", {
+						modelId: "gpt-daybreak-blue-latest",
+						error: "usage_limit_reached: The usage limit has been reached",
+					})
+				).switched,
+			).toBe(true);
+		});
+	}
+
 	test("Codex discovery aborts (keeps bundled models) when any account credential fails to refresh", async () => {
 		// Two configured Codex accounts: the fresh one resolves, the expired one's
 		// refresh throws so getOAuthAccesses reports ok:false. A partial union would
@@ -739,7 +824,7 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(registry.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
 
 		// A session sticky to account A moves to B for a model only B serves; an
-		// exclusive user pin would keep A.
+		// exclusive user pin to A is refused for that model.
 		const sessionId = "antigravity-claude-session";
 		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
 		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
