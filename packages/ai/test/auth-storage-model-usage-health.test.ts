@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { isModelEntitlementBlockScope } from "@oh-my-pi/pi-ai/auth/blocks";
 import { resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai/auth/sqlite-credential-store";
 import {
 	type ApiKeyCredential,
@@ -29,7 +30,8 @@ function makeStore(rows: StoredAuthCredential[], blocked = new Map<number, numbe
 		replaceAuthCredentials: async () => rows,
 		upsertAuthCredential: async () => rows,
 		async deleteAuthCredentials() {},
-		getCredentialBlock: credentialId => blocked.get(credentialId),
+		getCredentialBlock: (credentialId, _providerKey, blockScope) =>
+			isModelEntitlementBlockScope(blockScope) ? undefined : blocked.get(credentialId),
 		getCache(key) {
 			const entry = cache.get(key);
 			return entry && entry.expiresAtSec * 1000 > Date.now() ? entry.value : null;

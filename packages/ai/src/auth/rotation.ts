@@ -15,6 +15,7 @@ import {
 } from "./blocks";
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
+import type { ModelEntitlements } from "./entitlement";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
@@ -24,6 +25,7 @@ import type {
 	InvalidateCredentialMatchingOptions,
 	LimitsApi,
 	MarkUsageLimitOptions,
+	RecordModelDenialOptions,
 	RotateCredentialOptions,
 	UsageLimitMarkResult,
 } from "./types";
@@ -67,6 +69,7 @@ export interface RateLimitsDeps {
 	affinity: SessionAffinity;
 	usage: UsageService;
 	strategies: RankingStrategyResolver;
+	entitlements: ModelEntitlements;
 }
 
 /** Usage-limit marking, credential rotation after failures, and bearer-matched invalidation. */
@@ -151,6 +154,7 @@ export class RateLimits implements LimitsApi {
 		blockedUntil: number,
 		routing: CredentialBlockRouting,
 		providerTimed: boolean,
+		entitled: (credentialIndex: number) => boolean,
 	): UsageLimitMarkResult {
 		// Snapshot the live block deadline BEFORE this call's mark: the merged
 		// value below masks a pre-existing block shorter than this call's own
@@ -196,6 +200,7 @@ export class RateLimits implements LimitsApi {
 				(entry): entry is { credential: AuthCredential; index: number } =>
 					entry.credential.type === credentialType &&
 					entry.index !== targetIndex &&
+					entitled(entry.index) &&
 					this.#deps.affinity.allows(provider, sessionId, entry.credential),
 			);
 
@@ -330,6 +335,7 @@ export class RateLimits implements LimitsApi {
 			blockedUntil,
 			routing,
 			providerTimed,
+			this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds),
 		);
 		if (reportBlock && targetIndex >= 0) {
 			this.#deps.blocks.mark(provider, routing.providerKey, targetIndex, reportBlock.until, reportBlock.scope, true);
@@ -341,6 +347,22 @@ export class RateLimits implements LimitsApi {
 			...(reportResetAtMs === undefined ? {} : { reportResetAtMs }),
 		};
 	}
+
+	async recordModelDenial(
+		provider: string,
+		sessionId: string | undefined,
+		options: RecordModelDenialOptions,
+	): Promise<boolean> {
+		await this.#deps.pool.adoptExternalChanges();
+		const target = await this.#resolveCredentialTarget(provider, sessionId, {
+			credentialId: options.credentialId,
+			apiKey: options.apiKey,
+			allowStaleOAuthBearer: true,
+		});
+		if (!target) return false;
+		return this.#deps.entitlements.recordDenial(provider, target.index, options.modelId, options.ttlMs);
+	}
+
 	#extractStructuredApiKeyToken(apiKey: string): string | undefined {
 		if (!apiKey.startsWith("{")) return undefined;
 		try {
@@ -418,18 +440,23 @@ export class RateLimits implements LimitsApi {
 	 *   (temporary block via its own backoff — default plus server usage-report
 	 *   reset; sticky left intact so the next resolve re-ranks around the block).
 	 * - exact model-entitlement denial (Codex ChatGPT account or Cursor plan) →
-	 *   temporarily block only that requested model, then rotate.
-	 * - other account-scoped policy denial → temporarily block that account
-	 *   without marking its credential suspect, then rotate through siblings.
+	 *   record the account as not entitled to the requested model, temporarily
+	 *   block only that model, then rotate.
+	 * - other account-scoped policy denial → with a requested model and unless
+	 *   the organization refuses OAuth outright, record the same entitlement
+	 *   denial; temporarily block that account without marking its credential
+	 *   suspect, then rotate through siblings.
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
 	 *
 	 * A session with an exclusive pin never switches: a usage-limit failure is
-	 * still marked, and the result is `{ switched: false }` without waiting.
+	 * still marked, an entitlement denial still recorded, and the result is
+	 * `{ switched: false }` without waiting.
 	 *
-	 * For usage-limit and account-policy failures with no free sibling, sleeps
-	 * until the earliest sibling unblocks when that is at most
+	 * Only siblings entitled to `options.modelId` count. For usage-limit and
+	 * account-policy failures with no free entitled sibling, sleeps until the
+	 * earliest entitled sibling unblocks when that is at most
 	 * {@link SIBLING_UNBLOCK_WAIT_MAX_MS} away, then reports `afterSiblingWait`.
 	 * Aborting `options.signal` during that wait rejects.
 	 */
@@ -445,7 +472,24 @@ export class RateLimits implements LimitsApi {
 		const exactCursorModelPolicy = AIError.isCursorPlanAccountPolicyError(error, provider);
 		const accountPolicy = exactCursorModelPolicy || AIError.isAccountPolicyError(error);
 		const usageLimit = !accountPolicy && (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message));
+		const deniedModel = AIError.codexChatGPTAccountPolicyModel(error);
+		const exactCodexModelPolicy =
+			deniedModel !== undefined && AIError.isCodexChatGPTAccountPolicyError(error, provider, options?.modelId);
+		const exactModelPolicy = exactCodexModelPolicy || exactCursorModelPolicy;
+		// A denial naming another model, or refusing the organization's OAuth outright, says nothing about
+		// this account's entitlement to the requested model.
+		const learnDenial =
+			options?.modelId !== undefined &&
+			(exactModelPolicy ||
+				(accountPolicy && deniedModel === undefined && !AIError.isOrganizationOAuthDenial(error)));
 		if (this.#deps.affinity.hasExclusivePin(provider, sessionId)) {
+			if (learnDenial && options?.modelId !== undefined) {
+				await this.recordModelDenial(provider, sessionId, {
+					modelId: options.modelId,
+					apiKey: options.apiKey,
+					credentialId: options.credentialId,
+				});
+			}
 			// A pinned session never leaves its account: record the block for status, keep the pin, and
 			// let the caller surface the provider's error instead of waiting for a sibling.
 			if (usageLimit) {
@@ -455,6 +499,7 @@ export class RateLimits implements LimitsApi {
 					reason: parseRateLimitReason(message ?? ""),
 					providerTimed: retryAfterMs !== undefined,
 					modelId: options?.modelId,
+					accountIds: options?.accountIds,
 					apiKey: options?.apiKey,
 					credentialId: options?.credentialId,
 					signal: options?.signal,
@@ -472,6 +517,7 @@ export class RateLimits implements LimitsApi {
 				reason: parseRateLimitReason(message ?? ""),
 				providerTimed: retryAfterMs !== undefined,
 				modelId: options?.modelId,
+				accountIds: options?.accountIds,
 				apiKey: options?.apiKey,
 				credentialId: options?.credentialId,
 				signal: options?.signal,
@@ -479,10 +525,6 @@ export class RateLimits implements LimitsApi {
 			return awaitSiblingUnblock(mark, options?.signal);
 		}
 
-		const deniedModel = AIError.codexChatGPTAccountPolicyModel(error);
-		const exactCodexModelPolicy =
-			deniedModel !== undefined && AIError.isCodexChatGPTAccountPolicyError(error, provider, options?.modelId);
-		const exactModelPolicy = exactCodexModelPolicy || exactCursorModelPolicy;
 		const sessionCredential = await this.#resolveCredentialTarget(provider, sessionId, {
 			credentialId: options?.credentialId,
 			apiKey: options?.apiKey,
@@ -494,6 +536,7 @@ export class RateLimits implements LimitsApi {
 		// global block or a hard-auth invalidation.
 		if (deniedModel !== undefined && !exactCodexModelPolicy) return { switched: false };
 		if (exactModelPolicy || accountPolicy) {
+			if (learnDenial) this.#deps.entitlements.recordDenial(provider, sessionCredential.index, options?.modelId);
 			const modelPolicyScope = exactModelPolicy
 				? modelAccountPolicyBlockScope(provider, options?.modelId)
 				: undefined;
@@ -521,6 +564,7 @@ export class RateLimits implements LimitsApi {
 				Date.now() + DEFAULT_BLOCK_MS,
 				routing,
 				false,
+				this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds),
 			);
 			return awaitSiblingUnblock(mark, options?.signal);
 		}
@@ -528,12 +572,14 @@ export class RateLimits implements LimitsApi {
 		const providerKey = providerTypeKey(provider, sessionCredential.type);
 		// Snapshot sibling availability before mutating so a soft-deleting
 		// suspect hook can't reindex the answer out from under us.
+		const entitled = this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds);
 		const hasSibling = this.#deps.pool
 			.credentials(provider)
 			.some(
 				(credential, index) =>
 					credential.type === sessionCredential.type &&
 					index !== sessionCredential.index &&
+					entitled(index) &&
 					!this.#deps.blocks.isBlocked(provider, providerKey, index) &&
 					this.#deps.affinity.allows(provider, sessionId, credential),
 			);

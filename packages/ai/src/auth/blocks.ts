@@ -29,6 +29,17 @@ export const ACCOUNT_POLICY_BLOCK_SCOPE = "account-policy";
 const PROTECTED_BLOCK_SCOPES = [AUTH_BLOCK_SCOPE, ACCOUNT_POLICY_BLOCK_SCOPE] as const;
 
 const MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX = "model-policy:";
+const MODEL_ENTITLEMENT_BLOCK_SCOPE_PREFIX = "model-entitlement:";
+
+/** Scope recording that a credential is not entitled to one model. */
+export function modelEntitlementBlockScope(modelKey: string): string {
+	return `${MODEL_ENTITLEMENT_BLOCK_SCOPE_PREFIX}${modelKey}`;
+}
+
+/** Whether `scope` is a {@link modelEntitlementBlockScope}. */
+export function isModelEntitlementBlockScope(scope: string): boolean {
+	return scope.startsWith(MODEL_ENTITLEMENT_BLOCK_SCOPE_PREFIX);
+}
 const MODEL_ACCOUNT_POLICY_PROVIDERS: Readonly<Record<string, true>> = {
 	"openai-codex": true,
 	cursor: true,
@@ -365,6 +376,18 @@ export class CredentialBlocks implements BlocksApi {
 		return this.blockedUntil(provider, providerKey, credentialIndex, blockScope) !== undefined;
 	}
 
+	/** Expiry of exactly one scope's block for a credential, ignoring unscoped and protected blocks. */
+	scopeBlockedUntil(
+		provider: string,
+		providerKey: string,
+		credentialIndex: number,
+		scope: string,
+	): number | undefined {
+		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
+		if (credentialId === undefined) return undefined;
+		return this.#exactBlockedUntil(credentialId, providerKey, scope);
+	}
+
 	/**
 	 * Whether the in-memory block currently sitting at exactly `deadline` for
 	 * this credential was written with provider-stated timing. Mirrors the
@@ -462,10 +485,38 @@ export class CredentialBlocks implements BlocksApi {
 	 * after a saved reset is redeemed so the just-reset account is immediately
 	 * selectable again instead of being skipped/under-ranked by a stale block
 	 * that `markUsageLimitReached` set for the now-obsolete reset time.
+	 * Model-entitlement denials are kept until they expire.
 	 */
 	clearAll(provider: string, credentialId: number): void {
+		const providerKey = providerTypeKey(provider, "oauth");
+		const scopedPrefix = `${providerKey}\0`;
+		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
+		const persistedDenial = persistedScopes
+			? [...persistedScopes.keys()].some(scope => isModelEntitlementBlockScope(scope))
+			: false;
+		const memoryDenials = new Map<string, number>();
+		for (const [key, backoffMap] of this.#credentialBackoff) {
+			if (!key.startsWith(scopedPrefix)) continue;
+			const scope = key.slice(scopedPrefix.length);
+			const until = backoffMap.get(credentialId)?.until;
+			if (until !== undefined && until > Date.now() && isModelEntitlementBlockScope(scope)) {
+				memoryDenials.set(scope, until);
+			}
+		}
 		try {
-			this.deleteAll(credentialId);
+			if (persistedScopes && persistedDenial) {
+				// Delete only the other scopes so no reader ever sees the denial missing.
+				for (const scope of persistedScopes.keys()) {
+					if (!isModelEntitlementBlockScope(scope)) this.delete(credentialId, providerKey, scope, false);
+				}
+				this.#deps.usageCache.invalidateProviderKey(providerKey);
+			} else {
+				this.deleteAll(credentialId);
+				// Without a scope listing, the store's denial rows are restored from the mirrored memory copy.
+				for (const [blockScope, blockedUntilMs] of memoryDenials) {
+					this.#deps.store.upsertCredentialBlock?.({ credentialId, providerKey, blockScope, blockedUntilMs });
+				}
+			}
 		} catch (err) {
 			logger.debug("Failed to clear persisted credential blocks", {
 				err,
@@ -474,9 +525,8 @@ export class CredentialBlocks implements BlocksApi {
 			});
 		}
 
-		const providerKey = providerTypeKey(provider, "oauth");
-		const scopedPrefix = `${providerKey}\0`;
 		for (const key of this.#credentialBackoff.keys()) {
+			if (key.startsWith(scopedPrefix) && isModelEntitlementBlockScope(key.slice(scopedPrefix.length))) continue;
 			if (key === providerKey || key.startsWith(scopedPrefix)) this.#deleteCredentialBackoff(key, credentialId);
 		}
 	}

@@ -13,6 +13,7 @@ import type { SessionAffinity } from "./affinity";
 import { credentialBlockScopesForRequest, providerTypeKey } from "./blocks";
 import type { CredentialBlocks } from "./blocks";
 import type { KeyCascade, KeyOverrides } from "./cascade";
+import type { ModelEntitlements } from "./entitlement";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool, StoredCredential } from "./pool";
 import type { OAuthRefresher } from "./refresh";
@@ -45,6 +46,7 @@ export interface CredentialHealthDeps {
 	refresher: OAuthRefresher;
 	overrides: KeyOverrides;
 	strategies: RankingStrategyResolver;
+	entitlements: ModelEntitlements;
 }
 
 /** Model-level pool health and per-credential auth probes. */
@@ -113,10 +115,15 @@ export class CredentialHealth implements HealthApi {
 
 		// A restricted session's health covers only its allowlist: no other account's token
 		// reaches the usage endpoint, and no other account makes the model look healthy.
+		// Accounts not entitled to the model never serve it, so they are left out the same way.
+		const entitled = this.#deps.entitlements.entitled(provider, options.modelId, options.accountIds);
 		const stored = this.#deps.pool
 			.entries(provider)
 			.map((entry, index) => ({ entry, index }))
-			.filter(({ entry }) => this.#deps.affinity.allows(provider, options.sessionId, entry.credential));
+			.filter(
+				({ entry, index }) =>
+					entitled(index) && this.#deps.affinity.allows(provider, options.sessionId, entry.credential),
+			);
 		const oauthPool = stored.filter(({ entry }) => entry.credential.type === "oauth");
 		const apiKeyPool = stored.filter(({ entry }) => entry.credential.type === "api_key");
 		const loginApiKeyPool = apiKeyPool.filter(

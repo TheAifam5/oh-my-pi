@@ -16,6 +16,7 @@ import {
 	providerTypeKey,
 	type CredentialBlocks,
 } from "./blocks";
+import type { ModelEntitlements } from "./entitlement";
 import {
 	type DrainedState,
 	drainStateExpiresAtSec,
@@ -51,7 +52,6 @@ import {
 	type DrainReturnTrigger,
 	type DrainSpendClass,
 	type OAuthCredential,
-	oauthAccountKey,
 	type StoredAuthCredential,
 } from "./types";
 import type { UsageService } from "./usage";
@@ -212,6 +212,7 @@ export interface CredentialSelectorDeps {
 	usage: UsageService;
 	refresher: OAuthRefresher;
 	strategies: RankingStrategyResolver;
+	entitlements: ModelEntitlements;
 }
 
 /** Picks which stored credential serves a request: ordering, usage ranking, OAuth refresh ladder. */
@@ -597,12 +598,14 @@ export class CredentialSelector {
 		options: AuthApiKeyOptions | undefined,
 		filter?: (credential: ApiKeyCredential) => boolean,
 	): Promise<ApiKeySelection | undefined> {
+		const entitled = this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds);
 		const credentials = this.#deps.pool
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is ApiKeySelection => {
 				if (entry.credential.type !== "api_key") return false;
 				if (!(filter?.(entry.credential) ?? true)) return false;
+				if (!entitled(entry.index)) return false;
 				return this.accountLimit(provider, entry.index, options) === undefined;
 			});
 
@@ -1044,16 +1047,17 @@ export class CredentialSelector {
 	/**
 	 * Resolves an OAuth credential, trying credentials in priority order.
 	 *
-	 * Resolution ladder — a request in hand always beats "no API key":
+	 * Accounts not entitled to `options.modelId` (see {@link ModelEntitlements})
+	 * are never candidates. Among the rest, the resolution ladder — a request in
+	 * hand always beats "no API key":
 	 * 1. strict: unblocked credentials only, usage limits respected, plan
 	 *    filter enforced (when any account is confirmed eligible);
 	 * 2. plan-fitting last resort: same plan filter, but blocked/exhausted
 	 *    accounts are allowed (an explicit session pin first, then blocked
 	 *    candidates earliest-unblocking first) so the caller gets real
 	 *    usage-limit semantics from the wire instead of a missing key;
-	 * 3. unfiltered last resort: the plan filter matched nothing usable —
-	 *    skip it and try every account once; the server is the final arbiter
-	 *    of model access.
+	 * 3. plan-unfiltered last resort: the plan filter matched nothing usable —
+	 *    skip it and try every entitled account once.
 	 *
 	 * Returns both the API key bytes for outbound requests AND the refreshed
 	 * {@link OAuthCredential} so callers needing identity metadata (account id,
@@ -1076,8 +1080,12 @@ export class CredentialSelector {
 		);
 		// A session restriction drops every other account before limits, ranking,
 		// pins, and the fallback passes below, so none of them can route back to it
-		// or spend a usage read on it.
-		const allowed = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
+		// or spend a usage read on it. Accounts not entitled to the model are dropped
+		// the same way, so no relaxed pass can return them.
+		const entitled = this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds);
+		const allowed = stored.filter(
+			entry => entitled(entry.index) && this.#deps.affinity.allows(provider, sessionId, entry.credential),
+		);
 		// An account over a local limit is never selected, not even as a last resort.
 		const refusals = await Promise.all(
 			allowed.map(entry => this.accountRefusal(provider, entry.index, options, memo)),
@@ -1103,13 +1111,6 @@ export class CredentialSelector {
 		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
 		const planGate = strategy?.planGate?.(rankingContext);
 		const hasPlanRequirement = planGate !== undefined;
-		const accountIds = options?.accountIds?.length ? new Set(options.accountIds) : undefined;
-		const enforceAccounts =
-			accountIds !== undefined &&
-			credentials.some(({ credential }) => {
-				const accountKey = oauthAccountKey(credential);
-				return accountKey !== undefined && accountIds.has(accountKey);
-			});
 		const hasAccountPolicy = credentials.some(({ credential }) => {
 			const policy = this.#deps.policies.forCredential(provider, credential);
 			if (!policy) return false;
@@ -1482,16 +1483,11 @@ export class CredentialSelector {
 			}
 		}
 
-		const passes: Array<{
-			allowBlocked: boolean;
-			enforcePlanRequirement: boolean;
-			enforceAccounts: boolean;
-		}> = [
-			{ allowBlocked: false, enforcePlanRequirement, enforceAccounts },
-			{ allowBlocked: true, enforcePlanRequirement, enforceAccounts },
+		const passes: Array<{ allowBlocked: boolean; enforcePlanRequirement: boolean }> = [
+			{ allowBlocked: false, enforcePlanRequirement },
+			{ allowBlocked: true, enforcePlanRequirement },
 		];
-		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
-		if (enforceAccounts) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
+		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false });
 		// Blocked candidates rank earliest-unblock first, which would route a
 		// blocked explicit pin to an equally blocked sibling. Once the strict
 		// pass finds no unblocked account, the user's pin goes first.
@@ -1502,9 +1498,6 @@ export class CredentialSelector {
 		for (const pass of passes) {
 			for (const candidate of pass.allowBlocked ? lastResortCandidates : candidates) {
 				if (preflightFailures.has(candidate)) continue;
-				const candidateAccountKey = oauthAccountKey(candidate.selection.credential);
-				if (pass.enforceAccounts && (candidateAccountKey === undefined || !accountIds?.has(candidateAccountKey)))
-					continue;
 				const resolved = await this.tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
 					checkUsage,
 					allowBlocked: pass.allowBlocked,
@@ -1536,7 +1529,8 @@ export class CredentialSelector {
 	 * the request, so a blocked account reaches the provider and its own
 	 * usage-limit error surfaces. Otherwise (a preference): a blocked, exhausted,
 	 * or plan-ineligible account yields `undefined` so normal selection proceeds.
-	 * An account the session's restriction does not allow yields `undefined`.
+	 * An account the session's restriction does not allow, or one not entitled
+	 * to `options.modelId` (even when `exclusive`), yields `undefined`.
 	 * `options.forceRefresh` re-mints this credential's token first.
 	 *
 	 * @throws AIError.OAuthRefreshUnavailableError when `exclusive` and a retryable refresh failure left the account unusable.
@@ -1552,6 +1546,7 @@ export class CredentialSelector {
 		const credential = this.#deps.pool.credentials(provider)[index];
 		if (credential?.type !== "oauth" || !this.#deps.affinity.allows(provider, sessionId, credential))
 			return undefined;
+		if (!this.isEntitled(provider, index, options)) return undefined;
 		const refusal = await this.accountRefusal(provider, index, options, memo);
 		if (refusal) {
 			if (exclusive) {
@@ -1609,6 +1604,11 @@ export class CredentialSelector {
 			throw new AIError.OAuthRefreshUnavailableError(provider, transientRefreshFailure);
 		}
 		return resolved;
+	}
+
+	/** Whether a stored credential may serve `options.modelId` (see {@link ModelEntitlements}). */
+	isEntitled(provider: string, index: number, options?: AuthApiKeyOptions): boolean {
+		return this.#deps.entitlements.entitled(provider, options?.modelId, options?.accountIds)(index);
 	}
 
 	/** Whether a stored credential is free of local blocks for a request to `options.modelId`. */

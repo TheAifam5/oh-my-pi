@@ -22,6 +22,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { createSessionRestrictions, SessionAffinity, type SessionRestrictions } from "./auth/affinity";
 import { BlockStoreHealth, CredentialBlocks } from "./auth/blocks";
 import { KeyCascade, KeyOverrides } from "./auth/cascade";
+import { ModelEntitlements } from "./auth/entitlement";
 import { CredentialHealth } from "./auth/health";
 import { OAuthAccounts } from "./auth/oauth";
 import { AccountPolicies } from "./auth/policy";
@@ -76,6 +77,7 @@ interface AuthStorageModules {
 	resets: ResetCredits;
 	blocks: CredentialBlocks;
 	cache: CacheApi;
+	entitlements: ModelEntitlements;
 }
 
 /**
@@ -91,6 +93,7 @@ export class AuthStorage {
 	readonly #overrides: KeyOverrides;
 	readonly #policies: AccountPolicies;
 	readonly #restrictions: SessionRestrictions;
+	readonly #modelAccountAccess = new Map<string, ReadonlySet<string>>();
 	#modules: AuthStorageModules;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
@@ -141,6 +144,11 @@ export class AuthStorage {
 	/** Credential cache rows shared with broker clients (auth-broker server seam). */
 	get cache(): CacheApi {
 		return this.#modules.cache;
+	}
+
+	/** Register catalog account access for a model; an absent or empty list removes the restriction. */
+	setModelAccountAccess(provider: string, modelId: string, accountIds?: readonly string[]): void {
+		this.#modules.entitlements.noteAccountAccess(provider, modelId, accountIds ?? []);
 	}
 
 	/**
@@ -209,6 +217,7 @@ export class AuthStorage {
 		// override's `cacheVersion` separates its rows from other processes sharing the store.
 		const usageCache = new UsageCache(store, pool, provider => usage.providerFor(provider));
 		const blocks = new CredentialBlocks({ store, pool, health: blockHealth, usageCache, strategies });
+		const entitlements = new ModelEntitlements({ pool, blocks }, this.#modelAccountAccess);
 		const affinity = new SessionAffinity(store, pool, overrides, this.#restrictions, policies);
 		const usage = new UsageService({
 			store,
@@ -238,8 +247,9 @@ export class AuthStorage {
 			usage,
 			refresher,
 			strategies,
+			entitlements,
 		});
-		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies });
+		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies, entitlements });
 		const keys = new KeyCascade({
 			pool,
 			overrides,
@@ -267,10 +277,12 @@ export class AuthStorage {
 				refresher,
 				overrides,
 				strategies,
+				entitlements,
 			}),
 			limits,
 			resets: new ResetCredits({ store, pool, oauth, usage, usageCache, blocks }),
 			blocks,
+			entitlements,
 			cache: {
 				list: (prefix, limit) => store.listCacheRows?.(prefix, limit),
 				count: prefix => store.countCacheRows?.(prefix),

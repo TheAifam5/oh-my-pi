@@ -915,6 +915,21 @@ export function isCursorPlanAccountPolicyError(error: unknown, provider: string,
 	return "cause" in error && isCursorPlanAccountPolicyError(error.cause, provider, depth + 1);
 }
 
+const ORGANIZATION_OAUTH_DENIAL_PATTERN =
+	/\boauth_not_allowed_for_organization\b|\bOAuth authentication is currently not allowed for this organization\b/i;
+
+/** Whether an account-policy denial refuses the organization's OAuth access for every model. */
+export function isOrganizationOAuthDenial(error: unknown, depth = 0): boolean {
+	if (depth > 6) return false;
+	if (typeof error === "string") return ORGANIZATION_OAUTH_DENIAL_PATTERN.test(error);
+	if (!error || typeof error !== "object") return false;
+	for (const field of ["errorMessage", "message", "code"] as const) {
+		const value = field in error ? (error as Record<string, unknown>)[field] : undefined;
+		if (typeof value === "string" && ORGANIZATION_OAUTH_DENIAL_PATTERN.test(value)) return true;
+	}
+	return "cause" in error && isOrganizationOAuthDenial(error.cause, depth + 1);
+}
+
 /**
  * Strict-tool rejection: grammar too large, schema too complex, or structured
  * outputs unsupported by the model/endpoint.

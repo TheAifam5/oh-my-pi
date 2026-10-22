@@ -594,6 +594,8 @@ export interface ModelUsageHealthOptions {
 	/** Session asking; a restricted session's health covers only the accounts its restriction allows. */
 	sessionId?: string;
 	baseUrl?: string;
+	/** {@link AuthApiKeyOptions.accountIds} for `modelId`; absent, the list last resolved for it applies. */
+	accountIds?: readonly string[];
 	reserveFraction: number;
 	signal?: AbortSignal;
 }
@@ -602,7 +604,11 @@ export interface ModelUsageHealthOptions {
 export type AuthApiKeyOptions = {
 	baseUrl?: string;
 	modelId?: string;
-	/** {@link oauthAccountKey}s of accounts known to serve `modelId` from multi-account discovery; OAuth selection prefers them and tries other accounts only as a last resort. */
+	/**
+	 * {@link oauthAccountKey}s of accounts known to serve `modelId` from multi-account discovery. When
+	 * at least one stored OAuth account of the provider is listed, OAuth accounts not listed are never
+	 * selected for `modelId`; the list is remembered for later rotation and health reads of that model.
+	 */
 	accountIds?: readonly string[];
 	/**
 	 * Caller's cancel signal. Threaded into any broker-bound OAuth refresh so
@@ -891,6 +897,8 @@ export type MarkUsageLimitOptions = {
 	providerTimed?: boolean;
 	baseUrl?: string;
 	modelId?: string;
+	/** {@link AuthApiKeyOptions.accountIds} for `modelId`; absent, the list last resolved for it applies. */
+	accountIds?: readonly string[];
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
@@ -900,16 +908,31 @@ export type MarkUsageLimitOptions = {
 export type RotateCredentialOptions = {
 	error?: unknown;
 	modelId?: string;
+	/** {@link AuthApiKeyOptions.accountIds} for `modelId`; absent, the list last resolved for it applies. */
+	accountIds?: readonly string[];
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
 };
 
+/** Identify the credential a model-entitlement denial applies to. */
+export type RecordModelDenialOptions = {
+	modelId: string;
+	/** Failed credential row id; wins over `apiKey`, then the session's sticky credential. */
+	credentialId?: number;
+	/** Failed bearer or API key. */
+	apiKey?: string;
+	/** Exclusion lifetime; defaults to seven days. */
+	ttlMs?: number;
+};
+
 /**
  * Outcome of {@link LimitsApi.rotate}.
  *
- * `switched` is `true` when a usable same-type sibling credential is available,
- * so the caller's next resolve hands it out. `afterSiblingWait` is `true` when
+ * `switched` is `true` when a usable same-type sibling credential that is
+ * entitled to the request's model is available, so the caller's next resolve
+ * hands it out; `false` means no entitled account can serve the model now.
+ * `afterSiblingWait` is `true` when
  * no sibling was free at the failure but rotation slept out a sibling's short
  * block (e.g. a Cloud Code Assist capacity 429 that resets in under a second);
  * the freed credential may be one the caller already sent in this request, so
@@ -1656,9 +1679,10 @@ export interface LimitsApi {
 	/**
 	 * Marks the current session's credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.
-	 * Returns whether a sibling credential is available now; when none is, also
-	 * reports the earliest time a blocked sibling becomes available again so
-	 * callers can wait for the sibling instead of the provider's full window.
+	 * Returns whether a sibling credential entitled to `options.modelId` is
+	 * available now; when none is, also reports the earliest time a blocked
+	 * entitled sibling becomes available again so callers can wait for the
+	 * sibling instead of the provider's full window.
 	 */
 	markReached(
 		provider: string,
@@ -1680,9 +1704,13 @@ export interface LimitsApi {
 	 *   (temporary block via its own backoff — default plus server usage-report
 	 *   reset; sticky left intact so the next resolve re-ranks around the block).
 	 * - exact model-entitlement denial (Codex ChatGPT account or Cursor plan) →
-	 *   temporarily block only that requested model, then rotate.
-	 * - other account-scoped policy denial → temporarily block that account
-	 *   without marking its credential suspect, then rotate through siblings.
+	 *   record the account as not entitled to the requested model (see
+	 *   {@link LimitsApi.recordModelDenial}), temporarily block only that model,
+	 *   then rotate.
+	 * - other account-scoped policy denial → with a requested model and unless
+	 *   the organization refuses OAuth outright, record the same model
+	 *   entitlement denial; temporarily block that account without marking its
+	 *   credential suspect, then rotate through siblings.
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
@@ -1690,9 +1718,10 @@ export interface LimitsApi {
 	 * A session with an exclusive pin never switches: a usage-limit failure is
 	 * still marked, and the result is `{ switched: false }` without waiting.
 	 *
-	 * For usage-limit and account-policy failures with no free sibling, waits
-	 * (abortable via `options.signal`) when a sibling's block expires within a
-	 * few seconds, then reports `afterSiblingWait`.
+	 * `switched` counts only siblings entitled to `options.modelId`. For
+	 * usage-limit and account-policy failures with no free entitled sibling,
+	 * waits (abortable via `options.signal`) when such a sibling's block expires
+	 * within a few seconds, then reports `afterSiblingWait`.
 	 */
 	rotate(
 		provider: string,
@@ -1704,6 +1733,18 @@ export interface LimitsApi {
 		provider: string,
 		apiKey: string,
 		options?: InvalidateCredentialMatchingOptions,
+	): Promise<boolean>;
+	/**
+	 * Record that the failed credential is not entitled to `options.modelId`.
+	 * Until `options.ttlMs` (default seven days) elapses, no selection pass,
+	 * rotation, or health read hands that credential out for that model; other
+	 * models are unaffected. The record is persisted with the credential's
+	 * blocks. Returns false when no stored credential matches.
+	 */
+	recordModelDenial(
+		provider: string,
+		sessionId: string | undefined,
+		options: RecordModelDenialOptions,
 	): Promise<boolean>;
 }
 

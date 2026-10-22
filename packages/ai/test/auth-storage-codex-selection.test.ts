@@ -12,6 +12,7 @@ import {
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/registry/oauth/types";
 import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
@@ -2852,7 +2853,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-soon");
 	});
 
-	test("prefers discovered model accounts over a sticky Codex account, without filtering unmatched catalogs, but never over an exclusive pin", async () => {
+	test("routes a model only to discovered accounts over a sticky Codex account or an exclusive pin, without filtering unmatched catalogs", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.credentials.set("openai-codex", [
@@ -2875,12 +2876,12 @@ describe("AuthStorage codex oauth ranking", () => {
 
 		const pinnedSessionId = "daybreak-account-pinned";
 		expect(authStorage.sessions.pin("openai-codex", pinnedSessionId, firstAccount.credentialId)).toBe(true);
-		expect(
-			await authStorage.keys.get("openai-codex", pinnedSessionId, {
+		await expect(
+			authStorage.keys.get("openai-codex", pinnedSessionId, {
 				modelId: "gpt-daybreak-blue-latest",
 				accountIds: ["account-B"],
 			}),
-		).toBe("api-account-A");
+		).rejects.toBeInstanceOf(AIError.AccountUnavailableError);
 
 		const unmatchedSessionId = "daybreak-account-unmatched";
 		expect(authStorage.sessions.pin("openai-codex", unmatchedSessionId, firstAccount.credentialId, sticky)).toBe(
