@@ -28,13 +28,13 @@
 - Model hub pool rows show compact routing badges with full routing and refused-edit messages in a detail block
 - Model hub key hints page with `?` at narrow widths
 - `/account` key hints page with `?` at narrow widths, and its notices, detail values, and empty-page guidance wrap instead of being cut off
+- Model hub routing and group-name fields are real input fields in Tern, with undo and validation feedback
+- Unavailable model-pool members are shown as disabled and show their reason instead of attempting a switch
 
 ### Fixed
 
 - Native tool approvals in Tern now wait for the 500 ms arming delay
-- Model hub routing and group-name fields are real input fields in Tern, with undo and validation feedback
 - Long /account notices are no longer cut to one line in Tern
-- Unavailable model-pool members are shown as disabled and show their reason instead of attempting a switch
 - Clicking an account row in /account selects that account
 - /account keeps the selected field visible at narrow widths
 - Long advisor category and ownership lists scroll to the selection
