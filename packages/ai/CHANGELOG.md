@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Fixed Codex native-lane live-steering rejections ending turns with an error; replay once on a fresh connection and deliver rejected steering through the normal queue
 - Fixed model selection and credential rotation using accounts without model access, including immediately after catalog loading; account-specific model denials persist for seven days and remain excluded after quota resets
 - Fixed an Anthropic `404 not_found_error` for the requested model on one account ending the request instead of trying the provider's other accounts; the refusing account is excluded from that model only after another account serves it, and nothing is recorded when every account refuses
 - Fixed requests to a model limited to some accounts going to a blocked entitled account; when every entitled account is blocked, no request is sent and it fails as a usage limit naming the earliest unblock

@@ -2318,6 +2318,7 @@ class CodexStreamProcessor {
 	#steerConnection?: CodexWebSocketConnection;
 	/** A replaced attempt accepted steering its socket may still act on. */
 	#steerTainted = false;
+	#nativeLaneReplayed = false;
 
 	constructor(init: {
 		runtime: CodexStreamRuntime;
@@ -2928,6 +2929,17 @@ class CodexStreamProcessor {
 		// The generic provider-retry check treats every AbortError as transient.
 		if (error instanceof CodexSessionClosedError) return false;
 		this.#stopSteeringOnNativeLaneRejection(error);
+		if (error instanceof CodexProviderStreamError && error.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
+			const state = this.runtime.websocketState;
+			if (this.#nativeLaneReplayed || !state || this.options?.signal?.aborted) return false;
+			this.#nativeLaneReplayed = true;
+			this.runtime.resetAccumulators();
+			this.runtime.sawTerminalEvent = false;
+			resetOutputState(this.output);
+			this.firstTokenTime = undefined;
+			await this.#reopenWebSocketStream(state);
+			return true;
+		}
 		if (
 			error instanceof CodexSteerCommitError &&
 			this.runtime.websocketState &&

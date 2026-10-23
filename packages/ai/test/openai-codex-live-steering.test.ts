@@ -118,9 +118,14 @@ function messageFrames(itemId: string, text: string): Frame[] {
 }
 
 /** A source holding one steering message; records how the provider settled it. */
-function oneShotSteering(text: string): { source: LiveSteering; settled: () => "accepted" | "rejected" | undefined } {
+function oneShotSteering(text: string): {
+	source: LiveSteering;
+	settled: () => "accepted" | "rejected" | undefined;
+	deferred: UserMessage[];
+} {
 	let claimed = false;
 	let outcome: "accepted" | "rejected" | undefined;
+	const deferred: UserMessage[] = [];
 	const idle = (signal: AbortSignal) => {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		if (signal.aborted) resolve();
@@ -132,18 +137,20 @@ function oneShotSteering(text: string): { source: LiveSteering; settled: () => "
 		claim: async (): Promise<LiveSteerClaim | undefined> => {
 			if (claimed) return undefined;
 			claimed = true;
+			const message: UserMessage = { role: "user", content: text, timestamp: Date.now() };
 			return {
-				messages: [{ role: "user", content: text, timestamp: Date.now() }],
+				messages: [message],
 				accept: () => {
 					outcome = "accepted";
 				},
 				reject: () => {
 					outcome = "rejected";
+					deferred.push(message);
 				},
 			};
 		},
 	};
-	return { source, settled: () => outcome };
+	return { source, settled: () => outcome, deferred };
 }
 
 function options(
@@ -429,18 +436,26 @@ describe("codex live steering", () => {
 		expect(first.stopReason).toBe("stop");
 		expect(first.content).toEqual([expect.objectContaining({ type: "text", text: "Hi" })]);
 		expect(steering.settled()).toBe("rejected");
+		expect(steering.deferred).toHaveLength(1);
+		expect(ScriptedWebSocket.instances).toHaveLength(2);
+		expect(ScriptedWebSocket.instances[0]?.readyState).toBe(ScriptedWebSocket.CLOSED);
+		expect(creates()[1]).toEqual(creates()[0]);
+		expect(creates()[1]?.previous_response_id).toBeUndefined();
 
 		// The session stops steering: a later response is not steered again.
-		const steerMessage: UserMessage = { role: "user", content: "one more thing", timestamp: Date.now() };
+		const deferred = steering.deferred;
 		const next = oneShotSteering("and another");
 		await streamOpenAICodexResponses(
 			model,
-			{ systemPrompt: SYSTEM, messages: [user, first, steerMessage] },
+			{ systemPrompt: SYSTEM, messages: [user, first, ...deferred] },
 			options(state, next.source),
 		).result();
 		expect(next.settled()).toBeUndefined();
 		expect(steers()).toHaveLength(1);
 		expect(creates()).toHaveLength(3);
+		expect(creates()[2]?.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "one more thing" }] },
+		]);
 	});
 
 	it("keeps steering off for the session after the host replaces its Codex provider state", async () => {
@@ -490,7 +505,7 @@ describe("codex live steering", () => {
 		expect(await steerAttempted(model, state)).toBe(true);
 	});
 
-	it("leaves a native-lane rejection after streamed reasoning to the agent retry, which no longer steers", async () => {
+	it("recovers a native-lane rejection after streamed reasoning without failing the turn", async () => {
 		installSocket((frame, socket) => {
 			if (frame.type === "response.create" && creates().length === 1) {
 				// Reasoning streams before the steer goes out.
@@ -538,32 +553,55 @@ describe("codex live steering", () => {
 			{ systemPrompt: SYSTEM, messages: [user] },
 			options(state, steering.source),
 		).result();
-		// Replaying here would re-emit the streamed reasoning, so the provider
-		// surfaces a retryable rejection for the agent's same-model retry.
-		expect(first.stopReason).toBe("error");
-		expect(first.content).toEqual([expect.objectContaining({ type: "thinking", thinking: "Planning" })]);
-		expect(AIError.isCodexSteerRejection(first)).toBe(true);
-		expect(AIError.retriable(AIError.classifyMessage(first))).toBe(true);
+		expect(first.stopReason).toBe("stop");
+		expect(first.content).toEqual([expect.objectContaining({ type: "text", text: "Done" })]);
 		expect(steering.settled()).toBe("rejected");
-		expect(creates()).toHaveLength(1);
+		expect(creates()).toHaveLength(2);
 
-		// That retry drops the failed turn and carries the handed-back steer as
-		// ordinary input on a fresh chain; the session no longer steers.
 		const steerMessage: UserMessage = { role: "user", content: "one more thing", timestamp: Date.now() };
 		const next = oneShotSteering("and another");
 		const retry = await streamOpenAICodexResponses(
 			model,
-			{ systemPrompt: SYSTEM, messages: [user, steerMessage] },
+			{ systemPrompt: SYSTEM, messages: [user, first, steerMessage] },
 			options(state, next.source),
 		).result();
 		expect(retry.stopReason).toBe("stop");
 		expect(next.settled()).toBeUndefined();
 		expect(steers()).toHaveLength(1);
-		expect(creates()[1]?.previous_response_id).toBeUndefined();
-		expect(creates()[1]?.input).toEqual([
-			{ role: "user", content: [{ type: "input_text", text: "Hello" }] },
+		expect(creates()[2]?.input).toEqual([
 			{ role: "user", content: [{ type: "input_text", text: "one more thing" }] },
 		]);
+	});
+
+	it("ends with an error after a second native-lane rejection in the same turn", async () => {
+		installSocket((frame, socket) => {
+			if (frame.type === "response.create" && creates().length === 1) {
+				socket.emit({ type: "response.created", response: { id: "resp_1" } });
+				return;
+			}
+			socket.emit({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					code: "unsupported_native_inflight_message",
+					message: "The native turn lane rejected the input.",
+				},
+			});
+		});
+		const steering = oneShotSteering("one more thing");
+		const result = await streamOpenAICodexResponses(
+			createGpt6Model(),
+			{ systemPrompt: SYSTEM, messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
+			options(new Map(), steering.source),
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(AIError.isCodexSteerRejection(result)).toBe(true);
+		expect(steering.settled()).toBe("rejected");
+		expect(creates()).toHaveLength(2);
+		expect(steers()).toHaveLength(1);
+		expect(ScriptedWebSocket.instances).toHaveLength(2);
+		expect(ScriptedWebSocket.instances.every(socket => socket.readyState === ScriptedWebSocket.CLOSED)).toBe(true);
 	});
 });
 
