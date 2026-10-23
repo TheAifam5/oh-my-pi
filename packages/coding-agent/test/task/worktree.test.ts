@@ -108,6 +108,46 @@ describe("worktree isolation helpers", () => {
 		expect((error as Error).message).toContain("task.isolation.enabled: false");
 	});
 
+	it("reports the five largest untracked roots and leaves ignored build output outside the budget", async () => {
+		const repo = await createGitRepo();
+		await fs.writeFile(path.join(repo, ".gitignore"), "target/\n");
+		await runGit(repo, ["add", ".gitignore"]);
+		await runGit(repo, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"]);
+		await fs.mkdir(path.join(repo, "target"));
+		await fs.writeFile(path.join(repo, "target", "build.bin"), "");
+		await fs.truncate(path.join(repo, "target", "build.bin"), ISOLATION_BASELINE_MAX_CONTENT_BYTES + 1);
+		for (const [name, size] of [
+			[".fastembed_cache/a", 40],
+			[".fastembed_cache/b", 30],
+			["worktrees/page", 60],
+			["third", 50],
+			["fourth", 40],
+			["fifth", 30],
+			["sixth", 20],
+		] as const) {
+			await fs.mkdir(path.dirname(path.join(repo, name)), { recursive: true });
+			await fs.writeFile(path.join(repo, name), "x".repeat(size));
+		}
+		const error = await captureBaseline(repo, 100).catch((err: unknown) => err);
+		if (!(error instanceof IsolationBaselineTooLargeError)) throw new Error("Expected baseline refusal");
+		expect(error.contentBytes).toBe(270);
+		expect(error.largestUntracked).toEqual([
+			{ path: ".fastembed_cache/", bytes: 70 },
+			{ path: "worktrees/", bytes: 60 },
+			{ path: "third", bytes: 50 },
+			{ path: "fourth", bytes: 40 },
+			{ path: "fifth", bytes: 30 },
+		]);
+		expect(error.message).toContain('".fastembed_cache/" (70B)');
+		expect(error.message).not.toContain("target/");
+		expect(error.message).not.toContain("sixth");
+		expect(error.message).toContain("task.isolation.maxBaselineBytes");
+		const baseline = await captureBaseline(repo, 270);
+		expect(baseline.root.untracked).toContain(".fastembed_cache/a");
+		expect(baseline.root.untrackedPatch).toContain("x".repeat(40));
+		expect(baseline.root.untracked).not.toContain("target/build.bin");
+	});
+
 	// Regression: the staged and unstaged diffs were rendered in full before the
 	// #8939 gate ran, so a working tree whose index-vs-HEAD diff was enormous
 	// (a jj conflict commit exported to git materialises every side as a

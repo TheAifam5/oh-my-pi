@@ -188,7 +188,9 @@ With no argument, `/switch` opens the Alt+P session picker; `/model` still opens
 | Flag | Description |
 | --- | --- |
 | `--help`, `-h` | Show help for `omp` or a subcommand and exit. |
-| `--version`, `-v` | Print the installed version and exit. |
+| `--version`, `-v` | Print `omp/<package version>` on one line and exit. Add `--verbose` to include build identity. |
+
+`omp --version --verbose` prints `omp/18.12.6 (174d8192e6, 2026-10-22 20:49 UTC)` for compiled builds, with `dirty` after the commit when tracked files changed at build time. The stored build timestamp is UTC ISO; display precision is one minute. Source and package launches print `omp/18.12.6 (source)` in verbose mode without loading checkout metadata. Plain `--version` remains `omp/18.12.6`. The welcome version line includes build identity details; source checkouts also show their runtime-resolved commit there.
 
 ### Headless / print mode
 

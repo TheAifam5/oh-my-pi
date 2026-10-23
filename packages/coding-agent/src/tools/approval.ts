@@ -367,9 +367,17 @@ export function resolveApproval(
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
 	grants?: ApprovalGrantStore,
+	agentPolicies?: Record<string, unknown>,
 ): ResolvedApproval {
 	const decision = getToolDecision(tool, args);
 	const policyKey = decision.policyKey ?? tool.name;
+	const agentKey =
+		agentPolicies && Object.hasOwn(agentPolicies, policyKey)
+			? policyKey
+			: agentPolicies && Object.hasOwn(agentPolicies, tool.name)
+				? tool.name
+				: undefined;
+	const agentPolicy = agentKey === undefined ? undefined : normalizePolicy(agentPolicies?.[agentKey]);
 	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
 	const fallbackPolicy =
 		policyKey !== tool.name && userPolicy === undefined && Object.hasOwn(userConfig, tool.name)
@@ -411,6 +419,18 @@ export function resolveApproval(
 			override: decision.override,
 			source: "user",
 			...(combinedUserPolicyKey ? { policyKey: combinedUserPolicyKey } : {}),
+		};
+	}
+	if (agentPolicy === "allow" && decision.override && decision.policy === undefined) {
+		return { policy: "prompt", tier: decision.tier, override: true, source: "tool", reason: decision.reason };
+	}
+	if (agentPolicy !== undefined) {
+		return {
+			policy: agentPolicy,
+			tier: decision.tier,
+			override: true,
+			source: "user",
+			policyKey: agentKey,
 		};
 	}
 
@@ -753,7 +773,13 @@ export async function requestApproval(
 	ui: Pick<ExtensionUIContext, "select" | "approve">,
 	tool: ApprovalSubject,
 	args: unknown,
-	options: { reason?: string; appendix?: readonly string[]; sessionSubject?: string; grants?: boolean } = {},
+	options: {
+		reason?: string;
+		appendix?: readonly string[];
+		sessionSubject?: string;
+		grants?: boolean;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<ExtensionApprovalAnswer> {
 	const { reason, appendix = [], sessionSubject } = options;
 	const header = approvalHeader(tool, reason);
@@ -774,12 +800,15 @@ export async function requestApproval(
 			...(compactBlock ? [compactBlock] : []),
 			...appendix,
 		].join("\n");
-		const answer = await ui.approve({
+		const approvalPrompt = {
 			full,
 			compact,
 			...(session ? { session } : {}),
 			...(grants.length > 0 ? { grants } : {}),
-		});
+		};
+		const answer = options.signal
+			? await ui.approve(approvalPrompt, { signal: options.signal })
+			: await ui.approve(approvalPrompt);
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (typeof answer === "object" && answer !== null && grants.some(grant => grant.scope === answer.grant)) {
 			return { grant: answer.grant, always: answer.always === true };
@@ -787,7 +816,11 @@ export async function requestApproval(
 		return "deny";
 	}
 	const choices = { ...(session ? { session } : {}), ...(grants.length > 0 ? { grants } : {}) };
-	return approvalAnswerForChoice(choices, await ui.select(full, approvalChoiceLabels(choices)));
+	const labels = approvalChoiceLabels(choices);
+	const choice = options.signal
+		? await ui.select(full, labels, { signal: options.signal })
+		: await ui.select(full, labels);
+	return approvalAnswerForChoice(choices, choice);
 }
 
 /** The approve-this-call-only label: "Approve", or "Approve Once" beside grants that remember more. */

@@ -22,6 +22,7 @@ import {
 	SessionManager,
 } from "../session/session-manager";
 import type { EventBus } from "../utils/event-bus";
+import { discoverAgents } from "./discovery";
 import {
 	attachIrcWakeTurnMonitor,
 	compactionThresholdSettings,
@@ -222,6 +223,15 @@ export function createPersistedSubagentReviverFactory(
 			// Subscribe before minting proxies so a manager change during startup is replayed on bind.
 			const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
+			const currentDefinition = init.agent
+				? (
+						await discoverAgents(
+							ctx.session.sessionManager.getCwd(),
+							undefined,
+							ctx.session.effectiveExtensionRoots,
+						)
+					).agents.find(agent => agent.name === init.agent)
+				: undefined;
 
 			let session: AgentSession;
 			try {
@@ -256,6 +266,11 @@ export function createPersistedSubagentReviverFactory(
 						init.agent.trim().toLowerCase() !== SUB_AGENT_RULE_NAME
 							? init.agent
 							: ref.displayName,
+					agentSource:
+						(init.agentSource === "bundled" || init.agentSource === "user") &&
+						(currentDefinition?.source === "bundled" || currentDefinition?.source === "user")
+							? init.agentSource
+							: "project",
 					parentTaskPrefix: ref.id,
 					asyncJobManager: ctx.session.asyncJobManager,
 					parentAgentId: ref.parentId,

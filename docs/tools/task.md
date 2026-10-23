@@ -30,6 +30,14 @@
   - `packages/coding-agent/src/sdk.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
   - `docs/task-agent-discovery.md` — deeper discovery and precedence notes.
 
+## Tool approvals
+
+Headless children relay required tool approvals to the root session's interactive approval UI, including nested task agents. Requests queue and identify the requesting agent and tool with sanitized argument previews. Each approval covers one call only. Denial, cancellation, child abort, relay failure, missing root UI, and expiry of `task.approvalRelayTimeoutMs` (default five minutes) refuse the tool call.
+
+Trusted `task.agentApproval` maps exact agent definition names to exact tool/device names and `allow`, `deny`, or `prompt` policies. A matching allow skips ordinary prompts for that definition only; denies and critical safety gates remain enforced. Global config, trusted directory layers, config overlays, and runtime settings may supply it. Project settings are ignored with a warning; agent frontmatter and markdown cannot grant permission. Both settings are exposed under Tasks in `/settings`; the policy record accepts JSON. See [approval mode](../approval-mode.md#subagents).
+
+Per-agent allow grants apply only to bundled or user-sourced definitions. Project definitions, including same-name shadows, and definitions without verified provenance cannot inherit allow grants; project shadows log a warning once per session. Deny and prompt entries still apply.
+
 ## Inputs
 
 The wire schema is shape-swapped by `task.batch` (default on). One unit of work is `{ name?, agent?, task, solutionSpace, effort?, outputSchema?, schemaMode?, tools?, isolated? }`. `isolated` exists only when `task.isolation.enabled` is true **and plan mode is disabled**; `effort` requires `task.enableEffort=true` (default off), and `tools` requires `eval.tools.enabled` (default on).
@@ -96,6 +104,12 @@ Artifacts and side channels:
 - A subagent's own children are dot-qualified (`<id>.<child>`); `agent://<id>.<child>` reads that nested output. A slash path is always JSON extraction: `agent://<id>/<key>/<index>/…` extracts that value from a JSON output (e.g. `agent://<id>.<child>/reports/0/data`).
 - Each subagent gets `<id>.jsonl` session history when the parent persists artifacts; `history://<id>` renders it as a concise transcript (works for live and parked agents).
 - Isolated patch mode writes `<id>.patch` before merge; nested changes write `<id>.nested-<n>-<path>.patch` files in both merge modes.
+
+## Prompt inheritance
+
+Ordinary Task children inherit rules filtered by the child's model, skills, non-`AGENTS.md` context files, and the workspace tree. They also inherit the discovered user agent directory's `AGENTS.md` when `task.inheritUserAgentsMd` is on (boolean, default `true`; an absent setting uses the default). The user agent directory follows the active profile. Setting it to `false` excludes that file; project and directory `AGENTS.md` files remain excluded in either mode. Put model-specific guidance in `models:`-scoped rules.
+
+`AGENTS.override.md` files remain inherited as non-`AGENTS.md` context files, independently of this setting.
 
 ## Flow
 1. `TaskTool.create(...)` discovers agents through a process-level memo keyed by resolved cwd and effective extension roots (`discoverAgentsForCreate`). `refreshAgentDiscovery(...)` replaces the matching description snapshot after explicit reloads.

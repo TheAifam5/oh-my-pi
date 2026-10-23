@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added `task.inheritUserAgentsMd` (default on) and a /settings control so Task children inherit user-level `AGENTS.md` while project and directory `AGENTS.md` stay excluded.
+- Added configurable isolated-task baseline limits through `task.isolation.maxBaselineBytes` and `/settings`
+- Added queued root approval prompts for headless task subagents and vibe workers, including nested requests, cancellation, and timeout handling
+- Added trusted per-agent tool approval policies with definition-provenance protection and preserved deny/critical-safety enforcement
+- Added embedded commit, tracked-change status, and UTC build time to standalone binaries, `--version --verbose`, welcome headers, and session entry runtime identities; plain `--version` output is unchanged
 - Added opt-in advisor quota reserves (`advisor.budget.reservePct` and `whenReserved`), per-advisor WATCHDOG overrides, fallback or skip behavior, masked reserve notices, and /settings controls without restricting main sessions or subagents
 - Added user-owned directory settings layers under the active profile, canonical ancestor resolution, collision-safe path markers, live reload, per-key directory writes, provenance, and `omp config dirs` inspection
 - Added /settings scope selection for Global, the current directory and existing ancestor layers, with provenance badges and shadow warnings; `Ctrl+S` (`tui.settings.cycleScope`) cycles the scope
@@ -55,6 +60,8 @@
 
 ### Fixed
 
+- Improved oversized isolation-baseline errors with the largest untracked paths and actionable cache-ignore guidance
+- Fixed model hub pool edits accepting an untrusted account name in a new routing field when it was already stored only in account order or drain
 - Fixed model hub pool writes accepting untrusted account order or drain names; refused edits now report an error without changing the global config
 - Fixed the model hub's account order and drain editors offering account names defined only in project settings and writing them into the global pool routing; they now offer only names from settings layers other than the project
 - Fixed main turns and advisors falling back to another model when Anthropic answered a `404` for the model on one account; they now try the provider's other accounts first

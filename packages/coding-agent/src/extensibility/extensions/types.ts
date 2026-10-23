@@ -8,6 +8,7 @@
  * - Interact with the user via UI primitives
  */
 
+import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	type ExtensionUiComponent,
 	type ExtensionUiComponentFactory,
@@ -568,6 +569,8 @@ export interface ExtensionAgentIdentity {
 	 * without a definition (such as `/tan` clones) report `"sub"`.
 	 */
 	name: string;
+	/** Definition provenance; absent when the host did not resolve a definition. */
+	definitionSource?: AgentSource;
 	/** Task-tool nesting depth: 0 for a top-level session and for subagents not spawned by `task`. */
 	depth: number;
 	/** Registry id of the spawning agent; absent for a top-level session. */

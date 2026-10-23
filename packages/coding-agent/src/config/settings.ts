@@ -757,6 +757,13 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 	const project = policy.source === "project";
 	const restricted = project && !policy.allowProjectMetered;
 	let result = layer;
+	if (project && getByPath(layer, ["task", "agentApproval"]) !== undefined) {
+		warn(
+			"task.agentApproval",
+			"is read from trusted global, directory, overlay, and runtime settings only; ignored in project settings",
+		);
+		result = withLayerValue(result, ["task", "agentApproval"], undefined);
+	}
 	const accountPolicies = project ? getByPath(layer, cfgAuthAccountPolicies.segments) : undefined;
 	if (Array.isArray(accountPolicies)) {
 		const lower = policy.lower ? getByPath(policy.lower, cfgAuthAccountPolicies.segments) : undefined;

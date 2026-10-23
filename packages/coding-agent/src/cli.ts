@@ -29,6 +29,7 @@ import {
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import { formatVersion, getBuildIdentity } from "./build-identity";
 import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
@@ -529,7 +530,9 @@ export async function runCli(argv: string[]): Promise<void> {
 		// keeps the TUI graph out of worker, subcommand, help, and version launches.
 		// Loading it statically would erase the measured cold-start improvement.
 		const { beginStartupComposer, stopPendingStartupComposer } = await import("./modes/startup-composer");
-		beginStartupComposer({ version: VERSION });
+		beginStartupComposer({
+			version: formatVersion({ version: VERSION, ...getBuildIdentity() }).slice("omp/".length),
+		});
 		stopStartupComposer = stopPendingStartupComposer;
 	}
 
@@ -563,7 +566,15 @@ export async function runCli(argv: string[]): Promise<void> {
 			return;
 		}
 		runningCommand = resolved.argv[0];
-		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
+		await run({
+			bin: APP_NAME,
+			version: resolvedArgv.includes("--verbose")
+				? formatVersion({ version: VERSION, ...getBuildIdentity() }).slice("omp/".length)
+				: VERSION,
+			argv: resolved.argv,
+			commands,
+			metadataHelp: showHelp,
+		});
 	} finally {
 		stopStartupComposer?.();
 	}

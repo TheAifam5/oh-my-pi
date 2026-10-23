@@ -1,7 +1,11 @@
 #!/usr/bin/env bun
+/**
+ * OMP_BUILD_OUTDIR selects the binary output directory; defaults to the package's dist directory.
+ */
 
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { captureBuildIdentity } from "./build-identity";
 import { compileCodingAgent } from "./compile-binary";
 
 const packageDir = path.join(import.meta.dir, "..");
@@ -75,7 +79,8 @@ async function main(): Promise<void> {
 		(!crossBuild || crossBuild.platform === "darwin") &&
 		Bun.env.BUN_NO_CODESIGN_MACHO_BINARY !== "1";
 	const outName = crossBuild ? `omp-${crossBuild.id}` : "omp";
-	const outputPath = path.join(packageDir, "dist", outName);
+	const outputPath = path.join(path.resolve(Bun.env.OMP_BUILD_OUTDIR || path.join(packageDir, "dist")), outName);
+	const buildIdentity = await captureBuildIdentity(repoRoot);
 	// Generate inside the try so the finally always restores the empty checked-in
 	// placeholders (stats client archive, docs index) even on failure.
 	try {
@@ -87,6 +92,7 @@ async function main(): Promise<void> {
 		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:tool-views"]);
 		await compileCodingAgent({
 			repoRoot,
+			buildIdentity,
 			entrypoint: path.join(packageDir, "src", "cli.ts"),
 			outfile: outputPath,
 			transformersVersion,

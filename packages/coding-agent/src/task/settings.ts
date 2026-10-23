@@ -21,6 +21,53 @@ const EMPTY_AGENT_SOFT_REQUEST_BUDGET: Record<string, number | null> = {};
 
 const DEFAULT_AGENT_MODEL_OVERRIDES: Record<string, string | string[]> = {};
 
+export const cfgTaskAgentApproval = register({
+	id: "task.agentApproval",
+	type: "record",
+	default: {} as Record<string, Record<string, "allow" | "deny" | "prompt">>,
+	validate: value => {
+		if (value === undefined || value === null) return;
+		if (
+			!isRecord(value) ||
+			Object.values(value).some(
+				policies =>
+					!isRecord(policies) ||
+					Object.values(policies).some(policy => policy !== "allow" && policy !== "deny" && policy !== "prompt"),
+			)
+		) {
+			throw new Error("Invalid task.agentApproval: expected agent names mapped to tool approval policies.");
+		}
+	},
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Per-Agent Tool Approval",
+		description: "JSON map of agent definition names to exact tool approval policies; denies remain enforced",
+	},
+});
+
+export const cfgTaskApprovalRelayTimeoutMs = register({
+	id: "task.approvalRelayTimeoutMs",
+	type: "number",
+	default: 300000,
+	validate: value => {
+		if (value === undefined || value === null) return;
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0 || value > 2147483647) {
+			throw new Error("Invalid task.approvalRelayTimeoutMs: expected a positive timer-safe integer.");
+		}
+	},
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Approval Relay Timeout",
+		description: "Maximum wait for a parent UI approval, including queue time (milliseconds)",
+		options: [
+			{ value: "60000", label: "1 minute" },
+			{ value: "300000", label: "5 minutes" },
+			{ value: "900000", label: "15 minutes" },
+		],
+	},
+});
 // Delegation. Task and isolation settings declare `protocolDefault`: protocol hosts get neutral
 // defaults instead of the local user's interactive preferences.
 export const cfgTaskIsolationEnabled = register({
@@ -33,6 +80,32 @@ export const cfgTaskIsolationEnabled = register({
 		group: "Isolation",
 		label: "Allow Isolated Subagents",
 		description: "Allow per-task isolation with `isolated: true`; tasks without it run in the shared checkout",
+	},
+});
+
+export const cfgTaskIsolationMaxBaselineBytes = register({
+	id: "task.isolation.maxBaselineBytes",
+	protocolDefault: ["rpc", "acp"],
+	type: "number",
+	default: 1024 * 1024 * 1024,
+	validate: value => {
+		if (value === undefined || value === null) return;
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+			throw new Error("Invalid task.isolation.maxBaselineBytes: expected a positive safe integer byte count.");
+		}
+	},
+	ui: {
+		tab: "tasks",
+		group: "Isolation",
+		label: "Isolation Baseline Limit",
+		description: "Maximum buffered uncommitted content per repository, in bytes; larger limits use more memory",
+		options: [
+			{ value: "268435456", label: "256 MiB" },
+			{ value: "536870912", label: "512 MiB" },
+			{ value: "1073741824", label: "1 GiB" },
+			{ value: "2147483648", label: "2 GiB" },
+			{ value: "4294967296", label: "4 GiB" },
+		],
 	},
 });
 
@@ -249,6 +322,18 @@ export const cfgTaskBatch = register({
 		label: "Batch Task Calls",
 		description:
 			"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+	},
+});
+
+export const cfgTaskInheritUserAgentsMd = register({
+	id: "task.inheritUserAgentsMd",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Inherit User AGENTS.md",
+		description: "Include the user agent directory's AGENTS.md in subagents; project AGENTS.md files stay excluded",
 	},
 });
 

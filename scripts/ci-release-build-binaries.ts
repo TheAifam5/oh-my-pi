@@ -3,6 +3,8 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { captureBuildIdentity } from "../packages/coding-agent/scripts/build-identity";
+import type { BuildIdentity } from "../packages/coding-agent/src/build-identity";
 import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
 
 interface BinaryTarget {
@@ -122,7 +124,7 @@ async function runCommand(command: string[], cwd: string): Promise<void> {
 	}
 }
 
-async function buildBinary(target: BinaryTarget): Promise<void> {
+async function buildBinary(target: BinaryTarget, buildIdentity: BuildIdentity | undefined): Promise<void> {
 	console.log(`Building ${target.outfile}...`);
 	if (isDryRun) {
 		console.log(
@@ -133,6 +135,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 
 	await compileCodingAgent({
 		repoRoot,
+		buildIdentity,
 		entrypoint,
 		outfile: path.join(repoRoot, target.outfile),
 		transformersVersion,
@@ -193,13 +196,14 @@ async function main(): Promise<void> {
 		throw new Error("No release targets selected.");
 	}
 
+	const buildIdentity = isDryRun ? undefined : await captureBuildIdentity(repoRoot);
 	await fs.mkdir(binariesDir, { recursive: true });
 	// Generate inside the try so resetArtifacts() always restores the empty
 	// checked-in placeholders, even if a generate or build step throws.
 	try {
 		await generateBundle();
 		for (const target of selectedTargets) {
-			await buildBinary(target);
+			await buildBinary(target, buildIdentity);
 		}
 	} finally {
 		await resetArtifacts();

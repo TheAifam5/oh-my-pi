@@ -40,6 +40,7 @@ import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { ApprovalRelayHost } from "../../src/task/approval-relay";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -155,6 +156,7 @@ async function createPersistedSession(
 		tools?: string[];
 		readOnly?: boolean;
 		agent?: string;
+		agentSource?: "bundled" | "user" | "project";
 		isolated?: boolean;
 		retryFallback?: RetryFallbackRole;
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
@@ -173,6 +175,7 @@ async function createPersistedSession(
 		advisor,
 		readOnly: contract?.readOnly,
 		agent: contract?.agent,
+		agentSource: contract?.agentSource,
 		isolated: contract?.isolated,
 		retryFallback: contract?.retryFallback,
 		...(contract?.compactionThreshold !== undefined
@@ -238,6 +241,7 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 		settings: owner.settings ?? Settings.isolated(),
 		enableLsp: true,
 		eventBus,
+		subagentEventBus: eventBus,
 	});
 }
 
@@ -248,6 +252,63 @@ afterEach(async () => {
 });
 
 describe("persisted subagent revival", () => {
+	for (const { originalSource, policy } of [
+		{ originalSource: "bundled", policy: "allow" },
+		{ originalSource: "bundled", policy: "prompt" },
+		{ originalSource: "project", policy: "allow" },
+		{ originalSource: undefined, policy: "allow" },
+	] as const) {
+		it(`cold revival ${originalSource ?? "legacy"} provenance with ${policy} relays or honors a trusted agent allow`, async () => {
+			const cwd = makeTempDir("@pi-revive-approval-");
+			const marker = path.join(cwd, "approved");
+			const sessionFile = await createPersistedSession(cwd, false, undefined, undefined, {
+				agent: "task",
+				agentSource: originalSource,
+				tools: ["bash"],
+			});
+			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			authStorage.keys.setRuntime("anthropic", "fixture-key");
+			const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+			const bus = new EventBus();
+			let prompts = 0;
+			const host = new ApprovalRelayHost(bus, () => ({
+				select: async () => undefined,
+				approve: async () => {
+					prompts++;
+					return originalSource === "bundled" ? ("once" as const) : ("deny" as const);
+				},
+			}));
+			const settings = Settings.isolated({
+				"tools.approval": { bash: "prompt" },
+				"task.agentApproval": { task: { bash: policy } },
+				"bash.autoBackground.enabled": false,
+			});
+			const ref = AgentRegistry.global().register(createRef(sessionFile));
+			const reviver = await createFactory(cwd, bus, { authStorage, modelRegistry, settings })(ref);
+			if (!reviver) throw new Error("Missing reviver");
+			let revived: AgentSession | undefined;
+			try {
+				revived = await reviver(ref);
+				const bash = revived.getToolByName("bash");
+				if (!bash) throw new Error("Missing revived bash tool");
+				const execution = bash.execute("approval", { command: `printf approved > ${marker}` });
+				if (originalSource === "bundled") {
+					await execution;
+					expect(await Bun.file(marker).text()).toBe("approved");
+					expect(prompts).toBe(policy === "prompt" ? 1 : 0);
+				} else {
+					await expect(execution).rejects.toThrow("denied by user");
+					expect(await Bun.file(marker).exists()).toBe(false);
+					expect(prompts).toBe(1);
+				}
+			} finally {
+				host.dispose();
+				await revived?.dispose();
+				authStorage.close();
+			}
+		});
+	}
+
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);

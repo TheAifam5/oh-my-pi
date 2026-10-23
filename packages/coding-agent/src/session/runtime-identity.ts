@@ -1,23 +1,21 @@
-/**
- * Identity of the omp build running in this process, stamped into session files so a
- * transcript records which code produced each entry.
- *
- * Installed builds (compiled binary, package install) record only their version. A source
- * checkout records the commit, branch, and a hash of its uncommitted diff, because its
- * version string stays the same across every unreleased commit and local edit.
- */
+/** Identity of the running build, recorded on each session entry. */
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { $env, isCompiledBinary, isRecord, logger, VERSION } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "./session-entries";
+import { formatBuildTime, getBuildIdentity } from "../build-identity";
 
 export interface RuntimeIdentity {
 	/** omp package version. */
 	version: string;
-	/** Source checkout commit; absent for installed builds. */
+	/** Checkout commit, resolved at build time for standalone executables. */
 	commit?: string;
 	/** Source checkout branch; absent on a detached HEAD. */
 	branch?: string;
+	/** Whether tracked files changed at build time or in the source checkout. */
+	dirty?: boolean;
+	/** UTC ISO build timestamp; absent in source and older installed builds. */
+	buildTime?: string;
 	/**
 	 * Hash of the checkout's uncommitted tracked changes (`git diff HEAD`); absent when clean,
 	 * `unknown` when the diff could not be read (too large) or has not been read yet.
@@ -54,6 +52,7 @@ async function readUncommittedDiff(repo: VcsGitRepo, identity: RuntimeIdentity):
 	current = {
 		...identity,
 		diff: patch === null ? UNKNOWN_DIFF : patch ? Bun.hash(patch).toString(16).padStart(16, "0") : undefined,
+		dirty: patch === null ? undefined : patch.length > 0,
 	};
 }
 
@@ -64,7 +63,7 @@ async function readUncommittedDiff(repo: VcsGitRepo, identity: RuntimeIdentity):
 function resolveRuntimeIdentity(): RuntimeIdentity {
 	if (current) return current;
 	const label = $env.OMP_BUILD_LABEL?.replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_LENGTH);
-	current = { version: VERSION, label: label || undefined };
+	current = { version: VERSION, ...getBuildIdentity(), label: label || undefined };
 	try {
 		const repo = findSourceCheckout();
 		const head = repo?.headSync();
@@ -103,11 +102,17 @@ export function sameRuntimeIdentity(
 		a.commit === b.commit &&
 		a.branch === b.branch &&
 		(a.diff === b.diff || a.diff === UNKNOWN_DIFF || b.diff === UNKNOWN_DIFF) &&
+		(a.dirty === undefined ||
+			b.dirty === undefined ||
+			a.dirty === b.dirty ||
+			a.diff === UNKNOWN_DIFF ||
+			b.diff === UNKNOWN_DIFF) &&
+		a.buildTime === b.buildTime &&
 		a.label === b.label
 	);
 }
 
-const OPTIONAL_FIELDS = ["commit", "branch", "diff", "label"] as const;
+const OPTIONAL_FIELDS = ["commit", "branch", "diff", "label", "buildTime"] as const;
 
 /** Stamps are read back from session files without validation; a malformed one counts as unstamped. */
 function stampOf(entry: SessionEntry): RuntimeIdentity | null {
@@ -116,6 +121,7 @@ function stampOf(entry: SessionEntry): RuntimeIdentity | null {
 	for (const field of OPTIONAL_FIELDS) {
 		if (runtime[field] !== undefined && typeof runtime[field] !== "string") return null;
 	}
+	if (runtime.dirty !== undefined && typeof runtime.dirty !== "boolean") return null;
 	return runtime as unknown as RuntimeIdentity;
 }
 
@@ -141,6 +147,8 @@ export function formatRuntimeIdentity(identity: RuntimeIdentity | null | undefin
 	let text = identity.version;
 	if (identity.commit) text += ` ${identity.branch ? `${identity.branch}@` : ""}${identity.commit.slice(0, 10)}`;
 	if (identity.diff) text += ` +diff ${identity.diff.slice(0, 8)}`;
+	if (identity.dirty) text += " dirty";
+	if (identity.buildTime) text += ` ${formatBuildTime(identity.buildTime)}`;
 	if (identity.label) text += ` "${identity.label}"`;
 	return text;
 }

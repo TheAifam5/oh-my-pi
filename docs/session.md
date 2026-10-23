@@ -111,6 +111,12 @@ All non-header entries include:
 
 `parentId` can be `null` for a root entry (first append, or after `resetLeaf()`). Generated entry ids are normally eight hexadecimal characters, with a full Snowflake id as the collision-exhaustion fallback; consumers must not assume a fixed width.
 
+### Entry runtime identity and `/session` builds
+
+New entries carry a `runtime` stamp identifying their writer. `/session` lists these builds in entry order, collapsing consecutive matching identities. Entries copied by branching or collaboration retain their original stamps; older entries without a stamp appear as unknown.
+
+The stamp includes the package `version` and optional `commit`, `branch`, `diff`, `dirty`, `buildTime`, and `label`. Compiled executables embed the short Git commit, tracked-change `dirty` flag, and UTC ISO `buildTime` at build time. If Git metadata is unavailable, the commit is `unknown` and the dirty flag may be absent. Source checkouts resolve commit and branch at runtime and hash their tracked diff; they have no build timestamp. `OMP_BUILD_LABEL` adds a one-line label. Readers accept stamps without the newer fields.
+
 ## Entry Taxonomy
 
 `SessionEntry` is the union of:

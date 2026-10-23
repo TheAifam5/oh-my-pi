@@ -283,7 +283,7 @@ import { AgentOutputManager } from "./task/output-manager";
 import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency";
 import { sessionDelegationBias } from "./task/prompt-policy";
 import { isScoutSpawnable } from "./task/spawn-policy";
-import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentSource, StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -448,7 +448,14 @@ import {
 	cfgSnapcompactToolResults,
 	cfgWorkspaceAdditionalDirectories,
 } from "./session/context-settings";
-import { cfgTaskBatch, cfgTaskDisabledAgents, cfgTaskEager, cfgTaskMaxConcurrency } from "./task/settings";
+import {
+	cfgTaskApprovalRelayTimeoutMs,
+	cfgTaskBatch,
+	cfgTaskDisabledAgents,
+	cfgTaskEager,
+	cfgTaskMaxConcurrency,
+} from "./task/settings";
+import { ApprovalRelayHost, relayApproval } from "./task/approval-relay";
 
 /** Agent-level tool-call switches, snapshotted by the agent loop per prompt run. */
 const cfgToolCallSwitches = combine({
@@ -888,6 +895,8 @@ export interface CreateAgentSessionOptions {
 	 * "main" for a top-level session / "sub" for a subagent.
 	 */
 	agentName?: string;
+	/** Provenance of the resolved definition; project definitions cannot inherit per-agent allow grants. */
+	agentSource?: AgentSource;
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
 	/**
@@ -3833,11 +3842,29 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				kind: isSubagentSession ? "sub" : "main",
 				id: resolvedAgentId,
 				name: resolvedAgentName,
+				...(options.agentSource ? { definitionSource: options.agentSource } : {}),
 				depth: taskDepth,
 				...(options.parentAgentId ? { parentId: options.parentAgentId } : {}),
 			}),
 			createAnnotationsAPI,
 		);
+		if (!isSubagentSession) {
+			const approvalHost = new ApprovalRelayHost(subagentEventBus, () =>
+				extensionRunner.hasUI() ? extensionRunner.getUIContext() : undefined,
+			);
+			disposeCallbacks.add(() => approvalHost.dispose());
+		} else {
+			extensionRunner.approvalRelay = (tool, args, signal, reason, identity = extensionRunner.agentIdentity) =>
+				relayApproval(
+					subagentEventBus,
+					identity,
+					tool,
+					args,
+					cfgTaskApprovalRelayTimeoutMs.get(settings),
+					signal,
+					reason,
+				);
+		}
 		// A dialog waits for the user, not the agent: the session lets the display sleep while one is open.
 		const trackUserWait: UserWaitTracker = dialog => (hasSession ? session.waitForUser(dialog) : dialog());
 		extensionRunner.setUserWaitTracker(trackUserWait);

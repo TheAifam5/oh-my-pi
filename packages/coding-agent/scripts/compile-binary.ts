@@ -2,6 +2,8 @@
 // absent on cross-compiling release runners.
 import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
 import { embeddedAddonFiles, type NativeEmbedTarget } from "../../natives/scripts/embed-native";
+import type { BuildIdentity } from "../src/build-identity";
+import { captureBuildIdentity } from "./build-identity";
 import { buildDocsIndexPayload } from "./generate-docs-index";
 import { createJsonParsePlugin } from "./json-parse-plugin";
 import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
@@ -17,6 +19,8 @@ export interface CodingAgentCompileOptions {
 	readonly entrypoint: string;
 	/** Absolute standalone executable output path. */
 	readonly outfile: string;
+	/** Checkout identity captured before build-generated tracked artifacts change. */
+	readonly buildIdentity?: BuildIdentity;
 	/** Concrete Transformers.js version baked into the tiny-model worker. */
 	readonly transformersVersion: string;
 	/**
@@ -51,6 +55,9 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			files: options.native ? await embeddedAddonFiles(options.native) : {},
 			define: {
 				"process.env.PI_COMPILED": JSON.stringify("true"),
+				__OMP_BUILD_IDENTITY__: JSON.stringify(
+					options.buildIdentity ?? (await captureBuildIdentity(options.repoRoot)),
+				),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),
 			},

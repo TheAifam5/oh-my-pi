@@ -4,6 +4,7 @@ import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import { $ } from "bun";
 import { resolveCrossBuild } from "../packages/coding-agent/scripts/build-binary";
 import { compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
+import { captureBuildIdentity } from "../packages/coding-agent/scripts/build-identity";
 
 const repoRoot = path.join(import.meta.dir, "..");
 
@@ -92,6 +93,41 @@ it("runs code behind a lazy import() from a split chunk of the compiled binary",
 	expect(result.exitCode).toBe(0);
 	expect(result.text().trim()).toBe("lazy chunk");
 }, 30_000);
+
+it("embeds the captured checkout identity in compiled version output", async () => {
+	using temp = TempDir.createSync("@omp-build-identity-");
+	const entrypoint = temp.join("entry.ts");
+	const outfile = temp.join(process.platform === "win32" ? "probe.exe" : "probe");
+	const identityModule = path.join(repoRoot, "packages/coding-agent/src/build-identity.ts");
+	await Bun.write(
+		entrypoint,
+		`import { formatVersion, getBuildIdentity } from ${JSON.stringify(identityModule)};\n` +
+			`process.stdout.write(formatVersion({ version: "18.12.6", ...getBuildIdentity() }) + "\\n");\n`,
+	);
+	await compileCodingAgent({
+		repoRoot: temp.path(),
+		entrypoint,
+		outfile,
+		transformersVersion: "unused",
+		native: null,
+		buildIdentity: {
+			commit: "174d8192e6",
+			dirty: false,
+			buildTime: "2026-10-22T20:49:38.123Z",
+		},
+	});
+	const result = await $`${outfile}`.quiet().nothrow();
+	expect(result.exitCode).toBe(0);
+	expect(result.text()).toBe("omp/18.12.6 (174d8192e6, 2026-10-22 20:49 UTC)\n");
+}, 30_000);
+
+it("retains a UTC build timestamp when Git metadata is unavailable", async () => {
+	using temp = TempDir.createSync("@omp-no-build-repo-");
+	const identity = await captureBuildIdentity(temp.path());
+	expect(identity.commit).toBe("unknown");
+	expect(identity.dirty).toBeUndefined();
+	expect(new Date(identity.buildTime).toISOString()).toBe(identity.buildTime);
+});
 describe("macOS release binary entitlements", () => {
 	it("allows Xcode MCP automation through Apple Events", async () => {
 		const entitlements = await Bun.file(path.join(repoRoot, "scripts/macos-entitlements.plist")).text();

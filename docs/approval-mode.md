@@ -198,4 +198,21 @@ For `delete`, `move`, and `edit` patches containing deletion or rename operation
 
 ## Subagents
 
-Subagents run headless with `tools.approvalMode: yolo` so ordinary tier-based prompts do not stall them. The parent `task` approval is the authorization boundary. Per-tool policies still use the normal resolver: user `deny` remains absolute, and any call that resolves to `prompt` rejects because a headless subagent cannot satisfy it.
+Subagents run headless with `tools.approvalMode: yolo`. Calls that still require approval relay over the inherited subagent event bus to the root session's approval UI, including nested task agents. The prompt names the requesting agent id and definition name, tool, and sanitized argument preview. Concurrent child requests queue at the root. Approve authorizes only that call; Deny, cancellation, child abort, timeout, relay failure, and an unavailable root approval UI refuse execution. Relayed requests offer no remembered grants.
+
+`task.approvalRelayTimeoutMs` bounds queue and dialog time together (default `300000`, five minutes). A headless root cannot approve requests; use an interactive root or a trusted per-agent policy:
+
+```yaml
+task:
+  agentApproval:
+    engineer:
+      bash: allow
+    scout:
+      bash: prompt
+```
+
+Agent names are exact definition names, not generated task ids. Tool keys use the same exact tool/device names as `tools.approval`; `tool:pattern` and wildcard keys are not supported. Per-agent policies take precedence over ordinary global prompts, bash prompt patterns, and mode defaults. A deny from any source remains absolute, critical safety overrides remain gated, and provider safety checks still require approval. An allow for one definition does not authorize another definition.
+
+Only global config, trusted directory layers, explicit config overlays, and runtime settings may supply `task.agentApproval`. Project values are ignored with a warning. Agent frontmatter and markdown cannot grant approval. Both settings are available in `/settings` under Tasks; the policy record accepts JSON.
+
+An allow entry applies only to a bundled or user-sourced definition. Project definitions that shadow an allowed name cannot inherit its allow; they retain normal approval and log one warning per session. Cold revival requires both persisted original provenance and the currently discovered definition to be trusted; legacy transcripts without original provenance cannot inherit allow entries. Deny and prompt entries still apply to every source.

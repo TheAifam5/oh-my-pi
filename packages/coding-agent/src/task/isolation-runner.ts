@@ -49,7 +49,7 @@ import {
 	type WorktreeBaseline,
 } from "./worktree";
 
-import { cfgTaskIsolationCommits } from "./settings";
+import { cfgTaskIsolationCommits, cfgTaskIsolationMaxBaselineBytes } from "./settings";
 
 type IsoBackendKind = natives.IsoBackendKind;
 
@@ -453,7 +453,11 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		handle = await ensureIsolation(opts.context.repoRoot, opts.agentId, opts.preferredBackend);
 		const isolationDir = handle.mergedDir;
 		const isolationBackend = handle.backend;
-		const baseline = await captureIsolationBaseline(isolationDir, opts.context.repoRoot);
+		const baseline = await captureIsolationBaseline(
+			isolationDir,
+			opts.context.repoRoot,
+			opts.baseOptions.settings ? cfgTaskIsolationMaxBaselineBytes.get(opts.baseOptions.settings) : undefined,
+		);
 		taskBaseline = baseline;
 		const result = await runSubprocess({
 			...opts.baseOptions,

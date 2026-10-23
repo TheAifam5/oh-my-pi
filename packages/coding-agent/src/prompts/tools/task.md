@@ -1,4 +1,5 @@
 {{#if asyncEnabled}}{{#if batchEnabled}}Spawn `tasks[]` concurrently; IDs return immediately.{{else}}Spawn one agent; ID returns immediately.{{/if}}{{#if hasBlockingAgents}} BLOCKING agents return inline.{{/if}}{{else}}{{#if batchEnabled}}Run `tasks[]` synchronously.{{else}}Run one agent synchronously.{{/if}}{{/if}}
+Children inherit child-model-filtered rules, skills, non-AGENTS context, the workspace tree, and user AGENTS.md when `task.inheritUserAgentsMd` is on (default), not project AGENTS.md.
 {{#if asyncEnabled}}{{#ifAny structured hasStructuredAgents}}
 
 # Results

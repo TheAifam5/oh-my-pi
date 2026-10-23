@@ -24,7 +24,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import { isTaskToolDetails, type AgentSource, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
@@ -3600,6 +3600,7 @@ export class SessionManager {
 		task: string;
 		tools: string[];
 		agent?: string;
+		agentSource?: AgentSource;
 		modelRole?: string;
 		resolvedModel?: string;
 		retryFallback?: RetryFallbackRole;
@@ -4614,6 +4615,7 @@ export interface PersistedSessionInit {
 	task: string;
 	tools: string[];
 	agent?: string;
+	agentSource?: AgentSource;
 	modelRole?: string;
 	resolvedModel?: string;
 	retryFallback?: RetryFallbackRole;
@@ -4642,6 +4644,10 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			task: entry.task,
 			tools: entry.tools,
 			agent: entry.agent,
+			agentSource:
+				entry.agentSource === "bundled" || entry.agentSource === "user" || entry.agentSource === "project"
+					? entry.agentSource
+					: undefined,
 			modelRole: entry.modelRole,
 			resolvedModel: entry.resolvedModel,
 			retryFallback: entry.retryFallback,

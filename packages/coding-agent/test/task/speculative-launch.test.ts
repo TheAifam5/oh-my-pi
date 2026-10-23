@@ -251,4 +251,28 @@ describe("speculative launch authorization", () => {
 		expect(await authorize("yolo", true)).toMatchObject({ allowed: false });
 		expect(await authorize("always-ask", false)).toMatchObject({ allowed: false });
 	});
+
+	it("blocks speculative child launch when per-agent policy denies or prompts", async () => {
+		const settings = Settings.isolated({ "tools.approvalMode": "yolo" });
+		const session = {
+			cwd: "/tmp",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings,
+		};
+		for (const policy of ["deny", "prompt"] as const) {
+			const config = createSpeculativeToolExecutionConfig(settings, session, {
+				hasHandlers: () => false,
+				agentApprovalPolicies: { task: policy },
+			});
+			expect(
+				await config.host?.authorizeLaunch?.({
+					tool: { name: "task", approval: "exec" },
+					toolCall,
+					args: { context: "ctx" },
+				}),
+			).toMatchObject({ allowed: false });
+		}
+	});
 });

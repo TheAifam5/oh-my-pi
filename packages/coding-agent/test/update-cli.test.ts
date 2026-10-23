@@ -191,6 +191,14 @@ describe("parseReportedVersion", () => {
 		expect(parseReportedVersion("not a version")).toBeUndefined();
 	});
 
+	it("verifies enriched builds by package version without including identity metadata", () => {
+		expect(parseReportedVersion("omp/18.12.6 (174d8192e6, dirty, 2026-10-22 20:49 UTC)")).toBe("18.12.6");
+		expect(parseReportedVersion("omp/18.12.6-canary.1 (174d8192e6, 2026-10-22 20:49 UTC)")).toBe("18.12.6-canary.1");
+		expect(parseReportedVersion("omp/18.12.6 (source)")).toBe("18.12.6");
+		expect(parseReportedVersion("omp/18.12.6 (source)\nextra output")).toBeUndefined();
+		expect(parseReportedVersion("omp/18.12.6 trailing garbage")).toBeUndefined();
+	});
+
 	it("rejects version output from a different executable", () => {
 		expect(parseReportedVersion("node/18.0.5")).toBeUndefined();
 		expect(parseReportedVersion("codex/18.0.5")).toBeUndefined();

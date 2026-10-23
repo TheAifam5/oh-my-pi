@@ -298,6 +298,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const { approvalMode, userPolicies } = resolveApprovalFromContext(
 			context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
 		);
+		const identity = this.#agent ?? this.runner.agentIdentity;
+		const agentPolicies = this.runner.agentApprovalPoliciesFor?.(identity);
 		// `always-ask-cached` grants for this conversation, shared by the pre-check, the full gate,
 		// and the record after an approval.
 		const approvalGrants =
@@ -313,6 +315,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			approvalMode,
 			userPolicies,
 			approvalGrants,
+			agentPolicies,
 		);
 		if (preResolved.policy === "deny") {
 			throw denyError(preResolved, this.tool.name);
@@ -385,7 +388,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// input that newly resolves to `deny` is caught here even though the original passed the
 		// short-circuit above.
 		const resolvedArgs = approvalArgs(effectiveParams, context);
-		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
+		const resolved = resolveApproval(
+			this.tool,
+			resolvedArgs,
+			approvalMode,
+			userPolicies,
+			approvalGrants,
+			agentPolicies,
+		);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
 			cancelPreflight();
@@ -460,7 +470,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 			// Provider safety checks fail closed without an interactive prompt. Unlike
 			// ordinary tier approval, no setting or yolo mode may bypass this gate.
-			if (!this.runner.hasUI()) {
+			if (!this.runner.hasUI() && !this.runner.approvalRelay) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
 				cancelPreflight();
@@ -471,10 +481,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 				throw new Error(
 					`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
-						`Options:\n` +
-						`  1. Set tools.approvalMode: yolo in /settings\n` +
-						`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
-						`  3. Use an interactive UI to approve the tool call`,
+						`Requesting agent: "${identity?.id ?? "unknown"}" (${identity?.name ?? "unknown"}).\n` +
+						`Use an interactive root session to relay approval, or configure trusted ` +
+						(identity?.kind === "sub"
+							? `task.agentApproval.${identity.name}.${this.tool.name}: allow.`
+							: `tools.approval.${this.tool.name}: allow.`),
 				);
 			}
 
@@ -483,13 +494,25 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
 			let approved: boolean;
 			try {
-				const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
-					reason: approvalCheck.reason,
-					appendix: safetyAppendix,
-					sessionSubject: sessionScope?.subject,
-					grants: cacheTargets,
-				});
-				approved = answer !== "deny";
+				const answer =
+					!this.runner.hasUI() && this.runner.approvalRelay
+						? (await this.runner.approvalRelay(
+								this.tool,
+								resolvedArgs,
+								signal,
+								[approvalCheck.reason, ...safetyAppendix].filter(Boolean).join("\n"),
+								identity,
+							))
+							? "once"
+							: "deny"
+						: await requestApproval(uiContext, this.tool, resolvedArgs, {
+								reason: approvalCheck.reason,
+								appendix: safetyAppendix,
+								sessionSubject: sessionScope?.subject,
+								grants: cacheTargets,
+								signal,
+							});
+				approved = answer !== "deny" && !signal?.aborted;
 				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
 				if (typeof answer === "object" && approvalGrants) {
 					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);

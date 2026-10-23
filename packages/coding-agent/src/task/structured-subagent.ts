@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, getAgentDir, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
@@ -69,6 +69,7 @@ import {
 	cfgTaskAgentServiceTierOverrides,
 	cfgTaskDisabledAgents,
 	cfgTaskEnableLsp,
+	cfgTaskInheritUserAgentsMd,
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskIsolationMerge,
@@ -651,7 +652,11 @@ function buildExecutorOptions(
 		enableMCP,
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
-		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
+		contextFiles: session.contextFiles?.filter(
+			file =>
+				path.basename(file.path).toLowerCase() !== "agents.md" ||
+				(cfgTaskInheritUserAgentsMd.get(session.settings) && file.path === path.join(getAgentDir(), "AGENTS.md")),
+		),
 		skills,
 		// Autoload runs after session start, outside the seance isolation options.
 		autoloadSkills: preparedSession ? undefined : autoloadSkills,

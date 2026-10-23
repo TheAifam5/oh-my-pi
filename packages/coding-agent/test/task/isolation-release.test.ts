@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -111,6 +112,40 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
 
 describe("isolated agent release", () => {
 	const patch = "diff --git a/task.txt b/task.txt\n+work\n";
+
+	it("uses the configured baseline limit before starting an isolated subprocess", async () => {
+		const failure = new worktreeModule.IsolationBaselineTooLargeError("/repo/isolated", 128, 64);
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: "/repo/isolated",
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		const capture = vi.spyOn(worktreeModule, "captureIsolationBaseline").mockRejectedValue(failure);
+		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+		const subprocess = vi.spyOn(executorModule, "runSubprocess");
+		const outcome = await runIsolatedSubprocess({
+			baseOptions: {
+				cwd: "/repo",
+				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+				task: "Do work",
+				index: 0,
+				id: "BaselineLimit",
+				settings: Settings.isolated({ "task.isolation.maxBaselineBytes": 64 }),
+			},
+			context: { repoRoot: "/repo" },
+			preferredBackend: undefined,
+			agentId: "BaselineLimit",
+			mergeMode: "patch",
+			artifactsDir: "/unused",
+			buildFailureResult: error => ({ ...result("BaselineLimit"), exitCode: 1, error: String(error) }),
+		});
+		expect(capture).toHaveBeenCalledWith("/repo/isolated", "/repo", 64);
+		expect(subprocess).not.toHaveBeenCalled();
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		expect(outcome.exitCode).toBe(1);
+		expect(outcome.error).toContain("task.isolation.maxBaselineBytes");
+	});
 
 	it("does not re-commit a workspace that is unchanged since the run-end branch", async () => {
 		expect(await commitsAcrossRelease("ReleaseUnchanged", patch, patch)).toBe(1);

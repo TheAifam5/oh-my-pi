@@ -64,6 +64,7 @@ function isLocalReadSpeculationEvidence(value: unknown): value is LocalReadSpecu
 
 export interface SpeculationLifecycle {
 	hasHandlers(eventType: string): boolean;
+	readonly agentApprovalPolicies?: Record<string, "allow" | "deny" | "prompt">;
 }
 
 export type CodingAgentSpeculativeOperation = "direct.read" | "eval.read";
@@ -246,6 +247,7 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 			cfgToolsApprovalMode.get(this.settings),
 			cfgToolsApproval.get(this.settings),
 			getApprovalGrants(this.settings.getAgentDir(), this.toolSession.sessionManager?.getSessionId?.()),
+			this.extensionRunner?.agentApprovalPolicies,
 		);
 		if (approval.policy !== "allow") return { allowed: false, reason: "tool approval is not auto-allow" };
 		return { allowed: true };

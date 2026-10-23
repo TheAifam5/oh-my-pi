@@ -34,6 +34,14 @@ Every worker is a real, keep-alive task-executor subagent with the normal coding
 
 The tier always selects the bundled `sonic` or `task` definition, not a same-named discovered custom agent. Model resolution otherwise matches task-agent routing: `task.agentModelOverrides.sonic` / `.task` wins over the bundled agent model, and role aliases resolve through `modelRoles`, with the parent active/default model as fallback.
 
+## Worker tool approvals
+
+Workers relay prompt-gated tool calls to the director's root approval UI through the inherited subagent event bus. The dialog shows the worker id, bundled definition name (`sonic` or `task`), tool, and sanitized arguments. Concurrent requests queue; an approval authorizes only that call.
+
+Trusted `task.agentApproval.sonic` and `task.agentApproval.task` policies apply to their corresponding worker tiers. Allows skip ordinary prompts, but deny policies and critical safety gates remain enforced. Project settings and agent frontmatter cannot supply approval grants. See [subagent approvals](./approval-mode.md#subagents) for settings and provenance rules.
+
+`vibe_kill`, `/vibe` exit, worker-turn cancellation, parent disposal, and `task.approvalRelayTimeoutMs` expiry cancel pending approvals and refuse execution. An approval delivered after cancellation cannot run the tool.
+
 ## Worker-control tools
 
 | Tool         | Input and behavior                                                                                                                                                                                   |

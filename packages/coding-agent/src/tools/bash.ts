@@ -568,6 +568,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
 				if (!segmentRule) hasUnmatchedSegment = true;
 			}
+			for (const segment of compoundSegments) {
+				const literalCommand = segment.argv.join(" ");
+				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
+					return { tier: "exec", override: true, reason: "Critical pattern detected" };
+				}
+			}
 			if (promptRule) {
 				return {
 					tier: "exec",
@@ -575,12 +581,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					policy: "prompt",
 					reason: `Prompt required by bash pattern: ${promptRule.match}`,
 				};
-			}
-			for (const segment of compoundSegments) {
-				const literalCommand = segment.argv.join(" ");
-				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
-					return { tier: "exec", override: true, reason: "Critical pattern detected" };
-				}
 			}
 			// Unmatched segments retain the standalone tool-policy and mode fallback.
 			return hasUnmatchedSegment ? "exec" : { tier: "write", policy: "allow" };

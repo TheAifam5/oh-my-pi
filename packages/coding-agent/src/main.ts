@@ -102,6 +102,8 @@ import { ensureTheme, initTheme, stopThemeWatcher } from "@oh-my-pi/pi-tui/theme
 import type { SubmittedUserInput } from "./modes/types";
 import { createWarpEventBridgeExtension } from "./modes/warp-events";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { formatVersion } from "./build-identity";
+import { currentRuntimeIdentity } from "./session/runtime-identity";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -1818,7 +1820,7 @@ export async function runRootCommand(
 		const notifs: (InteractiveModeNotify | null)[] = [];
 
 		if (parsedArgs.version) {
-			writeStartupNotice(parsedArgs, `${VERSION}\n`);
+			writeStartupNotice(parsedArgs, `omp/${VERSION}\n`);
 			process.exit(0);
 		}
 
@@ -2735,7 +2737,7 @@ export async function runRootCommand(
 					logger.endTiming();
 					await runInteractiveMode(
 						session,
-						VERSION,
+						formatVersion(currentRuntimeIdentity()).slice("omp/".length),
 						startupChangelog,
 						notifs,
 						versionCheckPromise,

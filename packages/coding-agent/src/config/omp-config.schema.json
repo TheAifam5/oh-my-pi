@@ -3396,6 +3396,17 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "agentApproval": {
+          "description": "JSON map of agent definition names to exact tool approval policies; denies remain enforced",
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "approvalRelayTimeoutMs": {
+          "description": "Maximum wait for a parent UI approval, including queue time (milliseconds)",
+          "type": "number",
+          "default": 300000
+        },
         "isolation": {
           "type": "object",
           "additionalProperties": false,
@@ -3404,6 +3415,11 @@
               "description": "Allow per-task isolation with `isolated: true`; tasks without it run in the shared checkout",
               "type": "boolean",
               "default": false
+            },
+            "maxBaselineBytes": {
+              "description": "Maximum buffered uncommitted content per repository, in bytes; larger limits use more memory",
+              "type": "number",
+              "default": 1073741824
             },
             "apply": {
               "description": "Automatically apply successful isolated task changes to the parent checkout; disable to retain patch or branch artifacts",
@@ -3442,6 +3458,11 @@
         },
         "batch": {
           "description": "Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+          "type": "boolean",
+          "default": true
+        },
+        "inheritUserAgentsMd": {
+          "description": "Include the user agent directory's AGENTS.md in subagents; project AGENTS.md files stay excluded",
           "type": "boolean",
           "default": true
         },

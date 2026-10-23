@@ -192,7 +192,7 @@ function trustedAccountNames(settings: Settings): string[] {
  * Persist a pool edit from the model hub to the global config: `value` replaces the role's
  * `modelRoles` entry, the `retry.fallbackChains` entry, or the `modelGroups` entry; `undefined`
  * removes it. Account order and drain names the edit adds must belong to the trusted account-policy
- * layer; names already stored in the pool are kept.
+ * layer; names already stored in the same account-routing field are kept.
  *
  * @returns the refusal message for an invalid value or newly added untrusted account name; nothing is written then.
  */
@@ -204,10 +204,12 @@ export function writeModelHubPool(
 	try {
 		const added = routingAccountNames(value);
 		if (added.length > 0) {
-			const stored = new Set(routingAccountNames(storedGlobalPool(settings, target)).map(entry => entry.name));
+			const stored = new Set(
+				routingAccountNames(storedGlobalPool(settings, target)).map(entry => `${entry.field}:${entry.name}`),
+			);
 			const trustedNames = trustedAccountNames(settings);
 			for (const { field, name } of added) {
-				if (!stored.has(name) && !trustedNames.includes(name)) {
+				if (!stored.has(`${field}:${name}`) && !trustedNames.includes(name)) {
 					return `routing.accounts.${field}: account ${JSON.stringify(name)} is not defined in trusted auth.accountPolicies`;
 				}
 			}

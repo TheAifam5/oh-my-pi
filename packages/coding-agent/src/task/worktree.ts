@@ -166,6 +166,7 @@ export class IsolationBaselineTooLargeError extends Error {
 		readonly repoRoot: string,
 		readonly contentBytes: number | undefined,
 		readonly budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
+		readonly largestUntracked: readonly { path: string; bytes: number }[] = [],
 	) {
 		const measured =
 			contentBytes === undefined
@@ -173,8 +174,11 @@ export class IsolationBaselineTooLargeError extends Error {
 				: `${formatBytes(contentBytes)} of uncommitted content, over the ${formatBytes(budgetBytes)} isolation-snapshot budget`;
 		super(
 			`Working tree at ${repoRoot} carries ${measured}. ` +
-				`Isolated task snapshots buffer this content in memory, so proceeding would exhaust the host. ` +
-				`Commit or gitignore the bulk (untracked files that aren't ignored are the usual culprit), ` +
+				`Isolated task snapshots buffer this content in memory. ` +
+				(largestUntracked.length > 0
+					? `Largest untracked paths: ${largestUntracked.map(entry => `${JSON.stringify(entry.path)} (${formatBytes(entry.bytes)})`).join(", ")}. `
+					: "") +
+				`Commit or gitignore the bulk, raise \`task.isolation.maxBaselineBytes\` (bytes; larger limits use more memory), ` +
 				`or set \`task.isolation.enabled: false\` to run tasks without isolation.`,
 		);
 		this.name = "IsolationBaselineTooLargeError";
@@ -182,17 +186,30 @@ export class IsolationBaselineTooLargeError extends Error {
 }
 
 /** Sum untracked entry sizes without following symlinks, skipping entries that vanished. */
-async function sumUntrackedBytes(repoRoot: string, untracked: readonly string[]): Promise<number> {
-	if (untracked.length === 0) return 0;
+async function sumUntrackedBytes(
+	repoRoot: string,
+	untracked: readonly string[],
+): Promise<{ contentBytes: number; largest: { path: string; bytes: number }[] }> {
+	const totals = new Map<string, number>();
 	const { results } = await mapWithConcurrencyLimit([...untracked], 16, async entry => {
 		try {
 			const stat = await fs.lstat(path.join(repoRoot, entry));
-			return stat.isFile() ? stat.size : 0;
+			const bytes = stat.isFile() ? stat.size : 0;
+			const separator = entry.indexOf("/");
+			const group = separator < 0 ? entry : entry.slice(0, separator + 1);
+			totals.set(group, (totals.get(group) ?? 0) + bytes);
+			return bytes;
 		} catch {
 			return 0;
 		}
 	});
-	return results.reduce((total: number, size) => total + (size ?? 0), 0);
+	return {
+		contentBytes: results.reduce((total: number, size) => total + (size ?? 0), 0),
+		largest: [...totals]
+			.map(([entryPath, bytes]) => ({ path: entryPath, bytes }))
+			.sort((a, b) => b.bytes - a.bytes || a.path.localeCompare(b.path))
+			.slice(0, 5),
+	};
 }
 
 async function captureUntrackedPatch(
@@ -245,10 +262,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
 	// refused here rather than after buffering gigabytes (#8939). Untracked
 	// bytes come from stat (no reads); staged/unstaged are already rendered
 	// binary diffs, charged at their byte size.
-	const untrackedBytes = await sumUntrackedBytes(repoRoot, untracked);
+	const { contentBytes: untrackedBytes, largest } = await sumUntrackedBytes(repoRoot, untracked);
 	const contentBytes = untrackedBytes + Buffer.byteLength(staged) + Buffer.byteLength(unstaged);
 	if (contentBytes > budgetBytes) {
-		throw new IsolationBaselineTooLargeError(repoRoot, contentBytes, budgetBytes);
+		throw new IsolationBaselineTooLargeError(repoRoot, contentBytes, budgetBytes, largest);
 	}
 	const untrackedPatch = await captureUntrackedPatch(repoRoot, untracked, repo);
 	return { repoRoot, headCommit, staged, unstaged, untracked, untrackedPatch };

@@ -87,12 +87,14 @@ Which automatic inputs reach each kind of session. An input applies only when it
 | Session type     | `AGENTS.md`   | `CLAUDE.md` / `GEMINI.md` | `APPEND_SYSTEM.md` / `--append-system-prompt` | MCP tools | MCP server instructions | `WATCHDOG.md` | Personality |
 | ---------------- | ------------- | ------------------------- | --------------------------------------------- | --------- | ----------------------- | ------------- | ----------- |
 | Main session     | Discovered    | Discovered                | Yes                                           | Yes       | Yes                     | No            | Configured  |
-| Task subagent    | Not inherited | Inherited                 | No                                            | Inherited | Inherited               | No            | `none`      |
+| Task subagent    | User-level only, when `task.inheritUserAgentsMd` is on (default) | Inherited | No | Inherited | Inherited | No | `none` |
 | Advisor/watchdog | Inherited     | Inherited                 | No                                            | No        | No                      | Yes           | None        |
 
-1. Task spawning drops inherited context files whose basename is `agents.md` (case-insensitive). Text pulled in through `@` imports is not filtered, and additional workspace roots are discovered separately.
+1. Ordinary Task children inherit rules filtered by the child's model, skills, non-`AGENTS.md` context files, and the workspace tree. With `task.inheritUserAgentsMd=true` (the default, including when absent), they also inherit the discovered user agent directory's `AGENTS.md`, including the active profile's agent directory. With `false`, that file is excluded. Project and directory `AGENTS.md` files remain excluded in either mode. Text pulled in through `@` imports is not filtered, and additional workspace roots are discovered separately. Put model-specific guidance in `models:`-scoped rules.
 2. Context discovery selects one user file and one project file per directory depth, and higher-priority providers win. Foreign user files require `enabledProviders` opt-in. A standalone `CLAUDE.md` is supported; `GEMINI.md` is read from the user and project `.gemini` directories.
 3. A task agent's `tools:` list does not remove MCP tools or server instructions: the tools stay available top-level or under `xd://`. Plan-mode tasks and children of restricted sessions run with `restrictToolNames`, which drops both.
+
+`AGENTS.override.md` files remain inherited as non-`AGENTS.md` context files, independently of `task.inheritUserAgentsMd`.
 
 ## Handlebars template route
 

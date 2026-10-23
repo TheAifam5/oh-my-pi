@@ -1694,6 +1694,48 @@ describe("ModelHub", () => {
 				}
 			});
 
+			for (const storedField of ["order", "drain"] as const) {
+				test(`the ${kind} pool writer refuses moving an untrusted name from ${storedField} to the other field`, async () => {
+					const tmp = TempDir.createSync("@pi-model-hub-account-field-");
+					try {
+						const settings = await fileSettings(tmp, "{}\n");
+						const target = { kind, key: "smol" };
+						const pool = { strategy: "random", models: { a: { model: "test/model-a" } } };
+						const storedAccounts = storedField === "order" ? { order: ["gone"] } : { drain: "gone" };
+						const stored = { ...pool, routing: { accounts: storedAccounts } };
+						if (kind === "role") settings.setModelRoleSpec(target.key, stored);
+						else if (kind === "chain") settings.setFallbackChainSpec(target.key, stored);
+						else settings.setModelGroup(target.key, stored);
+						await settings.flush();
+						const config = Bun.file(tmp.join("agent", "config.yml"));
+						const before = await config.text();
+						const globalBefore = structuredClone(settings.getGlobalSettings());
+						const revision = settings.revision;
+						const addedField = storedField === "order" ? "drain" : "order";
+						const edited = { ...pool, routing: { accounts: { order: ["gone"], drain: "gone" } } };
+
+						expect(writeModelHubPool(settings, target, edited)).toBe(
+							`routing.accounts.${addedField}: account "gone" is not defined in trusted auth.accountPolicies`,
+						);
+						expect(settings.getGlobalSettings()).toEqual(globalBefore);
+						expect(settings.revision).toBe(revision);
+						await settings.flush();
+						expect(await config.text()).toBe(before);
+						expect(writeModelHubPool(settings, target, stored)).toBeUndefined();
+
+						cfgAuthAccountPolicies.set(settings, [
+							{ provider: "test", name: "gone", account: { email: "g@example.com" } },
+						]);
+						expect(writeModelHubPool(settings, target, edited)).toBeUndefined();
+						await settings.flush();
+						expect(await config.text()).toContain("drain: gone");
+					} finally {
+						AgentStorage.close();
+						tmp.removeSync();
+					}
+				});
+			}
+
 			test(`the ${kind} pool writer keeps stored unknown account names on unrelated edits`, async () => {
 				const tmp = TempDir.createSync("@pi-model-hub-account-stale-");
 				try {

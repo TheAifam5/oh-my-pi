@@ -7,7 +7,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
-import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentSource, StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
@@ -286,6 +286,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	tools: string[];
 	/** Agent definition name (for example `scout` or `reviewer`). */
 	agent?: string;
+	/** Original resolved definition provenance; absent in older transcripts. */
+	agentSource?: AgentSource;
 	/** Semantic model role declared by the agent, retained even after concrete model resolution. */
 	modelRole?: string;
 	/** Initially resolved provider/model selector for historical display. */
