@@ -28,6 +28,7 @@ import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "..
 import { CLOSE_ACTION, picker, pickerAction, pickerEvent } from "../native/picker";
 import type { TspPickerProps } from "@oh-my-pi/pi-wire";
 import { actionHint, hintsRow, type NativeHint } from "../native/overlay";
+import { sanitizeDisplaySingleLine } from "./extensions/display-text";
 
 /** Configured role resolved to a concrete model. */
 export interface ResolvedRoleModel {
@@ -131,6 +132,7 @@ export class ModelPickerComponent implements Component {
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#browser: ModelBrowser;
 	#configError: string | undefined;
+	#pickError: string | undefined;
 	#currentSelector: string | undefined;
 	#currentQuickRoleSelector: string | undefined;
 	#modelItems: ModelBrowserItem[] = [];
@@ -149,6 +151,7 @@ export class ModelPickerComponent implements Component {
 		| {
 				memo: string;
 				catalogue: ModelPickerCatalogue;
+				nativeCatalogue: ModelPickerCatalogue;
 				order: object;
 				preview: readonly NativeChild[];
 				node: NativeNode;
@@ -189,6 +192,13 @@ export class ModelPickerComponent implements Component {
 					: undefined,
 		});
 		this.#browser.onActivate = item => {
+			this.#pickError = undefined;
+			const member = this.#poolMembers.find(member => member.selector === item.selector);
+			if (member && member.state !== "usable") {
+				this.#pickError = sanitizeDisplaySingleLine(`${member.selector}: ${member.state}`);
+				this.#tui.requestRender();
+				return;
+			}
 			if (item.selector.startsWith("+") && this.#poolMembers.some(member => member.parent === item.selector)) {
 				this.#expandPool(true);
 				return;
@@ -296,13 +306,17 @@ export class ModelPickerComponent implements Component {
 			.filter(member => member.parent === parent)
 			.map(member => ({
 				provider: "",
-				id: `${member.selector}  ${member.state}  ${member.model.provider}/${member.model.id}`,
+				id: sanitizeDisplaySingleLine(
+					`${member.selector}  ${member.state}  ${member.model.provider}/${member.model.id}`,
+				),
 				selector: member.selector,
 				model: member.model,
+				labelColor: member.state === "usable" ? undefined : "dim",
 			}));
 	}
 	/** Switch browser content only when a leading `@` changes the search mode. */
 	#syncItemsForQuery(query: string, refresh = false): void {
+		this.#pickError = undefined;
 		const roleMode = !this.#selectOnly && (query.startsWith("@") || query.startsWith("+")) && !this.#taskMode;
 		const modeChanged = roleMode !== this.#roleMode;
 		const poolItems = roleMode ? this.#poolItems(query) : undefined;
@@ -371,8 +385,9 @@ export class ModelPickerComponent implements Component {
 
 		const inner = Math.max(1, width - 4);
 		const selectionOnly = this.#selectOnly;
-		const status = this.#configError
-			? theme.fg("error", ` ${this.#configError}`)
+		const error = this.#pickError ?? this.#configError;
+		const status = error
+			? theme.fg("error", ` ${error}`)
 			: this.#taskMode
 				? theme.fg("error", ` ${TASK_STATUS_HINT}`)
 				: theme.fg(
@@ -464,7 +479,8 @@ export class ModelPickerComponent implements Component {
 		const preview = this.#browser.pickerPreview("compact", current);
 		const selected = this.#browser.pickerSelected;
 		const cursor = this.#browser.cursor;
-		const memo = `${mode}\0${this.#configError ?? ""}\0${query}\0${cursor}\0${selected ?? ""}`;
+		const error = this.#pickError ?? this.#configError;
+		const memo = `${mode}\0${error ?? ""}\0${query}\0${cursor}\0${selected ?? ""}`;
 		const cached = this.#pickerRoot;
 		if (
 			cached !== undefined &&
@@ -475,8 +491,25 @@ export class ModelPickerComponent implements Component {
 		) {
 			return cached.node;
 		}
-		const subtitle: TspPickerProps["subtitle"] = this.#configError
-			? [span(this.#configError, "error")]
+		const errorItems = (items: ModelPickerCatalogue["items"]) =>
+			items.map(item => {
+				const member = this.#poolMembers.find(member => member.selector === item.id);
+				return member && member.state !== "usable"
+					? { ...item, disabled: sanitizeDisplaySingleLine(member.state), tone: "muted" as const }
+					: item;
+			});
+		const nativeCatalogue =
+			cached?.catalogue === catalogue
+				? cached.nativeCatalogue
+				: mode === "role" && query.includes("/")
+					? {
+							...catalogue,
+							items: errorItems(catalogue.items),
+							...(catalogue.itemsAdd ? { itemsAdd: errorItems(catalogue.itemsAdd) } : {}),
+						}
+					: catalogue;
+		const subtitle: TspPickerProps["subtitle"] = error
+			? [span(error, "error")]
 			: mode === "task"
 				? [span(TASK_STATUS_HINT, "warning")]
 				: mode === "selection"
@@ -499,7 +532,7 @@ export class ModelPickerComponent implements Component {
 				placeholder:
 					mode === "task" || mode === "selection" ? "Search models…" : "Search models, @ for quick roles…",
 				columns: MODEL_PICKER_COLUMNS,
-				...catalogue,
+				...nativeCatalogue,
 				order: view.order,
 				...(view.hits ? { hits: view.hits } : {}),
 				selected,
@@ -529,18 +562,19 @@ export class ModelPickerComponent implements Component {
 			},
 			preview,
 		);
-		this.#pickerRoot = { memo, catalogue, order: view, preview, node };
+		this.#pickerRoot = { memo, catalogue, nativeCatalogue, order: view, preview, node };
 		return node;
 	}
 
 	/** Root card over the status line, the embedded browser, and the mode's key hints. */
 	#describeCard(): NativeNode {
 		const mode = this.#selectOnly ? "selection" : this.#taskMode ? "task" : this.#roleMode ? "role" : "session";
-		const memo = `${mode}\0${this.#configError ?? ""}\0${this.#taskModeKey ?? ""}`;
+		const error = this.#pickError ?? this.#configError;
+		const memo = `${mode}\0${error ?? ""}\0${this.#taskModeKey ?? ""}`;
 		if (this.#nativeRoot?.memo === memo) return this.#nativeRoot.node;
 
-		const status = this.#configError
-			? span(this.#configError, "error")
+		const status = error
+			? span(error, "error")
 			: this.#taskMode
 				? span(TASK_STATUS_HINT, "error")
 				: span(

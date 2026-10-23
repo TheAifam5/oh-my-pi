@@ -669,3 +669,62 @@ test("application-cursor arrows expand and collapse session pools", () => {
 	picker.handleInput("\x1bOD");
 	expect(props(picker.describe(withPicker)).order).toEqual(["@security"]);
 });
+
+for (const state of ["blocked until 12:00:00", "exhausted", "no entitled account"]) {
+	test(`unusable pool members (${state}) are disabled and refuse native and keyboard activation`, () => {
+		const picked: string[] = [];
+		const picker = new ModelPickerComponent(
+			ui,
+			source({}, []),
+			{ ...registry(MODELS), refreshIfStale: async () => false },
+			MODELS.map(entry => ({ model: entry })),
+			{ onPick: (_model, selector) => picked.push(selector), onCancel: () => {} },
+		);
+		picker.setPoolMembers([
+			{ parent: "@security", selector: "@security/blocked", model: MODELS[0]!, state },
+			{ parent: "@security", selector: "@security/ready", model: MODELS[1]!, state: "usable" },
+		]);
+		picker.handleInput("@");
+		picker.handleInput("\x1b[C");
+		const items = props(picker.describe(withPicker)).items;
+		expect(items?.find(item => item.id === "@security/blocked")).toMatchObject({ disabled: state, tone: "muted" });
+		expect(items?.find(item => item.id === "@security/ready")?.disabled).toBeUndefined();
+		picker.handleNativeEvent({ type: "activate", key: "", item: "@security/blocked" });
+		expect(picked).toEqual([]);
+		expect(JSON.stringify(props(picker.describe(withPicker)).subtitle)).toContain(`@security/blocked: ${state}`);
+		expect(JSON.stringify(picker.describe(withoutPicker))).toContain(`@security/blocked: ${state}`);
+		expect(Bun.stripANSI(picker.render(160).join("\n"))).toContain(`@security/blocked: ${state}`);
+		picker.handleInput("\r");
+		expect(picked).toEqual([]);
+		expect(Bun.stripANSI(picker.render(160).join("\n"))).toContain(`@security/blocked: ${state}`);
+		picker.handleNativeEvent({ type: "activate", key: "", item: "@security/ready" });
+		picker.handleInput("\r");
+		expect(picked).toEqual(["@security/ready", "@security/ready"]);
+	});
+}
+
+test("pool availability refreshes native disabled state without changing the query or selection", () => {
+	const picker = new ModelPickerComponent(
+		ui,
+		source({}, []),
+		{ ...registry(MODELS), refreshIfStale: async () => false },
+		MODELS.map(entry => ({ model: entry })),
+		{ onPick: () => {}, onCancel: () => {} },
+	);
+	const member = { parent: "@security", selector: "@security/member", model: MODELS[0]! };
+	picker.setPoolMembers([{ ...member, state: "usable" }]);
+	picker.handleInput("@");
+	picker.handleInput("\x1b[C");
+	const initial = props(picker.describe(withPicker));
+	expect(initial.items?.find(item => item.id === member.selector)?.disabled).toBeUndefined();
+	picker.setPoolMembers([{ ...member, state: "exhausted" }]);
+	const blocked = props(picker.describe(withPicker));
+	expect(blocked.query).toBe(initial.query);
+	expect(blocked.selected).toBe(initial.selected);
+	expect(blocked.items?.find(item => item.id === member.selector)?.disabled).toBe("exhausted");
+	picker.setPoolMembers([{ ...member, state: "usable" }]);
+	const recovered = props(picker.describe(withPicker));
+	expect(recovered.query).toBe(initial.query);
+	expect(recovered.selected).toBe(initial.selected);
+	expect(recovered.items?.find(item => item.id === member.selector)?.disabled).toBeUndefined();
+});

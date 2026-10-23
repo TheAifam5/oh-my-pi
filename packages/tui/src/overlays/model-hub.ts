@@ -4475,7 +4475,9 @@ export class ModelHubComponent implements Component {
 			return cached.node;
 		}
 		if (usePicker) {
-			const described = this.#describePicker();
+			const pickerNode = this.#describePicker();
+			const field = this.#strip?.kind === "field" ? this.#describeStrip(cx) : undefined;
+			const described = field ? { ...pickerNode, c: [field, ...(pickerNode.c ?? [])] } : pickerNode;
 			this.#nativeCache = { version: this.#nativeVersion, picker: true, billing, node: described };
 			return described;
 		}
@@ -4504,6 +4506,19 @@ export class ModelHubComponent implements Component {
 		// Same gate as the mouse router: nothing is interactive while an assignment applies.
 		if (this.#assignmentPending) return;
 		const target = event.key.slice(event.key.lastIndexOf("/") + 1);
+		const strip = this.#strip;
+		if (target === "fieldInput" && strip?.kind === "field") {
+			if (event.type === "edit" || event.type === "undo") {
+				strip.input.handleNativeEvent(event);
+				strip.error = undefined;
+			} else if (event.type === "send" || (event.type === "action" && event.act === "submit")) {
+				this.#submitField();
+			} else {
+				return;
+			}
+			this.#requestRender();
+			return;
+		}
 		if (event.type === "action") {
 			const entry = this.#activeEntry();
 			if (target !== "login" || event.act !== "login") return;
@@ -5284,14 +5299,7 @@ export class ModelHubComponent implements Component {
 		}
 		if (strip.kind === "field") {
 			return {
-				label: [
-					span(`${strip.label} `, "muted"),
-					span(strip.input.getValue(), "mono"),
-					span("▏", "accent"),
-					strip.error !== undefined
-						? span(`  ${strip.error}`, "error")
-						: span(`  ${sanitizeDisplayLine(strip.hint)}`, "dim"),
-				],
+				label: [span(strip.label, "muted")],
 				items: [],
 			};
 		}
@@ -5782,7 +5790,7 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
-	#describeStrip(): NativeNode | undefined {
+	#describeStrip(cx?: DescribeContext): NativeNode | undefined {
 		const strip = this.#strip;
 		if (!strip) return undefined;
 		if (strip.kind === "name") {
@@ -5817,7 +5825,7 @@ export class ModelHubComponent implements Component {
 				{ gap: "sm", align: "center" },
 				[
 					text([span(strip.label, "accent")]),
-					col([strip.input], { grow: 1 }),
+					col([cx ? { ...strip.input.describe(cx), key: "fieldInput" } : strip.input], { grow: 1 }),
 					text(
 						[
 							strip.error !== undefined

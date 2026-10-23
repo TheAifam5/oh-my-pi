@@ -32,6 +32,9 @@
 ### Fixed
 
 - Native tool approvals in Tern now wait for the 500 ms arming delay
+- Model hub routing and group-name fields are real input fields in Tern, with undo and validation feedback
+- Long /account notices are no longer cut to one line in Tern
+- Unavailable model-pool members are shown as disabled and show their reason instead of attempting a switch
 - Clicking an account row in /account selects that account
 - /account keeps the selected field visible at narrow widths
 - Long advisor category and ownership lists scroll to the selection

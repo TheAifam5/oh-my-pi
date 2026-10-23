@@ -779,7 +779,7 @@ export class AccountManagerComponent implements Component {
 			),
 		);
 		const children: NativeChild[] = [
-			node("text", { spans: [span(status.text, status.tone)], truncate: "end" }, undefined, "status"),
+			node("text", { spans: [span(status.text, status.tone)], wrap: "word" }, undefined, "status"),
 			node(
 				"list",
 				{

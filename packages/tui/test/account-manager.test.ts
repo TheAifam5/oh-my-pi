@@ -6,6 +6,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { type TUI, visibleWidth } from "../src/index";
 import type { KeyId } from "../src/keys";
+import type { NativeChild, NativeNode } from "../src/native/node";
 import {
 	type AccountManagerAccount,
 	AccountManagerComponent,
@@ -315,6 +316,39 @@ describe("AccountManager", () => {
 			const lines = narrow(manager);
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 			expect(flat(lines)).toContain(`limits: ${reason}`);
+		});
+
+		test("native notices wrap without truncating sanitized refusal reasons", async () => {
+			const reason = "A long account policy refusal with\tunsafe\nspacing. ".repeat(6);
+			const { manager } = createManager([
+				account("a", "anthropic", {
+					fields: [{ id: "limits", label: "limits", key: "l", value: "0", readOnly: reason }],
+				}),
+			]);
+			manager.handleInput("l");
+			await settle();
+			const findStatus = (child: NativeChild): NativeNode | undefined => {
+				if (!child || !("k" in child)) return undefined;
+				if (child.key === "status") return child;
+				for (const nested of child.c ?? []) {
+					const found = findStatus(nested);
+					if (found) return found;
+				}
+				return undefined;
+			};
+			const status = findStatus(
+				manager.describe({ cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true }),
+			);
+			expect(status?.k).toBe("text");
+			if (status?.k !== "text") throw new Error("Missing native notice");
+			expect(status.p?.wrap).toBe("word");
+			expect(status.p?.truncate).toBeUndefined();
+			const spans = JSON.stringify(status.p?.spans);
+			expect(spans).toContain("limits:");
+			expect(spans.replace(/\s+/g, " ")).toContain("A long account policy refusal with unsafe spacing.");
+			expect(spans.match(/A long account policy refusal/g)).toHaveLength(6);
+			expect(spans).not.toContain("\\t");
+			expect(spans).not.toContain("\\n");
 		});
 
 		test("wraps an empty page's guidance", () => {
