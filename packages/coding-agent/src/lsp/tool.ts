@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "../tools/approval-actions";
 import * as fs from "node:fs";
 import path from "node:path";
 import type {
@@ -170,6 +171,7 @@ function formatRenameStatError(error: unknown): string {
  */
 export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Theme> {
 	readonly name = "lsp";
+	readonly approvalActions = builtinApprovalActions.lsp;
 	/** Some actions (rename, code actions) edit files through the language server. */
 	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {

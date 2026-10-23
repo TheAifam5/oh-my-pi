@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added exact `tool:action` approval policies for global and trusted per-agent settings, with action-scoped prompts and preserved deny and critical-safety enforcement
 - Added `task.inheritUserAgentsMd` (default on) and a /settings control so Task children inherit user-level `AGENTS.md` while project and directory `AGENTS.md` stay excluded.
 - Added configurable isolated-task baseline limits through `task.isolation.maxBaselineBytes` and `/settings`
 - Added queued root approval prompts for headless task subagents and vibe workers, including nested requests, cancellation, and timeout handling

@@ -25,6 +25,7 @@ import { extractUriScheme } from "../internal-urls/parse";
 import { InternalUrlRouter } from "../internal-urls/router";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { formatApprovalArguments } from "../tools/approval";
+import { mcpApprovalActions } from "../tools/approval-actions";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
@@ -726,6 +727,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	/** Server-declared read-only behavior for prewalk; approval stays conservative. */
 	readonly mcpReadOnlyHint: boolean | undefined;
 	readonly approval = "write" as const;
+	readonly approvalActions: CustomTool["approvalActions"];
 	/** Render completed MCP calls with the result header replacing the pending call header. */
 	readonly mergeCallAndResult = true;
 	/**
@@ -752,6 +754,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.label = `${connection.name}/${tool.name}`;
 		this.description = tool.description ?? `MCP tool from ${connection.name}`;
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
+		this.approvalActions = mcpApprovalActions(tool.inputSchema);
 		this.mcpToolName = tool.name;
 		this.mcpServerName = connection.name;
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;
@@ -864,6 +867,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	/** See {@link MCPTool.mcpReadOnlyHint}. */
 	readonly mcpReadOnlyHint: boolean | undefined;
 	readonly approval = "write" as const;
+	readonly approvalActions: CustomTool["approvalActions"];
 	/** Render completed MCP calls with the result header replacing the pending call header. */
 	readonly mergeCallAndResult = true;
 	/** See {@link MCPTool.strict}: MCP servers own validation, so stay non-strict. */
@@ -896,6 +900,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.label = `${serverName}/${tool.name}`;
 		this.description = tool.description ?? `MCP tool from ${serverName}`;
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
+		this.approvalActions = mcpApprovalActions(tool.inputSchema);
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;

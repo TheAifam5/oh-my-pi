@@ -1611,6 +1611,7 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		deferrable: tool.deferrable,
 		readsSkillUris: tool.readsSkillUris,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
+		approvalActions: tool.approvalActions,
 		// Extension tools take part in Ask-and-remember grants through the same bridge.
 		approvalCacheTargets:
 			typeof tool.approvalCacheTargets === "function"

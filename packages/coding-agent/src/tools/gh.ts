@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "./approval-actions";
 import type { GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
 import { type } from "@oh-my-pi/omptype";
 import type {
@@ -135,6 +136,7 @@ function buildBinaryFileReadResult(
 
 export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails> {
 	readonly name = "github";
+	readonly approvalActions = builtinApprovalActions.github;
 	/** Calls GitHub and can change remote state. */
 	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {

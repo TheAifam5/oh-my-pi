@@ -29,6 +29,7 @@ import {
 	getApprovalGrants,
 } from "./approval-cache";
 import { cfgToolsApproval, cfgToolsApprovalMode } from "./settings";
+import { isApprovalPolicyKey } from "./approval-actions";
 import {
 	approvalFolderListing,
 	type ApprovalFolderListing,
@@ -56,7 +57,10 @@ export interface ResolvedExecuteTimeApproval {
 	userPolicies: Record<string, unknown>;
 }
 
-type ApprovalSubject = Pick<AgentTool, "name" | "approval" | "formatApprovalDetails" | "approvalCacheTargets"> & {
+type ApprovalSubject = Pick<
+	AgentTool,
+	"name" | "approval" | "approvalActions" | "formatApprovalDetails" | "approvalCacheTargets"
+> & {
 	/**
 	 * Previous public name of this tool, when a rename changed how it mints.
 	 * MCP tools minted before digits were kept carry their digit-stripped name
@@ -293,7 +297,13 @@ function getToolDecision(
 ): Omit<ResolvedApproval, "policy"> & { policy?: ApprovalPolicy } {
 	const approval = tool.approval;
 	const decision: ToolApprovalDecision | undefined = typeof approval === "function" ? approval(args) : approval;
-	return normalizeDecision(decision);
+	const decisionValue = normalizeDecision(decision);
+	const action = tool.name === "bash" ? undefined : tool.approvalActions?.get(args);
+	const policyKey =
+		action !== undefined && tool.approvalActions?.names.includes(action)
+			? `${decisionValue.policyKey ?? tool.name}:${action}`
+			: decisionValue.policyKey;
+	return { ...decisionValue, ...(policyKey ? { policyKey } : {}) };
 }
 
 /**
@@ -305,6 +315,12 @@ function getToolDecision(
  */
 export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
 	return getToolDecision(tool, args).tier;
+}
+
+/** The tool-owned decision and exact policy key for a direct or dispatched call. */
+export function resolveToolApproval(tool: ApprovalSubject, args: unknown): ToolApprovalDecision {
+	const { override, ...decision } = getToolDecision(tool, args);
+	return { ...decision, ...(override ? { override } : {}), policyKey: decision.policyKey ?? tool.name };
 }
 
 /**
@@ -344,22 +360,10 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
 }
 
 /**
- * Resolve approval policy for a tool call.
- *
- * Resolution order:
- *  1. Tool `approval(args)` decision, defaulting to tier "exec" when omitted.
- *     A decision may carry a `policyKey` — `tools.approval.<policyKey>` is then
- *     the user override consulted instead of `tools.approval.<tool.name>`, with
- *     the invoking tool's own policy as the fallback when the user set none for
- *     the keyed sub-tool (e.g. an `xd://` device dispatch without a device
- *     policy still honors `tools.approval.write`).
- *  2. User per-tool override, if set and valid.
- *  3. Active mode tier comparison. In `always-ask-cached`, a call whose
- *     `approvalCacheTargets` are all granted in `grants` is allowed instead
- *     (see {@link resolveCachedModeApproval}).
- *
- * In yolo mode, override-based tool prompts are ignored; user `tools.approval`
- * settings remain authoritative.
+ * Resolve intrinsic, global, and per-agent approval policies before mode defaults.
+ * Exact action keys precede bare tool keys; a deny at either level is absolute.
+ * A per-agent bare allow cannot relax an explicit global action prompt.
+ * Bash critical overrides remain gated; ordinary prompts may be relaxed by per-agent allows.
  */
 export function resolveApproval(
 	tool: ApprovalSubject,
@@ -371,20 +375,29 @@ export function resolveApproval(
 ): ResolvedApproval {
 	const decision = getToolDecision(tool, args);
 	const policyKey = decision.policyKey ?? tool.name;
-	const agentKey =
-		agentPolicies && Object.hasOwn(agentPolicies, policyKey)
-			? policyKey
-			: agentPolicies && Object.hasOwn(agentPolicies, tool.name)
-				? tool.name
-				: undefined;
-	const agentPolicy = agentKey === undefined ? undefined : normalizePolicy(agentPolicies?.[agentKey]);
-	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
-	const fallbackPolicy =
-		policyKey !== tool.name && userPolicy === undefined && Object.hasOwn(userConfig, tool.name)
-			? normalizePolicy(userConfig[tool.name])
-			: undefined;
-	const effectiveUserPolicy = userPolicy ?? fallbackPolicy;
-	const userPolicyKey = userPolicy !== undefined ? policyKey : tool.name;
+	const baseKey = policyKey.includes(":") ? policyKey.slice(0, policyKey.indexOf(":")) : policyKey;
+	const keys = [...new Set([policyKey, baseKey, tool.name])];
+	const matchingPolicy = (
+		policies: Record<string, unknown> | undefined,
+	): { key: string; policy: ApprovalPolicy } | undefined => {
+		if (!policies) return undefined;
+		let first: { key: string; policy: ApprovalPolicy } | undefined;
+		for (const key of keys) {
+			if (!isApprovalPolicyKey(key) || !Object.hasOwn(policies, key)) continue;
+			const policy = normalizePolicy(policies[key]);
+			if (policy === undefined) continue;
+			const match = { key, policy };
+			if (policy === "deny") return match;
+			first ??= match;
+		}
+		return first;
+	};
+	const agentMatch = matchingPolicy(agentPolicies);
+	const agentKey = agentMatch?.key;
+	const agentPolicy = agentMatch?.policy;
+	const userMatch = matchingPolicy(userConfig);
+	const effectiveUserPolicy = userMatch?.policy;
+	const userPolicyKey = userMatch?.key;
 
 	// Legacy-name fallback for renamed tools (e.g. MCP mints that gained digits).
 	// Fail-closed: only `deny`/`prompt` carry over from the old key, so a
@@ -412,14 +425,23 @@ export function resolveApproval(
 			...(decision.reason ? { reason: decision.reason } : {}),
 		};
 	}
-	if (combinedUserPolicy === "deny") {
+	if (combinedUserPolicy === "deny" || agentPolicy === "deny") {
 		return {
 			policy: "deny",
 			tier: decision.tier,
 			override: decision.override,
 			source: "user",
-			...(combinedUserPolicyKey ? { policyKey: combinedUserPolicyKey } : {}),
+			policyKey: combinedUserPolicy === "deny" ? combinedUserPolicyKey : agentKey,
 		};
+	}
+	if (
+		agentPolicy === "allow" &&
+		agentKey !== policyKey &&
+		policyKey !== baseKey &&
+		userMatch?.key === policyKey &&
+		userMatch.policy === "prompt"
+	) {
+		return { policy: "prompt", tier: decision.tier, override: false, source: "user", policyKey };
 	}
 	if (agentPolicy === "allow" && decision.override && decision.policy === undefined) {
 		return { policy: "prompt", tier: decision.tier, override: true, source: "tool", reason: decision.reason };
@@ -645,8 +667,9 @@ export function formatApprovalArguments(args: unknown, options?: { showEmpty?: b
 }
 
 /** The prompt's header rows: tool name, MCP origin, and the reason it asks. */
-function approvalHeader(tool: ApprovalSubject, reason?: string): string[] {
-	const lines = [`Allow tool: ${tool.name}`];
+function approvalHeader(tool: ApprovalSubject, args: unknown, reason?: string): string[] {
+	const decision = getToolDecision(tool, args);
+	const lines = [`Allow tool: ${sanitizeText(decision.policyKey ?? tool.name)}`];
 
 	if (tool.name.startsWith("mcp__") && tool.approval === undefined) {
 		lines.push("Origin: MCP server tool");
@@ -672,7 +695,7 @@ function approvalDetails(tool: ApprovalSubject, args: unknown): string[] {
 
 /** Format the approval prompt body shown to the user: the header, then the tool's own details. */
 export function formatApprovalPrompt(tool: ApprovalSubject, args: unknown, reason?: string): string {
-	return [...approvalHeader(tool, reason), ...approvalDetails(tool, args)].join("\n");
+	return [...approvalHeader(tool, args, reason), ...approvalDetails(tool, args)].join("\n");
 }
 
 /**
@@ -782,7 +805,7 @@ export async function requestApproval(
 	} = {},
 ): Promise<ExtensionApprovalAnswer> {
 	const { reason, appendix = [], sessionSubject } = options;
-	const header = approvalHeader(tool, reason);
+	const header = approvalHeader(tool, args, reason);
 	const details = approvalDetails(tool, args);
 	const session = sessionSubject === undefined ? undefined : `Approve ${sessionSubject} for this session`;
 	const folder = options.grants ? approvalFolderCandidate(tool, args) : undefined;

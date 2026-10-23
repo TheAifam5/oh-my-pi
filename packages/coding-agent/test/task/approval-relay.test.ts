@@ -22,6 +22,7 @@ import { discoverAgents } from "../../src/task/discovery";
 import { cfgTaskAgentApproval } from "../../src/task/settings";
 import { resolveApproval } from "../../src/tools/approval";
 import { BashTool } from "../../src/tools/bash";
+import { GithubTool } from "../../src/tools/gh";
 import type { ToolSession } from "../../src/tools";
 import { EventBus } from "../../src/utils/event-bus";
 
@@ -55,7 +56,13 @@ const engineer: ExtensionAgentIdentity = {
 	depth: 1,
 	parentId: "Main",
 };
-function child(bus: EventBus, identity = engineer, overrides: Record<string, unknown> = {}, timeout = 500) {
+function child(
+	bus: EventBus,
+	identity = engineer,
+	overrides: Record<string, unknown> = {},
+	timeout = 500,
+	toolOverrides: Partial<AgentTool> = {},
+) {
 	let runs = 0;
 	const tool: AgentTool = {
 		name: "fixture",
@@ -67,6 +74,7 @@ function child(bus: EventBus, identity = engineer, overrides: Record<string, unk
 			runs++;
 			return { content: [{ type: "text", text: "executed" }], details: {} };
 		},
+		...toolOverrides,
 	};
 	const settings = Settings.isolated({ "tools.approval.fixture": "prompt", ...overrides });
 	const runner = new ExtensionRunner(
@@ -86,6 +94,7 @@ function child(bus: EventBus, identity = engineer, overrides: Record<string, unk
 	const wrapped = new ExtensionToolWrapper(tool, runner);
 	return {
 		execute: (signal?: AbortSignal) => wrapped.execute(crypto.randomUUID(), { value: "a\tb\u001b[31m" }, signal),
+		executeWith: (args: Record<string, unknown>) => wrapped.execute(crypto.randomUUID(), args),
 		executeAs: (agent: ExtensionAgentIdentity) =>
 			new ExtensionToolWrapper(tool, runner, agent).execute(crypto.randomUUID(), {}),
 		runs: () => runs,
@@ -93,6 +102,66 @@ function child(bus: EventBus, identity = engineer, overrides: Record<string, unk
 }
 
 describe("child approval relay", () => {
+	it("relays the action prompt despite a coarser agent grant and allows the other action", async () => {
+		const bus = new EventBus();
+		const prompts: ExtensionApprovalPrompt[] = [];
+		hostUI(bus, async prompt => {
+			prompts.push(prompt);
+			return "once";
+		});
+		const github = new GithubTool({} as ToolSession);
+		const worker = child(
+			bus,
+			engineer,
+			{
+				"tools.approval": { "github:pr_create": "prompt" },
+				"task.agentApproval": { engineer: { github: "allow" } },
+			},
+			500,
+			{
+				name: github.name,
+				parameters: github.parameters,
+				approval: github.approval,
+				approvalActions: github.approvalActions,
+			},
+		);
+		await worker.executeWith({ op: "run_watch" });
+		expect(prompts).toHaveLength(0);
+		await worker.executeWith({ op: "pr_create" });
+		expect(worker.runs()).toBe(2);
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0]!.full).toContain("Allow tool: github:pr_create");
+		expect(prompts[0]!.compact).toContain("github:pr_create");
+	});
+
+	it("retains exact action grants only for trusted definitions", async () => {
+		const bus = new EventBus();
+		let prompts = 0;
+		hostUI(bus, async () => {
+			prompts++;
+			return "deny";
+		});
+		const github = new GithubTool({} as ToolSession);
+		const overrides = {
+			"tools.approval": { github: "prompt" },
+			"task.agentApproval": { engineer: { "github:run_watch": "allow" } },
+		};
+		const tool = {
+			name: github.name,
+			parameters: github.parameters,
+			approval: github.approval,
+			approvalActions: github.approvalActions,
+		};
+		const trusted = child(bus, engineer, overrides, 500, tool);
+		await trusted.executeWith({ op: "run_watch" });
+		await expect(trusted.executeWith({ op: "pr_create" })).rejects.toThrow("denied by user");
+		const project = child(bus, { ...engineer, definitionSource: "project" }, overrides, 500, tool);
+		await expect(project.executeWith({ op: "run_watch" })).rejects.toThrow("denied by user");
+		expect(trusted.runs()).toBe(1);
+		expect(project.runs()).toBe(0);
+		expect(prompts).toBe(2);
+	});
+
 	it("executes an approved call once and prompts again on the next call", async () => {
 		const bus = new EventBus();
 		const prompts: ExtensionApprovalPrompt[] = [];

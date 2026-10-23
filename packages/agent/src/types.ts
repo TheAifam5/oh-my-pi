@@ -741,6 +741,7 @@ export interface SpeculativePhysicalOutcome {
 export interface SpeculativeToolReference {
 	name: string;
 	approval?: ToolApproval;
+	approvalActions?: ToolApprovalActions;
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
 }
 
@@ -1121,6 +1122,12 @@ export type ToolApprovalDecision =
 	  };
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
+/** Exact operation names and the tool-owned accessor for a call's operation discriminator. */
+export interface ToolApprovalActions {
+	readonly names: readonly string[];
+	get(args: unknown): string | undefined;
+}
+
 /**
  * Context passed to tool execution.
  * Apps can extend via declaration merging.
@@ -1274,6 +1281,9 @@ export interface AgentTool<
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+
+	/** Action-level approval keys; omitted for tools without an operation discriminator. */
+	approvalActions?: ToolApprovalActions;
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;

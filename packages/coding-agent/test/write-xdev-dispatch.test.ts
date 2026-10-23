@@ -296,11 +296,11 @@ describe("read and write route xd:// device URLs", () => {
 			// debug: inspection action → read; a real launch → exec (control).
 			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({
 				tier: "read",
-				policyKey: "debug",
+				policyKey: "debug:sessions",
 			});
 			expect(tier("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toEqual({
 				tier: "exec",
-				policyKey: "debug",
+				policyKey: "debug:launch",
 			});
 
 			// Fail closed: malformed JSON, non-object or schema-invalid payloads,

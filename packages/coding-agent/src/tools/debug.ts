@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "./approval-actions";
 import { type DebugToolDetails, formatLocation, formatSessionSnapshot } from "@oh-my-pi/pi-tui/tools/debug";
 import * as fs from "node:fs/promises";
 import { type } from "@oh-my-pi/omptype";
@@ -542,6 +543,7 @@ function resolveDisassemblyReference(memoryReference: string | undefined): strin
 
 export class DebugTool implements AgentTool<typeof debugSchema, DebugExecutionDetails> {
 	readonly name = "debug";
+	readonly approvalActions = builtinApprovalActions.debug;
 	/** Drives a debugger against a live process. */
 	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {

@@ -16,6 +16,7 @@ import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-entries";
 
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
+import { builtinApprovalActions } from "./approval-actions";
 
 /** Whether an unknown value is a persisted todo phase. */
 export function isTodoPhase(value: unknown): value is TodoPhase {
@@ -712,6 +713,13 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 	readonly name = "todo";
 	readonly approval = "read" as const;
+	readonly approvalActions = {
+		names: builtinApprovalActions.todo.names,
+		get: (args: unknown): string | undefined => {
+			const resolved = resolveTodoParams(args, (this.session.getTodoPhases?.().length ?? 0) > 0);
+			return typeof resolved === "string" ? undefined : resolved.op;
+		},
+	};
 	/** Applies list operations; re-running after a crash may apply them twice. */
 	readonly replay = "unsafe" as const;
 	readonly label = "Todo";

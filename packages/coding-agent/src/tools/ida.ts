@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "./approval-actions";
 import * as fs from "node:fs/promises";
 import { type } from "@oh-my-pi/omptype";
 import type {
@@ -78,6 +79,7 @@ function requireArg(value: string | undefined, name: string, action: IdaAction):
 /** IDA Pro tool: lifecycle, structured edits, and Python `exec` against process-wide shared IDBs. */
 export class IdaTool implements AgentTool<typeof idaSchema, IdaToolDetails> {
 	readonly name = "ida";
+	readonly approvalActions = builtinApprovalActions.ida;
 	/** Drives an external IDA session. */
 	readonly replay = "unsafe" as const;
 	readonly approval = (args: unknown): ToolApprovalDecision => {

@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "./approval-actions";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -39,6 +40,7 @@ export type ManageSkillParams = typeof manageSkillSchema.infer;
  */
 export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	readonly name = "manage_skill";
+	readonly approvalActions = builtinApprovalActions.manage_skill;
 	/** Creates or changes skills. */
 	readonly replay = "unsafe" as const;
 	readonly approval = "write" as const;

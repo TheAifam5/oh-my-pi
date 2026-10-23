@@ -23,6 +23,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { BatchArgsScanner, type TaskLaunchSession } from "@oh-my-pi/pi-coding-agent/task/speculative-launch";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { GithubTool } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
 const taskAgent: AgentDefinition = {
@@ -231,6 +232,31 @@ describe("task speculative launch", () => {
 });
 
 describe("speculative launch authorization", () => {
+	it("vetoes speculative execution of a globally prompted action despite a bare agent allow", async () => {
+		const settings = Settings.isolated({
+			"tools.approvalMode": "yolo",
+			"tools.approval": { "github:pr_create": "prompt" },
+		});
+		const session = {
+			cwd: "/tmp",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings,
+		};
+		const config = createSpeculativeToolExecutionConfig(settings, session, {
+			hasHandlers: () => false,
+			agentApprovalPolicies: { github: "allow" },
+		});
+		const tool = new GithubTool(session);
+		expect(await config.host?.authorizeLaunch?.({ tool, toolCall, args: { op: "pr_create" } })).toMatchObject({
+			allowed: false,
+		});
+		expect(await config.host?.authorizeLaunch?.({ tool, toolCall, args: { op: "run_watch" } })).toMatchObject({
+			allowed: true,
+		});
+	});
+
 	it("allows launches only under auto-allow approval without lifecycle handlers", async () => {
 		const launch = { tool: { name: "task", approval: "exec" as const }, toolCall, args: { context: "ctx" } };
 		const authorize = (approvalMode: string, handlers: boolean) => {

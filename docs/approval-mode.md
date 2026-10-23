@@ -56,6 +56,8 @@ tools:
     bash: prompt
     read: allow
     mcp__filesystem_delete: deny
+    github:run_watch: allow
+    github:pr_create: prompt
 ```
 
 For MCP tools, key the policy by the exact final registered name. The ordinary form is
@@ -66,12 +68,17 @@ capped with a deterministic hash suffix; use the final capped name rather than t
 
 The sanitizer lowercases names and retains letters, digits, and underscores. For MCP names changed by the older digit-stripping sanitizer, a legacy `deny` or `prompt` key is inherited only when no current-name policy applies; legacy `allow` is never inherited.
 
-A decision's `policyKey` selects `tools.approval.<policyKey>` first, falling back to the invoking tool's policy when the keyed policy is missing or invalid. For example, `write` to a mounted `xd://lsp` device consults `tools.approval.lsp` before `tools.approval.write` and uses the device operation's tier.
+A decision's `policyKey` selects a dispatched tool/device. For a call with a declared action, exact `<tool>:<action>` keys precede bare `<tool>` keys; no wildcards are supported. Any matching deny wins, including a bare-tool deny alongside an action allow. Tools without action metadata match only bare keys. Bash keeps `bash.patterns` and does not support `bash:` action keys. Unknown actions for known tools produce a warning and are ignored.
+
+For example, `write` to `xd://github` with `{"op":"pr_create"}` consults `github:pr_create`, then `github`, then `write`, and uses the device operation's tier and intrinsic restrictions.
+
+MCP dispatchers expose action keys when their input schema declares an enumerated `op`. Browser and computer eval-prelude capabilities remain bare-key-only; they do not use per-agent tool policies.
 
 Resolution per tool call:
 
 1. Evaluate `tool.approval(args)`; omitted/malformed decisions default to tier `exec`.
 2. A tool-declared `policy: deny` always denies. A user `deny` is checked next and also always denies.
+   Trusted per-agent policies apply after denies and before ordinary prompts and mode defaults. An exact per-agent action allow can relax an ordinary global prompt for that action. A bare per-agent tool allow cannot relax an explicit global action prompt.
 3. In `yolo`, an explicit tool `allow`/`prompt` policy wins; otherwise the valid user policy wins, or the call is allowed. The `override` flag alone does not force a prompt in `yolo`.
 4. In non-yolo modes, an `override: true` decision allows only an accompanying tool `policy: allow`; every other non-denied case prompts.
 5. Without an override, an explicit tool `allow`/`prompt` policy wins, then a valid user policy wins.
@@ -211,8 +218,10 @@ task:
       bash: prompt
 ```
 
-Agent names are exact definition names, not generated task ids. Tool keys use the same exact tool/device names as `tools.approval`; `tool:pattern` and wildcard keys are not supported. Per-agent policies take precedence over ordinary global prompts, bash prompt patterns, and mode defaults. A deny from any source remains absolute, critical safety overrides remain gated, and provider safety checks still require approval. An allow for one definition does not authorize another definition.
+Agent names are exact definition names, not generated task ids. Policy keys use the same exact `tool` or `tool:action` names as `tools.approval`; wildcard and command-pattern keys are not supported. Per-agent policies take precedence over ordinary global prompts, bash prompt patterns, and mode defaults. An action key beats a bare key within one map, except that any deny remains absolute. A per-agent `github:run_watch: allow` grants no other action. A bare per-agent `github: allow` grants every ordinary action except those with a global action-level `prompt` or `deny`; global `github:pr_create: prompt` therefore still prompts. Critical safety overrides remain gated, and provider safety checks still require approval. An allow for one definition does not authorize another definition.
 
 Only global config, trusted directory layers, explicit config overlays, and runtime settings may supply `task.agentApproval`. Project values are ignored with a warning. Agent frontmatter and markdown cannot grant approval. Both settings are available in `/settings` under Tasks; the policy record accepts JSON.
+
+Browser and computer eval-prelude capabilities are governed only by global `tools.approval`; per-agent entries for them have no effect.
 
 An allow entry applies only to a bundled or user-sourced definition. Project definitions that shadow an allowed name cannot inherit its allow; they retain normal approval and log one warning per session. Cold revival requires both persisted original provenance and the currently discovered definition to be trusted; legacy transcripts without original provenance cannot inherit allow entries. Deny and prompt entries still apply to every source.

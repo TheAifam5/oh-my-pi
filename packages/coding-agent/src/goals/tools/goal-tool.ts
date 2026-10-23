@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "../../tools/approval-actions";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -61,6 +62,7 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
+	readonly approvalActions = builtinApprovalActions.goal;
 	/** Goal ops touch only session state: `get` reads it; the rest change the goal, so `always-ask` still prompts. */
 	readonly approval = (args: unknown): ToolTier =>
 		args !== null && typeof args === "object" && "op" in args && args.op === "get" ? "read" : "write";

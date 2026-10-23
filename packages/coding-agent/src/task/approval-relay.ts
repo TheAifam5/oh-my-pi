@@ -10,7 +10,10 @@ const REQUEST = "task:approval:request";
 const RESPONSE = "task:approval:response";
 const hosts = new WeakMap<EventBus, ApprovalRelayHost>();
 
-type ApprovalTool = Pick<AgentTool, "name" | "approval" | "formatApprovalDetails" | "approvalCacheTargets">;
+type ApprovalTool = Pick<
+	AgentTool,
+	"name" | "approval" | "approvalActions" | "formatApprovalDetails" | "approvalCacheTargets"
+>;
 interface RelayRequest {
 	id: string;
 	agent: ExtensionAgentIdentity;
@@ -70,6 +73,7 @@ export class ApprovalRelayHost {
 						const details = request.tool.formatApprovalDetails?.(request.args);
 						const displayTool = {
 							approval: request.tool.approval,
+							approvalActions: request.tool.approvalActions,
 							name: approvalDisplay(request.tool.name),
 							formatApprovalDetails: () =>
 								(typeof details === "string" ? [details] : (details ?? [])).map(approvalDisplay),

@@ -29,6 +29,7 @@ import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
+	AgentTool,
 	AgentMessage,
 	AgentToolResult,
 	AgentToolUpdateCallback,
@@ -1015,6 +1016,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** Tool approval tier. Defaults to `"exec"` when omitted.
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
+	/** Exact actions and the accessor used for action-level approval policies. */
+	approvalActions?: AgentTool["approvalActions"];
 	/** Exact targets an approval mode may remember for this call (`always-ask-cached`), one key per
 	 *  target, derived from the call's args. Omit it and approvals are never remembered per target. */
 	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;

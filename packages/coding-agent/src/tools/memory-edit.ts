@@ -1,3 +1,4 @@
+import { builtinApprovalActions } from "./approval-actions";
 import { type } from "@oh-my-pi/omptype";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -19,6 +20,7 @@ export type MemoryEditParams = typeof memoryEditSchema.infer;
 
 export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	readonly name = "memory_edit";
+	readonly approvalActions = builtinApprovalActions.memory_edit;
 	readonly approval = "read" as const;
 	/** Edits memory state: re-running after a crash may apply the change twice. */
 	readonly replay = "unsafe" as const;

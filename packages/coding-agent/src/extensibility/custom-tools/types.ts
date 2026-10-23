@@ -9,6 +9,7 @@ import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
+	AgentTool,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApproval,
@@ -222,6 +223,8 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+	/** Exact actions and the accessor used for action-level approval policies. */
+	approvalActions?: AgentTool["approvalActions"];
 	/** Whether re-running the call after a crash is harmless; static or resolved from the call's arguments. Omitted means `"unsafe"`. */
 	replay?: ToolReplay;
 

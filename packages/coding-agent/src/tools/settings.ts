@@ -1,3 +1,5 @@
+import { isRecord } from "@oh-my-pi/pi-utils";
+import { validateApprovalPolicyKeys } from "./approval-actions";
 import { combine, describeSettingValue, register } from "../config/registry";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgBashEnabled } from "../exec/settings";
@@ -371,6 +373,9 @@ export const cfgToolsApproval = register({
 	id: "tools.approval",
 	type: "record",
 	default: {},
+	validate: value => {
+		if (isRecord(value)) validateApprovalPolicyKeys(value);
+	},
 	ui: {
 		tab: "interaction",
 		group: "Approvals",

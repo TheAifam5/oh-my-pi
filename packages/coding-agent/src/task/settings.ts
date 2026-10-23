@@ -1,3 +1,4 @@
+import { validateApprovalPolicyKeys } from "../tools/approval-actions";
 /**
  * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
  * settings-panel order; `config/all-settings.ts` registers every domain.
@@ -36,6 +37,9 @@ export const cfgTaskAgentApproval = register({
 			)
 		) {
 			throw new Error("Invalid task.agentApproval: expected agent names mapped to tool approval policies.");
+		}
+		for (const policies of Object.values(value)) {
+			validateApprovalPolicyKeys(policies as Record<string, unknown>);
 		}
 	},
 	ui: {

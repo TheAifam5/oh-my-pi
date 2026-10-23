@@ -24,6 +24,7 @@ import {
 	truncateForPrompt,
 } from "../../tools/approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
+import { validateApprovalPolicyKeys } from "../../tools/approval-actions";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -300,6 +301,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		);
 		const identity = this.#agent ?? this.runner.agentIdentity;
 		const agentPolicies = this.runner.agentApprovalPoliciesFor?.(identity);
+		validateApprovalPolicyKeys(userPolicies, this.tool);
+		if (agentPolicies) validateApprovalPolicyKeys(agentPolicies, this.tool);
 		// `always-ask-cached` grants for this conversation, shared by the pre-check, the full gate,
 		// and the record after an approval.
 		const approvalGrants =
@@ -407,7 +410,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// satisfies explicit prompts, but compares against a deep snapshot because
 		// handlers can mutate the original argument object in place. Denies were
 		// enforced above, and provider safety checks remain independently required.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+		const explicitPrompt = resolved.override || resolved.source === "user";
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		const acpBypass =
 			context !== undefined &&

@@ -3,6 +3,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { cfgTaskAgentApproval } from "../../task/settings";
+import { isApprovalPolicyKey } from "../../tools/approval-actions";
 import {
 	type AgentMessage,
 	type AgentTool,
@@ -1084,7 +1085,9 @@ export class ExtensionRunner {
 		if (!this.settings || identity.kind !== "sub") return undefined;
 		const policies = cfgTaskAgentApproval.get(this.settings);
 		if (!Object.hasOwn(policies, identity.name)) return undefined;
-		const agentPolicies = policies[identity.name];
+		const agentPolicies = Object.fromEntries(
+			Object.entries(policies[identity.name]).filter(([key]) => isApprovalPolicyKey(key)),
+		);
 		if (identity.definitionSource === "bundled" || identity.definitionSource === "user") return agentPolicies;
 		if (
 			identity.definitionSource === "project" &&

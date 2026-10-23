@@ -36,6 +36,23 @@ Headless children relay required tool approvals to the root session's interactiv
 
 Trusted `task.agentApproval` maps exact agent definition names to exact tool/device names and `allow`, `deny`, or `prompt` policies. A matching allow skips ordinary prompts for that definition only; denies and critical safety gates remain enforced. Global config, trusted directory layers, config overlays, and runtime settings may supply it. Project settings are ignored with a warning; agent frontmatter and markdown cannot grant permission. Both settings are exposed under Tasks in `/settings`; the policy record accepts JSON. See [approval mode](../approval-mode.md#subagents).
 
+Browser and computer eval-prelude capabilities are governed only by global `tools.approval`; per-agent entries for them have no effect.
+
+Both policy maps accept exact `tool:action` keys for tools with a declared operation discriminator. An action key precedes a bare tool key, except that any deny remains absolute. For example:
+
+```yaml
+tools:
+  approval:
+    github:run_watch: allow
+    github:pr_create: prompt
+task:
+  agentApproval:
+    engineer:
+      github: allow
+```
+
+The engineer can watch runs without approval, but `pr_create` still prompts: a bare per-agent tool allow cannot override a global action prompt. A per-agent `github:run_watch: allow` authorizes only `run_watch`; an exact action allow can relax that action's ordinary prompt. Unknown actions for known tools warn and are ignored. Tools without actions use bare keys only; bash retains `bash.patterns` instead of `bash:` keys. Wildcards are not supported. Relayed prompts identify the action.
+
 Per-agent allow grants apply only to bundled or user-sourced definitions. Project definitions, including same-name shadows, and definitions without verified provenance cannot inherit allow grants; project shadows log a warning once per session. Deny and prompt entries still apply.
 
 ## Inputs
