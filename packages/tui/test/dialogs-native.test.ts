@@ -267,15 +267,82 @@ describe("dialogs under a native surface", () => {
 			now.mockReturnValue(1_000 + 3 * APPROVE_ARM_MS);
 			approveFirst.handleInput(ENTER);
 			expect(defaulted.onApprove).toHaveBeenCalledTimes(1);
-			// Denying and clicking Approve are deliberate, so neither waits to arm.
+			// Esc denies before approval is armed.
 			const denied = { onApprove: vi.fn(), onDeny: vi.fn() };
 			new ApprovalDialogComponent(prompt, denied).handleInput("\x1b");
 			expect(denied.onDeny).toHaveBeenCalledTimes(1);
-			const pointed = { onApprove: vi.fn(), onDeny: vi.fn() };
-			const clicked = new ApprovalDialogComponent(prompt, pointed);
-			const approve = find(clicked.describe(), node => node.p?.role === "omp.btn" && node.key === "approve");
-			clicked.handleNativeEvent({ type: "action", key: approve!.path, act: "approve", mods: [] });
-			expect(pointed.onApprove).toHaveBeenCalledTimes(1);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it.each(["action", "select", "activate"] as const)(
+		"approval: native %s waits 500 ms after delayed first description and accepts approval at the deadline",
+		type => {
+			const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+			try {
+				const answers = type === "action" ? (["once"] as const) : (["once", "session", "grant0"] as const);
+				for (const answer of answers) {
+					now.mockReturnValue(1_000);
+					const callbacks = { onApprove: vi.fn(), onDeny: vi.fn() };
+					const onSession = vi.fn();
+					const onGrant = vi.fn();
+					const grant = { label: "Approve File", alwaysLabel: "Always Approve File" };
+					const dialog = new ApprovalDialogComponent("Allow tool: write\nPath: a.ts", callbacks, {
+						session: { label: "Approve for this session", onApprove: onSession },
+						grants: [grant],
+						onGrant,
+					});
+					now.mockReturnValue(2_000);
+					const target = find(dialog.describe(), node =>
+						type === "action"
+							? node.p?.role === "omp.btn" && node.key === "approve"
+							: node.p?.role === "omp.approval.choices",
+					)!;
+					const event =
+						type === "action"
+							? ({ type, key: target.path, act: "approve", mods: [] } as const)
+							: { type, key: target.path, item: answer };
+					dialog.handleNativeEvent(event);
+					now.mockReturnValue(2_000 + APPROVE_ARM_MS - 1);
+					dialog.handleNativeEvent(event);
+					expect(callbacks.onApprove).not.toHaveBeenCalled();
+					expect(callbacks.onDeny).not.toHaveBeenCalled();
+					expect(onSession).not.toHaveBeenCalled();
+					expect(onGrant).not.toHaveBeenCalled();
+					now.mockReturnValue(2_000 + APPROVE_ARM_MS);
+					dialog.handleNativeEvent(event);
+					if (answer === "once") expect(callbacks.onApprove).toHaveBeenCalledTimes(1);
+					else if (answer === "session") expect(onSession).toHaveBeenCalledTimes(1);
+					else expect(onGrant).toHaveBeenCalledWith(grant, false);
+					dialog.handleNativeEvent({ type: "action", key: "deny", act: "deny", mods: [] });
+					expect(callbacks.onDeny).not.toHaveBeenCalled();
+					dialog.dispose();
+				}
+			} finally {
+				now.mockRestore();
+			}
+		},
+	);
+
+	it.each(["action", "select", "activate"] as const)("approval: native %s denies before arming", type => {
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		try {
+			const callbacks = { onApprove: vi.fn(), onDeny: vi.fn() };
+			const dialog = new ApprovalDialogComponent("Allow tool: bash\nCommand: ls", callbacks);
+			const target = find(dialog.describe(), node =>
+				type === "action"
+					? node.p?.role === "omp.btn" && node.key === "deny"
+					: node.p?.role === "omp.approval.choices",
+			)!;
+			dialog.handleNativeEvent(
+				type === "action"
+					? { type, key: target.path, act: "deny", mods: [] }
+					: { type, key: target.path, item: "deny" },
+			);
+			expect(callbacks.onDeny).toHaveBeenCalledTimes(1);
+			expect(callbacks.onApprove).not.toHaveBeenCalled();
+			dialog.dispose();
 		} finally {
 			now.mockRestore();
 		}
@@ -355,6 +422,7 @@ describe("dialogs under a native surface", () => {
 				onGrant: clicked,
 			});
 			const list = find(pointed.describe(), node => node.p?.role === "omp.approval.choices")!;
+			now.mockReturnValue(1_000 + 2 * APPROVE_ARM_MS);
 			pointed.handleNativeEvent({ type: "select", key: list.path, item: "grant0" });
 			expect(clicked).toHaveBeenCalledWith(folder, false);
 		} finally {

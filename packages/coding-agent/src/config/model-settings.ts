@@ -119,6 +119,13 @@ export const cfgAuthDisabledAccounts = register({
 	type: "array",
 	default: EMPTY_DISABLED_ACCOUNTS,
 	validate: validateDisabledAccounts,
+	ui: {
+		tab: "providers",
+		group: "Accounts",
+		label: "Disabled Accounts",
+		description: "JSON list of excluded provider/account names, credential IDs, or account matchers",
+		editor: "json",
+	},
 });
 
 /**

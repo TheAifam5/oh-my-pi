@@ -32,6 +32,7 @@
           "default": {}
         },
         "disabledAccounts": {
+          "description": "JSON list of excluded provider/account names, credential IDs, or account matchers",
           "type": "array",
           "default": []
         }

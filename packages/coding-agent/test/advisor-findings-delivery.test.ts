@@ -1,3 +1,4 @@
+import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -13,6 +14,9 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { SessionAdvisors } from "@oh-my-pi/pi-coding-agent/session/session-advisors";
 import { ChainJudge } from "@oh-my-pi/pi-coding-agent/judgment";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
+import type { Component } from "@oh-my-pi/pi-tui";
+import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import {
 	ADVISOR_FINDINGS_ENTRY_TYPE,
@@ -891,6 +895,65 @@ describe("advisor findings delivery", () => {
 	});
 
 	describe("/advisor findings", () => {
+		beforeAll(async () => {
+			await initTheme(false);
+		});
+
+		it("reuses the native findings sheet and persists its resolve and reopen actions", async () => {
+			const tools = enable();
+			await advise(tools.get("Security"), report("security", "Token compared with ==."));
+			session.agent.clearSteeringQueue();
+			const overlays: Component[] = [];
+			const ctx = createInteractiveModeContext({
+				session,
+				sessionManager: session.sessionManager,
+				settings: session.settings,
+				editor: { setText: () => {}, addToHistory: () => {} },
+				ui: {
+					showOverlay: (component: Component) => {
+						overlays.push(component);
+						return { hide: () => {}, setHidden: () => {}, isHidden: () => false };
+					},
+					requestRender: () => {},
+					terminal: { rows: 40 },
+				},
+				showStatus: () => {},
+			});
+			const controller = new SelectorController(ctx);
+			ctx.showAdvisorFindings = filter => controller.showAdvisorFindings(filter);
+			await executeBuiltinSlashCommand("/advisor findings all", { ctx });
+			await executeBuiltinSlashCommand("/advisor findings all", { ctx });
+			expect(overlays).toHaveLength(1);
+			const overlay = overlays[0]!;
+			const tree = (): NativeNode | null | undefined =>
+				overlay.describe?.({
+					cols: 80,
+					dark: true,
+					reduceMotion: false,
+					supports: () => true,
+					feature: () => true,
+				});
+			expect(tree()?.k).toBe("picker");
+			expect(JSON.stringify(tree())).toContain("Token compared with ==");
+			overlay.handleNativeEvent?.({ type: "action", key: "", act: "resolve", mods: [] });
+			expect(session.getAdvisorFindings()[0]?.status).toBe("resolved");
+			overlay.handleNativeEvent?.({ type: "action", key: "", act: "reopen", mods: [] });
+			expect(session.getAdvisorFindings()[0]?.status).toBe("open");
+			const persisted = session.sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === ADVISOR_FINDINGS_ENTRY_TYPE);
+			expect(persisted.length).toBeGreaterThanOrEqual(3);
+			await executeBuiltinSlashCommand("/advisor findings open", { ctx });
+			expect(overlays).toHaveLength(1);
+			const filtered = tree();
+			expect(filtered?.k === "picker" ? filtered.p?.tab : undefined).toBe("open");
+			expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(overlay);
+			overlay.handleNativeEvent?.({ type: "action", key: "", act: "close", mods: [] });
+			expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
+			await executeBuiltinSlashCommand("/advisor findings all", { ctx });
+			expect(overlays).toHaveLength(2);
+		});
+
 		async function runFindings(mode: "TUI" | "text", args: string): Promise<string> {
 			const text = `/advisor findings ${args}`.trim();
 			if (mode === "text") {
@@ -914,11 +977,21 @@ describe("advisor findings delivery", () => {
 				sessionManager: session.sessionManager,
 				settings: session.settings,
 				editor: { setText: () => {}, addToHistory: () => {} },
+				ui: {
+					showOverlay: (component: Component) => {
+						status = component.render(120).join("\n");
+						return { hide: () => {}, setHidden: () => {}, isHidden: () => false };
+					},
+					requestRender: () => {},
+					terminal: { rows: 40 },
+				},
 				showStatus: value => {
 					status = value;
 				},
 				showError: () => {},
 			});
+			const controller = new SelectorController(ctx);
+			ctx.showAdvisorFindings = filter => controller.showAdvisorFindings(filter);
 			await executeBuiltinSlashCommand(text, { ctx });
 			return status;
 		}

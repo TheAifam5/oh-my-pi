@@ -256,3 +256,97 @@ it("cycles the scope with a rebound key and shows that key in the scope hint", a
 		setKeybindings(previous);
 	}
 });
+
+const NATIVE = {
+	cols: 120,
+	reduceMotion: false,
+	dark: true,
+	supports: () => true,
+	feature: () => true,
+};
+
+it("keeps the native scope label and Home/Root note visible while actions and keys cycle the same targets", async () => {
+	spyOn(Settings.instance, "listDirectoryLayerTargets").mockResolvedValue([
+		{ dir: cwd, file: "current", exists: false, label: "dir" },
+		{ dir: "/fixture/home", file: "home", exists: true, label: "home" },
+		{ dir: "/", file: "root", exists: true, label: "root" },
+	]);
+	const host = createSettingsHost();
+	const selector = panel(host);
+	await selector.ready;
+	const nativePrefs = () => {
+		const node = selector.describe(NATIVE);
+		if (node.k !== "prefs" || !node.p) throw new Error("Expected native prefs");
+		return node.p;
+	};
+	expect(nativePrefs().lead).toContain("Scope: Global");
+	expect(
+		nativePrefs()
+			.sections.flatMap(section => section.rows)
+			.some(row => row.control.k === "action" && row.control.act === "cycleScope"),
+	).toBe(true);
+	for (const target of host.targets?.slice(1) ?? []) {
+		selector.handleNativeEvent({ type: "action", key: "", act: "cycleScope", mods: [] });
+		expect(host.target).toBe(target.id);
+		expect(nativePrefs().lead).toContain(`Scope: ${target.label}`);
+		if (target.note) expect(nativePrefs().lead).toContain(target.note);
+	}
+	selector.handleInput("\x13");
+	expect(host.target).toBe("global");
+	expect(nativePrefs().lead).toContain("Scope: Global");
+	selector.handleNativeEvent({ type: "action", key: "", act: "page", value: "plugins", mods: [] });
+	expect(
+		nativePrefs()
+			.sections.flatMap(section => section.rows)
+			.some(row => row.control.k === "action" && row.control.act === "cycleScope"),
+	).toBe(false);
+	selector.handleNativeEvent({ type: "action", key: "", act: "cycleScope", mods: [] });
+	expect(host.target).toBe("global");
+});
+
+it.each(["global", "directory"])(
+	"edits disabled accounts as JSON in the selected %s scope from ANSI and native settings",
+	async scope => {
+		const host = createSettingsHost();
+		const selector = panel(host);
+		await selector.ready;
+		if (scope === "directory") selector.handleInput("\x13");
+		for (const character of "Disabled Accounts") selector.handleInput(character);
+		expect(Bun.stripANSI(selector.render(120).join("\n"))).toContain("Disabled Accounts");
+		const native = selector.describe(NATIVE);
+		if (native.k !== "prefs" || !native.p) throw new Error("Expected native prefs");
+		expect(
+			native.p.sections.flatMap(section => section.rows).find(row => row.id === "auth.disabledAccounts")?.control.k,
+		).toBe("text");
+		const submit = (value: string) => {
+			if (scope === "directory") {
+				selector.handleNativeEvent({ type: "change", key: "", item: "auth.disabledAccounts", value });
+			} else {
+				selector.handleInput("\n");
+				selector.handleInput("\x01");
+				selector.handleInput("\x0b");
+				for (const character of value) selector.handleInput(character);
+				selector.handleInput("\n");
+			}
+		};
+		submit('["anthropic/private",{"provider":"openai","email":"private@example.com"}]');
+		expect(await selector.pendingWrite).toBe(true);
+		const def = lookup("auth.disabledAccounts");
+		if (!def) throw new Error("Missing disabled accounts setting");
+		expect(settings.getLayerValues(def)).toContainEqual({
+			source: scope,
+			...(scope === "directory" ? { dir: cwd } : {}),
+			value: ["anthropic/private", { provider: "openai", email: "private@example.com" }],
+		});
+		submit('["invalid"]');
+		expect(await selector.pendingWrite).toBe(false);
+		expect(host.get("auth.disabledAccounts")).toEqual([
+			"anthropic/private",
+			{ provider: "openai", email: "private@example.com" },
+		]);
+		expect(Bun.stripANSI(selector.render(120).join("\n"))).toContain("auth.disabledAccounts[0] must be");
+		const rejected = selector.describe(NATIVE);
+		if (rejected.k !== "prefs" || !rejected.p) throw new Error("Expected native prefs");
+		expect(rejected.p.lead).toContain("auth.disabledAccounts[0] must be");
+	},
+);

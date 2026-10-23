@@ -519,6 +519,7 @@ export interface InteractiveModeContext {
 	/** Open the fullscreen `/usage` dashboard overlay for the given reports. */
 	showUsageDashboard(reports: UsageReport[]): void;
 	showAdvisorConfigure(): void;
+	showAdvisorFindings(filter?: "open" | "all"): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;

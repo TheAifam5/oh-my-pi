@@ -420,6 +420,8 @@ type Screen =
 	| "review-interval"
 	| "sync-backlog"
 	| "max-notes"
+	| "reserve-pct"
+	| "when-reserved"
 	| "owns"
 	| "instructions"
 	| "categories"
@@ -447,6 +449,8 @@ const PREFS_EDITOR_SCREENS: Partial<Record<Screen, true>> = {
 	"review-interval": true,
 	"sync-backlog": true,
 	"max-notes": true,
+	"reserve-pct": true,
+	"when-reserved": true,
 	owns: true,
 	tools: true,
 	instructions: true,
@@ -482,10 +486,12 @@ function screenHints(screen: Screen): (NativeHint | undefined)[] {
 		case "thinking":
 		case "review-mode":
 		case "sync-backlog":
+		case "when-reserved":
 		case "category-owner":
 			return [actionHint("tui.select.confirm", "pick"), actionHint("tui.select.cancel", "back")];
 		case "review-interval":
 		case "max-notes":
+		case "reserve-pct":
 		case "category-precedence":
 			return [actionHint("tui.input.submit", "save"), actionHint("tui.select.cancel", "cancel")];
 		case "owns":
@@ -799,6 +805,25 @@ export class AdvisorConfigOverlayComponent implements Component {
 					},
 				},
 				{
+					id: "reservePct",
+					label: "Quota reserve (%)",
+					hint: "0–100, or inherit to use advisor.budget.reservePct.",
+					changed: advisor.budget?.reservePct !== undefined ? true : undefined,
+					control: { k: "text", value: String(advisor.budget?.reservePct ?? "inherit") },
+				},
+				{
+					id: "whenReserved",
+					label: "When quota reserved",
+					hint: "Inherit uses advisor.budget.whenReserved.",
+					changed: advisor.budget?.whenReserved !== undefined ? true : undefined,
+					control: {
+						k: "choice",
+						value: advisor.budget?.whenReserved ?? "inherit",
+						options: ["inherit", "fallback", "skip"].map(value => ({ value, label: value })),
+						style: "menu",
+					},
+				},
+				{
 					id: "owns",
 					label: "Owns categories",
 					hint: "Claims these categories when they name no owner.",
@@ -1097,6 +1122,10 @@ export class AdvisorConfigOverlayComponent implements Component {
 				const advisor = this.#doc.advisors[index];
 				if (!advisor) return;
 				this.#detailField = event.item;
+				if (event.item === "reservePct" || event.item === "whenReserved") {
+					this.#changeBudget(index, event.item, event.value);
+					return;
+				}
 				if (event.item === "toggleEnabled" && typeof event.value === "boolean") {
 					if (event.value !== (advisor.enabled !== false)) this.#onDetailSelect(index, "toggleEnabled");
 				} else if (event.item === "tools" && Array.isArray(event.value)) {
@@ -1701,6 +1730,16 @@ export class AdvisorConfigOverlayComponent implements Component {
 				description: this.#maxNotesLabel(advisor.maxNotesPerUpdate),
 			},
 			{ value: "owns", label: "Owns categories", description: formatOwns(advisor.owns) },
+			{
+				value: "reservePct",
+				label: "Quota reserve (%)",
+				description: String(advisor.budget?.reservePct ?? "inherit"),
+			},
+			{
+				value: "whenReserved",
+				label: "When quota reserved",
+				description: advisor.budget?.whenReserved ?? "inherit",
+			},
 		];
 		if (advisor.model?.trim()) {
 			items.push({ value: "resetModel", label: "Reset model to advisor-role default" });
@@ -1751,6 +1790,12 @@ export class AdvisorConfigOverlayComponent implements Component {
 				return;
 			case "maxNotesPerUpdate":
 				this.#showMaxNotesEditor(index);
+				return;
+			case "reservePct":
+				this.#showReserveEditor(index);
+				return;
+			case "whenReserved":
+				this.#showWhenReservedPicker(index);
 				return;
 			case "owns":
 				this.#showOwnsEditor(index, new Set(this.#doc.advisors[index].owns ?? []), 0);
@@ -1945,6 +1990,75 @@ export class AdvisorConfigOverlayComponent implements Component {
 				role: "omp.overlay.advisor.interval",
 				title: `Review interval · ${advisor.name || "this advisor"}`,
 				hint: "Review every Nth eligible update; skipped updates join the next review.",
+			},
+		);
+	}
+
+	#changeBudget(index: number, field: "reservePct" | "whenReserved", value: unknown): boolean {
+		const advisor = this.#doc.advisors[index];
+		if (!advisor) return false;
+		const unset = value === null || (typeof value === "string" && ["", "inherit"].includes(value.trim()));
+		const budget = { ...advisor.budget };
+		if (field === "reservePct") {
+			const reserve = typeof value === "string" ? Number(value.trim()) : value;
+			if (!unset && (typeof reserve !== "number" || !Number.isFinite(reserve) || reserve < 0 || reserve > 100)) {
+				this.#cb.notify("Quota reserve must be a number from 0 to 100, or inherit.");
+				return false;
+			}
+			if (unset) delete budget.reservePct;
+			else budget.reservePct = reserve as number;
+		} else {
+			if (!unset && value !== "fallback" && value !== "skip") {
+				this.#cb.notify("When quota reserved must be fallback, skip, or inherit.");
+				return false;
+			}
+			if (unset) delete budget.whenReserved;
+			else budget.whenReserved = value as "fallback" | "skip";
+		}
+		if (Object.keys(budget).length === 0) delete advisor.budget;
+		else advisor.budget = budget;
+		this.#dirty = true;
+		this.#showDetail(index);
+		return true;
+	}
+
+	#showReserveEditor(index: number): void {
+		const input = new Input();
+		input.setValue(String(this.#doc.advisors[index].budget?.reservePct ?? "inherit"));
+		input.onSubmit = value => {
+			this.#changeBudget(index, "reservePct", value);
+		};
+		input.onEscape = () => this.#showDetail(index);
+		this.#setScreen(
+			"reserve-pct",
+			input,
+			`Type 0–100 or inherit · ${editorKey("tui.input.submit")} save · ${editorKey("tui.select.cancel")} cancel`,
+			undefined,
+			{
+				role: "omp.overlay.advisor.field",
+				title: "Quota reserve (%)",
+				hint: "Blank or inherit removes the override and uses advisor.budget.reservePct.",
+			},
+		);
+	}
+
+	#showWhenReservedPicker(index: number): void {
+		const current = this.#doc.advisors[index].budget?.whenReserved ?? "inherit";
+		const items = ["inherit", "fallback", "skip"].map(value => ({ value, label: value }));
+		const list = new SelectList(items, items.length, getSelectListTheme());
+		list.setSelectedValue(current);
+		list.onSelect = item => {
+			this.#changeBudget(index, "whenReserved", item.value);
+		};
+		list.onCancel = () => this.#showDetail(index);
+		this.#setScreen(
+			"when-reserved",
+			list,
+			`${editorKey("tui.select.confirm")} choose · ${editorKey("tui.select.cancel")} back`,
+			{
+				title: "When quota reserved",
+				subtitle: "Inherit uses advisor.budget.whenReserved.",
+				current: [current],
 			},
 		);
 	}

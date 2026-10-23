@@ -4,6 +4,9 @@
 
 ### Added
 
+- `/settings` in Tern shows the active scope and offers a Change scope action
+- `/advisor findings` opens a findings list with detail and resolve/reopen actions, including in Tern
+- `/advisor configure` edits per-advisor quota reserve and reserved action, including in Tern
 - Added the `tui.settings.cycleScope` keybinding (default `Ctrl+S`) and write scopes to the settings panel: `SettingsHost` gains optional `ready`, `targets`, `target`, `selectTarget()`, `provenance()`, and `shadowWarning()`, `set`/`unset` may return promises, and `SettingItem.provenance` shows a source badge without changing the editable value
 - Added expandable role-pool and model-group members to the session model picker, with concrete model ids and current availability
 - Added rule model selectors to the extensions inspector and `fallback` to the advisor configuration type
@@ -28,6 +31,7 @@
 
 ### Fixed
 
+- Native tool approvals in Tern now wait for the 500 ms arming delay
 - Clicking an account row in /account selects that account
 - /account keeps the selected field visible at narrow widths
 - Long advisor category and ownership lists scroll to the selection

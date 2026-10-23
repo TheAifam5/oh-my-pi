@@ -11,6 +11,8 @@ import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, Text, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import { AdvisorFindingsOverlay } from "@oh-my-pi/pi-tui/overlays/advisor-findings";
+import { runAdvisorFindingsCommand } from "../../slash-commands/helpers/advisor-findings";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -202,7 +204,8 @@ type MenuKind =
 	| "model-hub"
 	| "agents-dashboard"
 	| "agent-hub"
-	| "usage-dashboard";
+	| "usage-dashboard"
+	| "advisor-findings";
 
 /** An open menu: registered when the request runs, filled once its component mounts. */
 interface OpenMenu {
@@ -504,6 +507,28 @@ export class SelectorController {
 		});
 		const menu = this.#claimMenu("usage-dashboard");
 		this.#mountMenu(menu, dashboard, () => this.#showFullscreenMenu(dashboard));
+	}
+
+	showAdvisorFindings(filter: "open" | "all" = "open"): void {
+		const open = this.#openMenus.get("advisor-findings")?.component;
+		if (open instanceof AdvisorFindingsOverlay) open.setFilter(filter);
+		if (this.#focusOpenMenu("advisor-findings")) return;
+		const menu = this.#claimMenu("advisor-findings");
+		const overlay = new AdvisorFindingsOverlay(
+			this.ctx.ui,
+			{
+				getFindings: () => this.ctx.session.getAdvisorFindings(),
+				changeStatus: (action, id) => runAdvisorFindingsCommand(this.ctx.session, `${action} ${id}`),
+			},
+			() => {
+				menu.handle?.hide();
+				this.#releaseMenu("advisor-findings", menu);
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			},
+			filter,
+		);
+		this.#mountMenu(menu, overlay, () => this.#showFullscreenMenu(overlay));
 	}
 
 	showAdvisorConfigure(): void {

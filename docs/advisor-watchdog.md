@@ -92,6 +92,8 @@ advisors:
         whenReserved: skip
 ```
 
+In `/advisor configure`, each advisor's detail page exposes **Quota reserve (%)** and **When quota reserved** in both ANSI and native preferences. Quota reserve accepts numbers from 0 to 100; blank or `inherit` removes that override. The action offers `fallback`, `skip`, and `inherit`. Resetting a native field also removes its override. Each field inherits its matching global `advisor.budget.*` setting independently. Save & apply writes the edited roster to the selected scope's `WATCHDOG.yml`.
+
 ### Default advisor settings
 
 When no `WATCHDOG.yml` roster is present, the default advisor uses these settings from the Model tab:
@@ -327,7 +329,9 @@ A failed, timed-out, or malformed judgment leaves the group as recorded. When th
 
 ### Findings command
 
-`/advisor findings [open|all]` lists the session's open (default) or all findings, one per finding: id, status, severity, category, anchor display, owner, reporters, `possibly-fixed`, ids merged into it, then the lead report's defect. `/advisor findings resolve F<n>` closes an open finding as `resolved`; `/advisor findings reopen F<n>` reopens a resolved or expired one unless an open finding already holds its category and anchor. Both persist through the `advisor_findings` session entry, so a resumed session keeps them. The command works in the TUI and in ACP/text hosts; ids are case-insensitive.
+`/advisor findings [open|all]` opens an interactive findings sheet in the TUI. It shows open findings by default, ordered by severity; the all filter puts open findings first. Rows show id, status, severity, category, anchor, owner, and reporter count. The selected finding's preview shows its lead defect, impact, fix, reporters, flags, and merged ids. Use Up/Down to select, `f` to toggle open/all, `r` to resolve, `o` to reopen, PageUp/PageDown to scroll the ANSI preview, and Escape to close. Native terminals expose the same filters and actions in the picker sheet.
+
+ACP/text hosts retain the text listing, including the lead defect. `/advisor findings resolve F<n>` closes an open finding as `resolved`; `/advisor findings reopen F<n>` reopens a resolved or expired one unless an open finding already holds its category and anchor. Sheet actions and subcommands persist through the `advisor_findings` session entry, so a resumed session keeps them. Finding ids in subcommands are case-insensitive.
 
 ### Findings privacy
 

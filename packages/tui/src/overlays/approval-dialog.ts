@@ -5,10 +5,10 @@
  * an optional "approve for this session", and Deny — and an action
  * bar. The arrows move between the choices and Enter takes the highlighted
  * one; `app.approval.approve` (Ctrl+Enter by default) approves this call
- * outright and Esc denies. Enter and the approve chord only arm
- * {@link APPROVE_ARM_MS} after mount, so a key meant for the composer (Enter,
- * or the follow-up chord pressed mid-run) as the prompt appears never answers
- * it. With an {@link ApprovalDialogDraft}, every other key edits the composer
+ * outright and Esc denies. Enter, the approve chord, and native approval
+ * actions and choices arm {@link APPROVE_ARM_MS} after mount.
+ * Native Deny, Details, and Remember remain immediate.
+ * With an {@link ApprovalDialogDraft}, every other key edits the composer
  * mounted beneath the dialog, so a message can deny the call and steer the
  * turn instead: while the composer holds a draft, the arrows and Enter edit and
  * send it, and the highlight sits on Deny, relabeled to say Enter sends.
@@ -41,7 +41,7 @@ import { CountdownTimer } from "../chrome/countdown-timer";
 
 /** Detail rows shown before the rest scrolls, so the composer beneath keeps its room. */
 const MAX_DETAIL_ROWS: number = PREVIEW_LIMITS.COLLAPSED_ITEMS;
-/** Enter and the approve key are ignored this long after mount, so a key sent as the prompt appears cannot answer it. */
+/** Delay after mount before Enter, the approve key, and native approval actions and choices are accepted, in ms. */
 export const APPROVE_ARM_MS = 500;
 /** The Deny row while a composer draft holds Enter: sending it denies the call and steers the turn. */
 const DENY_AND_SEND_LABEL = "Deny and send message";
@@ -125,7 +125,8 @@ export class ApprovalDialogComponent implements Component {
 	#native: NativeNode | undefined;
 	/** Whether a draft held the keys when {@link #native} was described: it moves the highlight. */
 	#nativeDrafting = false;
-	readonly #armedAt = performance.now() + APPROVE_ARM_MS;
+	#armedAt = performance.now() + APPROVE_ARM_MS;
+	#nativeMounted = false;
 	readonly #countdown: CountdownTimer | undefined;
 
 	/** `prompt`: the approval title on its first line, the details after it. */
@@ -328,6 +329,10 @@ export class ApprovalDialogComponent implements Component {
 	 * and the primary Approve, whose keys show in their tooltips.
 	 */
 	describe(): NativeNode {
+		if (!this.#nativeMounted) {
+			this.#nativeMounted = true;
+			this.#armedAt = performance.now() + APPROVE_ARM_MS;
+		}
 		const drafting = this.options.draft?.hasDraft() ?? false;
 		if (this.#native && this.#nativeDrafting === drafting) return this.#native;
 		const cancelKey = getKeybindings().getKeys("tui.select.cancel")[0];
@@ -381,18 +386,26 @@ export class ApprovalDialogComponent implements Component {
 		return this.#native;
 	}
 
-	/** Deny, Approve, and Details run exactly what Esc, the approve key, and the expand key run; a click on a choice takes it. */
+	/** Native approvals wait for arming; Deny, Details, and Remember take effect immediately. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (this.#closed) return;
 		if (event.type === "action") {
-			if (event.act === "approve") this.#finish("once");
-			else if (event.act === "deny") this.#finish("deny");
+			if (event.act === "approve") {
+				if (this.#nativeMounted && performance.now() >= this.#armedAt) this.#finish("once");
+			} else if (event.act === "deny") this.#finish("deny");
 			else if (event.act === "expand") this.toggleDetails();
 			return;
 		}
 		if ((event.type !== "select" && event.type !== "activate") || leafKey(event.key) !== "choices") return;
 		const choice = this.#choices.find(candidate => candidate.answer === event.item);
-		if (choice) this.#take(choice.answer);
+		if (
+			choice &&
+			(choice.answer === "deny" ||
+				choice.answer === "remember" ||
+				(this.#nativeMounted && performance.now() >= this.#armedAt))
+		) {
+			this.#take(choice.answer);
+		}
 	}
 
 	/** Detail rows at `width`: one clipped row per detail, or wrapped rows once expanded. */

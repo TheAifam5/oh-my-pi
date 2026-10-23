@@ -8557,6 +8557,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showAdvisorConfigure();
 	}
 
+	showAdvisorFindings(filter?: "open" | "all"): void {
+		this.#selectorController.showAdvisorFindings(filter);
+	}
+
 	showHistorySearch(): void {
 		this.#selectorController.showHistorySearch();
 	}

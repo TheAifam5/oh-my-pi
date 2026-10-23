@@ -4,6 +4,10 @@
 
 ### Added
 
+- `/settings` in Tern shows the active scope and offers a Change scope action
+- `auth.disabledAccounts` is editable in `/settings` (Providers / Accounts) as a JSON list
+- `/advisor findings` opens a findings list with detail and resolve/reopen actions, including in Tern
+- `/advisor configure` edits per-advisor quota reserve and reserved action, including in Tern
 - Added exact `tool:action` approval policies for global and trusted per-agent settings, with action-scoped prompts and preserved deny and critical-safety enforcement
 - Added `task.inheritUserAgentsMd` (default on) and a /settings control so Task children inherit user-level `AGENTS.md` while project and directory `AGENTS.md` stay excluded.
 - Added configurable isolated-task baseline limits through `task.isolation.maxBaselineBytes` and `/settings`

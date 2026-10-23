@@ -181,7 +181,14 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				return;
 			}
 			if (verb === "findings") {
-				runtime.ctx.showStatus(runAdvisorFindingsCommand(runtime.ctx.session, rest), { dim: false, toast: false });
+				const filter = rest.trim().toLowerCase() || "open";
+				if (filter === "open" || filter === "all") {
+					runtime.ctx.showAdvisorFindings(filter);
+				} else {
+					runtime.ctx.showStatus(sanitizeDisplayLine(runAdvisorFindingsCommand(runtime.ctx.session, rest)), {
+						dim: false,
+					});
+				}
 				clearSubmittedText(runtime);
 				return;
 			}

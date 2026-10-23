@@ -768,7 +768,7 @@ export class SettingsSelectorComponent implements Component {
 		return truncateToWidth(`${prefix}${theme.bold(inputLine)} ${count} `, width);
 	}
 
-	#scopeLines(width = Number.POSITIVE_INFINITY): string[] {
+	#scopeLines(width?: number): string[] {
 		const host = this.#context.settings;
 		const target = host.targets?.find(candidate => candidate.id === host.target);
 		const lines: string[] = [];
@@ -776,7 +776,10 @@ export class SettingsSelectorComponent implements Component {
 			const label = this.#scopeReady ? (target?.label ?? "Global") : "Loading…";
 			const key = editorKey("tui.settings.cycleScope");
 			const hint = key ? ` · ${key} to change scope` : "";
-			lines.push(truncateToWidth(`Scope: ${replaceTabs(label)}`, Math.max(0, width - visibleWidth(hint))) + hint);
+			const scope = `Scope: ${replaceTabs(label)}`;
+			lines.push(
+				(width === undefined ? scope : truncateToWidth(scope, Math.max(0, width - visibleWidth(hint)))) + hint,
+			);
 			if (target?.note) lines.push(target.note);
 		}
 		if (this.#writeError) lines.push(this.#writeError);
@@ -932,6 +935,24 @@ export class SettingsSelectorComponent implements Component {
 				};
 			}
 			children.push(memo.prefsPreview.node);
+		}
+
+		if (this.#context.settings.selectTarget && (this.#currentTabId !== "plugins" || searching)) {
+			sections = [
+				{
+					id: "scope",
+					title: "Scope",
+					rows: [
+						{
+							id: "scope",
+							label: "Settings scope",
+							disabled: this.#scopeReady ? undefined : "Loading…",
+							control: { k: "action", label: "Change scope", act: "cycleScope" },
+						},
+					],
+				},
+				...sections,
+			];
 		}
 
 		const props: TspPrefsProps = {
@@ -1272,6 +1293,10 @@ export class SettingsSelectorComponent implements Component {
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (!this.#scopeReady) {
 			if (event.type === "action" && event.act === "close") this.#callbacks.onCancel();
+			return;
+		}
+		if (event.type === "action" && event.key === "" && event.act === "cycleScope") {
+			if (!(this.#searchList ?? this.#currentList)?.hasOpenSubmenu()) this.#cycleScope();
 			return;
 		}
 		if (event.key === "") {
@@ -1999,6 +2024,18 @@ export class SettingsSelectorComponent implements Component {
 		});
 	}
 
+	#cycleScope(): void {
+		const host = this.#context.settings;
+		if (!this.#scopeReady || !host.selectTarget || (this.#currentTabId === "plugins" && !this.#searchList)) return;
+		const targets = host.targets ?? [];
+		const index = targets.findIndex(candidate => candidate.id === host.target);
+		const next = targets[(index + 1) % targets.length];
+		if (!next) return;
+		host.selectTarget(next.id);
+		this.#refreshItems();
+		this.#context.requestRender?.();
+	}
+
 	handleInput(data: string): void {
 		if (!this.#scopeReady && !getKeybindings().matches(data, "tui.select.cancel")) return;
 		// SGR mouse reports (the fullscreen overlay enables tracking).
@@ -2026,15 +2063,7 @@ export class SettingsSelectorComponent implements Component {
 			this.#context.settings.selectTarget &&
 			(this.#currentTabId !== "plugins" || this.#searchList)
 		) {
-			const host = this.#context.settings;
-			const targets = host.targets ?? [];
-			const index = targets.findIndex(candidate => candidate.id === host.target);
-			const next = targets[(index + 1) % targets.length];
-			if (next && this.#scopeReady) {
-				host.selectTarget?.(next.id);
-				this.#refreshItems();
-				this.#context.requestRender?.();
-			}
+			this.#cycleScope();
 			return;
 		}
 
