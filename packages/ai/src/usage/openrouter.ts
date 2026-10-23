@@ -16,6 +16,7 @@ import type {
 	UsageReport,
 } from "../usage";
 import { isRecord } from "../utils";
+import { finiteNumber } from "./account-balance";
 import { knownBilling, moneyFromDecimal, type ProviderBilling, unknownBilling } from "./billing";
 import { DAY_MS, usageStatus } from "./shared";
 
@@ -39,10 +40,6 @@ type LimitReset = keyof typeof RESET_WINDOW_LABELS;
 
 function isLimitReset(value: unknown): value is LimitReset {
 	return typeof value === "string" && Object.hasOwn(RESET_WINDOW_LABELS, value);
-}
-
-function finiteNumber(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 /**

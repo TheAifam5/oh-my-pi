@@ -20,6 +20,9 @@
 
 ### Fixed
 
+- Request quota reserves now apply to pinned, preferred, and ordered accounts
+- Exclusive account pins no longer report a credential switch they forbid
+- OpenRouter free-variant requests now rank and block accounts by the effective `:free` model
 - Fixed Codex native-lane live-steering rejections ending turns with an error; replay once on a fresh connection and deliver rejected steering through the normal queue
 - Fixed model selection and credential rotation using accounts without model access, including immediately after catalog loading; account-specific model denials persist for seven days and remain excluded after quota resets
 - Fixed an Anthropic `404 not_found_error` for the requested model on one account ending the request instead of trying the provider's other accounts; the refusing account is excluded from that model only after another account serves it, and nothing is recorded when every account refuses

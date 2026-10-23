@@ -17,6 +17,7 @@ import {
 import { $env, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolvedApiKeyBearer, resolveNextAuthRetryKey } from "./auth-retry";
+import type { ApiKeyResolveContext } from "./auth-retry";
 import type { OAuthRequestIdentity } from "./auth/types";
 import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
@@ -38,6 +39,7 @@ import type { GoogleVertexOptions } from "./providers/google-vertex";
 import { streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
+import { applyOpenRouterRoutingVariant } from "./providers/openai-shared";
 import { streamPiNative } from "./providers/pi-native-client";
 import { streamSynthetic } from "./providers/synthetic";
 import {
@@ -1323,7 +1325,18 @@ function streamSimpleRequest<TApi extends Api>(
 		withModelSamplingParams(model, withTransportFetch(model, (options || {}) as SimpleStreamOptions)),
 	);
 
-	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
+	const configuredResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
+	const effectiveModelId =
+		configuredResolver && model.provider === "openrouter"
+			? applyOpenRouterRoutingVariant(
+					resolveWireModelId(model, requestOptions.disableReasoning ? undefined : requestOptions.reasoning),
+					requestOptions.openrouterVariant,
+				)
+			: undefined;
+	const apiKeyResolver =
+		configuredResolver && effectiveModelId !== undefined
+			? (context: ApiKeyResolveContext) => configuredResolver({ ...context, modelId: effectiveModelId })
+			: configuredResolver;
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;

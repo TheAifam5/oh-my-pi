@@ -110,6 +110,63 @@ describe("AuthStorage account names and exclusive pins", () => {
 		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
 	});
 
+	test.each([false, true])(
+		"markReached does not advertise a forbidden sibling under a pin (blocked sibling: %s)",
+		async blockedSibling => {
+			const storage = await storageWithAccounts();
+			if (blockedSibling) {
+				await storage.limits.markReached(PROVIDER, "sibling", { apiKey: "access-b", retryAfterMs: 10_000 });
+			}
+			storage.sessions.pin(PROVIDER, SESSION, credentialId(storage, "personal"));
+			const before = Date.now();
+			const result = await storage.limits.markReached(PROVIDER, SESSION, {
+				apiKey: "access-a",
+				retryAfterMs: 60_000,
+				providerTimed: true,
+			});
+			expect(result.switched).toBe(false);
+			expect(result.retryAtMs).toBeUndefined();
+			expect(result.blockedUntilMs).toBeGreaterThanOrEqual(before + 60_000);
+			expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+		},
+	);
+
+	test("a pinned API key cannot spend measured quota below the request reserve", async () => {
+		if (!store) throw new Error("test setup failed");
+		const storage = new AuthStorage(store, {
+			accountPolicies: POLICIES,
+			usageProviderResolver: () => ({
+				id: PROVIDER,
+				async fetchUsage() {
+					return {
+						provider: PROVIDER,
+						fetchedAt: Date.now(),
+						limits: [
+							{
+								id: "quota",
+								label: "Quota",
+								scope: { provider: PROVIDER, shared: true },
+								amount: { unit: "percent", usedFraction: 0.9 },
+								status: "ok",
+							},
+						],
+					};
+				},
+			}),
+		});
+		await storage.credentials.set(PROVIDER, { type: "api_key", key: API_KEY });
+		storage.sessions.setAccountPinSource({ project: () => "work" });
+		const notices: number[] = [];
+		await expect(
+			storage.keys.get(PROVIDER, SESSION, {
+				minRemainingPct: 20,
+				onReservedAccount: (_account, remaining) => notices.push(remaining),
+			}),
+		).rejects.toBeInstanceOf(AIError.AccountUnavailableError);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toBeCloseTo(10);
+	});
+
 	test("a session pin overrides the project pin until it is removed", async () => {
 		const storage = await storageWithAccounts();
 		storage.sessions.setAccountPinSource({

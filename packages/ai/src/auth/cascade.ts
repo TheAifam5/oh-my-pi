@@ -587,6 +587,8 @@ export class KeyCascade implements KeysApi {
 			return resolved.apiKey;
 		}
 		if (!this.#deps.selector.isEntitled(provider, target.index, options)) return undefined;
+		if (!(await this.#deps.selector.outsideRequestReserve(provider, target.credential, target.index, options)))
+			return undefined;
 		const refusal = this.#deps.selector.accountLimit(provider, target.index, options);
 		if (refusal) {
 			if (exclusive) throw new AIError.AccountLimitError(provider, refusal);
@@ -619,21 +621,21 @@ export class KeyCascade implements KeysApi {
 				await this.getWithCredential(provider, sessionId, {
 					...keyOptions,
 					baseUrl,
-					modelId,
 					refuseBlockedEntitled: true,
 				}),
 				this.#deps,
 				provider,
-				modelId,
+				keyOptions.modelId,
 			);
-		return async ({ lastChance, error, signal, previousKey }) => {
+		return async ({ lastChance, error, signal, previousKey, modelId: requestModelId }) => {
+			const effectiveModelId = requestModelId ?? modelId;
 			if (error === undefined) {
-				return resolve({ signal });
+				return resolve({ signal, modelId: effectiveModelId });
 			}
 			if (lastChance) {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
 					error,
-					modelId,
+					modelId: effectiveModelId,
 					signal,
 					apiKey: previousKey,
 				});
@@ -645,13 +647,14 @@ export class KeyCascade implements KeysApi {
 					// because a peer may have refreshed the failed bearer.
 					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
 				}
-				const resolved = await resolve({ signal });
+				const resolved = await resolve({ signal, modelId: effectiveModelId });
 				return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
 			}
 			return resolve({
 				forceRefresh: true,
 				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
 				signal,
+				modelId: effectiveModelId,
 			});
 		};
 	}

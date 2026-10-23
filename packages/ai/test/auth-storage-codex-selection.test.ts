@@ -395,6 +395,56 @@ describe("AuthStorage codex oauth ranking", () => {
 		).toBe("api-reserved");
 	});
 
+	test.each(["project", "member", "order"] as const)(
+		"request reserve excludes a reserved %s account before serving a bearer",
+		async route => {
+			if (!store) throw new Error("test setup failed");
+			authStorage = new AuthStorage(store, {
+				usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+				accountPolicies: [
+					{ provider: "openai-codex", name: "reserved", account: { accountId: "reserved" } },
+					{ provider: "openai-codex", name: "available", account: { accountId: "available" } },
+				],
+			});
+			await authStorage.credentials.set("openai-codex", [
+				{ type: "oauth", ...createCredential("reserved", "reserved@example.com") },
+				{ type: "oauth", ...createCredential("available", "available@example.com") },
+			]);
+			for (const [accountId, usedFraction] of [
+				["reserved", 0.9],
+				["available", 0.2],
+			] as const) {
+				usageByAccount.set(
+					accountId,
+					createCodexUsageReport({
+						accountId,
+						primary: { usedFraction, resetInMs: HOUR_MS },
+						secondary: { usedFraction, resetInMs: WEEK_MS },
+					}),
+				);
+			}
+			authStorage.sessions.setAccountPinSource(
+				route === "project"
+					? { project: () => "reserved" }
+					: route === "member"
+						? { member: () => "reserved" }
+						: { routing: () => ({ order: ["reserved", "available"] }) },
+			);
+			const notices: string[] = [];
+			const result = authStorage.keys.get("openai-codex", "reserve-routing", {
+				modelId: "gpt-5.4",
+				minRemainingPct: 20,
+				onReservedAccount: account => notices.push(account),
+			});
+			if (route === "project") {
+				await expect(result).rejects.toBeInstanceOf(AIError.AccountUnavailableError);
+			} else {
+				expect(await result).toBe("api-available");
+			}
+			expect(notices.length).toBeGreaterThan(0);
+		},
+	);
+
 	test("request reserve allows unknown, stale and exactly-at-threshold usage", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 		await authStorage.credentials.set("openai-codex", [

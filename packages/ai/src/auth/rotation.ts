@@ -195,6 +195,15 @@ export class RateLimits implements LimitsApi {
 					blockedUntil)
 				: blockedUntil;
 
+		if (this.#deps.affinity.hasExclusivePin(provider, sessionId)) {
+			return {
+				switched: false,
+				blockedUntilMs: mergedBlockedUntil,
+				priorBlockedUntilMs,
+				priorBlockedUntilTimed,
+			};
+		}
+
 		const remainingCredentials = this.#deps.pool
 			.credentials(provider)
 			.map((credential, index) => ({ credential, index }))
@@ -237,9 +246,9 @@ export class RateLimits implements LimitsApi {
 	/**
 	 * Marks the current session's credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.
-	 * Returns whether a sibling credential is available now; when none is, also
-	 * reports the earliest time a blocked sibling becomes available again so
-	 * callers can wait for the sibling instead of the provider's full window.
+	 * Returns whether an allowed sibling credential is available now; when none is,
+	 * reports the earliest time an allowed blocked sibling becomes available again.
+	 * An exclusive pin returns `switched: false` without a sibling `retryAtMs`.
 	 */
 	async markReached(
 		provider: string,

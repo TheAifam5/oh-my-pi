@@ -594,7 +594,8 @@ export class CredentialSelector {
 		return true;
 	}
 
-	async #outsideRequestReserve(
+	/** Whether a credential meets the request quota reserve; notifies when measured quota is below it. */
+	async outsideRequestReserve(
 		provider: string,
 		credential: AuthCredential,
 		index: number,
@@ -648,7 +649,7 @@ export class CredentialSelector {
 			});
 		if (options?.minRemainingPct !== undefined) {
 			const eligible = await Promise.all(
-				credentials.map(entry => this.#outsideRequestReserve(provider, entry.credential, entry.index, options)),
+				credentials.map(entry => this.outsideRequestReserve(provider, entry.credential, entry.index, options)),
 			);
 			credentials = credentials.filter((_entry, index) => eligible[index]);
 		}
@@ -1142,7 +1143,7 @@ export class CredentialSelector {
 		let credentials = allowed.filter(entry => !limited.has(entry.index));
 		if (options?.minRemainingPct !== undefined) {
 			const eligible = await Promise.all(
-				credentials.map(entry => this.#outsideRequestReserve(provider, entry.credential, entry.index, options)),
+				credentials.map(entry => this.outsideRequestReserve(provider, entry.credential, entry.index, options)),
 			);
 			credentials = credentials.filter((_entry, index) => eligible[index]);
 		}
@@ -1640,6 +1641,7 @@ export class CredentialSelector {
 	 * or plan-ineligible account yields `undefined` so normal selection proceeds.
 	 * An account the session's restriction does not allow, or one not entitled
 	 * to `options.modelId` (even when `exclusive`), yields `undefined`.
+	 * Request quota reserves remain enforced for both pins and preferences.
 	 * `options.forceRefresh` re-mints this credential's token first.
 	 *
 	 * @throws AIError.OAuthRefreshUnavailableError when `exclusive` and a retryable refresh failure left the account unusable.
@@ -1656,6 +1658,7 @@ export class CredentialSelector {
 		if (credential?.type !== "oauth" || !this.#deps.affinity.allows(provider, sessionId, credential))
 			return undefined;
 		if (!this.isEntitled(provider, index, options)) return undefined;
+		if (!(await this.outsideRequestReserve(provider, credential, index, options))) return undefined;
 		const refusal = await this.accountRefusal(provider, index, options, memo);
 		if (refusal) {
 			if (exclusive) {

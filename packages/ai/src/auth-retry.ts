@@ -32,6 +32,11 @@ export interface ApiKeyResolveContext {
 	previousKey?: string;
 	/** Caller cancel signal, threaded into any credential refresh / rotation work. */
 	signal?: AbortSignal;
+	/**
+	 * Effective request model id, including any OpenRouter variant.
+	 * Overrides the resolver's configured id for this call.
+	 */
+	modelId?: string;
 }
 
 /**
