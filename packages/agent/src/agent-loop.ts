@@ -2156,6 +2156,19 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			if (finalRequestSignal?.aborted) {
+				const aborted = emitAbortedAssistantMessage(
+					null,
+					false,
+					new Set(),
+					context,
+					config,
+					stream,
+					finalRequestSignal,
+				);
+				await finishChat(aborted);
+				return aborted;
+			}
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,

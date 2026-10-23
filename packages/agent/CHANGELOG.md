@@ -8,6 +8,10 @@
 - Added `terminate` to blocking `beforeToolCall` results: when every call in a batch is blocked with `terminate`, the loop records the results and goes to its stop boundary instead of starting another model turn
 - Added the `transformHeaders` option to `Agent`, passed to provider requests
 
+### Fixed
+
+- Cancelled agents no longer send another model request after a tool call is refused or aborted
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

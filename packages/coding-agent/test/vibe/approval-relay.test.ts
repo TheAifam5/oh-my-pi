@@ -118,7 +118,7 @@ async function harness(
 	disposers.push(async () => {
 		await registry.killAll(parent);
 	});
-	return { dir, marker, parent, registry, host, bus, manager, cli };
+	return { dir, marker, parent, registry, host, bus, manager, cli, requests: () => requests };
 }
 
 describe("real vibe worker approvals", () => {
@@ -169,7 +169,7 @@ describe("real vibe worker approvals", () => {
 	}
 
 	for (const kind of ["kill", "exit"] as const) {
-		it(`vibe ${kind} aborts an open approval and a late approve never executes`, async () => {
+		it(`vibe ${kind} aborts an open approval without another model request or late execution`, async () => {
 			const opened = Promise.withResolvers<void>();
 			const dismissed = Promise.withResolvers<void>();
 			const answer = Promise.withResolvers<ExtensionApprovalAnswer>();
@@ -192,9 +192,12 @@ describe("real vibe worker approvals", () => {
 				prompt: "Run the fixture command once.",
 			});
 			await opened.promise;
+			const requestsBeforeKill = h.requests();
 			if (kind === "kill") await h.registry.kill(h.parent, "CancelledWorker");
 			else await h.registry.killAll(h.parent);
 			await dismissed.promise;
+			expect(h.requests()).toBe(requestsBeforeKill);
+			expect(h.registry.screens(h.parent, ["CancelledWorker"])[0]?.state).toBe("dead");
 			answer.resolve("once");
 			expect(await Bun.file(h.marker).exists()).toBe(false);
 		}, 30000);

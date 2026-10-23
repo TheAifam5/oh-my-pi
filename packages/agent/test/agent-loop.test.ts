@@ -600,9 +600,11 @@ describe("agentLoop with AgentMessage", () => {
 		const mock = createMockModel();
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 		const controller = new AbortController();
+		const opened = Promise.withResolvers<void>();
 		let returnCalled = false;
-		const streamFn = () =>
-			({
+		const streamFn = () => {
+			opened.resolve();
+			return {
 				result: () => Promise.withResolvers<AssistantMessage>().promise,
 				[Symbol.asyncIterator]: () => ({
 					next: () => Promise.withResolvers<IteratorResult<AssistantMessageEvent>>().promise,
@@ -611,10 +613,12 @@ describe("agentLoop with AgentMessage", () => {
 						return Promise.withResolvers<IteratorResult<AssistantMessageEvent>>().promise;
 					},
 				}),
-			}) as AssistantMessageEventStream;
+			} as AssistantMessageEventStream;
+		};
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, controller.signal, streamFn);
-		queueMicrotask(() => controller.abort("stop now"));
+		await opened.promise;
+		controller.abort("stop now");
 		const messages = await stream.result();
 
 		expect(returnCalled).toBe(true);
@@ -6801,7 +6805,7 @@ describe("agentLoop passive additionalContext", () => {
 		release.resolve();
 		await consuming;
 
-		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls).toHaveLength(1);
 		const aborted = events.find(
 			event =>
 				event.type === "message_end" &&
