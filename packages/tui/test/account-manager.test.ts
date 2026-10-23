@@ -79,6 +79,38 @@ describe("AccountManager", () => {
 		expect(text).toContain("5h 75% left · resets in 2h10m");
 	});
 
+	test("clicking an account row edits that account, including after scrolling", async () => {
+		const { manager, applied } = createManager(
+			Array.from({ length: 30 }, (_, i) => account(`account-${i}`, "anthropic", { name: `name-${i}` })),
+		);
+		const clickRow = (id: number) => {
+			const lines = manager.render(140).map(line => Bun.stripANSI(line));
+			const row = lines.findIndex(line => line.includes(`account-${id}@example.com`));
+			expect(row).toBeGreaterThan(0);
+			manager.handleInput(`\x1b[<0;70;${row + 1}M`);
+		};
+		clickRow(0);
+		manager.handleInput("\x1b[C");
+		manager.handleInput(ENTER);
+		await settle();
+		expect(applied.at(-1)?.[0]).toBe("account-0");
+		clickRow(1);
+		manager.handleInput("d");
+		await settle();
+		expect(applied.at(-1)?.[0]).toBe("account-1");
+		for (let i = 0; i < 25; i++) manager.handleInput("\x1b[B");
+		manager.render(140);
+		clickRow(25);
+		manager.handleInput("d");
+		await settle();
+		expect(applied.at(-1)?.[0]).toBe("account-25");
+		clickRow(25);
+		manager.handleInput("\x1b[C");
+		manager.handleInput(ENTER);
+		await settle();
+		expect(applied.at(-1)?.[0]).toBe("account-25");
+	});
+
 	test("applies an input field through the host with the typed value", async () => {
 		const { manager, screen, applied } = createManager([account("a", "anthropic")], { message: "Set priority 7." });
 		manager.handleInput("p");
@@ -244,6 +276,28 @@ describe("AccountManager", () => {
 			for (const field of manyFields) expect(all).toContain(`${field.key} ${field.label}`);
 			expect(all).toContain("close");
 			expect(all).toContain("reload");
+		});
+
+		test("keeps every selected field and choice visible in the footer", () => {
+			const choices = Array.from({ length: 16 }, (_, i) => ({
+				id: `choice-${i}`,
+				label: `choice-${i}`,
+				value: "",
+				on: false,
+			}));
+			const fields = [...manyFields, { id: "pool", label: "pool", value: "", choices }];
+			const { manager } = createManager([account("a", "anthropic", { name: "a".repeat(120), fields })]);
+			manager.handleInput(ENTER);
+			for (const field of fields) {
+				expect(footer(narrow(manager))).toContain(`[ ${field.label}`);
+				manager.handleInput("\x1b[C");
+			}
+			manager.handleInput("\x1b[D");
+			manager.handleInput(ENTER);
+			for (const choice of choices) {
+				expect(footer(narrow(manager))).toContain(`[ ${choice.label}`);
+				manager.handleInput("\x1b[C");
+			}
 		});
 
 		test("wraps a long notice and detail value instead of cutting them", async () => {

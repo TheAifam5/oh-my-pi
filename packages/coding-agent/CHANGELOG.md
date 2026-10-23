@@ -61,6 +61,11 @@
 
 ### Fixed
 
+- Advisor quota reserves are rechecked on each request, not only at preflight
+- Project `.omp/config.yml` `auth.accountPolicies` is ignored with a warning so repositories cannot authorize saved-reset spending or paid draining
+- Directory settings writes keep last-good ancestor layers and reject changes that make the merged settings invalid
+- Settings watching survives replacing a config directory
+- A cancelled pool member pick no longer changes the model after the picker closes or the session changes
 - Improved oversized isolation-baseline errors with the largest untracked paths and actionable cache-ignore guidance
 - Fixed model hub pool edits accepting an untrusted account name in a new routing field when it was already stored only in account order or drain
 - Fixed model hub pool writes accepting untrusted account order or drain names; refused edits now report an error without changing the global config

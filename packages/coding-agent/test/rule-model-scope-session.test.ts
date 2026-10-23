@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { resolveSessionModelSelector } from "@oh-my-pi/pi-coding-agent/session/model-selector";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir, Snowflake } from "@oh-my-pi/pi-utils";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const OPUS_MARKER = "OPUS_ONLY_RULE_BODY_7f3a";
 const SONNET_MARKER = "SONNET_ONLY_RULE_BODY_2c9e";
@@ -46,6 +47,9 @@ describe("model-scoped rules in a live session", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	const sessions: AgentSession[] = [];
+	const originalEnv = Object.fromEntries(
+		["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"].map(key => [key, process.env[key]]),
+	);
 
 	beforeAll(async () => {
 		dir = path.join(os.tmpdir(), `pi-rule-model-scope-${Snowflake.next()}`);
@@ -60,8 +64,10 @@ describe("model-scoped rules in a live session", () => {
 	afterAll(async () => {
 		for (const session of sessions) await session.dispose().catch(() => {});
 		authStorage.close();
+		for (const [key, value] of Object.entries(originalEnv)) restoreEnvValue(key, value);
 		__resetDirsFromEnvForTests();
 		await removeWithRetries(dir);
+		for (const [key, value] of Object.entries(originalEnv)) expect(process.env[key]).toBe(value);
 	});
 
 	afterEach(() => {

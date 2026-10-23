@@ -15,6 +15,8 @@ import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/setti
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
+import * as modelSelector from "@oh-my-pi/pi-coding-agent/session/model-selector";
+import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 
 /** The overlay members of `ui` the single-instance guard reads and drives. */
 interface OverlayUi {
@@ -138,6 +140,53 @@ describe("single-instance menus", () => {
 		controller.showModelSelector({ temporaryOnly: true });
 		expect(shown).toHaveLength(2);
 	});
+
+	for (const interruption of ["close", "switch session", "new choice"] as const) {
+		it(`ignores a pending pool selection after ${interruption}`, async () => {
+			const { ui, shown } = overlayUi();
+			const old = createMockModel({ provider: "openai", id: "old" }).model;
+			const newer = createMockModel({ provider: "openai", id: "new" }).model;
+			const ctx = pickerContext(ui, [old, newer], old, Settings.isolated());
+			const original = ctx.viewSession;
+			const replacement = pickerContext(overlayUi().ui, [newer], newer).session;
+			const pending = Promise.withResolvers<modelSelector.SessionModelSelection>();
+			const resolve = spyOn(modelSelector, "resolveSessionModelSelector").mockReturnValue(pending.promise);
+			spyOn(modelSelector, "listSessionPoolMembers").mockResolvedValue([]);
+			const controller = new SelectorController(ctx);
+			controller.showModelSelector({ temporaryOnly: true });
+			const picker = shown[0];
+			if (!(picker instanceof ModelPickerComponent)) throw new Error("Expected model picker");
+			picker.setPoolMembers([{ parent: "@security", selector: "@security/member", model: old, state: "usable" }]);
+			for (const char of "@security/") picker.handleInput(char);
+			picker.handleNativeEvent({ type: "activate", key: "", item: "@security/member" });
+			expect(resolve).toHaveBeenCalledTimes(1);
+			if (interruption === "close") {
+				picker.handleInput("\x1b");
+				picker.handleInput("\x1b");
+			}
+			if (interruption === "switch session") Object.defineProperty(ctx, "viewSession", { get: () => replacement });
+			if (interruption === "new choice") {
+				picker.handleInput("\x1b");
+				picker.handleNativeEvent({ type: "activate", key: "", item: `${newer.provider}/${newer.id}` });
+			}
+			pending.resolve({
+				model: old,
+				selector: "@security/member",
+				poolRole: "security",
+				warning: undefined,
+				error: undefined,
+			});
+			await pending.promise;
+			await Promise.resolve();
+			if (interruption === "new choice") {
+				expect(original.setModelTemporary).toHaveBeenCalledTimes(1);
+				expect(original.setModelTemporary).toHaveBeenCalledWith(newer, undefined, { poolRole: undefined });
+			} else {
+				expect(original.setModelTemporary).not.toHaveBeenCalled();
+			}
+			expect(replacement.setModelTemporary).not.toHaveBeenCalled();
+		});
+	}
 
 	it("replaces an ordinary picker with selection-only and ignores stale picker input", () => {
 		const { ui, shown } = overlayUi();

@@ -208,6 +208,7 @@ type MenuKind =
 interface OpenMenu {
 	component?: Component;
 	handle?: OverlayHandle;
+	abort?: AbortController;
 	/** Shows `component` as a new overlay and focuses it; also raises a covered menu. */
 	mount?: () => OverlayHandle;
 }
@@ -279,6 +280,7 @@ export class SelectorController {
 	}
 
 	#releaseMenu(kind: MenuKind, menu: OpenMenu): void {
+		menu.abort?.abort();
 		if (this.#openMenus.get(kind) === menu) this.#openMenus.delete(kind);
 	}
 
@@ -802,8 +804,8 @@ export class SelectorController {
 		thinkingLevel: ConfiguredThinkingLevel | undefined,
 		compactFirst: boolean,
 		poolRole?: string,
+		target = this.ctx.viewSession,
 	): Promise<void> {
-		const target = this.ctx.viewSession;
 		const focusedAgentId = this.ctx.focusedAgentId;
 		const apply = async () => {
 			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
@@ -872,6 +874,8 @@ export class SelectorController {
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
 		const menu = this.#claimMenu(menuKind);
 		const memberLoad = new AbortController();
+		menu.abort = memberLoad;
+		let selection: AbortController | undefined;
 		const done = () => {
 			if (this.#openMenus.get(menuKind) !== menu) return;
 			memberLoad.abort();
@@ -880,7 +884,7 @@ export class SelectorController {
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
-		const isCurrent = () => this.#openMenus.get(menuKind) === menu;
+		const isCurrent = () => this.#openMenus.get(menuKind) === menu && this.ctx.viewSession === viewed;
 		const picker = new ModelPickerComponent(
 			this.ctx.ui,
 			createModelBrowserSource(this.ctx.settings, model => viewed.effectiveServiceTier(model)),
@@ -889,6 +893,10 @@ export class SelectorController {
 			{
 				onPick: async (model, selector, { overContext }) => {
 					if (!isCurrent()) return;
+					selection?.abort();
+					const pick = new AbortController();
+					selection = pick;
+					const signal = AbortSignal.any([memberLoad.signal, pick.signal]);
 					if (selectOnly) {
 						done();
 						try {
@@ -898,16 +906,19 @@ export class SelectorController {
 						}
 						return;
 					}
+					let applying = false;
 					try {
 						const resolved =
 							selector.startsWith("@") || selector.startsWith("+")
-								? await resolveSessionModelSelector(selector, viewed, this.ctx.settings)
+								? await resolveSessionModelSelector(selector, viewed, this.ctx.settings, { signal })
 								: undefined;
+						if (!isCurrent() || signal.aborted) return;
 						if (resolved && !resolved.model) throw new Error(resolved.error ?? `Unknown model: ${selector}`);
 						const targetModel = resolved?.model ?? model;
 						const contextWindow = targetModel.contextWindow ?? 0;
 						const compactFirst =
 							overContext || (contextWindow > 0 && (viewed.getContextUsage()?.tokens ?? 0) > contextWindow);
+						applying = true;
 						if (compactFirst) done();
 						await this.#applySessionModel(
 							targetModel,
@@ -915,16 +926,19 @@ export class SelectorController {
 							resolved?.thinkingLevel,
 							compactFirst,
 							resolved?.poolRole,
+							viewed,
 						);
 						if (!compactFirst) done();
 					} catch (error) {
+						if (!applying && (!isCurrent() || signal.aborted)) return;
 						this.ctx.showError(sanitizeErrorLine(error));
 					}
 				},
 				onPickRole: async entry => {
 					if (!isCurrent() || selectOnly) return;
+					selection?.abort();
 					try {
-						await this.ctx.viewSession.applyRoleModel(entry);
+						await viewed.applyRoleModel(entry);
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
 						this.ctx.showModelCycleTrack(
@@ -938,6 +952,7 @@ export class SelectorController {
 				},
 				onPickTask: (_model, selector) => {
 					if (!isCurrent() || selectOnly) return;
+					selection?.abort();
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
 					cfgTaskAgentModelOverrides.override(this.ctx.settings, {

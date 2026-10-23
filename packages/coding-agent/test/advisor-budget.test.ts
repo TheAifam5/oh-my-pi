@@ -137,6 +137,24 @@ describe("advisor quota reserve", () => {
 		});
 	}
 
+	it("rechecks the reserve on real request resolution after a successful preflight", async () => {
+		const { registry, controls } = await setup({ reservePct: 20 });
+		controls.remaining = 80;
+		expect(await registry.getApiKey(primary, "request-reserve", { minRemainingPct: 20 })).toBe("advisor-key");
+		controls.remaining = 10;
+		await authStorage?.usage.invalidate("anthropic");
+		const notices: number[] = [];
+		const resolver = registry.resolver("anthropic", {
+			sessionId: "request-reserve",
+			modelId: primary.id,
+			minRemainingPct: 20,
+			onReservedAccount: (_account, remaining) => notices.push(remaining),
+		});
+		expect(await resolver({ lastChance: false, error: undefined })).toBeUndefined();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toBeCloseTo(10);
+	});
+
 	it("skips reserved reviews without requests or repeated notices", async () => {
 		const { requested, notices, review } = await setup({ reservePct: 20, whenReserved: "skip" });
 		await review();

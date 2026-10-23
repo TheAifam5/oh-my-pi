@@ -24,7 +24,7 @@ export async function resolveSessionModelSelector(
 	selector: string,
 	session: AgentSession,
 	settings: Settings,
-	options: { advanceActiveRole?: boolean } = {},
+	options: { advanceActiveRole?: boolean; signal?: AbortSignal } = {},
 ): Promise<SessionModelSelection> {
 	try {
 		const scoped = session.scopedModels.map(entry => entry.model);
@@ -35,6 +35,7 @@ export async function resolveSessionModelSelector(
 			const pick = await pickRolePoolTarget(target, settings, availableModels, {
 				modelRegistry: session.modelRegistry,
 				sessionId: session.sessionId,
+				signal: options.signal,
 			});
 			if (!pick) throw new Error(sanitizeNoticeLine(`Pool member "${selector}" is unavailable`));
 			return {
@@ -47,7 +48,8 @@ export async function resolveSessionModelSelector(
 		}
 		if (target) {
 			let advance = target.advance;
-			if (target.advance) await session.resolveRoleModelAsync(target.role, { availableModels });
+			if (target.advance)
+				await session.resolveRoleModelAsync(target.role, { availableModels, signal: options.signal });
 			if (options.advanceActiveRole && !target.memberSelector && !advance) {
 				advance = session.isRolePoolPickActive(target.role);
 			}
@@ -56,6 +58,7 @@ export async function resolveSessionModelSelector(
 				memberSelector: target.memberSelector,
 				advance,
 				thinkingLevel: target.thinkingLevel,
+				signal: options.signal,
 			});
 			return {
 				model: resolved.model,

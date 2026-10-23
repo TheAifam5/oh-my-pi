@@ -3405,6 +3405,8 @@ export class ModelRegistry {
 			refreshReason: options?.refreshReason,
 			signal: options?.signal,
 			refuseBlockedEntitled: options?.refuseBlockedEntitled,
+			minRemainingPct: options?.minRemainingPct,
+			onReservedAccount: options?.onReservedAccount,
 		});
 	}
 

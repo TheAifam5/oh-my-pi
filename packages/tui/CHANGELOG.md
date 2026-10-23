@@ -28,6 +28,11 @@
 
 ### Fixed
 
+- Clicking an account row in /account selects that account
+- /account keeps the selected field visible at narrow widths
+- Long advisor category and ownership lists scroll to the selection
+- Pool rows in the model picker expand with application-cursor arrow keys
+- Project pin details shorten home paths
 - Fixed the status line's usage timeout cancelling the host's background usage fetch; it now bounds only its own wait
 - Advisor category and owns descriptions truncate with an ellipsis
 - Fixed `/account` input fields not showing their syntax hint

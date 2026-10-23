@@ -191,7 +191,7 @@ function shadowWarning(settings: Settings): string | undefined {
 }
 
 /**
- * Why an `auth.accountPolicies` edit would not apply: a project, `--config`, or runtime layer
+ * Why an `auth.accountPolicies` edit would not apply: a directory, `--config`, or runtime layer
  * sets the value and replaces the user config's; undefined when the user config value is effective.
  */
 export function accountPolicyWriteBlocker(settings: Settings): string | undefined {
@@ -1123,7 +1123,7 @@ export interface LogoutResult extends AccountWriteResult {
  * credential. Any failure restores the user-config policies.
  *
  * @throws AccountAdminError when the credential is no longer stored, or a
- * project or overlay policy names the account (it must be removed there first).
+ * directory, overlay, or runtime policy names the account (it must be removed there first).
  */
 export async function logoutAccount(
 	settings: Settings,

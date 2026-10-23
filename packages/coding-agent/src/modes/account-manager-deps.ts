@@ -837,7 +837,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					stored ? undefined : "no stored account",
 				].filter((badge): badge is string => badge !== undefined),
 				details: [
-					{ label: "directory", value: pin.dir },
+					{ label: "directory", value: shortenPath(pin.dir) },
 					{
 						label: "account",
 						value: stored

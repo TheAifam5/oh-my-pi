@@ -81,14 +81,16 @@ describe("account administration", () => {
 
 		const accountA = resolveAccount(authStorage, "a@example.com");
 		const result = labelAccount(settings, authStorage, accountA, "work");
-		expect(result.warning).toContain("project");
+		expect(result.warning).toBeUndefined();
 		expect(settings.getGlobalSettings().auth).toEqual({
 			accountPolicies: [{ provider: "anthropic", account: { accountId: "acc-a" }, name: "work" }],
 		});
 
 		const accountB = resolveAccount(authStorage, "anthropic/b@example.com");
 		expect(() => labelAccount(settings, authStorage, accountB, "work")).toThrow(AccountAdminError);
-		expect(cfgAuthAccountPolicies.get(settings)).toEqual([projectPolicy]);
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
+			{ provider: "anthropic", account: { accountId: "acc-a" }, name: "work" },
+		]);
 	});
 
 	it("resolves a provider prefix naming a login alias to the provider that stores its accounts", async () => {
@@ -153,7 +155,7 @@ describe("account administration", () => {
 		}
 	});
 
-	it("keeps user policies when logout is refused by a project policy or fails in the store", async () => {
+	it("preserves policies on failed logout but project policies cannot block successful logout", async () => {
 		const userPolicy = { provider: "anthropic", name: "work", account: { email: "a@example.com" } };
 		fs.writeFileSync(path.join(agentDir, "config.yml"), YAML.stringify({ auth: { accountPolicies: [userPolicy] } }));
 		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
@@ -170,9 +172,9 @@ describe("account administration", () => {
 			JSON.stringify({ auth: { accountPolicies: [userPolicy] } }),
 		);
 		const withProject = await Settings.loadIsolated({ cwd: project, agentDir });
-		await expect(logoutAccount(withProject, authStorage, accountA)).rejects.toBeInstanceOf(AccountAdminError);
-		expect(withProject.getGlobalSettings().auth).toEqual({ accountPolicies: [userPolicy] });
-		expect(authStorage.sessions.accounts("anthropic")).toHaveLength(2);
+		await logoutAccount(withProject, authStorage, accountA);
+		expect(cfgAuthAccountPolicies.get(withProject)).toEqual([]);
+		expect(authStorage.sessions.accounts("anthropic")).toHaveLength(1);
 	});
 
 	it("writes priority and reserve, and unpins the nearest pinned project from a subdirectory", async () => {

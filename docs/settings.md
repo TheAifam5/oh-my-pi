@@ -1134,6 +1134,8 @@ searxng:
 
 Provider credentials and custom model definitions are configured separately — see [Providers](./providers.md) and [Models](./models.md).
 
+`auth.accountPolicies` is read only from the global config, directory layers, `--config` overlays, and runtime overrides. Project `auth.accountPolicies` is ignored with a warning, including account selectors, routing, paid-spend policy, limits, and saved-reset authorization.
+
 #### Saved reset auto-consumption
 
 `codexResets.autoRedeem` and `claudeResets.autoRedeem` independently control saved-reset consumption: `yes` enables automatic spending, `no` disables it, and `unset` requires consent before the first spend. A session with no prompt UI to ask (such as `omp -p`) spends a reset under `unset` only when that reset expires within 5 minutes and would otherwise be lost; everything else waits for consent, with a notice pointing at `/usage reset`.

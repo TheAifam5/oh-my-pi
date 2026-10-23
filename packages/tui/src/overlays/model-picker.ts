@@ -6,7 +6,7 @@
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import { addKeyAliases, canonicalKeyId } from "../keybindings";
-import { type KeyId, parseKey } from "../keys";
+import { type KeyId, matchesKey, parseKey } from "../keys";
 import type { Component, TUI } from "../tui";
 import { type ThemeColor, theme } from "../theme/theme";
 import {
@@ -339,7 +339,12 @@ export class ModelPickerComponent implements Component {
 		// Mouse tracking is off outside fullscreen overlays; drop any stray SGR
 		// reports instead of feeding them to the search input.
 		if (data.startsWith("\x1b[<")) return;
-		if (this.#roleMode && (data === "\x1b[C" || data === "\x1b[D") && this.#expandPool(data === "\x1b[C")) return;
+		if (
+			this.#roleMode &&
+			(matchesKey(data, "right") || matchesKey(data, "left")) &&
+			this.#expandPool(matchesKey(data, "right"))
+		)
+			return;
 		if (this.#taskMatchKeys.size > 0) {
 			const parsed = parseKey(data);
 			const canonical = parsed !== undefined ? canonicalKeyId(parsed) : undefined;

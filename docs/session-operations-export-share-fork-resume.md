@@ -487,8 +487,10 @@ understands the flag.
    exit assumed): unfinished tool calls get interrupted results and an aborted
    assistant record ends the turn. A turn startup repair already closed, with or
    without a recorded exit, is taken as it is. That turn is then retried as
-   `/retry` does: a batch whose every call was cut off runs again; otherwise the
-   model answers from where the transcript stops.
+   `/retry` does: a batch whose every call failed or was cut off runs again only
+   when every call is proven never executed or its currently registered tool
+   declares it safe to replay. Otherwise the model continues from the failed
+   results, with a warning when replay was refused to avoid repeated side effects.
 
 Nothing is continued when the last turn finished, failed, or the user interrupted
 it, when a normal exit was recorded after it (the user quit with it

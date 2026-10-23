@@ -392,7 +392,7 @@ describe("local limits setting", () => {
 		expect(asked).toEqual([new Date(2026, 9, 8).getTime() - 1, now - 3_600_000]);
 	});
 
-	it("keeps global account limits when project account policies replace the global ones", async () => {
+	it("keeps trusted account names and limits when project policies try to replace them", async () => {
 		const limits = [{ metric: "requests", max: 1, window: DAY }];
 		fs.writeFileSync(
 			path.join(agentDir, "config.yml"),
@@ -415,19 +415,19 @@ describe("local limits setting", () => {
 		const warn = vi.spyOn(logger, "warn");
 
 		expect(await policies([])).toEqual([
-			{ provider: "openai", account: { email: "w@example.com" }, limits },
+			{ provider: "openai", name: "work", account: { email: "w@example.com" }, limits },
 			{ provider: "openai", account: { email: "h@example.com" }, limits },
 		]);
 		expect(
 			await policies([{ provider: "openai", name: "work", account: { email: "w@example.com" }, priority: 5 }]),
 		).toEqual([
-			{ provider: "openai", name: "work", account: { email: "w@example.com" }, priority: 5, limits },
+			{ provider: "openai", name: "work", account: { email: "w@example.com" }, limits },
 			{ provider: "openai", account: { email: "h@example.com" }, limits },
 		]);
-		expect(warn.mock.calls.some(([message]) => String(message).includes("their account limits are kept"))).toBe(true);
+		expect(warn.mock.calls.some(([message]) => String(message).includes("ignored in project settings"))).toBe(true);
 	});
 
-	it("matches project account policies to global ones by selector only and keeps the merged list valid", async () => {
+	it("project identity selectors cannot replace a trusted drain account", async () => {
 		const limits = [{ metric: "requests", max: 1, window: DAY }];
 		fs.writeFileSync(
 			path.join(agentDir, "config.yml"),
@@ -446,20 +446,13 @@ describe("local limits setting", () => {
 			expect(() => new AccountPolicies(merged as AuthAccountPolicies, undefined)).not.toThrow();
 			return merged;
 		};
-		const appended = { provider: "openai", account: { email: "w@example.com" }, limits };
-
-		// Same name, other selector: no limits inherited, and the name or drain cannot collide.
+		const trusted = { provider: "openai", name: "work", account: { email: "w@example.com" }, drain: true, limits };
 		expect(
 			await policies([{ provider: "openai", name: "work", account: { accountId: "acc-w" }, drain: true }]),
-		).toEqual([{ provider: "openai", name: "work", account: { accountId: "acc-w" }, drain: true }, appended]);
-		// The same account under other identity fields stays a separate entry.
-		expect(await policies([{ provider: "openai", account: { accountId: "acc-w" }, priority: 2 }])).toEqual([
-			{ provider: "openai", account: { accountId: "acc-w" }, priority: 2 },
-			appended,
-		]);
+		).toEqual([trusted]);
 	});
 
-	it("strips limits from project account policies and keeps the rest of each entry", async () => {
+	it("ignores project-only account names and limits with a warning", async () => {
 		const limits = [{ metric: "requests", max: 1, window: DAY }];
 		fs.writeFileSync(
 			path.join(getProjectAgentDir(project), "settings.json"),
@@ -472,10 +465,8 @@ describe("local limits setting", () => {
 		const warn = vi.spyOn(logger, "warn");
 		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
 
-		expect(cfgAuthAccountPolicies.get(settings)).toEqual([
-			{ provider: "openai", name: "work", account: { email: "w@example.com" } },
-		]);
-		expect(warn.mock.calls.some(([message]) => String(message).includes("accountPolicies[0].limits"))).toBe(true);
+		expect(cfgAuthAccountPolicies.get(settings)).toEqual([]);
+		expect(warn.mock.calls.some(([message]) => String(message).includes("auth.accountPolicies"))).toBe(true);
 	});
 
 	it("reports configured limits with counted usage, reset, and the pool limit closest to its cap", async () => {

@@ -291,17 +291,24 @@ describe("advisor taxonomy and notes budget editing", () => {
 		doc: WatchdogConfigDoc,
 		sink: { saved?: WatchdogConfigDoc; notices: string[]; warnings: string[] },
 		extra?: Partial<AdvisorConfigDeps>,
+		terminalRows?: number,
 	) =>
-		new AdvisorConfigOverlayComponent({} as TUI, { ...taxonomyDeps, ...extra }, "project", doc, {
-			loadDoc: async () => ({ advisors: [] }),
-			save: async (_scope, saved) => {
-				sink.saved = structuredClone(saved);
+		new AdvisorConfigOverlayComponent(
+			{ terminal: { rows: terminalRows } } as TUI,
+			{ ...taxonomyDeps, ...extra },
+			"project",
+			doc,
+			{
+				loadDoc: async () => ({ advisors: [] }),
+				save: async (_scope, saved) => {
+					sink.saved = structuredClone(saved);
+				},
+				close: () => {},
+				requestRender: () => {},
+				notify: message => sink.notices.push(message),
+				warn: message => sink.warnings.push(message),
 			},
-			close: () => {},
-			requestRender: () => {},
-			notify: message => sink.notices.push(message),
-			warn: message => sink.warnings.push(message),
-		});
+		);
 
 	const press = (overlay: AdvisorConfigOverlayComponent, key: string, times = 1) => {
 		for (let i = 0; i < times; i++) overlay.handleInput(key);
@@ -506,6 +513,35 @@ describe("advisor taxonomy and notes budget editing", () => {
 	});
 
 	const strip = (lines: readonly string[]): string => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+
+	for (const rows of [16, 40]) {
+		it(`keeps selected categories and ownership actions visible at ${rows} rows`, () => {
+			const categories = Object.fromEntries(
+				Array.from({ length: 60 }, (_, i) => [`category-${i}`, { description: `Description ${i}.` }]),
+			);
+			const overlay = open(
+				{ categories, advisors: [{ name: "Reviewer" }] },
+				{ notices: [], warnings: [] },
+				undefined,
+				rows,
+			);
+			press(overlay, down, 4);
+			press(overlay, "\r");
+			overlay.render(80);
+			press(overlay, down, 59);
+			expect(strip(overlay.render(80))).toMatch(/❯.*category-59/);
+			press(overlay, down, 3);
+			expect(strip(overlay.render(80))).toMatch(/❯.*Back/);
+			press(overlay, "\x1b");
+			press(overlay, "\x1b[A", 4);
+			press(overlay, "\r");
+			press(overlay, down, 7);
+			press(overlay, "\r");
+			overlay.render(80);
+			press(overlay, down, 60);
+			expect(strip(overlay.render(80))).toMatch(/❯.*Done/);
+		});
+	}
 
 	it("keeps the edited field selected when the detail screen rebuilds", () => {
 		const sink = { notices: [] as string[], warnings: [] as string[] };

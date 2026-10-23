@@ -571,6 +571,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 					"",
 				]
 			: [];
+		if (this.#active instanceof SelectList) this.#active.setMaxVisible(Math.max(1, rows - header.length));
 		const lines = [...header, ...this.#active.render(width)];
 		while (lines.length < rows) lines.push("");
 		return lines.slice(0, rows);

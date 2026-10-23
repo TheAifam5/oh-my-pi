@@ -653,3 +653,19 @@ test("a group/member search exposes group availability in the native picker", ()
 	expect(JSON.stringify(p.items)).toContain("exhausted");
 	for (const line of picker.render(40)) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40);
 });
+
+test("application-cursor arrows expand and collapse session pools", () => {
+	const picker = new ModelPickerComponent(
+		ui,
+		source({}, []),
+		{ ...registry(MODELS), refreshIfStale: async () => false },
+		MODELS.map(entry => ({ model: entry })),
+		{ onPick: () => {}, onCancel: () => {} },
+	);
+	picker.setPoolMembers([{ parent: "@security", selector: "@security/member", model: MODELS[0]!, state: "usable" }]);
+	picker.handleInput("@");
+	picker.handleInput("\x1bOC");
+	expect(props(picker.describe(withPicker)).order).toEqual(["@security/member"]);
+	picker.handleInput("\x1bOD");
+	expect(props(picker.describe(withPicker)).order).toEqual(["@security"]);
+});

@@ -525,10 +525,7 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#routeMouseEvent(event: SgrMouseEvent): boolean {
-		const { footerColumn, bodyHeight, contentLine, overSidebar, overBody, bodyLine } = this.#frame.locate(
-			event.row,
-			event.col,
-		);
+		const { footerColumn, bodyHeight, contentLine, overSidebar, overBody } = this.#frame.locate(event.row, event.col);
 		const strip = this.#strip;
 		if (footerColumn !== undefined && strip?.kind === "chips") {
 			if (event.leftClick && this.#frame.selectChipAt(strip, footerColumn)) this.#activateStripChip();
@@ -551,7 +548,7 @@ export class AccountManagerComponent implements Component {
 			}
 		} else if (overBody) {
 			this.#focus = "list";
-			const index = bodyLine - this.#listRowStart + this.#listScroll;
+			const index = contentLine - this.#listRowStart + this.#listScroll;
 			const account = this.#rows[index];
 			if (account) {
 				if (index === this.#rowIndex) this.#openFieldStrip(account);

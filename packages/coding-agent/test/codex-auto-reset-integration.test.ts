@@ -20,6 +20,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import type { AgentSideConnection, CreateElicitationRequest } from "@oh-my-pi/pi-utils/acp";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 import { getTestModel } from "./helpers/model-fixtures";
+import { cfgAuthAccountPolicies } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 
 const EMAIL = "user@example.com";
 const MINUTE = 60_000;
@@ -390,7 +391,19 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		expect(session.agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
-	it("still asks an ACP client with form elicitation about a reset about to expire", async () => {
+	it("project autoRedeem cannot bypass ACP saved-reset confirmation", async () => {
+		const agentDir = tempDir.join("agent");
+		const cwd = tempDir.join("project");
+		await Bun.write(`${agentDir}/config.yml`, "{}\n");
+		await Bun.write(
+			`${cwd}/.omp/config.yml`,
+			JSON.stringify({
+				auth: {
+					accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-a" }, autoRedeem: "yes" }],
+				},
+			}),
+		);
+		const loaded = await Settings.loadIsolated({ agentDir, cwd });
 		const account = {
 			accountId: "acct-a",
 			credentialId: 1,
@@ -398,7 +411,12 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 			limitReached: true,
 			creditExpiresInMs: 4 * MINUTE,
 		};
-		const { session, targets } = buildSession({ accounts: [account], streamErrorFirst: true, acpForm: true });
+		const { session, targets } = buildSession({
+			accounts: [account],
+			streamErrorFirst: true,
+			acpForm: true,
+			accountPolicies: cfgAuthAccountPolicies.get(loaded),
+		});
 		const elicitations = await attachAcpClient(session, true);
 		mockSchedulerWaitWithClock();
 

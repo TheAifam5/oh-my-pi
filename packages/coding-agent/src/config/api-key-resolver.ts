@@ -63,11 +63,12 @@ export function createApiKeyResolver(
 	provider: string,
 	options: ApiKeyResolverOptions = {},
 ): ApiKeyResolver {
-	const { sessionId, baseUrl, modelId, accountIds, minRemainingPct, onReservedAccount } = options;
+	const { sessionId, baseUrl, modelId: configuredModelId, accountIds, minRemainingPct, onReservedAccount } = options;
 	const resolveKey = async (
 		forceRefresh: boolean | undefined,
 		signal?: AbortSignal,
 		refreshReason?: AuthApiKeyOptions["refreshReason"],
+		modelId = configuredModelId,
 	): Promise<ApiKeyResolution> =>
 		confirmServedOnSuccess(
 			await registry.getApiKeyWithCredentialForProvider(provider, sessionId, {
@@ -85,9 +86,10 @@ export function createApiKeyResolver(
 			provider,
 			modelId,
 		);
-	return async ({ lastChance, error, signal, previousKey }) => {
+	return async ({ lastChance, error, signal, previousKey, modelId: requestModelId }) => {
+		const modelId = requestModelId ?? configuredModelId;
 		if (error === undefined) {
-			return resolveKey(undefined, signal);
+			return resolveKey(undefined, signal, undefined, modelId);
 		}
 		if (lastChance) {
 			// Account constraint (401 / usage / account-rate-limit): rotate to a
@@ -111,9 +113,9 @@ export function createApiKeyResolver(
 				// auth decline can instead mean a peer refreshed the bearer.
 				if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
 			}
-			const resolved = await resolveKey(undefined, signal);
+			const resolved = await resolveKey(undefined, signal, undefined, modelId);
 			return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
 		}
-		return resolveKey(true, signal, AIError.status(error) === 401 ? "auth-recovery" : undefined);
+		return resolveKey(true, signal, AIError.status(error) === 401 ? "auth-recovery" : undefined, modelId);
 	};
 }

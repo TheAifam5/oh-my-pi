@@ -44,8 +44,6 @@ import { sanitizeNoticeLine } from "../utils/notice-text";
 import { isRegisteredSearchEngine } from "../web/search/provider";
 import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import type { LocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
-import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
-import { AccountPolicies } from "@oh-my-pi/pi-ai/auth/policy";
 import {
 	type AnySetting,
 	all as allSettings,
@@ -580,66 +578,6 @@ function withoutAccountChoices(group: unknown, path: string, warn: ModelGroupWar
 }
 
 /**
- * Project `auth.accountPolicies` (replacing the lower array whole) with account limits kept
- * global-only: a project entry's own `limits` are dropped with a warning, a project entry with the
- * same provider and `account` selector as a lower entry carries that entry's limits, and lower
- * entries with limits no project entry matches are appended as `{ provider, account, limits }`.
- * An appended entry that would make the list fail {@link AccountPolicies} validation is left out
- * with a warning. Returns `project` itself when nothing changes.
- */
-function withGlobalAccountLimits(project: unknown[], lower: unknown[], warn: ModelGroupWarn): unknown[] {
-	const limited = lower.filter(
-		(entry): entry is RawSettings => isRecord(entry) && Array.isArray(entry.limits) && entry.limits.length > 0,
-	);
-	const sameSelector = (left: RawSettings, right: RawSettings) =>
-		left.provider === right.provider && Bun.deepEquals(left.account, right.account);
-	let changed = false;
-	const matched = new Set<RawSettings>();
-	const kept = project.map((entry, index) => {
-		if (!isRecord(entry)) return entry;
-		let next = entry;
-		if (Object.hasOwn(entry, "limits")) {
-			warn(
-				`auth.accountPolicies[${index}].limits`,
-				"is read from the global config only; ignored in project settings",
-			);
-			const { limits: _limits, ...rest } = entry;
-			next = rest;
-			changed = true;
-		}
-		const global = limited.find(candidate => sameSelector(candidate, next));
-		if (global) {
-			matched.add(global);
-			next = { ...next, limits: global.limits };
-			changed = true;
-		}
-		return next;
-	});
-	const unmatched = limited
-		.filter(entry => !matched.has(entry))
-		.map(entry => ({ provider: entry.provider, account: entry.account, limits: entry.limits }));
-	if (unmatched.length === 0) return changed ? kept : project;
-	warn("auth.accountPolicies", "replaces the global account policies; their account limits are kept");
-	if (!acceptsAccountPolicies(kept)) return kept;
-	const appended: unknown[] = [];
-	for (const entry of unmatched) {
-		if (acceptsAccountPolicies([...kept, ...appended, entry])) appended.push(entry);
-		else warn("auth.accountPolicies", "a global account limit conflicts with the project policies; left out");
-	}
-	return [...kept, ...appended];
-}
-
-/** Whether `policies` passes {@link AccountPolicies} validation. */
-function acceptsAccountPolicies(policies: unknown[]): boolean {
-	try {
-		new AccountPolicies(policies as AuthAccountPolicies, undefined);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/**
  * `global` with the `modelRoles`, `retry.fallbackChains`, and `modelGroups` entries of `above`
  * (the `--config` overlay, then runtime overrides) layered over it and the overlay parent's merged
  * ones under it, entry by entry, and the parent's `auth.accountPolicies` when `global` has none: the
@@ -747,7 +685,7 @@ function withGlobalPoolLimits(
  * - In the project layer: a record that is not a mapping (`modelGroups: null`, a list, …) is
  *   dropped (a `null` record silently), entry `null`s are dropped (a cleared entry falls back
  *   to global), and `allowProjectMeteredPools`, `auth.disabledAccounts`, pool member `account` fields,
- *   `routing.accounts`, and `auth.accountPolicies[].limits` are dropped.
+ *   `routing.accounts`, and `auth.accountPolicies` are dropped.
  *   Unless `allowProjectMetered`, a `modelGroups` entry named in `definedBelow` and an inline
  *   group whose funding includes `metered` are dropped too.
  *
@@ -764,11 +702,12 @@ function modelGroupLayerForMerge(layer: RawSettings, policy: ModelGroupLayerPoli
 		);
 		result = withLayerValue(result, ["task", "agentApproval"], undefined);
 	}
-	const accountPolicies = project ? getByPath(layer, cfgAuthAccountPolicies.segments) : undefined;
-	if (Array.isArray(accountPolicies)) {
-		const lower = policy.lower ? getByPath(policy.lower, cfgAuthAccountPolicies.segments) : undefined;
-		const kept = withGlobalAccountLimits(accountPolicies, Array.isArray(lower) ? lower : [], warn);
-		if (kept !== accountPolicies) result = withLayerValue(result, cfgAuthAccountPolicies.segments, kept);
+	if (project && getByPath(layer, cfgAuthAccountPolicies.segments) !== undefined) {
+		warn(
+			cfgAuthAccountPolicies.id,
+			"is read from the global config, directory layers, --config overlays, and runtime overrides only; ignored in project settings",
+		);
+		result = withLayerValue(result, cfgAuthAccountPolicies.segments, undefined);
 	}
 	if (project && Object.hasOwn(layer, cfgAllowProjectMeteredPools.id)) {
 		warn(cfgAllowProjectMeteredPools.id, "is read from the global config only; ignored in project settings");
@@ -1307,7 +1246,7 @@ export class Settings {
 	/** Whether {@link startWatching} is active. */
 	#watchingFiles = false;
 	/** Directory watchers for config sources, keyed by directory, with the basenames that trigger a reload. */
-	#fileWatchers = new Map<string, { watcher: fs.FSWatcher; names: Set<string> }>();
+	#fileWatchers = new Map<string, { watcher: fs.FSWatcher; names: Set<string>; dev: number; ino: number }>();
 	/** Debounce timer for watcher-triggered reloads. */
 	#watchReloadTimer?: NodeJS.Timeout;
 
@@ -1652,11 +1591,20 @@ export class Settings {
 			const candidate = { ...settings };
 			delete candidate.path;
 			this.#validateDirectorySettings(candidate);
+			const directory = await this.#readDirectoryLayers(canonical, this.#directory);
+			const replacement: DirectoryLayer = { dir: canonical, file, settings: candidate };
+			const index = directory.findIndex(layer => layer.dir === canonical);
+			if (index < 0) directory.push(replacement);
+			else directory[index] = replacement;
+			const layers: OwnLayers = { ...this.#ownLayers(), directory };
+			this.#settlePins(layers);
+			this.#validateAll(this.#mergeOverParent(this.#mergeOwnLayers(layers)), canonical);
 			await this.#writeYamlAtomically(writePath, stringifyYamlConfig(settings));
 		});
 		await this.#exclusive("rescope", async () => {
 			const previous = this.#snapshot();
-			this.#directory = await this.#readDirectoryLayers(this.#cwd);
+			const directory = await this.#readDirectoryLayers(this.#cwd, this.#directory);
+			if (this.#acceptsLayers({ ...this.#ownLayers(), directory }, file)) this.#directory = directory;
 			this.#rebuildMerged();
 			this.#fireChangesSince(previous);
 			this.#syncFileWatchers();
@@ -1932,6 +1880,7 @@ export class Settings {
 					continue;
 				}
 				const current = path.join(dir, segment);
+				if (segments.length === 1) addTarget(dir, segment);
 				if (segments.length === 0) addTarget(dir, segment);
 				try {
 					if (fs.lstatSync(current).isSymbolicLink()) {
@@ -1977,11 +1926,22 @@ export class Settings {
 			this.#fileWatchers.delete(dir);
 		}
 		for (const [dir, names] of targets) {
+			let identity: fs.Stats;
+			try {
+				identity = fs.statSync(dir);
+			} catch {
+				const stale = this.#fileWatchers.get(dir);
+				stale?.watcher.close();
+				this.#fileWatchers.delete(dir);
+				continue;
+			}
 			const existing = this.#fileWatchers.get(dir);
-			if (existing) {
+			if (existing && existing.dev === identity.dev && existing.ino === identity.ino) {
 				existing.names = names;
 				continue;
 			}
+			existing?.watcher.close();
+			this.#fileWatchers.delete(dir);
 			let watcher: fs.FSWatcher;
 			try {
 				watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
@@ -2000,7 +1960,7 @@ export class Settings {
 				watcher.close();
 				if (this.#fileWatchers.get(dir)?.watcher === watcher) this.#fileWatchers.delete(dir);
 			});
-			this.#fileWatchers.set(dir, { watcher, names });
+			this.#fileWatchers.set(dir, { watcher, names, dev: identity.dev, ino: identity.ino });
 			armed = true;
 		}
 		// The sources were last read before this watch existed, and Bun arms macOS
@@ -2208,7 +2168,8 @@ export class Settings {
 			// accepted so far: an invalid file keeps its own layer's last good values while the
 			// other layers still refresh. Strict validates the whole refresh and throws.
 			let layers = this.#ownLayers();
-			layers = { ...layers, directory };
+			const directoryTrial: OwnLayers = { ...layers, directory };
+			if (!keepLastGood || this.#acceptsLayers(directoryTrial, "directory layers")) layers = directoryTrial;
 			const adopted: LayerRefresh[] = [];
 			for (const refresh of refreshed) {
 				const trial: OwnLayers = { ...layers, [refresh.layer]: refresh.settings };

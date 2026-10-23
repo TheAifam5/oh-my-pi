@@ -306,8 +306,21 @@ export class HubFrame {
 		return renderStrip ? renderStrip() : truncateToWidth(theme.fg("dim", hint), width);
 	}
 
-	/** Render footer chips from a hub-selected horizontal window and record their hit ranges. */
-	renderChips(width: number, prefix: string, strip: StripState<StripChip<unknown>>, start = 0): string {
+	/** Render footer chips with the selected chip visible and record their hit ranges. */
+	renderChips(width: number, prefix: string, strip: StripState<StripChip<unknown>>, start?: number): string {
+		const selectedWidth = visibleWidth(strip.chips[strip.index]?.styled ?? "") + 4;
+		prefix = truncateToWidth(prefix, Math.max(0, width - Math.min(width, selectedWidth + 3)));
+		if (start === undefined) {
+			start = 0;
+			let used = visibleWidth(prefix);
+			for (let i = 0; i <= strip.index; i++) {
+				used += visibleWidth(strip.chips[i]?.styled ?? "") + 3 + (i === strip.index ? 2 : 0);
+			}
+			while (start < strip.index && used + (start > 0 ? 2 : 0) > width) {
+				used -= visibleWidth(strip.chips[start]?.styled ?? "") + 3;
+				start++;
+			}
+		}
 		let line = prefix;
 		let col = 2 + visibleWidth(prefix);
 		if (start > 0) {

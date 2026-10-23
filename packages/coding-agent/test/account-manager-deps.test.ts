@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAccountManagerDeps } from "@oh-my-pi/pi-coding-agent/modes/account-manager-deps";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -437,6 +438,16 @@ describe("account manager deps", () => {
 			"anthropic/claude-opus-4-5 has 0 limits.",
 		);
 		expect(Object.keys(limits() as object)).toEqual(["*"]);
+	});
+
+	it("shortens the home prefix in project pin directory details", async () => {
+		const project = path.join(os.homedir(), "projects", "pin-display");
+		const { deps } = await open({
+			auth: { accountPolicies: [workPolicy], accountPins: { [project]: { anthropic: "work" } } },
+		});
+		const pin = deps.pages!().find(page => page.id === "pins")!.rows[0]!;
+		expect(pin.details.find(detail => detail.label === "directory")?.value).toBe("~/projects/pin-display");
+		expect(JSON.stringify({ name: pin.name, details: pin.details })).not.toContain(os.homedir());
 	});
 
 	it("lists project pins of every directory and changes or removes one without touching the others", async () => {

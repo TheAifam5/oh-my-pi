@@ -60,6 +60,16 @@ describe("exact action approval policies", () => {
 		}
 	});
 
+	it("matches bare tool policies for action-bearing tools without action keys", () => {
+		for (const policy of ["allow", "deny", "prompt"] as const) {
+			const settings = Settings.isolated({ "tools.approval": { github: policy } });
+			expect(resolveApproval(github, create, "always-ask", cfgToolsApproval.get(settings))).toMatchObject({
+				policy,
+				policyKey: "github",
+			});
+		}
+	});
+
 	it("matches only the declared operation and gives action prompts priority over tool allows", () => {
 		const policies = { github: "allow", "github:pr_create": "prompt" };
 		expect(resolveApproval(github, create, "yolo", policies).policy).toBe("prompt");
