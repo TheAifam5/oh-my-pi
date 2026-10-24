@@ -11,8 +11,8 @@ import type { OAuthController, OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/ty
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthCredential } from "../session/auth-storage";
-import { buildWellKnownUrls } from "./oauth-discovery";
 import { MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX, MCP_OAUTH_URL_CREDENTIAL_PREFIX } from "./oauth-credential-id";
+import { buildWellKnownUrls } from "./oauth-discovery";
 
 /**
  * Deterministic credential id for an MCP server URL scoped to an OMP profile.
