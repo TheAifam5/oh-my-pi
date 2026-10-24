@@ -12,12 +12,7 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthCredential } from "../session/auth-storage";
 import { buildWellKnownUrls } from "./oauth-discovery";
-
-/** Credential-id prefix for OMP-managed MCP OAuth credentials keyed by profile and server URL. */
-const MCP_OAUTH_URL_CREDENTIAL_PREFIX = "mcp_oauth:";
-
-/** Credential-id prefix for profile-scoped MCP OAuth credentials (`mcp_oauth:profile:<profile>:<serverUrl>`). */
-const MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX = `${MCP_OAUTH_URL_CREDENTIAL_PREFIX}profile:`;
+import { MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX, MCP_OAUTH_URL_CREDENTIAL_PREFIX } from "./oauth-credential-id";
 
 /**
  * Deterministic credential id for an MCP server URL scoped to an OMP profile.
@@ -31,14 +26,6 @@ const MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX = `${MCP_OAUTH_URL_CREDENTIAL_PREFIX}p
  */
 export function mcpOAuthCredentialId(serverUrl: string, profile: string | undefined = getActiveProfile()): string {
 	return `${MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX}${profile ?? "default"}:${serverUrl}`;
-}
-
-/** Whether a credential id was minted by OMP's MCP OAuth flows (either era). */
-export function isManagedMCPOAuthCredentialId(credentialId: string | undefined): credentialId is string {
-	return (
-		!!credentialId &&
-		(credentialId.startsWith("mcp_oauth_") || credentialId.startsWith(MCP_OAUTH_URL_CREDENTIAL_PREFIX))
-	);
 }
 
 /**

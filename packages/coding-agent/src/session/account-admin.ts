@@ -40,7 +40,7 @@ import { GLOBAL_LIMIT_KEY, limitKeyScope } from "../config/local-limits";
 import type { ModelGroup, ParsedModelValue } from "../config/model-groups";
 import { cfgAuthAccountPins, cfgAuthAccountPolicies, cfgLimits, cfgModelGroups } from "../config/model-settings";
 import type { Settings } from "../config/settings";
-import { isManagedMCPOAuthCredentialId } from "../mcp/oauth-flow";
+import { isManagedMCPOAuthCredentialId } from "../mcp/oauth-credential-id";
 import { canonicalDir, projectAccountPin } from "./account-pins";
 import { loadEffectiveAuthAccountPolicyConfig } from "./auth-broker-config";
 import type { AuthAccountSummary, AuthStorage } from "./auth-storage";

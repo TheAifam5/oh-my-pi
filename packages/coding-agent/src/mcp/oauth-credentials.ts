@@ -4,8 +4,8 @@ import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import { expandEnvVarsDeep } from "../discovery/helpers";
 import type { AuthStorage } from "../session/auth-storage";
+import { isManagedMCPOAuthCredentialId } from "./oauth-credential-id";
 import {
-	isManagedMCPOAuthCredentialId,
 	type MCPStoredOAuthCredential,
 	mcpOAuthCredentialId,
 	mcpOAuthCredentialProfile,
