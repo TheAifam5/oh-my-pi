@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { cfgAuthAccountPolicies } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runAccountCommand } from "@oh-my-pi/pi-coding-agent/cli/account-cli";
+import { mcpOAuthCredentialId } from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	AccountAdminError,
 	accountLimits,
@@ -22,7 +23,6 @@ import {
 	setAccountReturn,
 	unpinProjectAccount,
 } from "@oh-my-pi/pi-coding-agent/session/account-admin";
-import { mcpOAuthCredentialId } from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	projectAccountPin,
 	registerSessionAccountPins,
