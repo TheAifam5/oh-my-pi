@@ -22,6 +22,7 @@ import {
 	setAccountReturn,
 	unpinProjectAccount,
 } from "@oh-my-pi/pi-coding-agent/session/account-admin";
+import { mcpOAuthCredentialId } from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	projectAccountPin,
 	registerSessionAccountPins,
@@ -104,6 +105,22 @@ describe("account administration", () => {
 		const ref = resolveAccount(authStorage, `anthropic-api-key/${apiKeyFingerprint(key)}`);
 		expect(ref.provider).toBe("anthropic");
 		expect(ref.account.type).toBe("api_key");
+	});
+
+	it("keeps MCP connector OAuth credentials out of account listing and resolution", async () => {
+		const mcpProvider = mcpOAuthCredentialId("https://mcp.example.com/mcp", "default");
+		await authStorage.credentials.set(mcpProvider, [
+			{ ...oauth("mcp"), email: "a@example.com", accountId: "acc-mcp" },
+		]);
+		const settings = await Settings.loadIsolated({ cwd: project, agentDir });
+
+		expect(listAccounts(settings, authStorage, project).map(row => [row.provider, row.label])).toEqual([
+			["anthropic", "a@example.com"],
+			["anthropic", "b@example.com"],
+		]);
+		expect(resolveAccount(authStorage, "a@example.com").provider).toBe("anthropic");
+		expect(() => resolveAccount(authStorage, "acc-mcp")).toThrow(AccountAdminError);
+		expect(authStorage.credentials.list(mcpProvider)).toHaveLength(1);
 	});
 
 	it("pins the current project to a named account and logs a named account out", async () => {

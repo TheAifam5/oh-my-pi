@@ -40,6 +40,7 @@ import { GLOBAL_LIMIT_KEY, limitKeyScope } from "../config/local-limits";
 import type { ModelGroup, ParsedModelValue } from "../config/model-groups";
 import { cfgAuthAccountPins, cfgAuthAccountPolicies, cfgLimits, cfgModelGroups } from "../config/model-settings";
 import type { Settings } from "../config/settings";
+import { isManagedMCPOAuthCredentialId } from "../mcp/oauth-flow";
 import { canonicalDir, projectAccountPin } from "./account-pins";
 import { loadEffectiveAuthAccountPolicyConfig } from "./auth-broker-config";
 import type { AuthAccountSummary, AuthStorage } from "./auth-storage";
@@ -104,9 +105,12 @@ export function accountLabel(account: AuthAccountSummary): string {
 	return org && org !== base ? `${base} (${org})` : base;
 }
 
+/** Model providers with stored credentials; MCP connector OAuth credentials are managed through `/mcp`. */
 function storedProviders(authStorage: AuthStorage): string[] {
 	const rows = [...authStorage.credentials.list(), ...authStorage.credentials.listUserDisabled()];
-	return [...new Set(rows.map(row => row.provider))].sort();
+	return [...new Set(rows.map(row => row.provider))]
+		.filter(provider => !isManagedMCPOAuthCredentialId(provider))
+		.sort();
 }
 
 /**

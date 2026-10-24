@@ -65,6 +65,7 @@
 
 ### Fixed
 
+- `/account` and `omp account` no longer list or resolve MCP connector OAuth credentials; manage those with `/mcp`
 - Advisor quota reserves are rechecked on each request, not only at preflight
 - Project `.omp/config.yml` `auth.accountPolicies` is ignored with a warning so repositories cannot authorize saved-reset spending or paid draining
 - Directory settings writes keep last-good ancestor layers and reject changes that make the merged settings invalid
