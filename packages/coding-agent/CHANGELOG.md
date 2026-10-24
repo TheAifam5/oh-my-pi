@@ -53,6 +53,7 @@
 
 ### Changed
 
+- Changed background job notices to state the outcome: "failed" or "was cancelled" instead of always "has completed", and to mark failed or cancelled jobs in multi-job notices
 - Changed advisors to receive matching model-scoped always-apply rules, refreshed on model changes; unscoped rules remain excluded
 - Changed `session_start` to fire again after `/new`, resume, and fork with the matching `reason`; handlers also registered for `session_switch` or `session_branch` can skip these with `isSessionReplacementStart(event)`
 - Changed retry fallback chain entries to match their model exactly, at startup too: a partial name such as `anthropic/sonnet` no longer matches a neighboring model, and an entry that matches no model is skipped with one warning naming the cause, given after the first model discovery for providers that discover models live

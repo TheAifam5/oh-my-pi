@@ -115,6 +115,8 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			result: escapeHarnessTags(entry.result),
 			type: entry.job?.type,
 			status: entry.job?.status,
+			failed: entry.job?.status === "failed",
+			cancelled: entry.job?.status === "cancelled",
 			agentId: entry.job?.agentId,
 			label: entry.job?.label,
 			durationMs: entry.durationMs,

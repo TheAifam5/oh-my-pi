@@ -564,34 +564,50 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 	});
 
-	it("keeps lifecycle metadata machine-readable without changing rendering or old consumers", () => {
-		const makeMessage = (status: AsyncJob["status"]) =>
-			buildAsyncResultBatchMessage([
-				{
-					jobId: "render-job",
-					result: "unchanged result",
-					job: {
-						id: "render-job",
-						agentId: "RenderWorker",
-						type: "task",
-						status,
-						startTime: Date.now(),
-						label: "render task",
-						abortController: new AbortController(),
-						promise: Promise.resolve(),
-					},
-					durationMs: 1000,
-					epoch: 0,
-				},
-			]);
-		const completed = makeMessage("completed");
-		const failed = makeMessage("failed");
-		const cancelled = makeMessage("cancelled");
+	it("states each job's outcome in the notice header while keeping the result body unchanged", () => {
+		const makeJob = (id: string, status: AsyncJob["status"]): AsyncResultEntry => ({
+			jobId: id,
+			result: "unchanged result",
+			job: {
+				id,
+				agentId: "RenderWorker",
+				type: "task",
+				status,
+				startTime: Date.now(),
+				label: "render task",
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+			},
+			durationMs: 1000,
+			epoch: 0,
+		});
+		const header = (status: AsyncJob["status"]) => {
+			const content = buildAsyncResultBatchMessage([makeJob("render-job", status)])?.content;
+			if (typeof content !== "string") throw new Error("Expected async batch text");
+			return content.split("\n")[1];
+		};
 
-		expect(failed?.content).toBe(completed?.content);
-		expect(cancelled?.content).toBe(completed?.content);
-		const oldConsumerDetails: { jobs: Array<{ jobId: string; label?: string }> } = completed!.details!;
-		expect(oldConsumerDetails.jobs.map(job => `${job.jobId}:${job.label ?? ""}`)).toEqual(["render-job:render task"]);
+		expect(header("completed")).toBe(
+			"Background job render-job has completed. Resume your work using the result below.",
+		);
+		expect(header("failed")).toBe("Background job render-job failed. Resume your work using the result below.");
+		expect(header("cancelled")).toBe(
+			"Background job render-job was cancelled. Resume your work using the result below.",
+		);
+
+		const batch = buildAsyncResultBatchMessage([
+			makeJob("ok-job", "completed"),
+			makeJob("bad-job", "failed"),
+			makeJob("stopped-job", "cancelled"),
+		]);
+		const text = typeof batch?.content === "string" ? batch.content : "";
+		expect(text).toContain("3 background jobs have finished.");
+		expect(text).toContain("── Job ok-job (render task) ──");
+		expect(text).toContain("── Job bad-job (render task) — failed ──");
+		expect(text).toContain("── Job stopped-job (render task) — cancelled ──");
+		expect(text.match(/unchanged result/g)).toHaveLength(3);
+		const oldConsumerDetails: { jobs: Array<{ jobId: string; label?: string }> } = batch!.details!;
+		expect(oldConsumerDetails.jobs.map(job => job.jobId)).toEqual(["ok-job", "bad-job", "stopped-job"]);
 	});
 
 	it("carries a schema-invalid background task's parsed payload as both a pointer and an inline preview", () => {
