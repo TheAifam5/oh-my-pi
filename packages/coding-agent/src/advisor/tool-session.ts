@@ -7,9 +7,11 @@ export function isolateAdvisorToolSession(session: ToolSession): ToolSession {
 		Object.getOwnPropertyDescriptors(session),
 		Object.getOwnPropertyDescriptors({
 			memoryContext: {
-				settings: memoryContext.settings,
-				getMnemopiSessionState: memoryContext.getMnemopiSessionState,
-				isDisposed: memoryContext.isDisposed,
+				get settings() {
+					return memoryContext.settings;
+				},
+				getMnemopiSessionState: memoryContext.getMnemopiSessionState?.bind(memoryContext),
+				isDisposed: memoryContext.isDisposed?.bind(memoryContext),
 			},
 			listAdvisorFindings: undefined,
 			getAdvisorFinding: undefined,

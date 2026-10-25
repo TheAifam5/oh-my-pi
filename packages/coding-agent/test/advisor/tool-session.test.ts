@@ -5,6 +5,7 @@ import { isolateAdvisorToolSession } from "@oh-my-pi/pi-coding-agent/advisor/too
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -89,6 +90,58 @@ describe("advisor peer isolation", () => {
 		]);
 		expect(source.agentRegistry).toBe(primary.agentRegistry);
 		expect(source.enableIrc).toBe(true);
+	});
+
+	it("preserves private-field memory receivers and live settings without restoring capabilities", async () => {
+		const primary = primaryToolSession(new AgentRegistry());
+		class MemoryContext {
+			#settings = Settings.isolated({ "memory.backend": "mnemopi" });
+			#disposed = false;
+			#state: MnemopiSessionState | undefined;
+			agentRegistry = primary.agentRegistry;
+
+			get settings() {
+				return this.#settings;
+			}
+
+			set settings(settings: Settings) {
+				this.#settings = settings;
+			}
+
+			getMnemopiSessionState() {
+				return this.#state;
+			}
+
+			isDisposed() {
+				return this.#disposed;
+			}
+
+			dispose() {
+				this.#disposed = true;
+			}
+		}
+		const memoryContext = new MemoryContext();
+		const advisor = isolateAdvisorToolSession({ ...primary, memoryContext });
+		const scopedMemory = advisor.memoryContext;
+		expect(scopedMemory).not.toBe(memoryContext);
+		expect(scopedMemory?.getMnemopiSessionState?.()).toBeUndefined();
+		expect(scopedMemory?.isDisposed?.()).toBe(false);
+		expect(scopedMemory?.settings).toBe(memoryContext.settings);
+		expect(Object.keys(scopedMemory ?? {}).sort()).toEqual(["getMnemopiSessionState", "isDisposed", "settings"]);
+		expect(advisor.agentRegistry).toBeUndefined();
+		expect(advisor.enableIrc).toBe(false);
+		const read = new ReadTool(advisor);
+		await expect(read.execute("class-memory", { path: "memory://root" })).rejects.toThrow("active backend: mnemopi");
+		memoryContext.settings = Settings.isolated({ "memory.backend": "hindsight" });
+		expect(scopedMemory?.settings).toBe(memoryContext.settings);
+		await expect(read.execute("updated-memory", { path: "memory://root" })).rejects.toThrow(
+			"active backend: hindsight",
+		);
+		memoryContext.dispose();
+		expect(scopedMemory?.isDisposed?.()).toBe(true);
+		await expect(read.execute("disposed-class-memory", { path: "memory://root" })).rejects.toThrow(
+			"Unknown protocol: memory://",
+		);
 	});
 
 	it.each(["hindsight", "mnemopi"])("keeps memory reads bound to %s without a peer registry", async backend => {
