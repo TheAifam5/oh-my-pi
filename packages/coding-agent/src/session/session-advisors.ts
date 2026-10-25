@@ -656,8 +656,9 @@ export interface AdvisorFindingActionResult {
 	reason: string;
 }
 
+/** Actor recorded on a session-initiated finding transition; advisors resolve only through `advise`. */
 export interface AdvisorFindingActionOptions {
-	by: string;
+	by: "user" | "agent";
 	reason?: string;
 }
 
