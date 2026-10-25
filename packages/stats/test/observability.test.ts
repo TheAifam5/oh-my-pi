@@ -178,7 +178,10 @@ it("returns read-only served-call aggregates without account identities", async 
 				"INSERT INTO usage_ledger VALUES (?, 'p', 'm', 'secret@example.invalid', 'role:test', 1000000000, 20, 30), (?, 'p', 'm', NULL, NULL, 2000000000, 10, 10)",
 			)
 			.run(Date.now(), Date.now());
-		const response = await handleApi(new Request("http://127.0.0.1/api/stats/observability?range=24h"), "127.0.0.1");
+		const response = await handleApi(
+			new Request("http://127.0.0.1/api/stats/observability?range=24h", { headers: { Host: "127.0.0.1" } }),
+			"127.0.0.1",
+		);
 		expect(response.status).toBe(200);
 		const serialized = await response.text();
 		expect(serialized.includes("secret@example.invalid")).toBe(false);

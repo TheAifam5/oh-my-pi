@@ -84,7 +84,8 @@ describe("model usage session entries", () => {
 		insertMessageStats((await parseSessionFile(file)).stats);
 		const [row] = getRecentRequests(1);
 
-		const response = await handleApi(new Request(`http://stats.test/api/request/${row.id}`));
+		const request = () => new Request(`http://stats.test/api/request/${row.id}`, { headers: { Host: "stats.test" } });
+		const response = await handleApi(request(), "stats.test");
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({
 			id: row.id,
@@ -94,6 +95,6 @@ describe("model usage session entries", () => {
 		});
 
 		await Bun.write(file, "");
-		expect((await handleApi(new Request(`http://stats.test/api/request/${row.id}`))).status).toBe(404);
+		expect((await handleApi(request(), "stats.test")).status).toBe(404);
 	});
 });

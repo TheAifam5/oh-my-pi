@@ -1,5 +1,6 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
+import { networkInterfaces } from "node:os";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { $, type Server } from "bun";
@@ -164,6 +165,36 @@ const ensureClientBuild = async () => {
  */
 const STATS_ACTION_HEADER = "X-Omp-Stats-Action";
 
+function apiAccessError(req: Request, bindHostname: string, bindPort = 80): string | null {
+	const url = new URL(req.url);
+	const sensitive = url.pathname === "/api/stats/observability" || req.method === "POST";
+	if (sensitive && !isStatsLoopbackHost(bindHostname)) {
+		return "A same-origin loopback dashboard request is required";
+	}
+
+	let expectedHostname = bindHostname;
+	if (bindHostname === "0.0.0.0" || bindHostname === "::" || bindHostname === "[::]") {
+		const requestHostname = url.hostname.replace(/^\[|\]$/g, "");
+		const localAddress =
+			isStatsLoopbackHost(requestHostname) ||
+			Object.values(networkInterfaces()).some(addresses =>
+				addresses?.some(address => address.address === requestHostname),
+			);
+		if (!localAddress) return "A same-origin dashboard request is required";
+		expectedHostname = requestHostname;
+	}
+	const expected = new URL(formatStatsDashboardUrl(expectedHostname, bindPort));
+	const origin = req.headers.get("origin");
+	if (
+		url.origin !== expected.origin ||
+		req.headers.get("host") !== expected.host ||
+		(origin !== null && origin !== expected.origin)
+	) {
+		return "A same-origin dashboard request is required";
+	}
+	return null;
+}
+
 /**
  * Handle API requests.
  */
@@ -174,19 +205,9 @@ export async function handleApi(
 ): Promise<Response> {
 	const url = new URL(req.url);
 	const path = url.pathname;
-	const sensitive = path === "/api/stats/observability" || req.method === "POST";
-	if (sensitive) {
-		const expected = new URL(formatStatsDashboardUrl(bindHostname, bindPort));
-		const host = req.headers.get("host") ?? url.host;
-		const origin = req.headers.get("origin");
-		if (
-			!isStatsLoopbackHost(bindHostname) ||
-			url.origin !== expected.origin ||
-			host !== expected.host ||
-			(origin !== null && origin !== expected.origin)
-		) {
-			return Response.json({ error: "A same-origin loopback dashboard request is required" }, { status: 403 });
-		}
+	const accessError = apiAccessError(req, bindHostname, bindPort);
+	if (accessError) {
+		return Response.json({ error: accessError }, { status: 403 });
 	}
 
 	// Stats reads are DB-only; ingest runs in the background (see `live.ts`).
@@ -410,6 +431,13 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
 				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
 			};
+
+			if (path.startsWith("/api/") && (req.method === "OPTIONS" || path === "/api/events")) {
+				const accessError = apiAccessError(req, hostname, server.port);
+				if (accessError) {
+					return Response.json({ error: accessError }, { status: 403, headers: dashboardHeaders });
+				}
+			}
 
 			if (req.method === "OPTIONS") {
 				return new Response(null, { headers: dashboardHeaders });

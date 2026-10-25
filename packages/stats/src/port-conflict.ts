@@ -21,7 +21,7 @@ export const STATS_DASHBOARD_HEADER = "x-omp-stats-dashboard";
 export const STATS_DASHBOARD_HOSTNAME_HEADER = "x-omp-stats-hostname";
 
 /** Identity-header value for dashboards enforcing an explicit bind host and same-origin access. */
-export const STATS_DASHBOARD_SECURITY_VERSION = "3";
+export const STATS_DASHBOARD_SECURITY_VERSION = "4";
 
 /** IPv4 loopback address shared by the dashboard server and reuse probe. */
 export const STATS_DASHBOARD_HOSTNAME = "127.0.0.1";

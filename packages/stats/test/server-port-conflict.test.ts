@@ -182,6 +182,12 @@ describe("startServer port conflicts", () => {
 			statsOwned: false,
 		},
 		{
+			name: "reclaims a version 3 dashboard without guarded aggregate reads",
+			response: `Response.json([], { headers: { "${STATS_DASHBOARD_HEADER}": "3", "${STATS_DASHBOARD_HOSTNAME_HEADER}": "${STATS_DASHBOARD_HOSTNAME}" } })`,
+			hostname: STATS_DASHBOARD_HOSTNAME,
+			statsOwned: true,
+		},
+		{
 			name: "reclaims a headerless legacy dashboard",
 			response: "Response.json([])",
 			hostname: STATS_DASHBOARD_HOSTNAME,

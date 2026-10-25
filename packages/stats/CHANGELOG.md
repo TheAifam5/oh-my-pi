@@ -15,6 +15,7 @@
 ### Fixed
 
 - Sensitive dashboard APIs reject foreign Host and Origin values and mismatched ports. Account headroom labels use anonymous per-provider ordinals instead of configured policy names.
+- All dashboard API reads and event streams reject foreign or missing Host values, foreign Origins, and URL authority mismatches. Explicit non-loopback aggregate access remains available with matching local authorities.
 - Findings indexing reads appended transcript tails with bounded checkpoints, respects targeted file syncs, and runs outside the session-ingestion lock.
 - Transcript projection checkpoints contain SHA-256 digests, not raw transcript fragments; the obsolete projection is dropped and rebuilt.
 
