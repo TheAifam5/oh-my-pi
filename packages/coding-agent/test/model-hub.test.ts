@@ -2805,6 +2805,73 @@ describe("ModelHub", () => {
 				expect(source.poolWriteBlocker?.({ kind: "group", key: "fast" })).toBe("set in the runtime layer");
 			});
 
+			test("renaming a profile in the Groups view repoints the roles that use it, keeping their shorthand", () => {
+				const settings = Settings.isolated();
+				settings.setModelGroup("fast", {
+					strategy: "random",
+					models: { a: { model: "test/model-a", defaultEffort: "high" } },
+					profiles: { low: { a: { effort: "low" } } },
+				});
+				// One reference in the `+group@profile` shorthand, one in object form; each keeps its form.
+				settings.setModelRoleSpec("smol", "+fast@low");
+				settings.setFallbackChainSpec("smol", { use: "fast", profile: "low" });
+				expect(createModelBrowserSource(settings).getPool?.({ kind: "group", key: "fast" })?.profiles).toEqual([
+					{ name: "low", efforts: { a: "low" } },
+				]);
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				hub.handleInput(UP); // All models → Groups
+				hub.handleInput("\n"); // +fast
+				hub.handleInput(DOWN); // member a
+				hub.handleInput(DOWN); // profile @low
+				expect(normalize(hub.render(220))).toMatch(/· @low .*a low .*used by modelRoles\.smol/);
+
+				hub.handleInput("R");
+				for (let i = 0; i < "low".length; i++) hub.handleInput("\x7f");
+				type(hub, "quick");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({
+					fast: {
+						strategy: "random",
+						models: { a: { model: "test/model-a", defaultEffort: "high" } },
+						profiles: { quick: { a: { effort: "low" } } },
+					},
+				});
+				expect(settings.getModelRoleEntries().smol).toBe("+fast@quick");
+				expect(settings.getGlobalSettings().retry).toMatchObject({
+					fallbackChains: { smol: { use: "fast", profile: "quick" } },
+				});
+			});
+
+			test("a profile a shadowed global entry still uses can be neither renamed nor deleted", () => {
+				const settings = Settings.isolated();
+				const group = {
+					strategy: "random",
+					models: { a: { model: "test/model-a" } },
+					profiles: { low: { a: { effort: "low" } } },
+				};
+				settings.setModelGroup("fast", group);
+				settings.setFallbackChainSpec("smol", "+fast@low");
+				// The effective chain is a plain list, so only the global entry still names @low.
+				cfgRetryFallbackChains.override(settings, { smol: ["test/model-b"] });
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				hub.handleInput(UP); // All models → Groups
+				hub.handleInput("\n"); // +fast
+				hub.handleInput(DOWN); // member a
+				hub.handleInput(DOWN); // profile @low
+				expect(normalize(hub.render(220))).toMatch(/· @low .*used by retry\.fallbackChains\.smol/);
+
+				hub.handleInput("x");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: group });
+				expect(normalize(hub.render(220))).toContain("+fast@low is used by retry.fallbackChains.smol");
+
+				hub.handleInput("R");
+				for (let i = 0; i < "low".length; i++) hub.handleInput("\x7f");
+				type(hub, "quick");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: group });
+				expect(normalize(hub.render(220))).toContain("retry.fallbackChains.smol uses +fast@low and is set in");
+			});
+
 			test("G declines renaming or deleting a group a shadowed global entry still references", () => {
 				const settings = Settings.isolated();
 				settings.setModelGroup("shared", { strategy: "random", models: { a: { model: "test/model-a" } } });

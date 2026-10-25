@@ -6,7 +6,7 @@ import type { DescribeContext, NativeChild, NativeNode } from "../src/native/nod
 import {
 	ModelHubComponent,
 	type ModelHubPool,
-	type ModelHubPoolTarget,
+	type ModelHubGroupReference,
 	type ModelHubRegistry,
 	type ModelHubSource,
 } from "../src/overlays/model-hub";
@@ -58,7 +58,7 @@ function source(
 		roles?: Record<string, ModelHubPool>;
 		chains?: Record<string, ModelHubPool>;
 		groups?: Record<string, ModelHubPool>;
-		groupUsers?: Record<string, ModelHubPoolTarget[]>;
+		groupUsers?: Record<string, ModelHubGroupReference[]>;
 	} = {},
 ): ModelHubSource {
 	return {
@@ -421,6 +421,40 @@ describe("Groups view", () => {
 		expect(item("member:group:fast:mini")?.facts).toMatchObject({ model: "openai/gpt-5.6-mini", thinking: "low" });
 	});
 
+	test("a new group's name is checked before the model browse, and a read-only group says why it cannot be edited", () => {
+		const { hub, writes } = groupsHub();
+		hub.handleNativeEvent({ type: "activate", key: "", item: "newGroup" });
+		for (const char of "Bad Name") hub.handleInput(char);
+		hub.handleInput("\r");
+		// Still naming: the refusal shows in the field and no browse started.
+		expect(props(hub.describe(withPicker)).scope).toBe("groups");
+		expect(JSON.stringify(hub.describe(withPicker))).toContain("lowercase letters, digits, - and _, starting with");
+		expect(writes).toEqual([]);
+
+		const locked = new ModelHubComponent(
+			ui,
+			source({ default: "demo/demo" }, [], {
+				groups: {
+					shared: {
+						source: { kind: "inline" },
+						strategy: "random",
+						members: [{ alias: "opus", model: "anthropic/claude-opus-5" }],
+						funding: [],
+						readOnly: "set in the project layer",
+					},
+				},
+			}),
+			registry(MODELS),
+			MODELS.map(entry => ({ model: entry })),
+			{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {}, onPoolChange: () => undefined },
+		);
+		hubs.push(locked);
+		locked.handleNativeEvent({ type: "action", key: "", act: "scope", value: "groups", mods: [] });
+		locked.handleNativeEvent({ type: "activate", key: "", item: "group:shared" });
+		const subtitle = JSON.stringify(props(locked.describe(withPicker)).subtitle);
+		expect(subtitle).toContain("modelGroups.shared is set in the project layer");
+	});
+
 	test("x deletes only an unused group; a used one is refused with its users", () => {
 		const { hub, writes } = groupsHub();
 		const act = (act: string) => hub.handleNativeEvent({ type: "action", key: "", act, mods: [] });
@@ -455,6 +489,137 @@ describe("Groups view", () => {
 			},
 		]);
 		expect(props(hub.describe(withPicker)).scope).toBe("groups");
+	});
+});
+
+describe("Group profiles", () => {
+	const fastRaw = {
+		strategy: "priority",
+		strategyOptions: { order: ["mini"] },
+		models: { mini: { model: "openai/gpt-5.6-mini", defaultEffort: "high" } },
+		profiles: { low: { mini: { effort: "low" } }, spare: {} },
+	};
+	const fastMembers = [{ alias: "mini", model: "openai/gpt-5.6-mini", effort: "high" }];
+	const profiles: NonNullable<ModelHubPool["profiles"]> = [
+		{ name: "low", efforts: { mini: "low" } },
+		{ name: "spare", efforts: {} },
+	];
+	const fixture = {
+		groups: {
+			fast: {
+				source: { kind: "inline" },
+				strategy: "priority",
+				members: fastMembers,
+				funding: [],
+				profiles,
+				raw: fastRaw,
+			},
+		},
+		// `smol` runs `+fast@low`, so it sees the profile's effort.
+		roles: {
+			smol: {
+				source: { kind: "ref", group: "fast", profile: "low" },
+				strategy: "priority",
+				members: [{ alias: "mini", model: "openai/gpt-5.6-mini", effort: "low" }],
+				funding: [],
+				profiles,
+				raw: fastRaw,
+			},
+		},
+		groupUsers: { fast: [{ kind: "role", key: "smol", profile: "low" }] },
+	} satisfies Parameters<typeof source>[2];
+
+	function profilesHub(scope: "roles" | "groups") {
+		const writes: [unknown, Record<string, unknown> | undefined][] = [];
+		const hub = new ModelHubComponent(
+			ui,
+			source({ default: "demo/demo", smol: "+fast@low" }, [], fixture),
+			registry(MODELS),
+			MODELS.map(entry => ({ model: entry })),
+			{
+				onAssign: () => {},
+				onUnassign: () => {},
+				onCancel: () => {},
+				onPoolChange: (target, value) => {
+					writes.push([target, value as Record<string, unknown> | undefined]);
+					return undefined;
+				},
+			},
+		);
+		hubs.push(hub);
+		hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: scope, mods: [] });
+		const act = (id: string, value?: string) =>
+			hub.handleNativeEvent({ type: "action", key: "", act: id, ...(value ? { value } : {}), mods: [] });
+		const select = (item: string) => hub.handleNativeEvent({ type: "select", key: "", item });
+		return { hub, writes, act, select };
+	}
+
+	test("each profile lists under its group with its overrides and who uses it", () => {
+		const { hub } = profilesHub("groups");
+		const p = props(hub.describe(withPicker));
+		expect(p.order?.filter(entry => typeof entry === "string")).toEqual([
+			"group:fast",
+			"member:group:fast:mini",
+			"profile:fast:low",
+			"profile:fast:spare",
+			"newGroup",
+		]);
+		const item = (id: string) => p.items?.find(entry => entry.id === id);
+		expect(item("profile:fast:low")).toMatchObject({
+			label: "@low",
+			facts: { thinking: "mini low", routing: "used by modelRoles.smol" },
+		});
+		expect(item("profile:fast:spare")).toMatchObject({
+			tone: "muted",
+			facts: { thinking: "no overrides", routing: "unused" },
+		});
+	});
+
+	test("x deletes only an unused profile; @ adds one", () => {
+		const { hub, writes, act, select } = profilesHub("groups");
+		select("profile:fast:low");
+		act("roles:clear");
+		expect(writes).toEqual([]);
+		select("profile:fast:spare");
+		act("roles:clear");
+		expect(writes.at(-1)?.[1]?.profiles).toEqual({ low: { mini: { effort: "low" } } });
+
+		act("roles:newProfile");
+		for (const char of "deep") hub.handleInput(char);
+		hub.handleInput("\r");
+		expect(writes.at(-1)).toEqual([
+			{ kind: "group", key: "fast" },
+			{ ...fastRaw, profiles: { ...fastRaw.profiles, deep: {} } },
+		]);
+	});
+
+	test("t on a member of a role using +fast@low sets the low profile's override, not the group default", () => {
+		const { hub, writes, act, select } = profilesHub("roles");
+		select("member:role:smol:mini");
+		hub.handleInput("t");
+		const strip = props(hub.describe(withPicker)).strip;
+		const inherit = strip?.items.find(chip => JSON.stringify(chip.label).includes("inherit"));
+		expect(inherit).toBeDefined();
+		act("strip", inherit?.id);
+		const [target, value] = writes.at(-1) ?? [];
+		expect(target).toEqual({ kind: "group", key: "fast" });
+		// Inherit removes the profile's override; the member keeps its default.
+		expect(value?.profiles).toEqual({ low: {}, spare: {} });
+		expect(value?.models).toEqual(fastRaw.models);
+	});
+
+	test("G offers each group's profiles, leaving out the one the role already uses", () => {
+		const { hub, writes, act, select } = profilesHub("roles");
+		select("role:smol");
+		act("roles:groups");
+		const labels = (props(hub.describe(withPicker)).strip?.items ?? []).map(chip => JSON.stringify(chip.label));
+		expect(labels.some(label => label.includes("use +fast@spare"))).toBe(true);
+		expect(labels.some(label => label.includes("use +fast@low"))).toBe(false);
+		const plain = props(hub.describe(withPicker)).strip?.items.find(chip =>
+			JSON.stringify(chip.label).includes('use +fast"'),
+		);
+		act("strip", plain?.id);
+		expect(writes.at(-1)).toEqual([{ kind: "role", key: "smol" }, { use: "fast" }]);
 	});
 });
 

@@ -7,6 +7,7 @@ import {
 } from "@oh-my-pi/pi-ai/usage/billing";
 import { parseLocalLimit } from "@oh-my-pi/pi-ai/usage/limits";
 import type {
+	ModelHubGroupReference,
 	ModelHubLimitSpecResult,
 	ModelHubPool,
 	ModelHubPoolTarget,
@@ -214,14 +215,30 @@ export function writeModelHubPool(
 				}
 			}
 		}
-		if (target.kind === "role") settings.setModelRoleSpec(target.key, value);
-		else if (target.kind === "chain") settings.setFallbackChainSpec(target.key, value);
-		else settings.setModelGroup(target.key, value);
+		if (target.kind === "group") {
+			settings.setModelGroup(target.key, value);
+			return undefined;
+		}
+		const written = shorthandReference(storedGlobalPool(settings, target), value) ?? value;
+		if (target.kind === "role") settings.setModelRoleSpec(target.key, written);
+		else settings.setFallbackChainSpec(target.key, written);
 		return undefined;
 	} catch (error) {
 		if (error instanceof ModelGroupConfigError) return error.message;
 		throw error;
 	}
+}
+
+/**
+ * `value` as the `+<group>[@<profile>]` shorthand when it is a pure group reference and the entry it
+ * replaces is stored in that shorthand; undefined otherwise, so the object form is written.
+ */
+function shorthandReference(stored: unknown, value: Readonly<Record<string, unknown>> | undefined): string | undefined {
+	if (typeof stored !== "string" || !stored.trimStart().startsWith("+") || !value) return undefined;
+	const keys = Object.keys(value);
+	if (typeof value.use !== "string" || !keys.every(key => key === "use" || key === "profile")) return undefined;
+	if (value.profile !== undefined && typeof value.profile !== "string") return undefined;
+	return value.profile === undefined ? `+${value.use}` : `+${value.use}@${value.profile}`;
 }
 
 /** The raw pool `target` names in the global config, the layer {@link writeModelHubPool} replaces. */
@@ -262,13 +279,19 @@ function parsePoolLimitSpec(spec: string): ModelHubLimitSpecResult {
 }
 
 /**
- * Role and fallback-chain entries that reference `modelGroups.<name>`: the effective entries, plus
- * global-layer entries a higher layer shadows.
+ * Role and fallback-chain entries that reference `modelGroups.<name>`, each with the profile its own
+ * value selects: the effective entries, plus global-layer entries a higher layer shadows. An entry
+ * whose effective and global values select different profiles is listed once per profile.
  */
-function modelGroupReferences(settings: Settings, name: string): ModelHubPoolTarget[] {
-	const references = new Map<string, ModelHubPoolTarget>();
+function modelGroupReferences(settings: Settings, name: string): ModelHubGroupReference[] {
+	const references = new Map<string, ModelHubGroupReference>();
 	const add = (target: ModelHubPoolTarget, spec: ParsedModelValue | undefined) => {
-		if (spec?.kind === "ref" && spec.ref.use === name) references.set(`${target.kind}:${target.key}`, target);
+		if (spec?.kind !== "ref" || spec.ref.use !== name) return;
+		const profile = spec.ref.profile;
+		references.set(`${target.kind}:${target.key}:${profile ?? ""}`, {
+			...target,
+			...(profile !== undefined ? { profile } : {}),
+		});
 	};
 	for (const role of Object.keys(settings.getModelRoleEntries())) {
 		add({ kind: "role", key: role }, settings.getModelRoleSpec(role));
@@ -500,6 +523,16 @@ function describeGroup(group: ModelGroup, profile: string | undefined): Omit<Mod
 	const quota = routingQuotaText(routing);
 	const accounts = routingAccountsText(routing);
 	const cache = routingCacheText(routing);
+	const profiles = [...group.profiles.entries()]
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+		.map(([name, entry]) => ({
+			name,
+			efforts: Object.fromEntries(
+				[...entry.models.entries()].flatMap(([alias, override]) =>
+					override.effort === undefined ? [] : [[alias, override.effort]],
+				),
+			),
+		}));
 	return {
 		strategy: formatGroupStrategies(group),
 		members,
@@ -508,6 +541,7 @@ function describeGroup(group: ModelGroup, profile: string | undefined): Omit<Mod
 		...(quota ? { quota } : {}),
 		...(accounts ? { accounts } : {}),
 		...(cache ? { cache } : {}),
+		...(profiles.length > 0 ? { profiles } : {}),
 	};
 }
 

@@ -10,6 +10,7 @@
 ### Added
 
 - `/models` has a Groups view below Roles that lists every `modelGroups` entry, including unused ones, and creates, renames, edits and deletes groups, in Tern and the TUI
+- `/models` Groups view lists each group's profiles and creates, renames, edits and deletes them; `G` can point a role at `+group@profile`
 - `/settings` in Tern shows the active scope and offers a Change scope action
 - `/advisor findings` opens a findings list with detail and resolve/reopen actions, including in Tern
 - `/advisor configure` edits per-advisor quota reserve and reserved action, including in Tern
@@ -39,6 +40,8 @@
 
 ### Fixed
 
+- `t` on a member of a role that uses `+group@profile` sets that profile's effort instead of the group default the profile overrides
+- Renaming a model group or profile in `/models` keeps references written as `+group@profile` in that shorthand instead of rewriting them as objects
 - Native tool approvals in Tern now wait for the 500 ms arming delay
 - Long /account notices are no longer cut to one line in Tern
 - Clicking an account row in /account selects that account

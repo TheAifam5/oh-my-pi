@@ -126,6 +126,7 @@ type RolesRow =
 	| { kind: "pool"; role: string }
 	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string }
 	| { kind: "group"; role: string }
+	| { kind: "profile"; role: string; profile: string }
 	| { kind: "separator" }
 	| { kind: "newFallback" }
 	| { kind: "newRole" }
@@ -149,6 +150,11 @@ type AssignTarget =
 export interface ModelHubPoolTarget {
 	kind: "role" | "chain" | "group";
 	key: string;
+}
+
+/** A role or chain entry that references a model group, with the profile its own value selects. */
+export interface ModelHubGroupReference extends ModelHubPoolTarget {
+	profile?: string;
 }
 
 /** One pool member as the hub shows it. */
@@ -181,6 +187,11 @@ export interface ModelHubPool {
 	accounts?: string;
 	/** `routing.cache` as display text (affinity, pricing). */
 	cache?: string;
+	/**
+	 * The group's profiles in name order: per-member effort overrides by alias. A member a profile
+	 * leaves out keeps its `defaultEffort`. Absent or empty: the group defines none.
+	 */
+	profiles?: readonly { name: string; efforts: Readonly<Record<string, string>> }[];
 	/** Why the hub must not edit this pool; undefined when it may. */
 	readOnly?: string;
 	/**
@@ -240,8 +251,11 @@ export interface ModelHubSource extends ModelBrowserSource {
 	formatLimit?(limit: unknown): string | undefined;
 	/** Names of the effective `modelGroups` entries; absent: none. */
 	readonly modelGroupNames?: readonly string[];
-	/** Effective role and chain entries that reference `modelGroups.<name>`. */
-	modelGroupReferences?(name: string): readonly ModelHubPoolTarget[];
+	/**
+	 * Role and chain entries that reference `modelGroups.<name>`, each with the profile its stored
+	 * value selects: effective entries plus global entries a higher layer shadows.
+	 */
+	modelGroupReferences?(name: string): readonly ModelHubGroupReference[];
 	/** Why a global write of `modelGroups.<name>` would not take effect; undefined when it would. */
 	modelGroupWriteBlocker?(name: string): string | undefined;
 }
@@ -378,8 +392,11 @@ type StripState =
 			role?: string;
 			/** Set when a thinking strip edits a fallback-chain entry instead of a role assignment. */
 			fallbackIndex?: number;
-			/** Set when a thinking strip edits a pool member's effort. */
-			poolMember?: { target: ModelHubPoolTarget; alias: string };
+			/**
+			 * Set when a thinking strip edits a pool member's effort: `profile` names the group profile
+			 * whose override it sets; absent sets the member's `defaultEffort`.
+			 */
+			poolMember?: { target: ModelHubPoolTarget; alias: string; profile?: string };
 			scope?: ModelRoleSelectionScope;
 			/** Where to land when a scope or thinking strip closes. */
 			returnToRoles: boolean;
@@ -447,7 +464,8 @@ type RolesAction =
 	| "reserve"
 	| "routing"
 	| "groups"
-	| "rename";
+	| "rename"
+	| "newProfile";
 
 /** Printable keys of the Roles view and the command each runs. */
 const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
@@ -474,6 +492,7 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	e: "routing",
 	G: "groups",
 	R: "rename",
+	"@": "newProfile",
 };
 
 /** Strategies `g` cycles through: each needs no options, or only an `order` the hub derives from the members. */
@@ -513,6 +532,21 @@ const POOL_ALIAS_MAX_LENGTH = 48;
 
 /** Member aliases the group grammar reserves. */
 const POOL_RESERVED_ALIASES: readonly string[] = ["window", "__proto__", "constructor", "prototype"];
+
+/**
+ * Grammar of model group and profile names, as the settings validator enforces it: lowercase, so
+ * case-insensitive lookups never confuse two names.
+ */
+const MODEL_GROUP_NAME = /^[a-z0-9][a-z0-9_-]*$/;
+
+/** Longest model group or profile name the validator accepts, in characters. */
+const MODEL_GROUP_NAME_MAX_LENGTH = 64;
+
+/** Names the validator rejects because they name object internals. */
+const MODEL_GROUP_RESERVED_NAMES: readonly string[] = ["constructor", "prototype"];
+
+/** Field hint of a group or profile name. */
+const NAME_HINT = "(lowercase letters, digits, - and _)";
 
 /** Picker fact columns of the Roles view; billing and routing hide first when narrow. */
 const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
@@ -621,6 +655,8 @@ function rolesRowKey(row: RolesRow, index: number): string {
 			return `member:${row.target.kind}:${row.role}:${row.alias}`;
 		case "group":
 			return `group:${row.role}`;
+		case "profile":
+			return `profile:${row.role}:${row.profile}`;
 		case "separator":
 			return `sep:${index}`;
 		case "newRole":
@@ -745,6 +781,8 @@ export class ModelHubComponent implements Component {
 	#rolesRows: RolesRow[] = [];
 	/** Pools read for the current rows, keyed `<kind>:<key>`; cleared on every rows rebuild. */
 	#poolCache = new Map<string, ModelHubPool | undefined>();
+	/** Group references read for the current rows, keyed by group name; cleared on every rows rebuild. */
+	#referenceCache = new Map<string, readonly ModelHubGroupReference[]>();
 	/** Sanitized billing text per `provider/model-id` for the current rows; cleared on every rows rebuild. */
 	#billingCache = new Map<string, string | undefined>();
 	#billingRevision: unknown;
@@ -1341,6 +1379,7 @@ export class ModelHubComponent implements Component {
 	 */
 	#buildRolesRows(): void {
 		this.#poolCache.clear();
+		this.#referenceCache.clear();
 		this.#billingCache.clear();
 		const rows: RolesRow[] = [];
 		const groupsView = this.#activeEntryId === "groups";
@@ -1349,7 +1388,10 @@ export class ModelHubComponent implements Component {
 			for (const name of [...this.#modelGroupNames()].sort()) {
 				const target: ModelHubPoolTarget = { kind: "group", key: name };
 				rows.push({ kind: "group", role: name });
-				rows.push(...this.#poolMemberRows(name, target, this.#pool(target)));
+				const pool = this.#pool(target);
+				rows.push(...this.#poolMemberRows(name, target, pool));
+				for (const profile of pool?.profiles ?? [])
+					rows.push({ kind: "profile", role: name, profile: profile.name });
 			}
 			if (this.#callbacks.onPoolChange) rows.push({ kind: "newGroup" });
 			this.#rolesRows = rows;
@@ -2108,7 +2150,8 @@ export class ModelHubComponent implements Component {
 				if (chip.thinkingLevel !== undefined && strip.poolMember !== undefined) {
 					this.#strip = null;
 					this.#frame.chipRanges = [];
-					this.#setPoolMemberEffort(strip.poolMember.target, strip.poolMember.alias, chip.thinkingLevel);
+					const { target, alias, profile } = strip.poolMember;
+					this.#setPoolMemberEffort(target, alias, chip.thinkingLevel, profile);
 					return;
 				}
 				if (strip.role && chip.thinkingLevel !== undefined && strip.fallbackIndex !== undefined) {
@@ -2610,30 +2653,60 @@ export class ModelHubComponent implements Component {
 		return item && getSupportedEfforts(item.model).length > 0 ? item : undefined;
 	}
 
-	/** `t` on a member row: the effort strip, where inherit clears `defaultEffort`. */
+	/**
+	 * `t` on a member row: the effort strip. A member of a pool that references a group through a
+	 * profile edits that profile's override (inherit removes it), else its `defaultEffort` (inherit
+	 * clears it).
+	 */
 	#openPoolEffortStrip(row: RolesRow | undefined): void {
-		const item = this.#poolMemberEffortItem(row);
-		if (!item || row?.kind !== "poolMember") return;
-		const member = this.#pool(row.target)?.members.find(entry => entry.alias === row.alias);
+		if (row?.kind !== "poolMember") return;
+		const source = this.#pool(row.target)?.source;
+		this.#openMemberEffortStrip(row.role, row.target, row.alias, source?.kind === "ref" ? source.profile : undefined);
+	}
+
+	/** The effort strip of member `alias` of the pool at `target`, for `profile` or its default. */
+	#openMemberEffortStrip(role: string, target: ModelHubPoolTarget, alias: string, profile: string | undefined): void {
+		const pool = this.#pool(target);
+		if (!this.#poolEditable(pool)) return;
+		const member = pool.members.find(entry => entry.alias === alias);
+		const parsed = member ? parseModelString(member.model) : undefined;
+		const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
+		if (!item || getSupportedEfforts(item.model).length === 0) return;
 		const options: ConfiguredThinkingLevel[] = [ThinkingLevel.Inherit, ...getSupportedEfforts(item.model)];
-		const current = options.find(level => level === member?.effort) ?? ThinkingLevel.Inherit;
+		// A profile row edits the override itself; a member row shows the effort it runs at.
+		const shown =
+			profile !== undefined && target.kind === "group"
+				? pool.profiles?.find(entry => entry.name === profile)?.efforts[alias]
+				: member?.effort;
+		const current = options.find(level => level === shown) ?? ThinkingLevel.Inherit;
 		this.#strip = {
 			kind: "thinking",
 			item,
-			role: row.role,
-			poolMember: { target: row.target, alias: row.alias },
+			role,
+			poolMember: { target, alias, ...(profile !== undefined ? { profile } : {}) },
 			chips: this.#thinkingChips(options),
 			index: Math.max(0, options.indexOf(current)),
 			returnToRoles: true,
 		};
 	}
 
-	#setPoolMemberEffort(target: ModelHubPoolTarget, alias: string, level: ConfiguredThinkingLevel): void {
+	#setPoolMemberEffort(
+		target: ModelHubPoolTarget,
+		alias: string,
+		level: ConfiguredThinkingLevel,
+		profile: string | undefined,
+	): void {
 		this.#editPool(target, draft => {
-			const member = draftRecord(draft, "models")[alias];
-			if (!isRecord(member)) return false;
-			if (level === ThinkingLevel.Inherit) delete member.defaultEffort;
-			else member.defaultEffort = level;
+			if (profile === undefined) {
+				const member = draftRecord(draft, "models")[alias];
+				if (!isRecord(member)) return false;
+				if (level === ThinkingLevel.Inherit) delete member.defaultEffort;
+				else member.defaultEffort = level;
+				return true;
+			}
+			const overrides = draftRecord(draftRecord(draft, "profiles"), profile);
+			if (level === ThinkingLevel.Inherit) delete overrides[alias];
+			else overrides[alias] = { effort: level };
 			return true;
 		});
 	}
@@ -2937,9 +3010,17 @@ export class ModelHubComponent implements Component {
 	#groupChips(entry: ModelHubPoolTarget): StripChip[] {
 		const pool = this.#pool(entry);
 		const current = pool?.source.kind === "ref" ? pool.source.group : undefined;
-		const chips = this.#modelGroupNames()
-			.filter(name => name !== current)
-			.map(name => this.#poolChip(`use +${name}`, () => this.#writePool(entry, { use: name })));
+		const currentProfile = pool?.source.kind === "ref" ? pool.source.profile : undefined;
+		// Every group, then each of its profiles; the reference the entry already holds is left out.
+		const chips = this.#modelGroupNames().flatMap(name =>
+			[undefined, ...this.#groupProfiles(name).map(entry => entry.name)]
+				.filter(profile => name !== current || profile !== currentProfile)
+				.map(profile =>
+					this.#poolChip(`use +${name}${profile === undefined ? "" : `@${profile}`}`, () =>
+						this.#writePool(entry, profile === undefined ? { use: name } : { use: name, profile }),
+					),
+				),
+		);
 		if (!this.#poolEditable(pool)) return chips;
 		const raw = pool.raw;
 		if (current === undefined) {
@@ -2968,9 +3049,10 @@ export class ModelHubComponent implements Component {
 
 	/** Name a new `modelGroups` entry holding the inline pool `raw`, and point `entry` at it. */
 	#openNewGroup(entry: ModelHubPoolTarget, raw: Readonly<Record<string, unknown>>): void {
-		this.#openPoolField("New group name:", "(letters, digits, - and _)", "", value => {
+		this.#openPoolField("New group name:", NAME_HINT, "", value => {
 			const name = value.trim();
-			if (name.length === 0) return "Enter a group name";
+			const refused = this.#nameRefusal("group", name);
+			if (refused !== undefined) return refused;
 			if (this.#modelGroupNames().includes(name)) return `modelGroups.${name} already exists`;
 			const { profile, ...definition } = raw;
 			const created = this.#savePool({ kind: "group", key: name }, definition);
@@ -2983,9 +3065,27 @@ export class ModelHubComponent implements Component {
 	}
 
 	#openRenameGroup(from: string, raw: Readonly<Record<string, unknown>>): void {
-		this.#openPoolField(`Rename +${from} to:`, "(letters, digits, - and _)", from, value =>
-			this.#renameGroup(from, value.trim(), raw),
-		);
+		this.#openPoolField(`Rename +${from} to:`, NAME_HINT, from, value => this.#renameGroup(from, value.trim(), raw));
+	}
+
+	/** Why `name` cannot name a group or profile: empty, too long, outside the grammar, or reserved. */
+	#nameRefusal(what: "group" | "profile", name: string): string | undefined {
+		if (name.length === 0) return `Enter a ${what} name`;
+		if (name.length > MODEL_GROUP_NAME_MAX_LENGTH)
+			return `A ${what} name has at most ${MODEL_GROUP_NAME_MAX_LENGTH} characters`;
+		if (!MODEL_GROUP_NAME.test(name) || MODEL_GROUP_RESERVED_NAMES.includes(name)) {
+			return `A ${what} name is lowercase letters, digits, - and _, starting with a letter or digit`;
+		}
+		return undefined;
+	}
+
+	/** Why the hub cannot edit `modelGroups.<group>` (its layer, its validation, or no writer); undefined when it can. */
+	#groupEditRefusal(group: string): string | undefined {
+		const pool = this.#pool({ kind: "group", key: group });
+		if (this.#poolEditable(pool)) return undefined;
+		if (!this.#callbacks.onPoolChange) return "group edits are not available here";
+		if (pool?.invalid !== undefined) return `modelGroups.${group} is invalid; fix it in config`;
+		return `modelGroups.${group} is ${pool?.readOnly ?? "not editable here"}`;
 	}
 
 	/**
@@ -2995,7 +3095,8 @@ export class ModelHubComponent implements Component {
 	 */
 	#renameGroup(from: string, to: string, raw: Readonly<Record<string, unknown>>): string | undefined {
 		if (to === from) return undefined;
-		if (to.length === 0) return "Enter a group name";
+		const refused = this.#nameRefusal("group", to);
+		if (refused !== undefined) return refused;
 		if (this.#modelGroupNames().includes(to)) return `modelGroups.${to} already exists`;
 		const references = this.#groupReferences(from);
 		for (const reference of references) {
@@ -3005,8 +3106,7 @@ export class ModelHubComponent implements Component {
 		const created = this.#savePool({ kind: "group", key: to }, raw);
 		if (created !== undefined) return created;
 		for (const reference of references) {
-			const source = this.#pool(reference)?.source;
-			const profile = source?.kind === "ref" ? source.profile : undefined;
+			const profile = reference.profile;
 			const error = this.#savePool(reference, profile === undefined ? { use: to } : { use: to, profile });
 			if (error !== undefined) {
 				this.#refreshAfterMutation();
@@ -3018,12 +3118,18 @@ export class ModelHubComponent implements Component {
 		return removed;
 	}
 
-	#groupReferences(name: string): readonly ModelHubPoolTarget[] {
+	/** References to `modelGroups.<name>`, memoized until the next rows rebuild. */
+	#groupReferences(name: string): readonly ModelHubGroupReference[] {
+		const cached = this.#referenceCache.get(name);
+		if (cached) return cached;
+		let references: readonly ModelHubGroupReference[];
 		try {
-			return this.#settings.modelGroupReferences?.(name) ?? [];
+			references = this.#settings.modelGroupReferences?.(name) ?? [];
 		} catch {
-			return [];
+			references = [];
 		}
+		this.#referenceCache.set(name, references);
+		return references;
 	}
 
 	/**
@@ -3051,9 +3157,10 @@ export class ModelHubComponent implements Component {
 	/** Groups view `n`: name a new `modelGroups` entry, then browse the catalog for its first member. */
 	#startNewGroup(): void {
 		if (!this.#callbacks.onPoolChange) return;
-		this.#openPoolField("New group name:", "(lowercase letters, digits, - and _)", "", value => {
+		this.#openPoolField("New group name:", NAME_HINT, "", value => {
 			const name = value.trim();
-			if (name.length === 0) return "Enter a group name";
+			const refused = this.#nameRefusal("group", name);
+			if (refused !== undefined) return refused;
 			if (this.#modelGroupNames().includes(name)) return `modelGroups.${name} already exists`;
 			const blocker = this.#settings.modelGroupWriteBlocker?.(name);
 			if (blocker !== undefined) return `modelGroups.${name} is ${blocker}`;
@@ -3079,29 +3186,185 @@ export class ModelHubComponent implements Component {
 		if (written) this.#landOnPoolMember({ kind: "group", key: name }, alias);
 	}
 
-	/** Groups view `x`: remove `modelGroups.<name>`; declined while an entry references it. */
+	/** Groups view `x`: remove `modelGroups.<name>`; declined while an entry references it or another layer owns it. */
 	#deleteUnusedGroup(name: string): void {
-		const users = this.#groupReferences(name);
-		if (users.length > 0) {
-			const paths = users.map(reference => this.#entryPath(reference)).join(", ");
-			this.#poolNotice(`+${name} is used by ${paths}; point those elsewhere first`);
+		const users = this.#referencePaths(this.#groupReferences(name));
+		if (users !== undefined) {
+			this.#poolNotice(`+${name} is used by ${users}; point those elsewhere first`);
 			return;
 		}
-		if (!this.#poolClearable({ kind: "group", key: name })) return;
+		const blocker = this.#settings.poolWriteBlocker?.({ kind: "group", key: name });
+		if (blocker !== undefined || !this.#callbacks.onPoolChange) {
+			this.#poolNotice(
+				blocker !== undefined ? `modelGroups.${name} is ${blocker}` : "group edits are not available here",
+			);
+			return;
+		}
 		this.#writePool({ kind: "group", key: name }, undefined);
 		this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
 	}
 
 	/** Groups view `R`: rename `modelGroups.<name>` and every entry that references it. */
 	#startRenameGroup(name: string): void {
+		const refused = this.#groupEditRefusal(name);
 		const pool = this.#pool({ kind: "group", key: name });
-		if (this.#poolEditable(pool)) this.#openRenameGroup(name, pool.raw);
+		if (refused !== undefined || !this.#poolEditable(pool)) {
+			this.#poolNotice(refused ?? `modelGroups.${name} is not editable here`);
+			return;
+		}
+		this.#openRenameGroup(name, pool.raw);
 	}
 
 	/** The entries that reference `modelGroups.<name>`, as config paths; "unused" when none do. */
 	#groupUsers(name: string): string {
-		const users = this.#groupReferences(name);
-		return users.length > 0 ? users.map(reference => this.#entryPath(reference)).join(", ") : "unused";
+		return this.#referencePaths(this.#groupReferences(name)) ?? "unused";
+	}
+
+	/** Distinct config paths of `references` as sanitized display text; undefined for none. */
+	#referencePaths(references: readonly ModelHubPoolTarget[]): string | undefined {
+		const paths = [...new Set(references.map(reference => this.#entryPath(reference)))];
+		return paths.length > 0 ? sanitizeDisplayLine(paths.join(", ")) : undefined;
+	}
+
+	// ─── Group profiles ─────────────────────────────────────────────────────
+
+	/** The entries whose own value references `modelGroups.<group>` through `profile`, shadowed global ones included. */
+	#profileReferences(group: string, profile: string): ModelHubGroupReference[] {
+		return this.#groupReferences(group).filter(reference => reference.profile === profile);
+	}
+
+	/** `group`'s profiles; empty when it defines none or is not a valid group. */
+	#groupProfiles(group: string): readonly { name: string; efforts: Readonly<Record<string, string>> }[] {
+		return this.#pool({ kind: "group", key: group })?.profiles ?? [];
+	}
+
+	/** Enter on a profile row: one chip per member with its override; a chip opens that member's effort strip. */
+	#openProfileStrip(group: string, profile: string): void {
+		const target: ModelHubPoolTarget = { kind: "group", key: group };
+		const pool = this.#pool(target);
+		if (!this.#poolEditable(pool)) {
+			this.#poolNotice(this.#groupEditRefusal(group) ?? `modelGroups.${group} is not editable here`);
+			return;
+		}
+		const efforts = pool.profiles?.find(entry => entry.name === profile)?.efforts ?? {};
+		this.#openPoolStrip(
+			`Profile @${profile} of +${group}`,
+			() =>
+				pool.members.map(member =>
+					this.#poolChip(
+						`${member.alias}: ${efforts[member.alias] ?? "default"}`,
+						() => this.#openMemberEffortStrip(group, target, member.alias, profile),
+						efforts[member.alias] !== undefined,
+					),
+				),
+			false,
+		);
+	}
+
+	/** `@` in the Groups view: name a new, empty profile of `group` and land on it. */
+	#startNewProfile(group: string): void {
+		const target: ModelHubPoolTarget = { kind: "group", key: group };
+		const refused = this.#groupEditRefusal(group);
+		if (refused !== undefined) {
+			this.#poolNotice(refused);
+			return;
+		}
+		this.#openPoolField(`New profile of +${group}:`, NAME_HINT, "", value => {
+			const name = value.trim();
+			const invalid = this.#nameRefusal("profile", name);
+			if (invalid !== undefined) return invalid;
+			if (this.#groupProfiles(group).some(entry => entry.name === name)) return `@${name} already exists`;
+			const error = this.#editPoolFromField(target, draft => {
+				draftRecord(draftRecord(draft, "profiles"), name);
+			});
+			if (error === undefined) this.#landOnProfile(group, name);
+			return error;
+		});
+	}
+
+	/**
+	 * `R` on a profile row: rename it. The new name is added first, every entry that references the
+	 * old one is pointed at it, then the old one is removed, so no entry ever names a missing profile.
+	 * Refused, writing nothing, when a referencing entry comes from a layer above global.
+	 */
+	#startRenameProfile(group: string, profile: string): void {
+		const target: ModelHubPoolTarget = { kind: "group", key: group };
+		const refused = this.#groupEditRefusal(group);
+		if (refused !== undefined) {
+			this.#poolNotice(refused);
+			return;
+		}
+		this.#openPoolField(`Rename @${profile} of +${group} to:`, NAME_HINT, profile, value => {
+			const to = value.trim();
+			if (to === profile) return undefined;
+			const invalid = this.#nameRefusal("profile", to);
+			if (invalid !== undefined) return invalid;
+			if (this.#groupProfiles(group).some(entry => entry.name === to)) return `@${to} already exists`;
+			const references = this.#profileReferences(group, profile);
+			for (const reference of references) {
+				const blocker = this.#settings.poolWriteBlocker?.(reference);
+				if (blocker !== undefined) {
+					return `${this.#entryPath(reference)} uses +${group}@${profile} and is ${blocker}`;
+				}
+			}
+			const added = this.#editPoolFromField(target, draft => {
+				const profiles = draftRecord(draft, "profiles");
+				profiles[to] = structuredClone(draftRecord(profiles, profile));
+			});
+			if (added !== undefined) return added;
+			for (const reference of references) {
+				const error = this.#savePool(reference, { use: group, profile: to });
+				if (error !== undefined) {
+					this.#refreshAfterMutation();
+					return error;
+				}
+			}
+			const removed = this.#editPoolFromField(target, draft => {
+				delete draftRecord(draft, "profiles")[profile];
+			});
+			if (removed === undefined) this.#landOnProfile(group, to);
+			return removed;
+		});
+	}
+
+	/**
+	 * `x` on a profile row: remove it; declined while an entry references it (a shadowed global entry
+	 * included) or another layer owns the group.
+	 */
+	#deleteProfile(group: string, profile: string): void {
+		const users = this.#referencePaths(this.#profileReferences(group, profile));
+		if (users !== undefined) {
+			this.#poolNotice(`+${group}@${profile} is used by ${users}; point those elsewhere first`);
+			return;
+		}
+		const refused = this.#groupEditRefusal(group);
+		if (refused !== undefined) {
+			this.#poolNotice(refused);
+			return;
+		}
+		this.#editPool({ kind: "group", key: group }, draft => {
+			const profiles = draftRecord(draft, "profiles");
+			if (!Object.hasOwn(profiles, profile)) return false;
+			delete profiles[profile];
+			if (Object.keys(profiles).length === 0) delete draft.profiles;
+			return true;
+		});
+		this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
+	}
+
+	/** Move the Groups cursor to profile `profile` of `group`; a missing row leaves it in place. */
+	#landOnProfile(group: string, profile: string): void {
+		const index = this.#rolesRows.findIndex(
+			row => row.kind === "profile" && row.role === group && row.profile === profile,
+		);
+		if (index >= 0) this.#roleIndex = index;
+	}
+
+	/** A profile row's summary: each override as `alias effort`; "no overrides" when it sets none. */
+	#profileSummary(group: string, profile: string): string {
+		const efforts = this.#groupProfiles(group).find(entry => entry.name === profile)?.efforts ?? {};
+		const parts = Object.entries(efforts).map(([alias, effort]) => `${alias} ${effort}`);
+		return sanitizeDisplayLine(parts.length > 0 ? parts.join(" · ") : "no overrides");
 	}
 
 	// ─── Pool display ───────────────────────────────────────────────────────
@@ -3159,6 +3422,13 @@ export class ModelHubComponent implements Component {
 	/** Column cells of a non-role Roles row (pool, pool member, fallback); undefined for other kinds. */
 	#rolesRowCells(row: RolesRow): RolesRowCells | undefined {
 		switch (row.kind) {
+			case "profile": {
+				const users = this.#referencePaths(this.#profileReferences(row.role, row.profile));
+				return {
+					thinking: this.#profileSummary(row.role, row.profile),
+					routing: users !== undefined ? `used by ${users}` : "unused",
+				};
+			}
 			case "pool":
 			case "group": {
 				const pool = row.kind === "pool" ? this.#chainPool(row.role) : this.#pool({ kind: "group", key: row.role });
@@ -3219,6 +3489,8 @@ export class ModelHubComponent implements Component {
 	 */
 	#rolesTableRow(row: RolesRow): { name: string; cells: RolesRowCells } | undefined {
 		switch (row.kind) {
+			case "profile":
+				return { name: `  · @${sanitizeDisplayLine(row.profile)}`, cells: this.#rolesRowCells(row) ?? {} };
 			case "role": {
 				const info = this.#settings.getRoleInfo(row.role);
 				const cells = this.#roleCells(row.role);
@@ -3654,11 +3926,17 @@ export class ModelHubComponent implements Component {
 			case "pool":
 				this.#startAssignFallback(row.role, null);
 				return;
-			case "group":
-				this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
+			case "group": {
+				const refused = this.#groupEditRefusal(row.role);
+				if (refused !== undefined) this.#poolNotice(refused);
+				else this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
 				return;
+			}
 			case "newGroup":
 				this.#startNewGroup();
+				return;
+			case "profile":
+				this.#openProfileStrip(row.role, row.profile);
 				return;
 			case "poolMember":
 				this.#startAssignPoolMember(row.role, row.target, row.alias);
@@ -3768,6 +4046,7 @@ export class ModelHubComponent implements Component {
 				else if (role) this.#unassignRole(role);
 				else if (row?.kind === "fallback") this.#removeFallback(row);
 				else if (row?.kind === "group") this.#deleteUnusedGroup(row.role);
+				else if (row?.kind === "profile") this.#deleteProfile(row.role, row.profile);
 				else if (row?.kind === "poolMember") {
 					if (editable) this.#removePoolMember(row.target, row.alias);
 				} else if (row?.kind === "pool" || (row?.kind === "chainKey" && this.#isPooledChain(row.role))) {
@@ -3782,7 +4061,13 @@ export class ModelHubComponent implements Component {
 					this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
 				} else if (row?.kind === "poolMember" && row.target.kind !== "role") {
 					this.#startAssignPoolMember(row.role, row.target, null);
-				} else if (row && row.kind !== "newRole" && row.kind !== "separator" && row.kind !== "newGroup") {
+				} else if (
+					row &&
+					row.kind !== "newRole" &&
+					row.kind !== "separator" &&
+					row.kind !== "newGroup" &&
+					row.kind !== "profile"
+				) {
 					this.#startAssignFallback(row.role, null);
 				}
 				return;
@@ -3839,7 +4124,18 @@ export class ModelHubComponent implements Component {
 				return;
 			case "rename":
 				if (row?.kind === "group") this.#startRenameGroup(row.role);
+				else if (row?.kind === "profile") this.#startRenameProfile(row.role, row.profile);
 				return;
+			case "newProfile": {
+				const group =
+					row?.kind === "group" || row?.kind === "profile"
+						? row.role
+						: row?.kind === "poolMember" && row.target.kind === "group"
+							? row.target.key
+							: undefined;
+				if (group !== undefined) this.#startNewProfile(group);
+				return;
+			}
 			case "save":
 				if (this.#callbacks.onSavePreset && this.#activeEntryId === "roles") this.#openNameStrip("preset");
 				return;
@@ -3859,6 +4155,8 @@ export class ModelHubComponent implements Component {
 					this.#openFallbackThinkingStrip(row);
 				} else if (row?.kind === "poolMember") {
 					this.#openPoolEffortStrip(row);
+				} else if (row?.kind === "profile") {
+					this.#openProfileStrip(row.role, row.profile);
 				}
 				return;
 		}
@@ -4197,6 +4495,7 @@ export class ModelHubComponent implements Component {
 				editable && { label: "rename", keys: ["shift+r"] },
 				this.#poolClearable(target) && { label: "delete", keys: ["x"] },
 				{ label: "new group", keys: ["n"] },
+				editable && { label: "new profile", keys: ["@"] },
 				...routing,
 			);
 		} else if (row.kind === "role") {
@@ -4581,6 +4880,9 @@ export class ModelHubComponent implements Component {
 						: `${formatKeyHint("x")} delete · ${formatKeyHint("n")} new group`;
 				return `${upDown} rows · ${pick} · ${left} providers`;
 			}
+			if (row?.kind === "profile") {
+				return `${upDown} rows · ${enter} edit efforts · ${formatKeyHint("shift+r")} rename · ${formatKeyHint("x")} delete · ${formatKeyHint("@")} new profile · ${left} providers`;
+			}
 			// Same rule as fallback rows: advertise `t` only where a strip would
 			// open — an assigned role whose model has thinking levels to offer.
 			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
@@ -4963,6 +5265,16 @@ export class ModelHubComponent implements Component {
 				return node("item", { label: [span("+ New fallback…", "dim")] }, undefined, key);
 			case "newGroup":
 				return node("item", { label: [span("+ New group…", "dim")] }, undefined, key);
+			case "profile":
+				return node(
+					"item",
+					{
+						label: [span("    @", "dim"), span(sanitizeDisplayLine(rowDef.profile), "muted")],
+						value: rolesCellValue(this.#rolesRowCells(rowDef) ?? {}),
+					},
+					undefined,
+					key,
+				);
 			case "group": {
 				const cells = this.#rolesRowCells(rowDef) ?? {};
 				const used = this.#groupReferences(rowDef.role).length > 0;
@@ -5521,6 +5833,19 @@ export class ModelHubComponent implements Component {
 				case "newGroup":
 					actions.push(roleAction("pick", "New group", "enter", true));
 					break;
+				case "profile": {
+					// A group another layer owns, or an invalid one, lists its profiles read-only.
+					const refused = this.#groupEditRefusal(row.role);
+					const gate = (action: TspPickerAction): TspPickerAction =>
+						refused === undefined ? action : { ...action, disabled: refused };
+					actions.push(
+						gate(roleAction("pick", "Edit efforts", "enter", true)),
+						gate(roleAction("rename", "Rename", "shift+r")),
+						gate(roleAction("clear", "Delete", "x")),
+						gate(roleAction("newProfile", "New profile", "@")),
+					);
+					break;
+				}
 				case "group":
 					// An invalid group has no editable pool: offer delete and new only.
 					actions.push(
@@ -5654,6 +5979,18 @@ export class ModelHubComponent implements Component {
 				case "newGroup":
 					items.push({ id, label: "New group…", icon: "plus", tone: "muted" });
 					return;
+				case "profile": {
+					const used = this.#profileReferences(row.role, row.profile).length > 0;
+					items.push({
+						id,
+						label: `@${sanitizeDisplayLine(row.profile)}`,
+						mono: true,
+						depth: 1,
+						...(used ? {} : { tone: "muted" as const }),
+						facts: rolesCellFacts(this.#rolesRowCells(row) ?? {}),
+					});
+					return;
+				}
 				case "group": {
 					const users = this.#groupUsers(row.role);
 					items.push({
@@ -5884,6 +6221,28 @@ export class ModelHubComponent implements Component {
 					...this.#poolPreview(this.#pool({ kind: "group", key: row.role }), "Group"),
 				);
 				break;
+			case "profile": {
+				const efforts = this.#groupProfiles(row.role).find(entry => entry.name === row.profile)?.efforts ?? {};
+				const members = this.#pool({ kind: "group", key: row.role })?.members ?? [];
+				children.push(
+					text([span(`+${sanitizeDisplayLine(row.role)}@${sanitizeDisplayLine(row.profile)}`, "mono")], {
+						role: "omp.picker.title",
+					}),
+					node("kv", {
+						items: [
+							{
+								k: [span("Used by", "muted")],
+								v: (this.#rolesRowCells(row)?.routing ?? "unused").replace(/^used by /, ""),
+							},
+							...members.map(member => ({
+								k: [span(sanitizeDisplayLine(member.alias), "muted")],
+								v: efforts[member.alias] ?? `default (${member.effort ?? "inherit"})`,
+							})),
+						],
+					}),
+				);
+				break;
+			}
 			case "newGroup":
 				children.push(
 					text("New group", { role: "omp.picker.title" }),
@@ -6289,6 +6648,16 @@ export class ModelHubComponent implements Component {
 			}
 			if (row?.kind === "newGroup") {
 				return [upDown("rows"), keys("new group", "enter"), keys("providers", "left")];
+			}
+			if (row?.kind === "profile") {
+				return [
+					upDown("rows"),
+					keys("edit efforts", "enter"),
+					keys("rename", "shift+r"),
+					keys("delete", "x"),
+					keys("new profile", "@"),
+					keys("providers", "left"),
+				];
 			}
 			if (row?.kind === "group") {
 				return [upDown("rows"), keys("delete", "x"), keys("new group", "n"), keys("providers", "left")];
