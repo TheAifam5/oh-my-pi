@@ -28,6 +28,7 @@ export interface AdvisorFindingView {
 	possiblyFixed?: boolean;
 	interrupted?: boolean;
 	merged?: readonly { id: string }[];
+	resolution?: { by: string; reason?: string; turn: number };
 }
 
 export interface AdvisorFindingsSource {
@@ -94,6 +95,9 @@ export class AdvisorFindingsOverlay implements Component {
 			`Reporters: ${[...new Set(finding.reports.map(report => report.advisor))].join(", ") || "-"}`,
 			`Flags: ${[finding.possiblyFixed ? "possibly-fixed" : "", finding.interrupted ? "interrupted" : ""].filter(Boolean).join(", ") || "-"}`,
 			`Merged ids: ${finding.merged?.map(entry => entry.id).join(", ") || "-"}`,
+			...(finding.resolution
+				? [`Resolved by: ${finding.resolution.by}`, `Resolution reason: ${finding.resolution.reason ?? "-"}`]
+				: []),
 		].flatMap(line => sanitizeDisplayText(line).split(/\r?\n/));
 	}
 

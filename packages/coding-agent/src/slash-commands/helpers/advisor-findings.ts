@@ -1,7 +1,7 @@
 import type { AdvisorFinding } from "../../advisor";
 import type { AgentSession } from "../../session/agent-session";
 
-export const ADVISOR_FINDINGS_USAGE = "Usage: /advisor findings [open|all] | resolve F<n> | reopen F<n>";
+export const ADVISOR_FINDINGS_USAGE = "Usage: /advisor findings [open|all] | resolve F<n> [reason…] | reopen F<n>";
 
 function formatFinding(finding: AdvisorFinding): string {
 	const reporters = [...new Set(finding.reports.map(report => report.advisor))];
@@ -17,6 +17,10 @@ function formatFinding(finding: AdvisorFinding): string {
 	];
 	if (finding.possiblyFixed) head.push("possibly-fixed");
 	if (finding.merged?.length) head.push(`merged=${finding.merged.map(merged => merged.id).join(", ")}`);
+	if (finding.resolution) {
+		head.push(`resolved-by=${finding.resolution.by}`);
+		if (finding.resolution.reason) head.push(`reason=${finding.resolution.reason}`);
+	}
 	return lead ? `${head.join(" ")}\n  ${lead.defect}` : head.join(" ");
 }
 
@@ -25,7 +29,10 @@ function formatFinding(finding: AdvisorFinding): string {
  * session's advisor findings with their lead report; `resolve F<n>` and
  * `reopen F<n>` change one finding's status and persist the ledger.
  */
-export function runAdvisorFindingsCommand(session: AgentSession, args: string): string {
+export function runAdvisorFindingsCommand(
+	session: Pick<AgentSession, "getAdvisorFindings" | "resolveAdvisorFinding" | "reopenAdvisorFinding">,
+	args: string,
+): string {
 	const [verb = "open", id, ...extra] = args.trim().split(/\s+/).filter(Boolean);
 	const action = verb.toLowerCase();
 	if (action === "open" || action === "all") {
@@ -34,12 +41,17 @@ export function runAdvisorFindingsCommand(session: AgentSession, args: string): 
 		if (findings.length === 0) return action === "all" ? "No advisor findings." : "No open advisor findings.";
 		return findings.map(formatFinding).join("\n");
 	}
-	if ((action !== "resolve" && action !== "reopen") || !id || extra.length > 0 || !/^F\d+$/i.test(id)) {
+	if (
+		(action !== "resolve" && action !== "reopen") ||
+		!id ||
+		(action === "reopen" && extra.length > 0) ||
+		!/^F\d+$/i.test(id)
+	) {
 		return ADVISOR_FINDINGS_USAGE;
 	}
 	const requested = `F${id.slice(1)}`;
 	if (action === "resolve") {
-		const { result, finding } = session.resolveAdvisorFinding(requested);
+		const { result, finding } = session.resolveAdvisorFinding(requested, extra.join(" ") || undefined);
 		if (!finding) return `No advisor finding ${requested}.`;
 		const merged = finding.id === requested ? "" : ` (${requested} was merged into it)`;
 		return result === "resolved"

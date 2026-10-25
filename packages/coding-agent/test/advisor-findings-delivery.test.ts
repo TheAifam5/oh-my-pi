@@ -503,7 +503,7 @@ describe("advisor findings delivery", () => {
 		expect(entries.length).toBeGreaterThan(0);
 		const last = entries.at(-1);
 		expect(last?.type === "custom" ? last.data : undefined).toMatchObject({
-			v: 1,
+			v: 2,
 			findings: [{ id: "F1", category: "security", status: "open", reports: [{ advisor: "Correctness" }] }],
 		});
 		const resumed = createSession(sessionManager);

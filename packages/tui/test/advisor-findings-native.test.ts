@@ -99,6 +99,24 @@ test("native findings prioritize open severity and expose lead details, flags, r
 	expect(props(overlay).items?.[0]?.facts?.status).toBe("open");
 });
 
+test("all findings show the resolution author and reason in native and ANSI previews", () => {
+	const overlay = sheet(
+		[
+			finding("F1", {
+				status: "resolved",
+				resolution: { by: "agent", reason: "Verified bounds check", turn: 3 },
+			}),
+		],
+		"all",
+	);
+	const native = JSON.stringify(overlay.describe(cx).c);
+	expect(native).toContain("Resolved by: agent");
+	expect(native).toContain("Resolution reason: Verified bounds check");
+	const ansi = overlay.render(80).join("\n");
+	expect(ansi).toContain("Resolved by: agent");
+	expect(ansi).toContain("Resolution reason: Verified bounds check");
+});
+
 test("empty findings retain native filters, disabled mutation actions, and close", () => {
 	let closed = 0;
 	const overlay = new AdvisorFindingsOverlay(

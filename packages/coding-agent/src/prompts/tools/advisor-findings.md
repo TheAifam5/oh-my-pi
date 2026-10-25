@@ -1,0 +1,3 @@
+Manage the session's advisor findings. `list` filters by status (`open` by default; `resolved`, `expired`, or `all`). `get` takes one `id` and includes every retained report. Listings include resolution author and reason.
+
+`resolve` and `reopen` take a non-empty `ids` array and a required non-empty `reason`. Resolve only after evaluating the defect; closure records `by=agent` and the reason for advisors. Reopen can report `superseded` when an open finding already covers the category and anchor. Each id receives a result; merged aliases report `merged-into` with the canonical id and the operation's outcome. Resolving an already closed finding does not overwrite its resolution.

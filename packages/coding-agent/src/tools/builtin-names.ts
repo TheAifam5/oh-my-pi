@@ -1,4 +1,5 @@
 export const BUILTIN_TOOL_NAMES = [
+	"advisor_findings",
 	"read",
 	"bash",
 	"edit",

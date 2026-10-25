@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added the main-agent `advisor_findings` tool for listing, inspecting, resolving, and reopening findings, with persisted resolution authors and reasons shared in advisor digests; `/advisor findings resolve` accepts an optional reason
 - `/settings` in Tern shows the active scope and offers a Change scope action
 - `auth.disabledAccounts` is editable in `/settings` (Providers / Accounts) as a JSON list
 - `/advisor findings` opens a findings list with detail and resolve/reopen actions, including in Tern
@@ -45,7 +46,7 @@
 - Added `/account` pages and keys for Global limits (list, add, edit, and remove top-level `limits` entries for `*`, a provider, or `provider/model-id`; an edited limit keeps its `id`), Project pins (re-pin or remove any `auth.accountPins` entry), and an OAuth account's saved-reset policy (`w` for resets-on windows `5h`, `7d`, `any`; `a` for auto-redeem `yes`, `no`, `unset`, `inherit`), written to `auth.accountPolicies` like `omp account reset`
 - Added `/settings` Model tab rows for `advisor.aggregation.judge.timeoutMs` (5–60 s) and `advisor.aggregation.judge.model` (`@judge`), and an `allowProjectMeteredPools` toggle
 - Added advisor finding categories: `WATCHDOG.yml` `categories` (`description`, `owner`, `precedence`) and per-advisor `owns`, layered user then project over a bundled default taxonomy; `advise` requires a `category` from the session's taxonomy
-- Added the advisor findings ledger, persisted in the `advisor_findings` session entry across advisor rebuilds and resume (at most 256 findings, expiring after 50 untouched primary turns); `advise` `relatesTo` and `relation` (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`) relate a report to an open finding, and only its owner can resolve it
+- Added the advisor findings ledger, persisted in the `advisor_findings` session entry across advisor rebuilds and resume (at most 256 findings, expiring after 50 untouched primary turns); `advise` `relatesTo` and `relation` (`duplicate`, `adds`, `escalates`, `disputes`, `resolved`) relate a report to an open finding, and only owner advisors can resolve through `advise`; users and the main agent have separate findings-management actions
 - Added the `advisor.findingsDigest` setting (default on): advisor reviews end with an `<open-findings>` digest of up to 12 open findings, showing `approach` topics and file anchors the advisor may read without a prompt, and marking the owner's findings whose anchored line changed as `possibly-fixed`
 - Added the opt-in advisor findings judge (`advisor.aggregation.judge`), which merges open findings of different categories on one anchor using the `judge` role; report text reaches it only when it shares every reporting advisor's provider, base URL origin, and authentication identity, unless `allowCrossDomain` is set
 - Added `/advisor findings [open|all]`, `/advisor findings resolve F<n>`, and `/advisor findings reopen F<n>`

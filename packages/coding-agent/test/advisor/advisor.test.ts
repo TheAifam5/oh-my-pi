@@ -2468,6 +2468,29 @@ describe("advisor", () => {
 			expect(promptText(promptInputs[0])).not.toContain("note");
 		});
 
+		it("keeps findings inspection report bodies out of advisor-bound transcript deltas", async () => {
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "Review the next change.", timestamp: 1 },
+				{
+					role: "toolResult",
+					toolCallId: "inspect-findings",
+					toolName: "advisor_findings",
+					content: [{ type: "text", text: "private defect, impact, and fix from another provider" }],
+					details: { reports: [{ defect: "private structured report" }] },
+					isError: false,
+					timestamp: 2,
+				},
+			];
+			const runtime = new AdvisorRuntime(agent, { snapshotMessages: () => messages });
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(2_000, 1);
+			expect(promptText(promptInputs[0])).toContain("Review the next change.");
+			expect(promptText(promptInputs[0])).not.toContain("private defect");
+			expect(promptText(promptInputs[0])).not.toContain("private structured report");
+		});
+
 		it("obfuscates session updates before prompting the advisor", async () => {
 			const secret = "ADVISOR_SECRET_TOKEN_123";
 			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);

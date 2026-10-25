@@ -49,6 +49,9 @@ import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
+import type { AdvisorFindingsLedger } from "../advisor/findings-ledger";
+import { cfgAdvisorEnabled } from "../advisor/settings";
+import { AdvisorFindingsTool } from "./advisor-findings";
 import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
@@ -214,6 +217,7 @@ export interface DeferredDiagnosticsEntry {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	getAdvisorFindingsLedger?: () => AdvisorFindingsLedger | undefined;
 	/** Current working directory */
 	cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
@@ -590,6 +594,7 @@ type ClassifiedToolFactory = (
  * `BUILTIN_TOOLS[name](session)` to construct a tool directly.
  */
 export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
+	advisor_findings: AdvisorFindingsTool.createIf,
 	read: s => new ReadTool(s),
 	security_scan: s => new SecurityScanTool(s),
 	bash: s => new BashTool(s),
@@ -794,6 +799,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "security_scan") return cfgSecurityEnabled.get(session.settings);
 		if (name === "think") return externalThinkingActive;
 		if (name === "ask") return cfgAskEnabled.get(session.settings);
+		if (name === "advisor_findings")
+			return cfgAdvisorEnabled.get(session.settings) && session.getAdvisorFindingsLedger !== undefined;
 		if (name === "context_notes" || name === "new_context")
 			return cfgCompactionExperimentalContextManagement.get(session.settings);
 		if (name === "checkpoint" || name === "rewind")

@@ -117,7 +117,12 @@ import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
-import { type AdvisorCategory, type AdvisorFinding, loadAdvisorTranscriptCosts } from "../advisor";
+import {
+	type AdvisorCategory,
+	type AdvisorFinding,
+	type AdvisorFindingsLedger,
+	loadAdvisorTranscriptCosts,
+} from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { classifyAutoPrewalk } from "../auto-prewalk/classifier";
 import { reset as resetCapabilities } from "../capability";
@@ -15680,9 +15685,13 @@ export class AgentSession implements SettingsScope {
 		return this.#advisors.getAdvisorFindings();
 	}
 
+	getAdvisorFindingsLedger(): AdvisorFindingsLedger {
+		return this.#advisors.getAdvisorFindingsLedger();
+	}
+
 	/** Resolve advisor finding `id` for the user; persists to the session. */
-	resolveAdvisorFinding(id: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
-		return this.#advisors.resolveAdvisorFinding(id);
+	resolveAdvisorFinding(id: string, reason?: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
+		return this.#advisors.resolveAdvisorFinding(id, reason);
 	}
 
 	/** Reopen a resolved or expired advisor finding; persists to the session. */

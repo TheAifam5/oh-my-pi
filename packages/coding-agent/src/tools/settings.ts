@@ -2,6 +2,7 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import { validateApprovalPolicyKeys } from "./approval-actions";
 import { combine, describeSettingValue, register } from "../config/registry";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
+import { cfgAdvisorEnabled } from "../advisor/settings";
 import { cfgBashEnabled } from "../exec/settings";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
 import { cfgEvalJs, cfgEvalPy } from "../eval/settings";
@@ -1143,6 +1144,7 @@ export const cfgDevAutoqaConsent = register({
 
 /** Settings read by `resolveBuiltinToolPlan` (`tools/index.ts`); a live session reconciles its built-ins when any changes. */
 export const cfgBuiltinToolGates = combine({
+	advisor: cfgAdvisorEnabled,
 	ask: cfgAskEnabled,
 	astEdit: cfgAstEditEnabled,
 	astGrep: cfgAstGrepEnabled,

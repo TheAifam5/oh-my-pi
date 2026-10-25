@@ -46,7 +46,15 @@ export function renderFindingsDigest(
 				b.index - a.index,
 		)
 		.map(item => item.finding);
-	if (open.length === 0) return undefined;
+	const resolved = findings
+		.filter(finding => finding.status === "resolved" && finding.resolution?.by === "agent")
+		.sort((a, b) => (b.resolution?.turn ?? 0) - (a.resolution?.turn ?? 0))
+		.slice(0, ADVISOR_FINDINGS_DIGEST_LIMIT)
+		.map(
+			finding =>
+				`${finding.id} ${finding.category || "-"} resolved by agent: ${JSON.stringify(finding.resolution?.reason ?? "")}`,
+		);
+	if (open.length === 0 && resolved.length === 0) return undefined;
 	const entries = open.slice(0, ADVISOR_FINDINGS_DIGEST_LIMIT).map(finding => {
 		let entry = `${finding.id} ${finding.category || "-"} ${finding.severity ?? "nit"} owner=${finding.owner ?? "-"} reporters=${new Set(finding.reports.map(report => report.advisor)).size}`;
 		if (finding.where && viewer.canReadAnchor(finding)) entry += ` at ${fileAnchorDisplay(finding.where)}`;
@@ -58,6 +66,7 @@ export function renderFindingsDigest(
 	});
 	return prompt.render(findingsDigestTemplate, {
 		entries,
+		resolved,
 		more: Math.max(0, open.length - ADVISOR_FINDINGS_DIGEST_LIMIT),
 	});
 }

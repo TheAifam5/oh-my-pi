@@ -640,7 +640,7 @@ export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> 
 		});
 		if (!decision.accepted) return this.#suppressed(args, advice.note, decision.reason);
 		const outcome = this.#ledger.recordRelated(finding, { ...this.#reportInput(args, advice), relation });
-		if (relation === "resolved") this.#ledger.resolve(finding.id);
+		if (relation === "resolved") this.#ledger.resolve(finding.id, this.#advisor, args.defect);
 		if (outcome.type !== "attached") return this.#result(ADVISOR_ACK_DUPLICATE, args, advice.note);
 		advice.finding = finding.id;
 		advice.relation = relation;

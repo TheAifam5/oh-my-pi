@@ -14,7 +14,7 @@ export type AdvisorFileAnchor = Extract<AdviseWhere, { type: "file" }>;
 /** Session entry type persisting the findings ledger. */
 export const ADVISOR_FINDINGS_ENTRY_TYPE = "advisor_findings";
 /** Persisted ledger format version. */
-export const ADVISOR_FINDINGS_VERSION = 1;
+export const ADVISOR_FINDINGS_VERSION = 2;
 /** Open findings untouched for this many primary turns expire. */
 export const ADVISOR_FINDING_EXPIRY_TURNS = 50;
 /** Most findings the ledger holds; resolved/expired findings are evicted first, then the oldest. */
@@ -23,6 +23,12 @@ export const ADVISOR_FINDINGS_CAPACITY = 256;
 export const ADVISOR_FINDING_REPORTS_CAPACITY = 16;
 
 export type AdvisorFindingStatus = "open" | "resolved" | "expired";
+
+export interface AdvisorFindingResolution {
+	by: string;
+	reason?: string;
+	turn: number;
+}
 
 /** One advisor's report on a finding. */
 export interface AdvisorReport {
@@ -54,6 +60,7 @@ export interface AdvisorFinding {
 	/** Live owner advisor of the category when the finding was opened. */
 	owner?: string;
 	status: AdvisorFindingStatus;
+	resolution?: AdvisorFindingResolution;
 	/** Highest severity across reports. */
 	severity?: AdvisorSeverity;
 	reports: AdvisorReport[];
@@ -269,10 +276,11 @@ export class AdvisorFindingsLedger {
 	}
 
 	/** Close an open finding as resolved. Returns whether it was open. */
-	resolve(id: string): boolean {
+	resolve(id: string, by = "user", reason?: string): boolean {
 		const finding = this.get(id);
 		if (!finding || finding.status !== "open") return false;
 		finding.status = "resolved";
+		finding.resolution = { by, reason: reason?.trim() || undefined, turn: this.#turn };
 		finding.lastTouchedTurn = this.#turn;
 		this.#unindex(finding);
 		this.#changed();
@@ -289,6 +297,7 @@ export class AdvisorFindingsLedger {
 		if (finding.status === "open") return "open";
 		if (findingKeys(finding).some(key => this.#byKey.has(key))) return "superseded";
 		finding.status = "open";
+		delete finding.resolution;
 		finding.lastTouchedTurn = this.#turn;
 		this.#index(finding);
 		this.#changed();
@@ -415,7 +424,7 @@ export class AdvisorFindingsLedger {
 	load(data: unknown): void {
 		this.clear();
 		const version = typeof data === "object" && data !== null && "v" in data ? data.v : undefined;
-		if (version !== ADVISOR_FINDINGS_VERSION) {
+		if (version !== 1 && version !== ADVISOR_FINDINGS_VERSION) {
 			if (data !== undefined) {
 				logger.warn("Ignoring advisor findings ledger with an unsupported version", { version });
 			}
@@ -541,6 +550,7 @@ const findingSchema = type({
 	anchor: "string",
 	"owner?": "string | undefined",
 	status: "'open' | 'resolved' | 'expired'",
+	"resolution?": type({ by: "string", "reason?": "string | undefined", turn: "number.integer" }).or("undefined"),
 	"severity?": severitySchema,
 	reports: reportSchema.array(),
 	createdTurn: "number.integer",

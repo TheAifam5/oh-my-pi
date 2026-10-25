@@ -467,9 +467,11 @@ describe("AgentSession advisor context maintenance", () => {
 			await expect(transition).rejects.toThrow(failure);
 			expect(fallbackCalls).toBe(0);
 			expect(advisor.state.messages).toEqual(previousAdvisorMessages);
-			expect(getApiKey).toHaveBeenCalledWith(advisorMock, advisor.sessionId, {
-				signal: expect.any(AbortSignal),
-			});
+			expect(getApiKey).toHaveBeenCalledWith(
+				advisorMock,
+				advisor.sessionId,
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
 		} finally {
 			releaseCompaction.resolve();
 			await prompt;

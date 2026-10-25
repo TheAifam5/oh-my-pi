@@ -3354,15 +3354,19 @@ export class SessionAdvisors {
 		return this.#findings.list();
 	}
 
+	getAdvisorFindingsLedger(): AdvisorFindingsLedger {
+		return this.#findings;
+	}
+
 	/**
 	 * Resolve finding `id` for the user (`/advisor findings resolve`). `id`
 	 * may name a finding merged into another one; the result names the
 	 * finding acted on. The change persists to the session.
 	 */
-	resolveAdvisorFinding(id: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
+	resolveAdvisorFinding(id: string, reason?: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
 		const finding = this.#findings.get(id);
 		if (!finding) return { result: "missing" };
-		return { result: this.#findings.resolve(finding.id) ? "resolved" : "closed", finding };
+		return { result: this.#findings.resolve(finding.id, "user", reason) ? "resolved" : "closed", finding };
 	}
 
 	/**
@@ -3488,7 +3492,7 @@ export class SessionAdvisors {
 			}
 			if (await canReadFileAnchor(finding.where, ctx)) readable.add(finding);
 		}
-		return renderFindingsDigest(open, {
+		return renderFindingsDigest(this.#findings.list(), {
 			owns: finding => this.#findings.isOwner(finding, advisor),
 			canReadAnchor: finding => readable.has(finding),
 		});

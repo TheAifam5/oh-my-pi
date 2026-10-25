@@ -20,6 +20,13 @@ import { adviseArgumentTexts } from "./advise-tool";
 import { ADVISOR_RENDER_OPTIONS, advisorToolIOTransform, renderAdvisorDeltaChunks } from "./delta-split";
 import { fingerprintMessage } from "./message-fingerprint";
 
+function visibleToAdvisors(message: AgentMessage): boolean {
+	return (
+		!(message.role === "custom" && message.customType === "advisor") &&
+		!(message.role === "toolResult" && message.toolName === "advisor_findings")
+	);
+}
+
 /**
  * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
  * `Agent`. `state.error` mirrors `Agent.state.error`: provider/stream failures
@@ -885,7 +892,7 @@ export class AdvisorRuntime {
 
 	#formatRawDelta(rawMessages: AgentMessage[], wip = false, updateSeenContext = true): string | null {
 		const delta = rawMessages
-			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
+			.filter(visibleToAdvisors)
 			.map(message =>
 				updateSeenContext ? this.#dedupContextMessage(message) : this.#dedupContextMessageReadOnly(message),
 			);
@@ -1244,9 +1251,7 @@ export class AdvisorRuntime {
 		// turn can restore it (see #rollbackFailedTurn). `??=` keeps the first
 		// snapshot across coalescing re-prepares within one in-flight batch.
 		this.#seenContextInFlight ??= [...this.#seenContext];
-		return rawMessages
-			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
-			.map(message => this.#dedupContextMessage(message));
+		return rawMessages.filter(visibleToAdvisors).map(message => this.#dedupContextMessage(message));
 	}
 
 	#terminalAssistantFailure(snapshot: number): AssistantMessage | undefined {

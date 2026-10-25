@@ -126,7 +126,7 @@ describe("AdvisorFindingsLedger", () => {
 	it("ignores an unknown version and a malformed snapshot", () => {
 		const ledger = new AdvisorFindingsLedger();
 		ledger.record(input());
-		ledger.load({ v: 2, findings: [] });
+		ledger.load({ v: 99, findings: [] });
 		expect(ledger.list()).toEqual([]);
 		ledger.load({ v: 1, findings: "nope" });
 		expect(ledger.list()).toEqual([]);
