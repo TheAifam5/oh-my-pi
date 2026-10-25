@@ -117,12 +117,7 @@ import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
-import {
-	type AdvisorCategory,
-	type AdvisorFinding,
-	type AdvisorFindingsLedger,
-	loadAdvisorTranscriptCosts,
-} from "../advisor";
+import { type AdvisorCategory, type AdvisorFinding, loadAdvisorTranscriptCosts } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { classifyAutoPrewalk } from "../auto-prewalk/classifier";
 import { reset as resetCapabilities } from "../capability";
@@ -451,6 +446,9 @@ import type { ServingModel } from "./retry-fallback-chains";
 import {
 	type AdvisorCatchupOptions,
 	type AdvisorFindingCommandResult,
+	type AdvisorFindingActionOptions,
+	type AdvisorFindingActionResult,
+	type AdvisorFindingSummary,
 	type AdvisorStats,
 	type AdvisorStatusOverviewEntry,
 	type AdvisorTaxonomyStatus,
@@ -15685,8 +15683,20 @@ export class AgentSession implements SettingsScope {
 		return this.#advisors.getAdvisorFindings();
 	}
 
-	getAdvisorFindingsLedger(): AdvisorFindingsLedger {
-		return this.#advisors.getAdvisorFindingsLedger();
+	listAdvisorFindings(status: AdvisorFinding["status"] | "all" = "open"): AdvisorFindingSummary[] {
+		return this.#advisors.listAdvisorFindings(status);
+	}
+
+	getAdvisorFinding(id: string): AdvisorFindingSummary | undefined {
+		return this.#advisors.getAdvisorFinding(id);
+	}
+
+	resolveAdvisorFindings(ids: readonly string[], options: AdvisorFindingActionOptions): AdvisorFindingActionResult[] {
+		return this.#advisors.resolveAdvisorFindings(ids, options);
+	}
+
+	reopenAdvisorFindings(ids: readonly string[], options: AdvisorFindingActionOptions): AdvisorFindingActionResult[] {
+		return this.#advisors.reopenAdvisorFindings(ids, options);
 	}
 
 	/** Resolve advisor finding `id` for the user; persists to the session. */

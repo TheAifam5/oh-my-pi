@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { AdvisorFindingsLedger, renderFindingsDigest } from "../../src/advisor";
 import { Settings } from "../../src/config/settings";
 import type { AgentSession } from "../../src/session/agent-session";
+import { SessionAdvisors, type SessionAdvisorsHost } from "../../src/session/session-advisors";
 import { runAdvisorFindingsCommand } from "../../src/slash-commands/helpers/advisor-findings";
 import type { ToolSession } from "../../src/tools";
 import { AdvisorFindingsTool } from "../../src/tools/advisor-findings";
@@ -18,14 +19,31 @@ function record(ledger: AdvisorFindingsLedger, category = "logic") {
 	}).finding;
 }
 
-function toolSession(ledger: AdvisorFindingsLedger, enabled = true): ToolSession {
+function sessionAdvisors(ledger: AdvisorFindingsLedger, persist?: (data: unknown) => void): SessionAdvisors {
+	const host = {
+		isDisposed: () => false,
+		sessionManager: {
+			getBranch: () => [{ type: "custom", customType: "advisor_findings", data: structuredClone(ledger.toEntry()) }],
+			appendCustomEntry: (_type: string, data: unknown) => {
+				ledger.load(data);
+				persist?.(data);
+			},
+		},
+	} as unknown as SessionAdvisorsHost;
+	return new SessionAdvisors(host, { enabled: false });
+}
+
+function toolSession(ledger: AdvisorFindingsLedger, enabled = true, persist?: (data: unknown) => void): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
 		settings: Settings.isolated({ "advisor.enabled": enabled }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
-		getAdvisorFindingsLedger: () => ledger,
+		listAdvisorFindings: status => sessionAdvisors(ledger).listAdvisorFindings(status),
+		getAdvisorFinding: id => sessionAdvisors(ledger).getAdvisorFinding(id),
+		resolveAdvisorFindings: (ids, options) => sessionAdvisors(ledger, persist).resolveAdvisorFindings(ids, options),
+		reopenAdvisorFindings: (ids, options) => sessionAdvisors(ledger, persist).reopenAdvisorFindings(ids, options),
 	};
 }
 
@@ -39,7 +57,11 @@ describe("advisor findings management", () => {
 		});
 		record(ledger);
 		ledger.advanceTurn();
-		const tool = new AdvisorFindingsTool(toolSession(ledger));
+		const tool = new AdvisorFindingsTool(
+			toolSession(ledger, true, data => {
+				snapshot = data;
+			}),
+		);
 		await tool.execute("resolve", { op: "resolve", ids: ["f1"], reason: " Bounds check added. " });
 		const restored = new AdvisorFindingsLedger();
 		restored.load(snapshot);
@@ -87,7 +109,7 @@ describe("advisor findings management", () => {
 			{ id: "F99", result: "missing" },
 		]);
 		await tool.execute("again", { op: "resolve", ids: ["F1"], reason: "Replacement" });
-		expect(lead.resolution?.reason).toBe("Fixed bounds");
+		expect(ledger.get("F1")?.resolution?.reason).toBe("Fixed bounds");
 	});
 
 	it("refuses superseded reopens and otherwise reopens with resolution metadata cleared", async () => {
@@ -122,12 +144,9 @@ describe("advisor findings management", () => {
 		const ledger = new AdvisorFindingsLedger();
 		record(ledger);
 		const session: Pick<AgentSession, "getAdvisorFindings" | "resolveAdvisorFinding" | "reopenAdvisorFinding"> = {
-			getAdvisorFindings: () => ledger.list(),
-			resolveAdvisorFinding: (id, reason) => ({
-				result: ledger.resolve(id, "user", reason) ? "resolved" : "closed",
-				finding: ledger.get(id),
-			}),
-			reopenAdvisorFinding: id => ({ result: ledger.reopen(id), finding: ledger.get(id) }),
+			getAdvisorFindings: () => sessionAdvisors(ledger).getAdvisorFindings(),
+			resolveAdvisorFinding: (id, reason) => sessionAdvisors(ledger).resolveAdvisorFinding(id, reason),
+			reopenAdvisorFinding: id => sessionAdvisors(ledger).reopenAdvisorFinding(id),
 		};
 		expect(runAdvisorFindingsCommand(session, "resolve f1 Verified bounds check")).toContain("Resolved F1");
 		expect(ledger.get("F1")?.resolution).toMatchObject({ by: "user", reason: "Verified bounds check" });
@@ -140,7 +159,7 @@ describe("advisor findings management", () => {
 		const ledger = new AdvisorFindingsLedger();
 		expect(AdvisorFindingsTool.createIf(toolSession(ledger, false))).toBeNull();
 		const session = toolSession(ledger);
-		delete session.getAdvisorFindingsLedger;
+		delete session.listAdvisorFindings;
 		expect(AdvisorFindingsTool.createIf(session)).toBeNull();
 		const tool = new AdvisorFindingsTool(toolSession(ledger));
 		expect(tool.approval({ op: "list" })).toBe("read");

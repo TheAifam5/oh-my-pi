@@ -625,6 +625,42 @@ export interface AdvisorFindingCommandResult<R extends string> {
 	finding?: AdvisorFinding;
 }
 
+export interface AdvisorFindingSummary {
+	id: string;
+	status: AdvisorFinding["status"];
+	severity: NonNullable<AdvisorFinding["severity"]>;
+	category: string;
+	owner: string | undefined;
+	anchor: string;
+	reporters: string[];
+	possiblyFixed: boolean;
+	merged: AdvisorFinding["merged"];
+	defect: string;
+	resolution: AdvisorFinding["resolution"];
+	reports?: AdvisorFinding["reports"];
+}
+
+export interface AdvisorFindingActionResult {
+	id: string;
+	result:
+		| "resolved"
+		| "reopened"
+		| "already open"
+		| "already resolved"
+		| "already expired"
+		| "missing"
+		| "merged-into"
+		| "superseded";
+	mergedInto?: string;
+	outcome?: Exclude<AdvisorFindingActionResult["result"], "merged-into">;
+	reason: string;
+}
+
+export interface AdvisorFindingActionOptions {
+	by: string;
+	reason?: string;
+}
+
 /**
  * One advisor's status-line slice: runtime status plus whether it has
  * finished reviewing the current yield — i.e. it is not going to add any
@@ -3351,11 +3387,69 @@ export class SessionAdvisors {
 
 	/** The session findings ledger's findings, oldest first. */
 	getAdvisorFindings(): readonly AdvisorFinding[] {
-		return this.#findings.list();
+		return structuredClone(this.#findings.list());
 	}
 
-	getAdvisorFindingsLedger(): AdvisorFindingsLedger {
-		return this.#findings;
+	/** Detached finding summaries, oldest first. */
+	listAdvisorFindings(status: AdvisorFinding["status"] | "all" = "open"): AdvisorFindingSummary[] {
+		return this.#findings
+			.list()
+			.filter(finding => status === "all" || finding.status === status)
+			.map(finding => this.#summarizeFinding(finding, false));
+	}
+
+	/** A detached finding summary including reports; merged ids select their canonical finding. */
+	getAdvisorFinding(id: string): AdvisorFindingSummary | undefined {
+		const finding = this.#findings.get(id.toUpperCase());
+		return finding ? this.#summarizeFinding(finding, true) : undefined;
+	}
+
+	#summarizeFinding(finding: AdvisorFinding, reports: boolean): AdvisorFindingSummary {
+		return structuredClone({
+			id: finding.id,
+			status: finding.status,
+			severity: finding.severity ?? "nit",
+			category: finding.category,
+			owner: finding.owner,
+			anchor: finding.anchor,
+			reporters: this.#findings.reporters(finding),
+			possiblyFixed: finding.possiblyFixed ?? false,
+			merged: finding.merged,
+			defect: this.#findings.leadReport(finding).defect,
+			resolution: finding.resolution,
+			...(reports ? { reports: finding.reports } : {}),
+		});
+	}
+
+	resolveAdvisorFindings(ids: readonly string[], options: AdvisorFindingActionOptions): AdvisorFindingActionResult[] {
+		return this.#changeFindings(ids, "resolve", options);
+	}
+
+	reopenAdvisorFindings(ids: readonly string[], options: AdvisorFindingActionOptions): AdvisorFindingActionResult[] {
+		return this.#changeFindings(ids, "reopen", options);
+	}
+
+	#changeFindings(
+		ids: readonly string[],
+		op: "resolve" | "reopen",
+		options: AdvisorFindingActionOptions,
+	): AdvisorFindingActionResult[] {
+		const reason = options.reason?.trim() ?? "";
+		return ids.map(rawId => {
+			const id = rawId.toUpperCase();
+			const finding = this.#findings.get(id);
+			if (!finding) return { id, result: "missing", reason };
+			let outcome: Exclude<AdvisorFindingActionResult["result"], "merged-into">;
+			if (op === "resolve") {
+				outcome = this.#findings.resolve(finding.id, options.by, reason) ? "resolved" : `already ${finding.status}`;
+			} else {
+				const reopened = this.#findings.reopen(finding.id);
+				outcome = reopened === "open" ? "already open" : reopened;
+			}
+			return id === finding.id
+				? { id, result: outcome, reason }
+				: { id, result: "merged-into", mergedInto: finding.id, outcome, reason };
+		});
 	}
 
 	/**
@@ -3364,9 +3458,13 @@ export class SessionAdvisors {
 	 * finding acted on. The change persists to the session.
 	 */
 	resolveAdvisorFinding(id: string, reason?: string): AdvisorFindingCommandResult<"resolved" | "missing" | "closed"> {
-		const finding = this.#findings.get(id);
+		const action = this.resolveAdvisorFindings([id], { by: "user", reason })[0]!;
+		const finding = this.#findings.get(id.toUpperCase());
 		if (!finding) return { result: "missing" };
-		return { result: this.#findings.resolve(finding.id, "user", reason) ? "resolved" : "closed", finding };
+		return {
+			result: (action.outcome ?? action.result) === "resolved" ? "resolved" : "closed",
+			finding: structuredClone(finding),
+		};
 	}
 
 	/**
@@ -3375,9 +3473,14 @@ export class SessionAdvisors {
 	 * anchor. The change persists to the session.
 	 */
 	reopenAdvisorFinding(id: string): AdvisorFindingCommandResult<"reopened" | "open" | "missing" | "superseded"> {
-		const finding = this.#findings.get(id);
+		const action = this.reopenAdvisorFindings([id], { by: "user" })[0]!;
+		const finding = this.#findings.get(id.toUpperCase());
 		if (!finding) return { result: "missing" };
-		return { result: this.#findings.reopen(finding.id), finding };
+		const outcome = action.outcome ?? action.result;
+		return {
+			result: outcome === "reopened" ? "reopened" : outcome === "superseded" ? "superseded" : "open",
+			finding: structuredClone(finding),
+		};
 	}
 
 	/**

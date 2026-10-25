@@ -140,6 +140,38 @@ describe("advisor findings delivery", () => {
 		return session.yieldQueue.drainLazy().map(build => textOf(build() as AgentMessage));
 	}
 
+	it("returns detached snapshots through session reads and slash-command results", async () => {
+		const tools = enable();
+		await advise(tools.get("Correctness"), report("logic", "Missing bounds check."));
+		session.resolveAdvisorFindings(["F1"], { by: "agent", reason: "Bounds checked." });
+		const detail = session.getAdvisorFinding("f1");
+		const summary = session.listAdvisorFindings("all")[0];
+		const finding = session.getAdvisorFindings()[0];
+		if (!detail?.reports?.[0] || !detail.resolution || !summary || !finding) {
+			throw new Error("Expected a resolved finding snapshot");
+		}
+		detail.reports[0].defect = "Changed report";
+		detail.resolution.reason = "Changed resolution";
+		detail.reporters.push("Changed reporter");
+		summary.status = "open";
+		finding.reports.length = 0;
+		expect(session.getAdvisorFinding("F1")).toMatchObject({
+			status: "resolved",
+			resolution: { by: "agent", reason: "Bounds checked." },
+			reports: [{ defect: "Missing bounds check." }],
+		});
+		const command = session.reopenAdvisorFinding("F1");
+		if (!command.finding) throw new Error("Expected reopened finding");
+		command.finding.reports[0]!.defect = "Changed command report";
+		expect(session.getAdvisorFinding("F1")).toMatchObject({
+			status: "open",
+			defect: "Missing bounds check.",
+			reporters: ["Correctness"],
+			reports: [{ defect: "Missing bounds check." }],
+		});
+		expect(session.getAdvisorFindings()[0]?.reports).toHaveLength(1);
+	});
+
 	it("interrupts once per finding: three advisors on one anchor give one steer plus asides, owner first", async () => {
 		const tools = enable();
 		session.agent.state.isStreaming = true;

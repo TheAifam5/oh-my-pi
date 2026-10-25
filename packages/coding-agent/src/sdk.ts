@@ -2732,7 +2732,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
 			getGoalRuntime: () => session?.goalRuntime,
-			getAdvisorFindingsLedger: () => session?.getAdvisorFindingsLedger(),
+			listAdvisorFindings: status => session?.listAdvisorFindings(status) ?? [],
+			getAdvisorFinding: id => session?.getAdvisorFinding(id),
+			resolveAdvisorFindings: (ids, options) => session?.resolveAdvisorFindings(ids, options) ?? [],
+			reopenAdvisorFindings: (ids, options) => session?.reopenAdvisorFindings(ids, options) ?? [],
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
 			getTurnBudget: () => sessionManager.getTurnBudget(),
 			recordEvalSubagentUsage: output => sessionManager.recordEvalSubagentOutput(output),
@@ -5184,7 +5187,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (defaulting to read/grep/glob).
 		const advisorToolSession: ToolSession = {
 			...toolSession,
-			getAdvisorFindingsLedger: undefined,
+			listAdvisorFindings: undefined,
+			getAdvisorFinding: undefined,
+			resolveAdvisorFindings: undefined,
+			reopenAdvisorFindings: undefined,
 			// The primary may carry a dormant xd:// write transport. Advisors use
 			// their own configured tool slate, so a selected write is always full.
 			deviceOnlyWrite: undefined,
