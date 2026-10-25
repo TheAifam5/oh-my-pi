@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `/account` in Tern is a table: providers and policy pages as scopes, accounts grouped by provider with Billing, State, Type, Routing, Pins and Limits columns, and each field as an action
+
 ### Added
 
 - `/settings` in Tern shows the active scope and offers a Change scope action

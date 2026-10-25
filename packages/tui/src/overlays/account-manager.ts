@@ -13,7 +13,15 @@
  * {@link AccountManagerDeps.apply} by action id.
  */
 
-import type { TspSpan } from "@oh-my-pi/pi-wire";
+import type {
+	TspPickerAction,
+	TspPickerColumn,
+	TspPickerGroup,
+	TspPickerItem,
+	TspPickerProps,
+	TspPickerScope,
+	TspSpan,
+} from "@oh-my-pi/pi-wire";
 import {
 	type Component,
 	Input,
@@ -26,6 +34,8 @@ import {
 	wrapTextWithAnsi,
 } from "../index";
 import { col, node, row, span, text } from "../native/describe";
+import { CLOSE_ACTION, type PickerEvent, picker, pickerAction, pickerEvent } from "../native/picker";
+import { providerMark } from "./model-browser";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { actionHint, type NativeHint, hintsRow } from "../native/overlay";
 import { theme } from "../theme";
@@ -73,6 +83,13 @@ export interface AccountManagerField extends AccountManagerAction {
 	/** Opens a second strip of these actions instead of applying the field itself. */
 	choices?: AccountManagerAction[];
 }
+/** One column of the Tern account table: its cells are each row's {@link AccountManagerAccount.facts}`[id]`. */
+export interface AccountManagerColumn {
+	id: string;
+	head: string;
+	/** Higher stays visible longer when the table is narrow. */
+	priority: number;
+}
 
 /** One stored account as the manager shows it, or one row of an {@link AccountManagerPage}. */
 export interface AccountManagerAccount {
@@ -85,6 +102,8 @@ export interface AccountManagerAccount {
 	identity: string;
 	/** Short facts for the list row (`priority 10`, `drain`, `session pin`). */
 	badges: string[];
+	/** Table cells by column id; a column without a cell here is blank for this row. */
+	facts?: Readonly<Record<string, string>>;
 	/** The detail block of the selected account. */
 	details: { label: string; value: string; tone?: "dim" | "warning" | "success" | "error" }[];
 	fields: AccountManagerField[];
@@ -108,11 +127,15 @@ export interface AccountManagerPage {
 	rows: AccountManagerAccount[];
 	/** Configured entries the sidebar counts; omitted counts every row. */
 	count?: number;
+	/** Table columns of this page's rows; absent: one column of the rows' badges. */
+	columns?: AccountManagerColumn[];
 }
 
 /** Host-owned account listing and persistence. */
 export interface AccountManagerDeps {
 	load: () => AccountManagerAccount[];
+	/** Table columns of account rows; absent: one column of the rows' badges. */
+	accountColumns?: AccountManagerColumn[];
 	/** Pages listed after the providers; their rows' edits go through {@link apply} by row id. */
 	pages?: () => AccountManagerPage[];
 	/**
@@ -156,6 +179,9 @@ function sanitizeAccount(account: AccountManagerAccount): AccountManagerAccount 
 		provider: clean(account.provider),
 		identity: clean(account.identity),
 		badges: account.badges.map(clean),
+		...(account.facts
+			? { facts: Object.fromEntries(Object.entries(account.facts).map(([key, value]) => [key, clean(value)])) }
+			: {}),
 		details: account.details.map(detail => ({ ...detail, label: clean(detail.label), value: clean(detail.value) })),
 		fields: account.fields.map(field => ({
 			...action(field),
@@ -201,7 +227,7 @@ export class AccountManagerComponent implements Component {
 
 	/** Bumped on every visible-state change; the described node is rebuilt when it moves. */
 	#nativeVersion = 0;
-	#nativeCache: { version: number; node: NativeNode } | undefined;
+	#nativeCache: { version: number; picker: boolean; node: NativeNode } | undefined;
 
 	readonly #frame: HubFrame = new HubFrame(
 		"Accounts",
@@ -710,9 +736,19 @@ export class AccountManagerComponent implements Component {
 	// Native (TSP) description
 	// ═══════════════════════════════════════════════════════════════════════
 
-	describe(_cx: DescribeContext): NativeNode {
+	nativeSheet(cx: DescribeContext): boolean {
+		return cx.supports("picker");
+	}
+
+	describe(cx: DescribeContext): NativeNode {
+		const usePicker = cx.supports("picker");
 		const cached = this.#nativeCache;
-		if (cached?.version === this.#nativeVersion) return cached.node;
+		if (cached?.version === this.#nativeVersion && cached.picker === usePicker) return cached.node;
+		if (usePicker) {
+			const described = this.#describePicker(cx);
+			this.#nativeCache = { version: this.#nativeVersion, picker: true, node: described };
+			return described;
+		}
 		const footer: NativeChild[] = [];
 		const strip = this.#describeStrip();
 		if (strip) footer.push(strip);
@@ -724,11 +760,30 @@ export class AccountManagerComponent implements Component {
 			this.#describeBody(),
 			node("col", { gap: "xs" }, footer, "footer"),
 		);
-		this.#nativeCache = { version: this.#nativeVersion, node: described };
+		this.#nativeCache = { version: this.#nativeVersion, picker: false, node: described };
 		return described;
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		const picked = pickerEvent(event);
+		if (picked) {
+			if (this.#busy && !(picked.kind === "action" && picked.act === CLOSE_ACTION.id)) return;
+			this.#handlePickerEvent(picked);
+			this.#requestRender();
+			return;
+		}
+		const strip = this.#strip;
+		if (event.key.endsWith("stripInput") && strip?.kind === "input") {
+			if (event.type === "edit" || event.type === "undo") {
+				strip.input.handleNativeEvent(event);
+			} else if (event.type === "send" || (event.type === "action" && event.act === "submit")) {
+				void this.#apply(strip.accountId, strip.action, strip.input.getValue().trim());
+			} else {
+				return;
+			}
+			this.#requestRender();
+			return;
+		}
 		if ((event.type !== "select" && event.type !== "activate") || this.#busy) return;
 		const target = event.key.slice(event.key.lastIndexOf("/") + 1);
 		const activate = event.type === "activate";
@@ -755,6 +810,235 @@ export class AccountManagerComponent implements Component {
 			return;
 		}
 		this.#requestRender();
+	}
+
+	// ─── Tern picker table ───────────────────────────────────────────────
+
+	/** The Tern account table: providers and pages as scopes, rows with one column per fact, the selected row's details as preview. */
+	#describePicker(cx: DescribeContext): NativeNode {
+		const entry = this.#activeEntry();
+		const selected = this.#selected();
+		const status = this.#statusText();
+		const strip = this.#strip;
+		const columns = this.#pickerColumns();
+		const multiProvider = entry.kind === "all";
+		const items: TspPickerItem[] = this.#rows.map(account => ({
+			id: accountItemId(account),
+			label: account.name ?? "(unnamed)",
+			detail: multiProvider && account.provider ? `${account.provider} · ${account.identity}` : account.identity,
+			...(account.name === undefined ? { tone: "muted" as const } : {}),
+			...(multiProvider && account.provider ? { mark: providerMark(account.provider) } : {}),
+			facts: this.#rowFacts(account),
+		}));
+		const props: TspPickerProps = {
+			title: "Accounts",
+			...(this.#busy || this.#notice ? { subtitle: [span(status.text, status.tone)] } : {}),
+			icon: "key",
+			noun: entry.kind === "page" ? "rows" : "accounts",
+			size: "lg",
+			layout: "rows",
+			preview: "side",
+			query: null,
+			scopes: this.#pickerScopes(),
+			scope: entry.id,
+			columns,
+			items,
+			order: this.#pickerOrder(multiProvider),
+			selected: selected ? accountItemId(selected) : null,
+			total: this.#rows.length,
+			empty: entry.kind === "page" ? (entry.page?.empty ?? "") : "No stored accounts. Log in with /login.",
+			actions: this.#pickerActions(selected),
+			strip: strip ? this.#pickerStrip(strip) : null,
+			focus: strip ? "strip" : this.#focus === "scope" ? "scopes" : "list",
+		};
+		const preview: NativeChild[] = [this.#detailSection(selected)];
+		if (strip?.kind === "input") {
+			preview.unshift(
+				row(
+					[
+						text([span(this.#stripPrefix(strip), "accent")]),
+						col([{ ...strip.input.describe(cx), key: "stripInput" }], { grow: 1 }),
+						text([span(strip.action.input?.hint ?? "", "dim")], { wrap: "word" }),
+					],
+					{ gap: "sm", align: "center" },
+				),
+			);
+		}
+		return picker(props, preview);
+	}
+
+	/** Columns of the active scope that at least one row fills, else one column of the rows' badges. */
+	#pickerColumns(): TspPickerColumn[] {
+		const entry = this.#activeEntry();
+		const declared = entry.kind === "page" ? entry.page?.columns : this.#deps.accountColumns;
+		if (!declared) return [{ id: "badges", head: "Details", format: "dim", priority: 1 }];
+		return declared
+			.filter(column => this.#rows.some(account => (account.facts?.[column.id] ?? "").length > 0))
+			.map((column, index) => ({
+				id: column.id,
+				head: column.head,
+				format: index === 0 ? "text" : "dim",
+				priority: column.priority,
+			}));
+	}
+
+	/** `account`'s table cells: its facts, or its badges when the scope declares no columns. */
+	#rowFacts(account: AccountManagerAccount): Record<string, string> {
+		const entry = this.#activeEntry();
+		const declared = entry.kind === "page" ? entry.page?.columns : this.#deps.accountColumns;
+		if (!declared) return account.badges.length > 0 ? { badges: account.badges.join(" · ") } : {};
+		const facts: Record<string, string> = {};
+		for (const [key, value] of Object.entries(account.facts ?? {})) if (value.length > 0) facts[key] = value;
+		return facts;
+	}
+
+	/** Row order: All accounts groups rows under a head per provider; other scopes list rows as they are. */
+	#pickerOrder(byProvider: boolean): (string | TspPickerGroup)[] {
+		if (!byProvider) return this.#rows.map(accountItemId);
+		const order: (string | TspPickerGroup)[] = [];
+		let head: (TspPickerGroup & { count: number }) | undefined;
+		for (const account of this.#rows) {
+			if (head?.group !== account.provider) {
+				head = { group: account.provider, label: account.provider || "Other", count: 0 };
+				order.push(head);
+			}
+			head.count++;
+			order.push(accountItemId(account));
+		}
+		return order;
+	}
+
+	/** The sidebar as picker scopes: All accounts, one per provider, then the host's pages. */
+	#pickerScopes(): TspPickerScope[] {
+		const scopes: TspPickerScope[] = [];
+		for (const entry of this.#entries) {
+			const count = Number(entry.annotation ?? 0);
+			if (entry.kind === "all") scopes.push({ id: entry.id, label: entry.label, icon: "users", count });
+			else if (entry.kind === "provider") {
+				scopes.push({
+					id: entry.id,
+					label: entry.label,
+					mark: providerMark(entry.provider ?? entry.label),
+					group: "Providers",
+					count,
+				});
+			} else if (entry.kind === "page") {
+				scopes.push({ id: entry.id, label: entry.label, icon: "settings", group: "Policies", count });
+			}
+		}
+		return scopes;
+	}
+
+	/** The action bar: the open strip's apply/back, else edit, each field's shortcut, reload and close. */
+	#pickerActions(selected: AccountManagerAccount | undefined): TspPickerAction[] {
+		const strip = this.#strip;
+		if (strip?.kind === "input") {
+			return [
+				pickerAction("stripSubmit", "Save", "enter", { primary: true }),
+				pickerAction("cancel", "Back", "escape"),
+			];
+		}
+		if (strip) {
+			return [
+				pickerAction("stripApply", strip.field ? "Apply" : "Open", "enter", { primary: true }),
+				pickerAction("cancel", "Back", "escape"),
+			];
+		}
+		const actions: TspPickerAction[] = [];
+		if (selected) {
+			actions.push(pickerAction("edit", "Edit", "enter", { primary: true }));
+			for (const field of selected.fields) {
+				if (!field.key) continue;
+				actions.push(
+					pickerAction(
+						`field:${field.id}`,
+						field.label,
+						field.key,
+						field.readOnly ? { disabled: field.readOnly } : undefined,
+					),
+				);
+			}
+		}
+		if (this.#deps.refresh) actions.push(pickerAction("reload", "Reload", "ctrl+r"));
+		actions.push(CLOSE_ACTION);
+		return actions;
+	}
+
+	/** The open strip as the picker's chip strip; an input strip shows its prompt here and its field in the preview. */
+	#pickerStrip(strip: StripState): NonNullable<TspPickerProps["strip"]> {
+		if (strip.kind === "input") return { label: [span(this.#stripPrefix(strip), "muted")], items: [] };
+		return {
+			label: [span(this.#stripPrefix(strip), "muted")],
+			items: strip.chips.map((chip, index) => ({
+				id: String(index),
+				label: this.#chipSpans(chip),
+				...(chip.action.on ? { on: true } : {}),
+			})),
+			selected: String(strip.index),
+		};
+	}
+
+	#handlePickerEvent(event: PickerEvent): void {
+		if (event.kind !== "action") {
+			if (this.#strip) return;
+			const index = this.#rows.findIndex(account => accountItemId(account) === event.item);
+			if (index < 0) return;
+			this.#focus = "list";
+			this.#rowIndex = index;
+			if (event.kind === "activate") this.#openFieldStrip(this.#rows[index]!);
+			return;
+		}
+		const { act, value } = event;
+		const strip = this.#strip;
+		if (act === CLOSE_ACTION.id) {
+			this.#close();
+		} else if (act === "cancel") {
+			if (strip) this.#stripBack(strip);
+		} else if (act === "scope") {
+			const entry = this.#entries.find(candidate => candidate.id === value);
+			if (strip || !entry || entry.kind === "separator") return;
+			this.#selectEntry(entry);
+			this.#focus = "list";
+		} else if (act === "strip") {
+			const index = Number(value);
+			if (strip?.kind !== "chips" || !Number.isInteger(index) || !strip.chips[index]) return;
+			strip.index = index;
+			this.#activateStripChip();
+		} else if (act === "stripApply") {
+			this.#activateStripChip();
+		} else if (act === "stripSubmit") {
+			if (strip?.kind === "input") void this.#apply(strip.accountId, strip.action, strip.input.getValue().trim());
+		} else if (act === "reload") {
+			if (!strip) void this.#refresh();
+		} else if (!strip) {
+			const account = this.#selected();
+			if (!account) return;
+			this.#focus = "list";
+			if (act === "edit") this.#openFieldStrip(account);
+			else if (act.startsWith("field:")) {
+				const field = account.fields.find(candidate => `field:${candidate.id}` === act);
+				if (field) this.#activate(account, field);
+			}
+		}
+	}
+
+	/** The selected row's detail section: its name and identity, then its labelled details. */
+	#detailSection(selected: AccountManagerAccount | undefined): NativeNode {
+		if (!selected) return node("section", {}, [text([span("Select an account to inspect", "dim")])], "detail");
+		return node(
+			"section",
+			{ head: [span(selected.name ?? "(unnamed)", "accent strong"), span(`  ${selected.identity}`, "dim")] },
+			[
+				node("kv", {
+					items: selected.details.map(detail => ({
+						k: [span(detail.label, "muted")],
+						v: [span(detail.value, detail.tone)],
+					})),
+					layout: "grid",
+				}),
+			],
+			"detail",
+		);
 	}
 
 	#describeBody(): NativeNode {
@@ -793,26 +1077,7 @@ export class AccountManagerComponent implements Component {
 				"accounts",
 			),
 		];
-		children.push(
-			selected
-				? node(
-						"section",
-						{
-							head: [span(selected.name ?? "(unnamed)", "accent strong"), span(`  ${selected.identity}`, "dim")],
-						},
-						[
-							node("kv", {
-								items: selected.details.map(detail => ({
-									k: [span(detail.label, "muted")],
-									v: [span(detail.value, detail.tone)],
-								})),
-								layout: "grid",
-							}),
-						],
-						"detail",
-					)
-				: node("section", {}, [text([span("Select an account to inspect", "dim")])], "detail"),
-		);
+		children.push(this.#detailSection(selected));
 		return node("col", { gap: "sm", grow: 1 }, children, "body");
 	}
 

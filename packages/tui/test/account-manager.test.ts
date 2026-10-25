@@ -6,6 +6,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { type TUI, visibleWidth } from "../src/index";
 import type { KeyId } from "../src/keys";
+import type { TspPickerProps } from "@oh-my-pi/pi-wire";
 import type { NativeChild, NativeNode } from "../src/native/node";
 import {
 	type AccountManagerAccount,
@@ -337,7 +338,13 @@ describe("AccountManager", () => {
 				return undefined;
 			};
 			const status = findStatus(
-				manager.describe({ cols: 80, reduceMotion: false, dark: true, supports: () => true, feature: () => true }),
+				manager.describe({
+					cols: 80,
+					reduceMotion: false,
+					dark: true,
+					supports: kind => kind !== "picker",
+					feature: () => true,
+				}),
 			);
 			expect(status?.k).toBe("text");
 			if (status?.k !== "text") throw new Error("Missing native notice");
@@ -386,6 +393,74 @@ describe("AccountManager", () => {
 			]);
 			manager.handleInput("a");
 			expect(footer(narrow(manager))).toContain("<usd|requests> <max> <day|week>");
+		});
+	});
+
+	describe("Tern picker table", () => {
+		const withPicker = { cols: 140, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+		const columns = [
+			{ id: "billing", head: "Billing", priority: 3 },
+			{ id: "state", head: "State", priority: 2 },
+			{ id: "limits", head: "Limits", priority: 1 },
+		];
+		function pickerManager(rows: AccountManagerAccount[]) {
+			const applied: [string, string, string | undefined][] = [];
+			const manager = new AccountManagerComponent(
+				tuiStub,
+				{
+					load: () => rows,
+					accountColumns: columns,
+					apply: async (accountId, actionId, value) => {
+						applied.push([accountId, actionId, value]);
+						return { message: "saved" };
+					},
+				},
+				{ onCancel: () => {} },
+			);
+			const props = () => {
+				const root = manager.describe(withPicker);
+				expect(root.k).toBe("picker");
+				return root.p as TspPickerProps;
+			};
+			return { manager, props, applied };
+		}
+
+		test("rows carry one cell per declared column some row fills, grouped by provider under All accounts", () => {
+			const { props } = pickerManager([
+				account("a", "anthropic", { name: "work", facts: { billing: "5h 75% left", state: "enabled" } }),
+				account("b", "openai", { facts: { state: "disabled", limits: "" } }),
+			]);
+			const p = props();
+			// `limits` is declared but no row fills it, so the table drops it.
+			expect(p.columns?.map(column => column.id)).toEqual(["billing", "state"]);
+			expect(p.items?.find(item => item.id === "account:a")?.facts).toEqual({
+				billing: "5h 75% left",
+				state: "enabled",
+			});
+			expect(p.items?.find(item => item.id === "account:b")).toMatchObject({ label: "(unnamed)", tone: "muted" });
+			expect((p.order ?? []).map(entry => (typeof entry === "string" ? entry : `# ${String(entry.label)}`))).toEqual(
+				["# anthropic", "account:a", "# openai", "account:b"],
+			);
+		});
+
+		test("field actions and the chip strip apply through the host", async () => {
+			const { manager, props, applied } = pickerManager([
+				account("a", "anthropic", { facts: { state: "enabled" } }),
+			]);
+			const act = (id: string, value?: string) =>
+				manager.handleNativeEvent({ type: "action", key: "", act: id, ...(value ? { value } : {}), mods: [] });
+			expect(props().actions?.map(action => action.id)).toEqual(["edit", "field:priority", "field:drain", "close"]);
+			act("field:drain");
+			await settle();
+			expect(applied).toEqual([["a", "drain", "on"]]);
+
+			act("edit");
+			const strip = props().strip;
+			expect(strip?.items.map(item => item.id)).toEqual(["0", "1"]);
+			act("strip", "1");
+			await settle();
+			expect(applied.at(-1)).toEqual(["a", "drain", "on"]);
+			expect(props().strip).toBeNull();
 		});
 	});
 });

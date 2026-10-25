@@ -543,6 +543,25 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					poolMembership.length > 0 ? "pool" : undefined,
 					row.limits.length > 0 ? `${row.limits.length} limit${row.limits.length === 1 ? "" : "s"}` : undefined,
 				].filter((badge): badge is string => badge !== undefined),
+				facts: {
+					type: row.account.type === "oauth" ? "OAuth" : "API key",
+					state: row.account.disabled ? "disabled" : row.drain ? "drained first" : "enabled",
+					billing: billing?.summary ?? "",
+					routing: [
+						row.priority !== undefined ? `priority ${row.priority}` : undefined,
+						row.reservePct !== undefined ? `reserve ${row.reservePct}%` : undefined,
+					]
+						.filter(Boolean)
+						.join(" · "),
+					pins: [
+						pinnedForSession ? "session" : undefined,
+						row.projectPinned ? "project" : undefined,
+						...poolMembership.map(path => `pool ${path}`),
+					]
+						.filter(Boolean)
+						.join(", "),
+					limits: row.limits.map(formatAccountLimitSpec).join(", "),
+				},
 				details,
 				fields: fieldsFor(row, members, pinnedForSession),
 			};
@@ -761,6 +780,11 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					entry.invalid ? "invalid" : `${entry.limits.length} limit${entry.limits.length === 1 ? "" : "s"}`,
 					shadowed ? entry.source : undefined,
 				].filter((badge): badge is string => badge !== undefined),
+				facts: {
+					covers: scope,
+					limits: entry.invalid ? "invalid" : usage.join(" · "),
+					layer: shadowed ? entry.source : "user",
+				},
 				details: [
 					{ label: "covers", value: scope },
 					{
@@ -791,6 +815,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 			name: "(add scope)",
 			identity: "limits for a provider/model, a provider, or * (every call)",
 			badges: [],
+			facts: { covers: "add a scope" },
 			details: [{ label: "add", value: NEW_SCOPE_HINT, tone: "dim" }],
 			fields: [
 				{
@@ -802,7 +827,18 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				},
 			],
 		});
-		return { id: "limits", label: "Global limits", empty: "No global limits.", rows, count };
+		return {
+			id: "limits",
+			label: "Global limits",
+			empty: "No global limits.",
+			rows,
+			count,
+			columns: [
+				{ id: "covers", head: "Covers", priority: 3 },
+				{ id: "limits", head: "Limits", priority: 2 },
+				{ id: "layer", head: "Layer", priority: 1 },
+			],
+		};
 	};
 
 	const pinsPage = (): AccountManagerPage => {
@@ -836,6 +872,17 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					pin.shadowedBy ? `replaced by ${pin.shadowedBy}` : undefined,
 					stored ? undefined : "no stored account",
 				].filter((badge): badge is string => badge !== undefined),
+				facts: {
+					account: `${pin.provider}/${pin.name}`,
+					status: [
+						coversHere ? "this directory" : undefined,
+						pin.shadowedBy ? `replaced by ${pin.shadowedBy}` : undefined,
+						stored ? undefined : "no stored account",
+					]
+						.filter(Boolean)
+						.join(" · "),
+					layer: shadowed ? pin.source : "user",
+				},
 				details: [
 					{ label: "directory", value: shortenPath(pin.dir) },
 					{
@@ -877,6 +924,11 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 			label: "Project pins",
 			empty: "No project pins. Pin the current project from an account (j).",
 			rows,
+			columns: [
+				{ id: "account", head: "Account", priority: 3 },
+				{ id: "status", head: "Status", priority: 2 },
+				{ id: "layer", head: "Layer", priority: 1 },
+			],
 		};
 	};
 
@@ -937,6 +989,14 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 
 	return {
 		load,
+		accountColumns: [
+			{ id: "billing", head: "Billing", priority: 6 },
+			{ id: "state", head: "State", priority: 5 },
+			{ id: "type", head: "Type", priority: 4 },
+			{ id: "routing", head: "Routing", priority: 3 },
+			{ id: "pins", head: "Pins", priority: 2 },
+			{ id: "limits", head: "Limits", priority: 1 },
+		],
 		pages: () => [limitsPage(), pinsPage()],
 		refresh: () => withTimeout(authStorage.credentials.reload(), STORE_TIMEOUT_MS, STORE_TIMEOUT_MESSAGE),
 		apply: async (id, actionId, value = "", expect) => {
