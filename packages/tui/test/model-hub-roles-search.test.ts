@@ -1,8 +1,4 @@
-/**
- * The Roles view's letter commands (`s` save preset, `f` fallback, …) must not
- * swallow a search: the picker offers no search field while they own the
- * keys, and once a query is live, typing keeps editing it.
- */
+/** Roles and Groups search is explicit and independent of the model catalogue query. */
 import { beforeAll, expect, test } from "bun:test";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { TspPickerProps } from "@oh-my-pi/pi-wire";
@@ -103,16 +99,61 @@ test("with no query the Roles rows hide the search field and keep their letter c
 	expect(pickerProps(hub).strip).not.toBeNull();
 });
 
-test("a live query keeps taking printable keys on the Roles rows", () => {
+test("Roles search filters its own rows, marks hits, and Escape clears before closing", () => {
+	const hub = createHub();
+	hub.handleNativeEvent(CLICK_ROLES);
+	hub.handleInput("/");
+	for (const ch of "def") hub.handleInput(ch);
+	let props = pickerProps(hub);
+	expect(props.scope).toBe("roles");
+	expect(props.query).toBe("def");
+	expect(props.items?.map(item => item.id)).toEqual(["role:default"]);
+	expect(props.hits?.["role:default"]).toEqual([[0, 3]]);
+	expect(Bun.stripANSI(hub.render(160).join("\n"))).toContain("Search: def");
+	hub.handleInput("\x1b");
+	props = pickerProps(hub);
+	expect(props.query).toBeNull();
+	expect(props.items?.some(item => item.id === "newRole")).toBe(true);
+	hub.dispose();
+});
+
+test("Search action enters query mode without triggering letter commands and no matches has empty text", () => {
+	const hub = createHub();
+	hub.handleNativeEvent(CLICK_ROLES);
+	hub.handleNativeEvent({ type: "action", key: "", act: "search", mods: [] });
+	hub.handleInput("s");
+	const props = pickerProps(hub);
+	expect(props.strip).toBeNull();
+	expect(props.query).toBe("s");
+	expect(props.items).toEqual([]);
+	expect(props.empty).toBe("No rows match your search.");
+	expect(Bun.stripANSI(hub.render(160).join("\n"))).toContain("No rows match your search.");
+	hub.dispose();
+});
+
+test("catalogue queries do not leak into Roles", () => {
 	const hub = createHub();
 	for (const ch of "son") hub.handleInput(ch);
 	hub.handleNativeEvent(CLICK_ROLES);
-	expect(pickerProps(hub).query).toBe("son");
+	expect(pickerProps(hub).query).toBeNull();
+	hub.dispose();
+});
 
-	hub.handleInput("n");
-	hub.handleInput("e");
-	const props = pickerProps(hub);
-	expect(props.strip).toBeNull();
-	expect(props.query).toBe("sonne");
-	expect(props.scope).toBe("all");
+test("pasted C1 controls are removed from the terminal query line", () => {
+	const hub = createHub();
+	hub.handleNativeEvent(CLICK_ROLES);
+	hub.handleInput("/");
+	hub.handleInput("\x1b[200~query\u0085text\x1b[201~");
+	const screen = hub.render(180).join("\n");
+	expect(screen).not.toMatch(/[\u0080-\u009f]/);
+	expect(Bun.stripANSI(screen)).toContain("Search: querytext");
+	hub.dispose();
+});
+
+test("an empty Groups view uses the same no-query empty text in both renderers", () => {
+	const hub = createHub();
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "groups", mods: [] });
+	expect(pickerProps(hub).empty).toBe("No rows in this view.");
+	expect(Bun.stripANSI(hub.render(180).join("\n"))).toContain("No rows in this view.");
+	hub.dispose();
 });

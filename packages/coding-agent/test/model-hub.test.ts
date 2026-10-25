@@ -422,6 +422,12 @@ describe("ModelHub", () => {
 			hub.handleInput("\n"); // dive into the role rows
 			hub.handleInput(DOWN); // default → smol row
 			hub.handleInput("x");
+			expect(settings.getModelRole("smol")).toBe("test/worker-model");
+			expect(footerLine(hub.render(220))).toContain("smol");
+			hub.handleInput(ESC);
+			expect(settings.getModelRole("smol")).toBe("test/worker-model");
+			hub.handleInput("x");
+			hub.handleInput("\n");
 
 			expect(settings.getModelRole("smol")).toBeUndefined();
 			const lines = hub.render(220).map(line => stripVTControlCharacters(line));
@@ -697,7 +703,7 @@ describe("ModelHub", () => {
 			hub.handleInput(UP); // All models → Groups
 			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			hub.handleInput("\n"); // dive into rows
-			expect(footerLine(hub.render(220))).toContain("save preset");
+			expect(footerLine(hub.render(220))).toContain("Save preset");
 
 			hub.handleInput("s");
 			expect(footerLine(hub.render(220))).toContain("Preset name:");
@@ -717,7 +723,7 @@ describe("ModelHub", () => {
 			bareHub.handleInput(UP); // All models → Groups
 			bareHub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			bareHub.handleInput("\n"); // dive into rows
-			expect(footerLine(bareHub.render(220))).not.toContain("save preset");
+			expect(footerLine(bareHub.render(220))).not.toContain("Save preset");
 
 			bareHub.handleInput("s");
 			expect(footerLine(bareHub.render(220))).not.toContain("Preset name:");
@@ -860,7 +866,7 @@ describe("ModelHub", () => {
 			for (let step = 0; step < 20 && !selected().includes("DICTATION"); step++) hub.handleInput(DOWN);
 			expect(selected()).toContain("DICTATION");
 
-			expect(footerLine(hub.render(220))).not.toContain("t thinking");
+			expect(footerLine(hub.render(220))).not.toContain("t Thinking");
 			hub.handleInput("t");
 			expect(footerLine(hub.render(220))).not.toContain("inherit");
 		});
@@ -981,6 +987,8 @@ describe("ModelHub", () => {
 			hub.handleInput("\n");
 			hub.handleInput(DOWN); // Project default → global default.
 			hub.handleInput("\n");
+			expect(onUnassign).not.toHaveBeenCalled();
+			hub.handleInput("\n");
 
 			expect(onUnassign).toHaveBeenCalledWith("default", "global");
 			expect(onAssign).not.toHaveBeenCalled();
@@ -1013,6 +1021,7 @@ describe("ModelHub", () => {
 				projectDefault.hub.handleInput("\n"); // Sidebar → model list.
 				projectDefault.hub.handleInput("\n");
 				projectDefault.hub.handleInput("\n");
+				projectDefault.hub.handleInput("\n");
 				expect(projectDefault.onUnassign).toHaveBeenCalledWith("default", "project");
 				expect(projectDefault.onAssign).not.toHaveBeenCalled();
 
@@ -1020,6 +1029,7 @@ describe("ModelHub", () => {
 				globalDefault.hub.handleInput("\n"); // Sidebar → model list.
 				globalDefault.hub.handleInput("\n");
 				globalDefault.hub.handleInput(DOWN);
+				globalDefault.hub.handleInput("\n");
 				globalDefault.hub.handleInput("\n");
 				expect(globalDefault.onUnassign).toHaveBeenCalledWith("default", "global");
 				expect(globalDefault.onAssign).not.toHaveBeenCalled();
@@ -1030,6 +1040,7 @@ describe("ModelHub", () => {
 				projectAutoSelected.hub.handleInput(DOWN);
 				projectAutoSelected.hub.handleInput(DOWN);
 				projectAutoSelected.hub.handleInput("\n");
+				projectAutoSelected.hub.handleInput("\n");
 				expect(projectAutoSelected.onUnassign).toHaveBeenCalledWith("smol", "project");
 				expect(projectAutoSelected.onAssign).not.toHaveBeenCalled();
 
@@ -1039,6 +1050,7 @@ describe("ModelHub", () => {
 				globalAutoSelected.hub.handleInput(DOWN);
 				globalAutoSelected.hub.handleInput(DOWN);
 				globalAutoSelected.hub.handleInput(DOWN);
+				globalAutoSelected.hub.handleInput("\n");
 				globalAutoSelected.hub.handleInput("\n");
 				expect(globalAutoSelected.onUnassign).toHaveBeenCalledWith("smol", "global");
 				expect(globalAutoSelected.onAssign).not.toHaveBeenCalled();
@@ -1126,6 +1138,7 @@ describe("ModelHub", () => {
 			classifyHub.hub.handleInput("\t"); // Sidebar → model list.
 			classifyHub.hub.handleInput("\n"); // Open the role strip for gpt-5.5.
 			classifyHub.hub.handleInput("\n"); // Select "project default" (first chip).
+			classifyHub.hub.handleInput("\n");
 			expect(classifyHub.onUnassign).toHaveBeenCalledWith("default", "project");
 			expect(classifyHub.onAssign).not.toHaveBeenCalled();
 		});
@@ -1153,6 +1166,8 @@ describe("ModelHub", () => {
 			hub.handleInput("\n"); // Sidebar → model list.
 			hub.handleInput("\n"); // role strip
 			hub.handleInput(DOWN); // default → smol chip (down moves right)
+			hub.handleInput("\n");
+			expect(onUnassign).not.toHaveBeenCalled();
 			hub.handleInput("\n");
 
 			expect(onUnassign).toHaveBeenCalledWith("smol");
@@ -1290,6 +1305,7 @@ describe("ModelHub", () => {
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b"]);
 
 			hub.handleInput("x"); // cursor landed on the replaced entry — remove it
+			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", []);
 			expect(normalize(hub.render(220))).not.toContain("↳");
 		});
@@ -1309,6 +1325,7 @@ describe("ModelHub", () => {
 
 			// Cursor followed the moved entry: x removes model-a, not model-b.
 			hub.handleInput("x");
+			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b"]);
 		});
 
@@ -1865,8 +1882,9 @@ describe("ModelHub", () => {
 				expect(normalize(hub.render(220))).toContain(
 					"SMOL invalid pool · skipped · modelRoles.smol.strategyOptions",
 				);
-				expect(footerLine(hub.render(220))).toContain("x clear");
+				expect(footerLine(hub.render(220))).toContain("x Clear");
 				hub.handleInput("x");
+				hub.handleInput("\n");
 				expect(await savedRoles(settings, tmp)).toEqual({ default: "test/model-a" });
 				expect(normalize(hub.render(220))).not.toContain("invalid pool");
 			} finally {
@@ -1887,7 +1905,7 @@ describe("ModelHub", () => {
 				});
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				expect(footerLine(hub.render(220))).toContain("⏎ replace");
+				expect(footerLine(hub.render(220))).toContain("⏎ Replace");
 				hub.handleInput("\n");
 				for (const ch of "model-b") hub.handleInput(ch);
 				hub.handleInput("\n");
@@ -1942,6 +1960,11 @@ describe("ModelHub", () => {
 				strategyOptions: { order: ["a", "b", "model-c"] },
 			});
 			hub.handleInput("x"); // the cursor landed on the new member
+			expect(smol()).toMatchObject({
+				strategy: ["cheapest", "priority"],
+				strategyOptions: { order: ["a", "b", "model-c"] },
+			});
+			hub.handleInput("\n");
 			expect(smol()).toMatchObject({ strategy: ["cheapest", "priority"], strategyOptions: { order: ["a", "b"] } });
 			hub.handleInput(UP);
 			hub.handleInput(UP); // member a
@@ -2082,7 +2105,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // DEFAULT → SMOL
-			expect(footerLine(hub.render(220))).toContain("m pool");
+			expect(footerLine(hub.render(220))).toContain("m Make pool");
 			hub.handleInput("m");
 
 			const group = smolGroup(settings);
@@ -2102,6 +2125,7 @@ describe("ModelHub", () => {
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput(DOWN); // its only member
 			hub.handleInput("x");
+			hub.handleInput("\n");
 
 			expect(normalize(hub.render(220))).toContain("modelRoles.smol.models: must define at least one model");
 			expect(smolGroup(settings).models.map(member => member.alias)).toEqual(["a"]);
@@ -2234,6 +2258,7 @@ describe("ModelHub", () => {
 			hub.handleInput(UP); // ↳ test/model-a
 			hub.handleInput(UP); // test/* header (separator is skipped)
 			hub.handleInput("x");
+			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("test/*", []);
 			expect(normalize(hub.render(220))).not.toMatch(fallbackRow("test/model-a"));
 		});
@@ -2247,7 +2272,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(footerLine(hub.render(220))).toContain("t thinking");
+			expect(footerLine(hub.render(220))).toContain("t Thinking");
 
 			hub.handleInput("t");
 			const strip = footerLine(hub.render(220));
@@ -2319,7 +2344,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its wildcard entry
 			expect(normalize(hub.render(220))).toMatch(fallbackRow("test/*"));
-			expect(footerLine(hub.render(220))).not.toContain("t thinking");
+			expect(footerLine(hub.render(220))).not.toContain("t Thinking");
 
 			hub.handleInput("t"); // inert: no strip, no chain write
 			expect(onFallbackChainChange).not.toHaveBeenCalled();
@@ -2356,7 +2381,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(footerLine(hub.render(220))).toContain("t thinking");
+			expect(footerLine(hub.render(220))).toContain("t Thinking");
 
 			hub.handleInput("t");
 			hub.handleInput("\x1b[C"); // inherit → off
@@ -2374,7 +2399,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
 			expect(normalize(hub.render(220))).toMatch(fallbackRow("OpenAI/GPT-5.5"));
-			expect(footerLine(hub.render(220))).toContain("t thinking");
+			expect(footerLine(hub.render(220))).toContain("t Thinking");
 
 			hub.handleInput("t");
 			hub.handleInput("\x1b[C"); // inherit → off
@@ -2489,7 +2514,7 @@ describe("ModelHub", () => {
 				}
 				for (const page of pages) expect(page).toContain("? more keys");
 				const all = pages.join(" ");
-				for (const hint of ["u quota unknown", "r quota reserve", "e routing", "a cache affinity"]) {
+				for (const hint of ["u Quota unknown", "r Quota reserve", "e Routing", "a Cache affinity"]) {
 					expect(all).toContain(hint);
 				}
 				expect(smolGroup(settings)).toEqual(before);
@@ -2500,7 +2525,7 @@ describe("ModelHub", () => {
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				expect(footerLine(hub.render(400))).toContain("a cache affinity");
+				expect(footerLine(hub.render(400))).toContain("a Cache affinity");
 
 				hub.handleInput("a");
 				expect(smolRouting(settings)?.cache).toEqual({ affinity: true });
@@ -2794,7 +2819,10 @@ describe("ModelHub", () => {
 
 				hub.handleInput(UP); // back from the new member to the group row
 				hub.handleInput(UP);
+				const beforeDelete = structuredClone(settings.getGlobalSettings().modelGroups);
 				hub.handleInput("x");
+				expect(settings.getGlobalSettings().modelGroups).toEqual(beforeDelete);
+				hub.handleInput("\n");
 				expect(Object.hasOwn(settings.getGlobalSettings().modelGroups ?? {}, "spare")).toBe(false);
 
 				const runtime = Settings.isolated({
@@ -3064,7 +3092,7 @@ describe("ModelHub", () => {
 				const chain = () => cfgRetryFallbackChains.get(settings).smol as unknown;
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				expect(footerLine(hub.render(400))).toContain("⇧G group");
+				expect(footerLine(hub.render(400))).toContain("⇧G Group");
 
 				hub.handleInput("G");
 				hub.handleInput("\n"); // new group…

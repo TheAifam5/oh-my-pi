@@ -446,6 +446,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				key: "e",
 				value: row.account.disabled ? "off" : "on",
 				on: row.account.disabled !== true,
+				...(row.account.disabled ? {} : { confirm: "Disable account? No request will use it" }),
 			},
 			{
 				id: "limits",

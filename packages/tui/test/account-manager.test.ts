@@ -276,8 +276,8 @@ describe("AccountManager", () => {
 			}
 			const all = seen.join(" ");
 			for (const field of manyFields) expect(all).toContain(`${field.key} ${field.label}`);
-			expect(all).toContain("close");
-			expect(all).toContain("reload");
+			expect(all).toContain("Close");
+			expect(all).toContain("Reload");
 		});
 
 		test("keeps every selected field and choice visible in the footer", () => {
@@ -454,7 +454,14 @@ describe("AccountManager", () => {
 			]);
 			const act = (id: string, value?: string) =>
 				manager.handleNativeEvent({ type: "action", key: "", act: id, ...(value ? { value } : {}), mods: [] });
-			expect(props().actions?.map(action => action.id)).toEqual(["edit", "field:priority", "field:drain", "close"]);
+			expect(props().actions?.map(action => action.id)).toEqual([
+				"edit",
+				"field:priority",
+				"field:drain",
+				"search",
+				"reload",
+				"close",
+			]);
 			act("field:drain");
 			await settle();
 			expect(applied).toEqual([["a", "drain", "on"]]);
@@ -472,5 +479,127 @@ describe("AccountManager", () => {
 			expect(applied.at(-1)).toEqual(["a", "drain", "on"]);
 			expect(props().strip).toBeNull();
 		});
+
+		test("search matches account name, identity and provider, preserves selection and highlights labels", () => {
+			const { manager, props, applied, closed } = pickerManager([
+				account("a", "anthropic", { name: "work" }),
+				account("b", "openai", { name: "backup" }),
+			]);
+			manager.handleNativeEvent({ type: "select", key: "", item: "account:b" });
+			manager.handleNativeEvent({ type: "action", key: "", act: "search", mods: [] });
+			for (const char of "back") manager.handleInput(char);
+			expect(props().items?.map(item => item.id)).toEqual(["account:b"]);
+			expect(props().items?.[0]?.hits).toEqual([[0, 4]]);
+			expect(props().selected).toBe("account:b");
+			expect(Bun.stripANSI(manager.render(180).join("\n"))).toContain("Search: back");
+			manager.handleInput("\x1b");
+			expect(props().items).toHaveLength(2);
+			expect(props().selected).toBe("account:b");
+			expect(closed).toEqual([]);
+			for (const query of ["b@example.com", "openai"]) {
+				manager.handleInput("/");
+				for (const char of query) manager.handleInput(char);
+				expect(props().items?.map(item => item.id)).toEqual(["account:b"]);
+				manager.handleInput("\x1b");
+			}
+			expect(applied).toEqual([]);
+		});
+
+		test("search empty results and load errors have explicit picker and TUI states", () => {
+			const { manager, props } = pickerManager([account("a", "anthropic")]);
+			manager.handleInput("/");
+			for (const char of "missing") manager.handleInput(char);
+			expect(props()).toMatchObject({ state: "ready", empty: "No accounts match your search.", items: [] });
+			expect(Bun.stripANSI(manager.render(180).join("\n"))).toContain("No accounts match your search.");
+			const failed = new AccountManagerComponent(
+				tuiStub,
+				{
+					load: () => {
+						throw new Error("Cannot load accounts");
+					},
+					apply: async () => ({}),
+				},
+				{ onCancel: () => {} },
+			);
+			const root = failed.describe(withPicker);
+			expect(root.p).toMatchObject({ state: "error", message: "Cannot load accounts" });
+			expect(Bun.stripANSI(failed.render(180).join("\n"))).toContain("Cannot load accounts");
+		});
+
+		test("status badges use host facts, and disabled action reasons share the footer", () => {
+			const { manager, props } = pickerManager([
+				account("a", "anthropic", {
+					name: "work",
+					badges: ["disabled", "drain", "session pin", "project pin", "plan exhausted"],
+					fields: [{ id: "priority", label: "priority", key: "p", value: "4", readOnly: "set in another layer" }],
+				}),
+				account("b", "openai", { name: "backup" }),
+			]);
+			expect(props().items?.[0]?.badges?.map(badge => badge.text)).toEqual([
+				"disabled",
+				"drain",
+				"session pin",
+				"project pin",
+				"plan exhausted",
+			]);
+			expect(props().items?.[1]?.badges).toEqual([]);
+			expect(props().actions?.find(action => action.id === "field:priority")?.disabled).toBe("set in another layer");
+			const screen = Bun.stripANSI(manager.render(1000).join("\n"));
+			for (const action of props().actions ?? []) expect(screen).toContain(action.label);
+			expect(screen).toContain("set in another layer");
+		});
+
+		test("destructive actions require confirmation in native and plain renderers; cancel writes nothing", async () => {
+			const { manager, props, applied } = pickerManager([
+				account("a", "anthropic", {
+					name: "work",
+					fields: [
+						{ id: "enabled", label: "enabled", key: "e", value: "on", on: true, confirm: "Disable account?" },
+					],
+				}),
+			]);
+			expect(props().actions?.find(action => action.id === "field:enabled")?.danger).toBe(true);
+			manager.handleNativeEvent({ type: "action", key: "", act: "field:enabled", mods: [] });
+			expect(props().confirm?.text).toContain("work (a@example.com)");
+			expect(applied).toEqual([]);
+			manager.handleNativeEvent({ type: "action", key: "", act: "close", mods: [] });
+			expect(applied).toEqual([]);
+			manager.handleInput("e");
+			expect(Bun.stripANSI(manager.render(220).join("\n"))).toContain("Disable account? — work (a@example.com)");
+			manager.handleInput("\x1b");
+			expect(applied).toEqual([]);
+			manager.handleInput("e");
+			manager.handleInput(ENTER);
+			await settle();
+			expect(applied).toEqual([["a", "enabled", "off"]]);
+		});
 	});
+});
+
+test("account save exposes loading state until the host completes", async () => {
+	const pending = Promise.withResolvers<AccountManagerResult>();
+	const manager = new AccountManagerComponent(
+		tuiStub,
+		{
+			load: () => [account("a", "anthropic")],
+			apply: () => pending.promise,
+		},
+		{ onCancel: () => {} },
+	);
+	manager.handleInput("d");
+	const context = { cols: 160, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+	expect(manager.describe(context).p).toMatchObject({ state: "loading", message: "Saving…" });
+	expect(Bun.stripANSI(manager.render(180).join("\n"))).toContain("Saving…");
+	pending.resolve({ message: "Saved" });
+	await settle();
+	expect(manager.describe(context).p).toMatchObject({ state: "ready", message: "Saved" });
+});
+
+test("pasted C1 controls are removed from the account terminal query line", () => {
+	const { manager } = createManager([account("a", "anthropic")]);
+	manager.handleInput("/");
+	manager.handleInput("\x1b[200~query\u0085text\x1b[201~");
+	const screen = manager.render(180).join("\n");
+	expect(screen).not.toMatch(/[\u0080-\u009f]/);
+	expect(Bun.stripANSI(screen)).toContain("Search: querytext");
 });

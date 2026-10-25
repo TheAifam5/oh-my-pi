@@ -36,10 +36,19 @@ import type { Component, TUI } from "../tui";
 import { extractPrintableText, matchesKey } from "../keys";
 import { FuzzyCorpus } from "../fuzzy";
 import { formatKeyHint, formatKeyHints } from "../app-keybindings";
-import { boundKeys, editorKey, editorKeys } from "../chrome/keybinding-hints";
+import { boundKeys, editorKey } from "../chrome/keybinding-hints";
 import type { KeyName } from "../key-hint-format";
 import { col, compact, kbd, md, node, span, text } from "../native/describe";
-import { CLOSE_ACTION, type PickerEvent, picker, pickerAction, pickerEvent } from "../native/picker";
+import {
+	CLOSE_ACTION,
+	type PickerEvent,
+	picker,
+	pickerAction,
+	pickerActionHints,
+	pickerEvent,
+	pickerHits,
+	pickerQuery,
+} from "../native/picker";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { actionHint, hintsRow, type NativeHint } from "../native/overlay";
 import { plainText } from "../native/spans";
@@ -781,6 +790,13 @@ export class ModelHubComponent implements Component {
 	#focus: "scope" | "list" = "scope";
 
 	#rolesRows: RolesRow[] = [];
+	#roleSearch = new Input();
+	#roleSearching = false;
+	#roleRowsTotal = 0;
+	#roleConfirm:
+		| { key: string; view: string; text: string }
+		| { role: string; scope?: ModelRoleSelectionScope; text: string }
+		| undefined;
 	/** Pools read for the current rows, keyed `<kind>:<key>`; cleared on every rows rebuild. */
 	#poolCache = new Map<string, ModelHubPool | undefined>();
 	/** Group references read for the current rows, keyed by group name; cleared on every rows rebuild. */
@@ -1398,7 +1414,7 @@ export class ModelHubComponent implements Component {
 					rows.push({ kind: "profile", role: name, profile: profile.name });
 			}
 			if (this.#callbacks.onPoolChange) rows.push({ kind: "newGroup" });
-			this.#rolesRows = rows;
+			this.#filterRolesRows(rows);
 			return;
 		}
 		const chains = this.#fallbackChains();
@@ -1449,7 +1465,52 @@ export class ModelHubComponent implements Component {
 			}
 		}
 		rows.push({ kind: "newFallback" });
-		this.#rolesRows = rows;
+		this.#filterRolesRows(rows);
+	}
+
+	#filterRolesRows(rows: RolesRow[]): void {
+		this.#roleRowsTotal = rows.filter(row => row.kind !== "separator").length;
+		const selected = this.#rolesRows[this.#roleIndex];
+		const selectedKey = selected ? rolesRowKey(selected, this.#roleIndex) : undefined;
+		const tokens = this.#roleSearch.getValue().toLowerCase().split(/\s+/).filter(Boolean);
+		this.#rolesRows = tokens.length
+			? rows.filter(row => {
+					if (!("role" in row)) return false;
+					const info = row.kind === "role" ? this.#settings.getRoleInfo(row.role) : undefined;
+					const cells = row.kind === "role" ? this.#roleCells(row.role) : this.#rolesRowCells(row);
+					const search = [
+						row.role,
+						info?.tag,
+						info?.name,
+						row.kind === "profile" ? row.profile : undefined,
+						row.kind === "poolMember" ? row.alias : undefined,
+						...Object.values(cells ?? {}),
+					]
+						.join(" ")
+						.toLowerCase();
+					return tokens.every(token => search.includes(token));
+				})
+			: rows;
+		const index = this.#rolesRows.findIndex((row, index) => rolesRowKey(row, index) === selectedKey);
+		this.#roleIndex = index >= 0 ? index : Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
+		this.#roleScrollStart = 0;
+	}
+
+	#roleBadges(row: RolesRow): NonNullable<TspPickerItem["badges"]> {
+		const badges: { text: string; tone?: "warning" | "muted" | "error" }[] = [];
+		if (row.kind === "role" && this.#roles[row.role]?.autoSelected)
+			badges.push({ text: "auto-selected", tone: "muted" });
+		if (row.kind === "group" && this.#groupReferences(row.role).length === 0)
+			badges.push({ text: "unused", tone: "muted" });
+		if (row.kind === "profile" && this.#profileReferences(row.role, row.profile).length === 0)
+			badges.push({ text: "unused", tone: "muted" });
+		const target = row.kind === "profile" ? { kind: "group" as const, key: row.role } : this.#rowPoolTarget(row);
+		const pool = target ? this.#pool(target) : undefined;
+		if (pool?.invalid !== undefined) badges.push({ text: "invalid pool", tone: "error" });
+		if (pool?.readOnly !== undefined) badges.push({ text: "read-only", tone: "warning" });
+		const billing = (row.kind === "role" ? this.#roleCells(row.role) : this.#rolesRowCells(row))?.billing;
+		if (billing && /\bexhausted\b/i.test(billing)) badges.push({ text: "exhausted", tone: "warning" });
+		return badges;
 	}
 
 	/**
@@ -2123,14 +2184,12 @@ export class ModelHubComponent implements Component {
 				return;
 			case "unassign":
 				if (chip.role) {
-					if (this.#settings.modelRoleStorage === "project") {
-						this.#callbacks.onUnassign(chip.role, chip.scope);
-					} else {
-						this.#callbacks.onUnassign(chip.role);
-					}
-					this.#refreshAfterMutation();
+					this.#roleConfirm = {
+						role: chip.role,
+						scope: chip.scope,
+						text: `Clear role ${sanitizeDisplayLine(chip.role)}${chip.scope ? ` (${chip.scope})` : ""}?`,
+					};
 				}
-				this.#closeStrip();
 				return;
 			case "fallback":
 				this.#appendFallback(strip.item, "default");
@@ -3754,6 +3813,12 @@ export class ModelHubComponent implements Component {
 			if (matchesSelectCancel(data)) this.#callbacks.onCancel();
 			return;
 		}
+		if (this.#roleConfirm) {
+			if (matchesSelectCancel(data)) this.#roleConfirm = undefined;
+			else if (matchesKey(data, "enter") || data === "\n" || extractPrintableText(data) === "x")
+				this.#confirmRoleClear();
+			return;
+		}
 		if (data.startsWith("\x1b[<")) {
 			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
 			return;
@@ -3772,6 +3837,18 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		const rolesView = isRolesView(entry.kind) && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked && this.#assigning === null;
+		if (rolesView && (this.#roleSearching || extractPrintableText(data) === "/")) {
+			this.#focus = "list";
+			if (!this.#roleSearching) this.#roleSearching = true;
+			else if (matchesKey(data, "enter") || data === "\n") this.#roleSearching = false;
+			else if (matchesSelectUp(data) || matchesSelectDown(data)) {
+				this.#roleIndex = this.#stepRoleIndex(this.#roleIndex, matchesSelectUp(data) ? -1 : 1);
+			} else {
+				this.#roleSearch.handleInput(data);
+				this.#buildRolesRows();
+			}
+			return;
+		}
 
 		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
 			this.#focus = this.#focus === "scope" ? "list" : "scope";
@@ -3832,14 +3909,7 @@ export class ModelHubComponent implements Component {
 		}
 
 		if (rolesView) {
-			const printable = extractPrintableText(data);
-			// Typing searches the catalog from the sidebar, and from the rows
-			// while a query is live (the picker shows its search field only
-			// then); otherwise the rows' letter commands own printable keys.
-			const typed = printable !== undefined && printable.trim().length > 0;
-			const editsQuery =
-				this.#browser.query.length > 0 && (printable !== undefined || matchesKey(data, "backspace"));
-			if ((this.#focus === "scope" && typed) || editsQuery) {
+			if (this.#focus === "scope" && extractPrintableText(data) !== undefined) {
 				this.#setActiveEntry("all");
 				this.#focus = "list";
 				this.#browser.handleInput(data);
@@ -3879,6 +3949,10 @@ export class ModelHubComponent implements Component {
 
 	/** The cancel key's ladder: close a strip, leave assign mode, clear the query, then close the hub. */
 	#cancel(): void {
+		if (this.#roleConfirm) {
+			this.#roleConfirm = undefined;
+			return;
+		}
 		if (this.#assignmentPending) {
 			this.#callbacks.onCancel();
 			return;
@@ -3889,6 +3963,12 @@ export class ModelHubComponent implements Component {
 		}
 		if (this.#assigning !== null) {
 			this.#cancelAssign();
+			return;
+		}
+		if (isRolesView(this.#activeEntry().kind) && (this.#roleSearching || this.#roleSearch.getValue())) {
+			this.#roleSearching = false;
+			this.#roleSearch.setValue("");
+			this.#buildRolesRows();
 			return;
 		}
 		if (this.#isBrowserView(this.#activeEntry()) && this.#browser.query.length > 0) {
@@ -4080,11 +4160,39 @@ export class ModelHubComponent implements Component {
 	}
 
 	/** One Roles-view command on the selected row (keys and action-bar buttons share it). */
-	#runRolesAction(action: RolesAction): void {
+	#runRolesAction(action: RolesAction, confirmed = false): void {
 		this.#poolStatus = undefined;
 		const row = this.#rolesRows[this.#roleIndex];
 		const role = row?.kind === "role" ? row.role : undefined;
 		const editable = this.#rowEditablePool(row);
+		const offered = this.#pickerActions(this.#activeEntry(), true, false).find(
+			candidate => candidate.id === `roles:${action}`,
+		);
+		if (action === "clear" && !offered) return;
+		if (offered?.disabled) {
+			if (typeof offered.disabled === "string") this.#poolNotice(offered.disabled);
+			return;
+		}
+		if (action === "clear" && row && !confirmed && offered?.danger) {
+			const target =
+				row.kind === "profile"
+					? `profile +${row.role}@${row.profile}`
+					: row.kind === "group"
+						? `group +${row.role}`
+						: row.kind === "poolMember"
+							? `member ${row.alias} of ${row.role}`
+							: row.kind === "fallback"
+								? `fallback ${row.chainIndex + 1} of ${row.role}`
+								: "role" in row
+									? `${row.kind === "role" ? "role" : "fallback chain"} ${row.role}`
+									: row.kind;
+			this.#roleConfirm = {
+				key: rolesRowKey(row, this.#roleIndex),
+				view: this.#activeEntryId,
+				text: `Remove ${sanitizeDisplayLine(target)}?`,
+			};
+			return;
+		}
 		switch (action) {
 			case "pick":
 				if (row) this.#activateRolesRow(row);
@@ -4209,6 +4317,22 @@ export class ModelHubComponent implements Component {
 					this.#openProfileStrip(row.role, row.profile);
 				}
 				return;
+		}
+	}
+
+	#confirmRoleClear(): void {
+		const pending = this.#roleConfirm;
+		this.#roleConfirm = undefined;
+		if (pending && "role" in pending) {
+			if (this.#settings.modelRoleStorage === "project") this.#callbacks.onUnassign(pending.role, pending.scope);
+			else this.#callbacks.onUnassign(pending.role);
+			this.#closeStrip();
+			this.#refreshAfterMutation();
+			return;
+		}
+		const row = this.#rolesRows[this.#roleIndex];
+		if (pending && row && pending.view === this.#activeEntryId && pending.key === rolesRowKey(row, this.#roleIndex)) {
+			this.#runRolesAction("clear", true);
 		}
 	}
 
@@ -4405,11 +4529,9 @@ export class ModelHubComponent implements Component {
 			Math.max(0, active),
 		);
 		const { names, active: activePreset } = this.#presets();
-		// p/P type into a live query instead of switching presets.
-		const presetKeys =
-			this.#browser.query.length > 0
-				? formatKeyHints(["ctrl+left", "ctrl+right"])
-				: `${formatKeyHints(["ctrl+left", "ctrl+right"])} · ${formatKeyHints(["p", "shift+p"])}`;
+		const presetKeys = this.#roleSearching
+			? formatKeyHints(["ctrl+left", "ctrl+right"])
+			: `${formatKeyHints(["ctrl+left", "ctrl+right"])} · ${formatKeyHints(["p", "shift+p"])}`;
 		const preset =
 			names.length > 0
 				? `   ${theme.fg("dim", "Preset:")} ${activePreset ? theme.fg("accent", activePreset) : theme.fg("muted", "custom")}  ${theme.fg("dim", presetKeys)}`
@@ -4652,6 +4774,13 @@ export class ModelHubComponent implements Component {
 		const groupsView = this.#activeEntryId === "groups";
 		// The Groups view has no tab strip; its blank row keeps the rows where the role tabs leave them.
 		lines.push(groupsView ? "" : this.#renderRoleTabs(width));
+		if (this.#roleSearching || this.#roleSearch.getValue()) {
+			lines.push(truncateToWidth(` Search: ${sanitizeDisplayLine(this.#roleSearch.getValue())}`, width));
+		}
+		if (!this.#rolesRows.length) {
+			const empty = this.#roleSearch.getValue().trim() ? "No rows match your search." : "No rows in this view.";
+			lines.push(theme.fg("dim", ` ${empty}`));
+		}
 		// First row's offset in bodyLine coordinates: the mouse router's
 		// `bodyLine` has already dropped the status row, leaving the tabs row.
 		this.#rolesRowStart = lines.length;
@@ -4760,6 +4889,11 @@ export class ModelHubComponent implements Component {
 				line += `  ${styled}`;
 			}
 			line = line.trimEnd();
+			const badges = this.#roleBadges(rowDef);
+			if (badges.length) {
+				const markers = ` [${badges.map(badge => badge.text).join(" · ")}]`;
+				line = `${truncateToWidth(line, Math.max(1, width - visibleWidth(markers)))}${theme.fg("dim", markers)}`;
+			}
 			// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
 			const cycleIndex = role !== undefined ? cycleOrder.indexOf(role) : -1;
 			if (cycleIndex >= 0) {
@@ -4851,114 +4985,24 @@ export class ModelHubComponent implements Component {
 	}
 
 	#footerHint(width: number): string {
-		const enter = formatKeyHint("enter");
-		const cancel = editorKey("tui.select.cancel");
-		const upDown = editorKeys("tui.select.up", "tui.select.down");
-		const left = formatKeyHint("left");
-		const leftRight = formatKeyHints(["left", "right"]);
-		const enterRight = formatKeyHints(["enter", "right"]);
-		const altLeftRight = formatKeyHints(["alt+left", "alt+right"]);
-		const strip = this.#strip;
-		if (strip) {
-			if (strip.kind === "name") {
-				if (strip.purpose === "compaction") {
-					return `${enter} ${compactionConfirmPending(strip) ? "accept" : "set"} compaction point · ${cancel} cancel`;
-				}
-				if (strip.purpose === "preset") {
-					return `${enter} save preset · ${cancel} cancel`;
-				}
-				return `${enter} create + pick model · ${cancel} cancel`;
-			}
-			if (strip.kind === "field") return `${enter} save · ${cancel} cancel`;
-			if (strip.kind === "pool") {
-				return strip.refresh
-					? `${leftRight} choose · ${enter} toggle · ${cancel} done`
-					: `${leftRight} choose · ${enter} apply · ${cancel} cancel`;
-			}
-			if (strip.kind === "role") return `${leftRight} choose · ${enter} assign/clear · ${cancel} cancel`;
-			if (strip.kind === "scope") return `${leftRight} save scope · ${enter} choose · ${cancel} cancel`;
-			return `${leftRight} thinking level · ${enter} apply · ${cancel} keep`;
-		}
-		if (this.#assigning !== null) {
-			if (this.#focus === "scope") {
-				return `${enterRight} models · ${upDown} providers · type to search · ${altLeftRight} kind · ${cancel} cancel`;
-			}
-			const browse = `${upDown} models · ${left} providers · type to search · ${altLeftRight} kind · ${cancel} cancel`;
-			switch (this.#assigning.kind) {
-				case "fallback":
-					return `${enter} pick fallback · ${browse}`;
-				case "poolMember":
-					return `${enter} pick member · ${browse}`;
-				case "fallbackKey":
-					return `${enter} pick the protected model · ${browse}`;
-				default:
-					return `${enter} assign · ${browse}`;
-			}
-		}
-		const entry = this.#activeEntry();
-		if (isRolesView(entry.kind)) {
-			if (this.#focus !== "list") {
-				if (entry.kind === "groups") return `${upDown} providers · ${enterRight} groups · ${cancel} close`;
-				const presets =
-					this.#presets().names.length > 0 ? ` · ${formatKeyHints(["ctrl+left", "ctrl+right"])} preset` : "";
-				return `${upDown} providers · ${enterRight} roles · ${altLeftRight} tabs${presets} · ${cancel} close`;
-			}
-			// A live query takes printable keys and backspace, so the letter commands rest.
-			if (this.#browser.query.length > 0) {
-				return `${upDown} rows · ${enter} pick · type to search · ${left} providers · ${cancel} close`;
-			}
-			const row = this.#rolesRows[this.#roleIndex];
-			const compaction =
-				this.#callbacks.onCompactionPointChange && this.#roleRowModel()
-					? ` · ${formatKeyHint("k")} compaction limit`
-					: "";
-			const poolHints = this.#poolRowHints(row);
-			if (poolHints) {
-				const parts = poolHints.map(hint => `${formatKeyHints(hint.keys)} ${hint.label}`);
-				const page = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page : 0;
-				return pagedHints([`${upDown} rows`, ...parts, `${left} providers`], width, page);
-			}
-			const convert = `${this.#legacyPoolSource(row) ? ` · ${formatKeyHint("m")} pool` : ""}${
-				this.#groupsAvailable(row) ? ` · ${formatKeyHint("shift+g")} group` : ""
-			}`;
-			if (row?.kind === "fallback") {
-				// Advertise `t` only when the entry resolves: wildcards always
-				// inherit and unknown models have no ladder to offer, so the
-				// action would be inert there.
-				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
-				const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction} · [/] reorder${convert} · ${left} providers`;
-			}
-			if (row?.kind === "chainKey") {
-				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain${convert} · ${left} providers`;
-			}
-			if (row?.kind === "newFallback") {
-				return `${upDown} rows · ${enter} new model/provider fallback chain · ${left} providers`;
-			}
-			// Same rule as fallback rows: advertise `t` only where a strip would
-			// open — an assigned role whose model has thinking levels to offer.
-			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
-			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
-			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
-			const fallback =
-				row?.kind !== "role" || this.#fallbackAddable(row.role) ? ` · ${formatKeyHint("f")} fallback` : "";
-			return `${upDown} rows · ${enter} pick${fallback} · ${formatKeyHint("x")} clear${thinking}${compaction}${convert} · ${formatKeyHint("c")} cycle · [/] reorder · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
-		}
-		if (entry.kind === "provider" && entry.locked) {
-			return entry.oauth
-				? `${enter} log in · ${upDown} providers · ${cancel} close`
-				: `${upDown} providers · ${cancel} close`;
-		}
-		const refresh = entry.kind === "provider" ? ` · ${formatKeyHint("f5")} refresh` : "";
-		if (this.#focus === "scope") {
-			return `${enterRight} models · ${upDown} providers · type to search · ${altLeftRight} kind${refresh} · ${cancel} close`;
-		}
-		return `${enter} assign roles · ${upDown} models · ${left} providers · type to search · ${altLeftRight} kind${refresh} · ${cancel} close`;
+		const page = this.#poolHintPage?.index === this.#roleIndex ? this.#poolHintPage.page : 0;
+		return pagedHints(
+			this.#footerHints().flatMap(hint =>
+				hint ? [`${hint.keys.length ? `${formatKeyHints(hint.keys)} ` : ""}${hint.label}`] : [],
+			),
+			width,
+			page,
+		);
 	}
 
 	#renderFooter(width: number): string {
 		const strip = this.#strip;
+		if (this.#roleConfirm) {
+			return truncateToWidth(
+				`${this.#roleConfirm.text} · ${formatKeyHint("enter")} confirm · ${editorKey("tui.select.cancel")} cancel`,
+				width,
+			);
+		}
 		return this.#frame.renderFooter(
 			width,
 			this.#footerHint(width),
@@ -5065,6 +5109,7 @@ export class ModelHubComponent implements Component {
 			return described;
 		}
 		const footer: NativeChild[] = [];
+		if (this.#roleConfirm) footer.push(text([span(this.#roleConfirm.text, "warning")]));
 		const strip = this.#describeStrip();
 		if (strip) footer.push(strip);
 		footer.push(hintsRow(this.#footerHints()));
@@ -5528,15 +5573,15 @@ export class ModelHubComponent implements Component {
 			size: "lg",
 			layout: "rows",
 			preview: "side",
-			// The Roles rows' letter commands own printable keys until a query
-			// is live, so the sheet offers no search field to type into.
-			query: rolesView && this.#browser.query.length === 0 ? null : this.#browser.query,
-			cursor: this.#browser.cursor,
-			placeholder: "Search models…",
+			...(rolesView
+				? pickerQuery(this.#roleSearching || this.#roleSearch.getValue() ? this.#roleSearch : null)
+				: { query: this.#browser.query, cursor: this.#browser.cursor }),
+			placeholder: rolesView ? "Search roles and groups…" : "Search models…",
 			scopes: this.#pickerScopes(),
 			scope: entry.id,
 			actions: this.#pickerActions(entry, rolesView, lockedView),
 			strip: strip ? this.#pickerStrip(strip) : null,
+			confirm: this.#roleConfirm ? { text: this.#roleConfirm.text, act: "confirm", label: "Remove" } : null,
 			focus: strip ? "strip" : this.#focus === "scope" ? "scopes" : "list",
 		};
 		if (rolesView) {
@@ -5566,7 +5611,23 @@ export class ModelHubComponent implements Component {
 					items,
 					order: this.#rolePickerOrder(),
 					selected: row && row.kind !== "separator" ? rolesRowKey(row, this.#roleIndex) : null,
-					total: groupsView ? this.#rolesRows.length : this.#allRolesRowCount(),
+					total: groupsView ? this.#roleRowsTotal : this.#allRolesRowCount(),
+					hits: Object.fromEntries(
+						items.map(item => [
+							item.id,
+							pickerHits(
+								typeof item.label === "string" ? item.label : "",
+								this.#roleSearch.getValue().toLowerCase().split(/\s+/),
+							),
+						]),
+					),
+					state: this.#assignmentPending
+						? "loading"
+						: this.#configError || this.#poolStatus?.tone === "error"
+							? "error"
+							: "ready",
+					message: this.#configError ? sanitizeDisplayLine(this.#configError) : this.#poolStatus?.text,
+					empty: this.#roleSearch.getValue().trim() ? "No rows match your search." : "No rows in this view.",
 				},
 				this.#rolePreview(row),
 			);
@@ -5596,8 +5657,9 @@ export class ModelHubComponent implements Component {
 		const refreshing =
 			this.#catalogRefreshing ||
 			(entry.kind === "provider" && this.#refreshingProviders.has(entry.providerId ?? ""));
-		const state =
-			view.count > 0 || query
+		const state = this.#assignmentPending
+			? "loading"
+			: view.count > 0 || query
 				? "ready"
 				: refreshing
 					? "loading"
@@ -5772,6 +5834,8 @@ export class ModelHubComponent implements Component {
 	#pickerActions(entry: SidebarEntry, rolesView: boolean, lockedView: boolean): TspPickerAction[] {
 		const strip = this.#strip;
 		const cancel = (label: string): TspPickerAction => ({ ...CLOSE_ACTION, label });
+		if (this.#roleConfirm)
+			return [pickerAction("confirm", "Remove", "enter", { primary: true, danger: true }), cancel("Cancel")];
 		if (this.#assignmentPending) return [CLOSE_ACTION];
 		if (strip) {
 			if (strip.kind === "field") {
@@ -5802,12 +5866,27 @@ export class ModelHubComponent implements Component {
 							"stripApply",
 							strip.kind === "thinking" ? "Apply" : strip.kind === "scope" ? "Save to scope" : "Assign / clear",
 							"enter",
-							{ primary: true },
+							{ primary: true, danger: strip.chips[strip.index]?.action === "unassign" },
 						);
 			return [apply, cancel(strip.kind === "thinking" ? "Keep" : "Cancel")];
 		}
 		const refresh =
 			entry.kind === "provider" && !entry.locked ? pickerAction("refresh", "Refresh provider", "f5") : undefined;
+		if (this.#focus === "scope" && !lockedView) {
+			return compact([
+				pickerAction("focusList", rolesView ? (entry.kind === "groups" ? "Groups" : "Roles") : "Models", "enter"),
+				rolesView ? pickerAction("search", "Search", "/") : refresh,
+				cancel(
+					this.#assigning
+						? "Cancel"
+						: rolesView && this.#roleSearch.getValue()
+							? "Clear search"
+							: this.#browser.query
+								? "Clear search"
+								: "Close",
+				),
+			]);
+		}
 		if (this.#assigning !== null) {
 			const label =
 				this.#assigning.kind === "fallback"
@@ -5820,16 +5899,15 @@ export class ModelHubComponent implements Component {
 			return compact([pickerAction("assign", label, "enter", { primary: true }), refresh, cancel("Cancel")]);
 		}
 		if (rolesView) {
+			if (this.#roleSearching)
+				return [pickerAction("searchDone", "Done searching", "enter"), cancel("Clear search")];
 			const row = this.#rolesRows[this.#roleIndex];
-			// A live query takes the letter keys: those buttons keep working but lose their keycaps.
-			const searching = this.#browser.query.length > 0;
+			const searching = this.#roleSearching;
 			const roleAction = (action: RolesAction, label: string, key: string, primary = false) =>
-				pickerAction(
-					`roles:${action}`,
-					label,
-					searching && key !== "enter" ? undefined : key,
-					primary ? { primary: true } : undefined,
-				);
+				pickerAction(`roles:${action}`, label, searching && key !== "enter" ? undefined : key, {
+					...(primary ? { primary: true } : {}),
+					...(action === "clear" ? { danger: true } : {}),
+				});
 			const poolHints = this.#poolRowHints(row);
 			if (poolHints) {
 				const actions = poolHints.flatMap((hint): TspPickerAction[] => {
@@ -5842,7 +5920,43 @@ export class ModelHubComponent implements Component {
 					const label = `${hint.label.charAt(0).toUpperCase()}${hint.label.slice(1)}`;
 					return action ? [roleAction(action, label, key, key === "enter")] : [];
 				});
-				return [...actions, CLOSE_ACTION];
+				const target =
+					row?.kind === "profile" ? { kind: "group" as const, key: row.role } : this.#rowPoolTarget(row);
+				const pool = target ? this.#pool(target) : undefined;
+				const readOnly =
+					row?.kind === "group" || row?.kind === "profile" ? this.#groupEditRefusal(row.role) : pool?.readOnly;
+				if (readOnly) {
+					if (!actions.some(action => action.id === "roles:pick")) {
+						actions.push({ ...roleAction("pick", "Edit", "enter"), disabled: sanitizeDisplayLine(readOnly) });
+					}
+					if (target?.kind === "group") {
+						const clear = actions.find(action => action.id === "roles:clear");
+						if (clear) clear.disabled = sanitizeDisplayLine(readOnly);
+						else actions.push({ ...roleAction("clear", "Remove", "x"), disabled: sanitizeDisplayLine(readOnly) });
+					}
+				}
+				if (target && !this.#poolClearable(target) && !actions.some(action => action.id === "roles:clear")) {
+					actions.push({
+						...roleAction("clear", "Remove", "x"),
+						disabled: "Read-only: another layer owns this entry",
+					});
+				}
+				if (row?.kind === "group" || row?.kind === "profile") {
+					const used =
+						row.kind === "group"
+							? this.#groupReferences(row.role)
+							: this.#profileReferences(row.role, row.profile);
+					if (used.length) {
+						const clear = actions.find(action => action.id === "roles:clear");
+						if (clear)
+							clear.disabled = `+${row.role}${row.kind === "profile" ? `@${row.profile}` : ""} is used by ${this.#referencePaths(used)}; point those elsewhere first`;
+					}
+				}
+				return [
+					...actions,
+					pickerAction("search", "Search", "/"),
+					this.#roleSearch.getValue() ? cancel("Clear search") : CLOSE_ACTION,
+				];
 			}
 			const convert = this.#legacyPoolSource(row) ? roleAction("pool", "Make pool", "m") : undefined;
 			const actions: (TspPickerAction | undefined)[] = [];
@@ -5895,8 +6009,18 @@ export class ModelHubComponent implements Component {
 					actions.push(roleAction("pick", "New role", "enter", true));
 					break;
 			}
+			if (row?.kind === "role" && this.#cycleOrder().includes(row.role)) {
+				actions.push(roleAction("earlier", "Earlier", "["), roleAction("later", "Later", "]"));
+			}
+			if (row?.kind === "role" && this.#presets().names.length > 0) {
+				actions.push(roleAction("prevPreset", "Previous preset", "shift+p"));
+			}
 			if (this.#groupsAvailable(row)) actions.push(roleAction("groups", "Model group", "shift+g"));
-			return compact([...actions, CLOSE_ACTION]);
+			return compact([
+				...actions,
+				pickerAction("search", "Search", "/"),
+				this.#roleSearch.getValue() ? cancel("Clear search") : CLOSE_ACTION,
+			]);
 		}
 		if (lockedView) {
 			return entry.oauth
@@ -6107,6 +6231,13 @@ export class ModelHubComponent implements Component {
 					: {}),
 			});
 		});
+		const rowsById = new Map(this.#rolesRows.map((row, index) => [rolesRowKey(row, index), row]));
+		for (const item of items) {
+			const row = rowsById.get(item.id);
+			if (!row) continue;
+			const badges = this.#roleBadges(row);
+			if (badges.length) item.badges = [...(item.badges ?? []), ...badges];
+		}
 		this.#pickerRoleItems = { rows: this.#rolesRows, roles: this.#roles, cycle, billing: billingRevision, items };
 		return items;
 	}
@@ -6380,6 +6511,12 @@ export class ModelHubComponent implements Component {
 
 	/** Picker pointer events, each on the path of the key it stands for. */
 	#handlePickerEvent(event: PickerEvent): void {
+		if (this.#roleConfirm) {
+			if (event.kind === "action" && event.act === "confirm") this.#confirmRoleClear();
+			else if (event.kind === "action" && (event.act === CLOSE_ACTION.id || event.act === "cancel"))
+				this.#roleConfirm = undefined;
+			return;
+		}
 		if (event.kind === "action" && event.act === CLOSE_ACTION.id) {
 			this.#cancel();
 			return;
@@ -6413,6 +6550,20 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 		switch (act) {
+			case "focusList":
+				this.#focus = "list";
+				return;
+			case "search":
+				if (rolesView && !this.#strip) {
+					this.#roleSearching = true;
+					this.#focus = "list";
+				}
+				return;
+			case "searchDone":
+				this.#roleSearching = false;
+				return;
+			case "confirm":
+				return;
 			case "scope":
 				this.#clickSidebarEntry(this.#entries.find(candidate => candidate.id === value));
 				return;
@@ -6585,156 +6736,19 @@ export class ModelHubComponent implements Component {
 	}
 
 	#footerHints(): (NativeHint | undefined)[] {
-		const keys = (label: string, ...ids: KeyName[]): NativeHint => ({ keys: ids, label });
-		const cancel = (label: string) => actionHint("tui.select.cancel", label);
-		const upDown = (label: string) => actionHint(["tui.select.up", "tui.select.down"], label);
-		const search = keys("type to search");
-		const kind = keys("kind", "alt+left", "alt+right");
-		const reorder = keys("reorder", "[", "]");
-		const strip = this.#strip;
-		if (strip) {
-			switch (strip.kind) {
-				case "name":
-					return strip.purpose === "compaction"
-						? [
-								keys(
-									compactionConfirmPending(strip) ? "accept compaction point" : "set compaction point",
-									"enter",
-								),
-								cancel("cancel"),
-							]
-						: strip.purpose === "preset"
-							? [keys("save preset", "enter"), cancel("cancel")]
-							: [keys("create + pick model", "enter"), cancel("cancel")];
-				case "role":
-					return [keys("choose", "left", "right"), keys("assign/clear", "enter"), cancel("cancel")];
-				case "scope":
-					return [keys("save scope", "left", "right"), keys("choose", "enter"), cancel("cancel")];
-				case "thinking":
-					return [keys("thinking level", "left", "right"), keys("apply", "enter"), cancel("keep")];
-				case "field":
-					return [keys("save", "enter"), cancel("cancel")];
-				case "pool":
-					return strip.refresh
-						? [keys("choose", "left", "right"), keys("toggle", "enter"), cancel("done")]
-						: [keys("choose", "left", "right"), keys("apply", "enter"), cancel("cancel")];
-			}
-		}
-		if (this.#assigning !== null) {
-			if (this.#focus === "scope") {
-				return [keys("models", "enter", "right"), upDown("providers"), search, kind, cancel("cancel")];
-			}
-			const pick =
-				this.#assigning.kind === "fallback"
-					? "pick fallback"
-					: this.#assigning.kind === "fallbackKey"
-						? "pick the protected model"
-						: this.#assigning.kind === "poolMember"
-							? "pick member"
-							: "assign";
-			return [keys(pick, "enter"), upDown("models"), keys("providers", "left"), search, kind, cancel("cancel")];
-		}
-		const presetHint = this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right") : undefined;
 		const entry = this.#activeEntry();
-		if (isRolesView(entry.kind)) {
-			if (this.#focus !== "list") {
-				if (entry.kind === "groups")
-					return [upDown("providers"), keys("groups", "enter", "right"), cancel("close")];
-				return [
-					upDown("providers"),
-					keys("roles", "enter", "right"),
-					keys("tabs", "alt+left", "alt+right"),
-					presetHint,
-					cancel("close"),
-				];
+		const rolesView = isRolesView(entry.kind) && this.#assigning === null;
+		const actions = this.#pickerActions(entry, rolesView, entry.kind === "provider" && entry.locked === true);
+		const hints: (NativeHint | undefined)[] = pickerActionHints(actions);
+		if (!this.#roleConfirm) {
+			hints.push(actionHint(["tui.select.up", "tui.select.down"], this.#focus === "scope" ? "providers" : "rows"));
+			if (this.#strip && this.#strip.kind !== "name" && this.#strip.kind !== "field") {
+				hints.push({ keys: ["left", "right"], label: "choose" });
+			} else if (!this.#strip) {
+				hints.push({ keys: ["tab"], label: "providers / rows" });
+				if (!rolesView) hints.push({ keys: [], label: "type to search" });
 			}
-			// A live query takes printable keys and backspace, so the letter commands rest.
-			if (this.#browser.query.length > 0) {
-				return [
-					upDown("rows"),
-					keys("pick", "enter"),
-					search,
-					keys("providers", "left"),
-					presetHint,
-					cancel("close"),
-				];
-			}
-			const row = this.#rolesRows[this.#roleIndex];
-			const compaction =
-				this.#callbacks.onCompactionPointChange && this.#roleRowModel() ? keys("compaction limit", "k") : undefined;
-			const poolHints = this.#poolRowHints(row);
-			if (poolHints) {
-				return [
-					upDown("rows"),
-					...poolHints.map(hint => keys(hint.label, ...hint.keys)),
-					keys("providers", "left"),
-				];
-			}
-			const convert = this.#legacyPoolSource(row) ? keys("pool", "m") : undefined;
-			const group = this.#groupsAvailable(row) ? keys("group", "shift+g") : undefined;
-			if (row?.kind === "fallback") {
-				// Advertise `t` only where a strip would open, as the ANSI footer does.
-				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
-				return [
-					upDown("rows"),
-					keys("replace", "enter"),
-					keys("add another", "f"),
-					keys("remove", "x"),
-					editable ? keys("thinking", "t") : undefined,
-					compaction,
-					reorder,
-					convert,
-					group,
-					keys("providers", "left"),
-				];
-			}
-			if (row?.kind === "chainKey") {
-				return [
-					upDown("rows"),
-					keys("add fallback", "enter", "f"),
-					keys("clear chain", "x"),
-					convert,
-					group,
-					keys("providers", "left"),
-				];
-			}
-			if (row?.kind === "newFallback") {
-				return [upDown("rows"), keys("new model/provider fallback chain", "enter"), keys("providers", "left")];
-			}
-			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
-			return [
-				upDown("rows"),
-				keys("pick", "enter"),
-				row?.kind !== "role" || this.#fallbackAddable(row.role) ? keys("fallback", "f") : undefined,
-				keys("clear", "x"),
-				editable ? keys("thinking", "t") : undefined,
-				compaction,
-				convert,
-				group,
-				keys("cycle", "c"),
-				reorder,
-				keys("new", "n"),
-				this.#callbacks.onSavePreset ? keys("save preset", "s") : undefined,
-				this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right", "p", "shift+p") : undefined,
-			];
 		}
-		if (entry.kind === "provider" && entry.locked) {
-			return entry.oauth
-				? [keys("log in", "enter"), upDown("providers"), cancel("close")]
-				: [upDown("providers"), cancel("close")];
-		}
-		const refresh = entry.kind === "provider" ? keys("refresh", "f5") : undefined;
-		if (this.#focus === "scope") {
-			return [keys("models", "enter", "right"), upDown("providers"), search, kind, refresh, cancel("close")];
-		}
-		return [
-			keys("assign roles", "enter"),
-			upDown("models"),
-			keys("providers", "left"),
-			search,
-			kind,
-			refresh,
-			cancel("close"),
-		];
+		return hints;
 	}
 }

@@ -23,6 +23,7 @@ import type { Input } from "../components/input";
 import type { SelectItem, SelectList } from "../components/select-list";
 import { col, node } from "./describe";
 import type { NativeChild, NativeNode, NativeUiEvent } from "./node";
+import type { NativeHint } from "./overlay";
 
 /** The picker sheet; `preview` children fill its preview pane. */
 export function picker(p: TspPickerProps, preview?: readonly NativeChild[]): NativeNode {
@@ -76,6 +77,14 @@ export function pickerAction(
 
 /** The right-aligned `Close esc` every picker ends with; Tern's backdrop and head `esc` send it too. */
 export const CLOSE_ACTION: TspPickerAction = { id: "close", label: "Close", keys: ["esc"], end: true };
+
+/** Footer hints of the same actions shown in a picker, including disabled reasons. */
+export function pickerActionHints(actions: readonly TspPickerAction[]): NativeHint[] {
+	return actions.map(action => ({
+		keys: action.keys?.length ? [action.keys.map(key => (key === "esc" ? "escape" : key)).join("+") as KeyName] : [],
+		label: `${action.label}${action.disabled ? ` (${typeof action.disabled === "string" ? action.disabled : "unavailable"})` : ""}`,
+	}));
+}
 
 /** A `time` fact: the compact age of `at` (`now`, `5m`, `2h`, `3d`, `2w`, `6mo`, `1y`). */
 export function pickerAge(at: Date | number, now = Date.now()): string {

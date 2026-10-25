@@ -421,6 +421,51 @@ describe("Groups view", () => {
 		expect(item("member:group:fast:mini")?.facts).toMatchObject({ model: "openai/gpt-5.6-mini", thinking: "low" });
 	});
 
+	test("searches group names, member aliases and models while preserving a matching selection", () => {
+		const { hub } = groupsHub();
+		hub.handleNativeEvent({ type: "select", key: "", item: "member:group:fast:mini" });
+		hub.handleInput("/");
+		for (const ch of "mini") hub.handleInput(ch);
+		let p = props(hub.describe(withPicker));
+		expect(p.scope).toBe("groups");
+		expect(p.selected).toBe("member:group:fast:mini");
+		expect(p.items?.map(item => item.id)).toEqual(["member:group:fast:mini"]);
+		expect(p.hits?.["member:group:fast:mini"]).toEqual([[0, 4]]);
+		hub.handleInput("\x1b");
+		hub.handleInput("/");
+		for (const ch of "openai") hub.handleInput(ch);
+		p = props(hub.describe(withPicker));
+		expect(p.items?.map(item => item.id)).toEqual(["member:group:fast:mini"]);
+		expect(p.selected).toBe("member:group:fast:mini");
+		expect(Bun.stripANSI(hub.render(180).join("\n"))).toContain("Search: openai");
+		hub.handleInput("\x1b");
+		hub.handleInput("/");
+		for (const ch of "spare") hub.handleInput(ch);
+		expect(props(hub.describe(withPicker)).items?.map(item => item.id)).toEqual([
+			"group:spare",
+			"member:group:spare:opus",
+		]);
+	});
+
+	test("unused badges and disabled destructive actions reflect references, and footers share action labels", () => {
+		const { hub } = groupsHub();
+		let p = props(hub.describe(withPicker));
+		expect(p.items?.find(item => item.id === "group:spare")?.badges).toContainEqual({
+			text: "unused",
+			tone: "muted",
+		});
+		expect(p.items?.find(item => item.id === "group:fast")?.badges).toBeUndefined();
+		hub.handleNativeEvent({ type: "select", key: "", item: "group:fast" });
+		p = props(hub.describe(withPicker));
+		expect(p.actions?.find(action => action.id === "roles:clear")).toMatchObject({
+			danger: true,
+			disabled: expect.stringContaining("used by"),
+		});
+		const screen = Bun.stripANSI(hub.render(1200).join("\n"));
+		for (const action of p.actions ?? []) expect(screen).toContain(action.label);
+		expect(screen).toContain("used by");
+	});
+
 	test("a new group's name is checked before the model browse, and a read-only group says why it cannot be edited", () => {
 		const { hub, writes } = groupsHub();
 		hub.handleNativeEvent({ type: "activate", key: "", item: "newGroup" });
@@ -467,6 +512,13 @@ describe("Groups view", () => {
 
 		hub.handleNativeEvent({ type: "select", key: "", item: "group:spare" });
 		act("roles:clear");
+		expect(writes).toEqual([]);
+		expect(props(hub.describe(withPicker)).confirm?.text).toContain("+spare");
+		act("close");
+		expect(writes).toEqual([]);
+		expect(props(hub.describe(withPicker)).confirm).toBeNull();
+		act("roles:clear");
+		act("confirm");
 		expect(writes).toEqual([[{ kind: "group", key: "spare" }, undefined]]);
 	});
 
@@ -594,6 +646,19 @@ describe("Group profiles", () => {
 			tone: "muted",
 			facts: { thinking: "no overrides", routing: "unused" },
 		});
+		expect(item("profile:fast:spare")?.badges).toContainEqual({ text: "unused", tone: "muted" });
+		expect(item("profile:fast:low")?.badges).toBeUndefined();
+	});
+
+	test("profile search preserves the selected profile and highlights its name", () => {
+		const { hub, select } = profilesHub("groups");
+		select("profile:fast:spare");
+		hub.handleInput("/");
+		for (const char of "spare") hub.handleInput(char);
+		const p = props(hub.describe(withPicker));
+		expect(p.items?.map(item => item.id)).toEqual(["profile:fast:spare"]);
+		expect(p.selected).toBe("profile:fast:spare");
+		expect(p.hits?.["profile:fast:spare"]).toEqual([[1, 6]]);
 	});
 
 	test("x deletes only an unused profile; @ adds one", () => {
@@ -603,6 +668,12 @@ describe("Group profiles", () => {
 		expect(writes).toEqual([]);
 		select("profile:fast:spare");
 		act("roles:clear");
+		expect(writes).toEqual([]);
+		expect(props(hub.describe(withPicker)).confirm?.text).toContain("+fast@spare");
+		act("close");
+		expect(writes).toEqual([]);
+		act("roles:clear");
+		act("confirm");
 		expect(writes.at(-1)?.[1]?.profiles).toEqual({ low: { mini: { effort: "low" } } });
 
 		act("roles:newProfile");
@@ -702,6 +773,8 @@ test("pools render inside the roles picker and their actions edit only what the 
 	expect(item("member:role:smol:opus")).toMatchObject({ label: "opus", depth: 1 });
 	expect(item("member:role:smol:opus")?.facts).toMatchObject({ model: "anthropic/claude-opus-5", thinking: "high" });
 	expect(item("pooled:default")?.facts?.routing).toContain("read-only: edit modelGroups.fast in config");
+	expect(item("pooled:default")?.badges).toContainEqual({ text: "read-only", tone: "warning" });
+	expect(item("role:smol")?.badges?.some(badge => badge.text === "read-only")).toBeFalsy();
 	expect(item("member:chain:default:mini")).toMatchObject({ depth: 2 });
 	expect(p.total).toBe(p.order?.filter(entry => typeof entry === "string").length);
 	// The generic native frame lists the same pool rows.
@@ -714,7 +787,8 @@ test("pools render inside the roles picker and their actions edit only what the 
 	expect(p.actions?.map(action => action.id)).not.toContain("roles:fallback");
 	select("member:chain:default:mini");
 	p = props(hub.describe(withPicker));
-	expect(p.actions?.map(action => action.id)).toEqual(["close"]);
+	expect(p.actions?.find(action => action.id === "roles:pick")?.disabled).toBe("edit modelGroups.fast in config");
+	expect(p.actions?.map(action => action.id)).toEqual(["roles:pick", "search", "close"]);
 
 	select("role:smol");
 	p = props(hub.describe(withPicker));
@@ -1084,4 +1158,147 @@ test("Roles renders hostile labels, keys and fallback selectors as single-line d
 	hub.handleInput("\x1b");
 	hub.handleInput("\x1b[B");
 	displayed(hub.describe(withPicker));
+});
+
+test("role search matches names and assigned models, preserves selection, and shares action labels with the footer", () => {
+	const hub = openHub({ assign: [], cancel: 0 });
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	hub.handleNativeEvent({ type: "select", key: "", item: "role:default" });
+	for (const query of ["default", "demo/demo"]) {
+		hub.handleInput("/");
+		for (const char of query) hub.handleInput(char);
+		const p = props(hub.describe(withPicker));
+		expect(p.items?.map(item => item.id)).toEqual(
+			query === "default" ? ["role:default", "fallback:default:0"] : ["role:default"],
+		);
+		expect(p.selected).toBe("role:default");
+		hub.handleInput("\x1b");
+	}
+	const p = props(hub.describe(withPicker));
+	const screen = Bun.stripANSI(hub.render(1400).join("\n"));
+	for (const action of p.actions ?? []) expect(screen).toContain(action.label);
+	expect(p.actions?.find(action => action.id === "roles:clear")?.danger).toBe(true);
+});
+
+test("role status badges distinguish auto selection, invalid pools and verified exhausted billing", () => {
+	const settings: ModelHubSource = {
+		...source({ default: "demo/demo", broken: "+bad" }, [], {
+			roles: {
+				broken: { source: { kind: "inline" }, strategy: "", members: [], funding: [], invalid: "strategy missing" },
+			},
+		}),
+		knownRoleIds: ["default", "smol", "broken"],
+		resolveRoleValue: (value, models) => ({
+			model: models.find(
+				model => `${model.provider}/${model.id}` === (value === "pi/smol" ? "openai/gpt-5.6" : value),
+			),
+			explicitThinkingLevel: false,
+		}),
+		billingFor: selector => (selector === "demo/demo" ? "included exhausted" : "unknown"),
+	};
+	const hub = new ModelHubComponent(
+		ui,
+		settings,
+		registry(MODELS),
+		MODELS.map(model => ({ model })),
+		{
+			onAssign: () => {},
+			onUnassign: () => {},
+			onCancel: () => {},
+		},
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	const p = props(hub.describe(withPicker));
+	expect(p.items?.find(item => item.id === "role:default")?.badges).toContainEqual({
+		text: "exhausted",
+		tone: "warning",
+	});
+	expect(
+		p.items?.find(item => item.id === "role:default")?.badges?.some(badge => badge.text === "auto-selected"),
+	).toBeFalsy();
+	expect(p.items?.find(item => item.id === "role:smol")?.badges).toContainEqual({
+		text: "auto-selected",
+		tone: "muted",
+	});
+	expect(
+		p.items?.find(item => item.id === "role:smol")?.badges?.some(badge => badge.text === "exhausted"),
+	).toBeFalsy();
+	expect(p.items?.find(item => item.id === "role:broken")?.badges).toContainEqual({
+		text: "invalid pool",
+		tone: "error",
+	});
+	const screen = Bun.stripANSI(hub.render(400).join("\n"));
+	expect(screen).toContain("[auto-selected]");
+	expect(screen).toContain("[invalid pool]");
+	expect(screen).toContain("[exhausted]");
+});
+
+test("clearing roles, pools and whole fallback chains requires target-specific confirmation", () => {
+	const writes: string[] = [];
+	const settings: ModelHubSource = {
+		...source({ default: "demo/demo", smol: "+pool" }, [], {
+			roles: {
+				smol: {
+					source: { kind: "inline" },
+					strategy: "random",
+					members: [{ alias: "demo", model: "demo/demo" }],
+					funding: [],
+					raw: { strategy: "random", models: { demo: { model: "demo/demo" } } },
+				},
+			},
+		}),
+		fallbackChains: { "demo/demo": ["openai/gpt-5.6"] },
+	};
+	const hub = new ModelHubComponent(
+		ui,
+		settings,
+		registry(MODELS),
+		MODELS.map(model => ({ model })),
+		{
+			onAssign: () => {},
+			onUnassign: role => {
+				writes.push(role);
+			},
+			onFallbackChainChange: key => {
+				writes.push(key);
+			},
+			onPoolChange: target => {
+				writes.push(target.key);
+				return undefined;
+			},
+			onCancel: () => {},
+		},
+	);
+	hubs.push(hub);
+	const act = (act: string) => hub.handleNativeEvent({ type: "action", key: "", act, mods: [] });
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	for (const [index, item] of ["role:default", "role:smol", "chain:demo/demo"].entries()) {
+		hub.handleNativeEvent({ type: "select", key: "", item });
+		act("roles:clear");
+		expect(writes).toHaveLength(index);
+		expect(props(hub.describe(withPicker)).confirm?.text).toContain(item.slice(item.indexOf(":") + 1));
+		act("close");
+		expect(writes).toHaveLength(index);
+		act("roles:clear");
+		act("confirm");
+		expect(writes).toHaveLength(index + 1);
+	}
+});
+
+test("Roles surfaces configuration errors through picker state and the terminal status row", () => {
+	const hub = new ModelHubComponent(
+		ui,
+		source({}, []),
+		{
+			...registry(MODELS),
+			getError: () => "Cannot load models",
+		},
+		[],
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	expect(props(hub.describe(withPicker))).toMatchObject({ state: "error", message: "Cannot load models" });
+	expect(Bun.stripANSI(hub.render(200).join("\n"))).toContain("Cannot load models");
 });

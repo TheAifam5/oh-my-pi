@@ -6,6 +6,11 @@
 
 - `/account` in Tern is a table: providers and policy pages as scopes, accounts grouped by provider with Billing, State, Type, Routing, Pins and Limits columns, and each field as an action
 - `/models` Roles view shows pools, pool members and fallbacks in separate Model, Thinking, Billing and Routing columns, aligned in the TUI and as table columns in Tern
+- `/models` Roles and Groups and `/account` offer explicit `/` search with matching-row selection preservation, highlighted Tern label hits, and no-results text; Enter restores row shortcuts and Escape clears the search first
+- Hub footers and Tern action bars share action labels and availability, including disabled reasons and destructive action styling
+- Model and account rows show data-backed status badges, including auto-selected roles, invalid or read-only pools, unused groups and profiles, account drain and pins, and exhausted billing
+- Clearing roles, pools and fallback chains, removing entries, deleting groups or profiles, and disabling accounts require target-specific confirmation in both renderers
+- Account and model pickers expose loading, error and empty states alongside their terminal status rows
 
 ### Added
 

@@ -34,13 +34,22 @@ import {
 	wrapTextWithAnsi,
 } from "../index";
 import { col, node, row, span, text } from "../native/describe";
-import { CLOSE_ACTION, type PickerEvent, picker, pickerAction, pickerEvent } from "../native/picker";
+import {
+	CLOSE_ACTION,
+	type PickerEvent,
+	picker,
+	pickerAction,
+	pickerActionHints,
+	pickerEvent,
+	pickerHits,
+	pickerQuery,
+} from "../native/picker";
 import { providerMark } from "./model-browser";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
-import { actionHint, type NativeHint, hintsRow } from "../native/overlay";
+import { type NativeHint, hintsRow } from "../native/overlay";
 import { theme } from "../theme";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
-import type { KeyId } from "../keys";
+import { extractPrintableText, type KeyId } from "../keys";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
 import { formatKeyHint, formatKeyHints } from "../app-keybindings";
 import { editorKey, editorKeys } from "../chrome/keybinding-hints";
@@ -72,6 +81,8 @@ export interface AccountManagerAction {
 	readOnly?: string;
 	/** The state the action was offered against, passed back so the host can refuse a stale edit. */
 	expect?: string;
+	/** Target-specific confirmation required before applying this action. */
+	confirm?: string;
 }
 
 /** One editable property of an account, offered as a footer chip. */
@@ -172,6 +183,7 @@ function sanitizeAccount(account: AccountManagerAccount): AccountManagerAccount 
 		label: clean(entry.label),
 		...(entry.input ? { input: { initial: clean(entry.input.initial), hint: clean(entry.input.hint) } } : {}),
 		...(entry.readOnly !== undefined ? { readOnly: clean(entry.readOnly) } : {}),
+		...(entry.confirm !== undefined ? { confirm: clean(entry.confirm) } : {}),
 	});
 	return {
 		...account,
@@ -215,11 +227,15 @@ export class AccountManagerComponent implements Component {
 	#activeEntryId = "all";
 	#focus: "scope" | "list" = "list";
 	#rows: AccountManagerAccount[] = [];
+	#rowTotal = 0;
 	#rowIndex = 0;
 	#listScroll = 0;
 	#strip: StripState | null = null;
 	#notice: Notice | null = null;
 	#busy = false;
+	#search = new Input();
+	#searching = false;
+	#confirm: { accountId: string; action: AccountManagerAction; value?: string; text: string } | undefined;
 	/** Footer hint page `?` selected for the account row `id`; page 0 elsewhere. */
 	#hintPage: { id: string; page: number } | undefined;
 	/** Set once the overlay closed; a late apply or refresh result is dropped. */
@@ -322,13 +338,40 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#buildRows(): void {
+		const selectedId = this.#selected()?.id;
 		const entry = this.#activeEntry();
-		this.#rows =
+		const rows =
 			entry.kind === "provider"
 				? this.#accounts.filter(account => account.provider === entry.provider)
 				: entry.kind === "page"
 					? (entry.page?.rows ?? [])
 					: this.#accounts;
+		this.#rowTotal = rows.length;
+		const tokens = this.#search.getValue().toLowerCase().split(/\s+/).filter(Boolean);
+		this.#rows = tokens.length
+			? rows.filter(account =>
+					tokens.every(token =>
+						`${account.name ?? ""} ${account.identity} ${account.provider}`.toLowerCase().includes(token),
+					),
+				)
+			: rows;
+		const index = this.#rows.findIndex(account => account.id === selectedId);
+		this.#rowIndex = index >= 0 ? index : 0;
+		this.#listScroll = 0;
+	}
+
+	#clearSearch(): boolean {
+		if (!this.#searching && !this.#search.getValue()) return false;
+		this.#searching = false;
+		this.#search.setValue("");
+		this.#buildRows();
+		return true;
+	}
+
+	#emptyText(): string {
+		if (this.#search.getValue().trim()) return "No accounts match your search.";
+		const entry = this.#activeEntry();
+		return entry.kind === "page" ? (entry.page?.empty ?? "") : "No stored accounts. Log in with /login.";
 	}
 
 	#selected(): AccountManagerAccount | undefined {
@@ -397,6 +440,16 @@ export class AccountManagerComponent implements Component {
 			const input = new Input();
 			input.setValue(action.input.initial);
 			this.#strip = { kind: "input", accountId: account.id, action, input };
+			return;
+		}
+		if (action.confirm) {
+			this.#strip = null;
+			this.#confirm = {
+				accountId: account.id,
+				action,
+				value: action.on === undefined ? undefined : action.on ? "off" : "on",
+				text: `${action.confirm} — ${this.#accountTitle(account)} (${account.identity})`,
+			};
 			return;
 		}
 		void this.#apply(account.id, action, action.on === undefined ? undefined : action.on ? "off" : "on");
@@ -474,6 +527,12 @@ export class AccountManagerComponent implements Component {
 			if (matchesSelectCancel(data)) this.#close();
 			return;
 		}
+		if (this.#confirm) {
+			if (matchesSelectCancel(data)) this.#confirm = undefined;
+			else if (isEnter(data)) this.#confirmApply();
+			this.#requestRender();
+			return;
+		}
 		if (data.startsWith("\x1b[<")) {
 			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
 			this.#requestRender();
@@ -492,8 +551,29 @@ export class AccountManagerComponent implements Component {
 			this.#requestRender();
 			return;
 		}
+		if (this.#searching) {
+			if (matchesSelectCancel(data)) this.#clearSearch();
+			else if (isEnter(data)) this.#searching = false;
+			else if (matchesSelectUp(data) || matchesSelectDown(data)) {
+				this.#rowIndex = Math.max(
+					0,
+					Math.min(this.#rows.length - 1, this.#rowIndex + (matchesSelectUp(data) ? -1 : 1)),
+				);
+			} else {
+				this.#search.handleInput(data);
+				this.#buildRows();
+			}
+			this.#requestRender();
+			return;
+		}
 		if (matchesSelectCancel(data)) {
-			this.#close();
+			if (!this.#clearSearch()) this.#close();
+			return;
+		}
+		if (extractPrintableText(data) === "/") {
+			this.#searching = true;
+			this.#focus = "list";
+			this.#requestRender();
 			return;
 		}
 		if (matchesKey(data, "ctrl+r")) {
@@ -522,9 +602,19 @@ export class AccountManagerComponent implements Component {
 			} else if (account && data === "?") {
 				const page = this.#hintPage?.id === account.id ? this.#hintPage.page + 1 : 1;
 				this.#hintPage = { id: account.id, page };
+			} else if (extractPrintableText(data) !== undefined) {
+				this.#searching = true;
+				this.#search.handleInput(data);
+				this.#buildRows();
 			}
 		}
 		this.#requestRender();
+	}
+
+	#confirmApply(): void {
+		const pending = this.#confirm;
+		this.#confirm = undefined;
+		if (pending) void this.#apply(pending.accountId, pending.action, pending.value);
 	}
 
 	#moveSidebar(delta: number): void {
@@ -619,6 +709,9 @@ export class AccountManagerComponent implements Component {
 			statusLines[MAX_STATUS_LINES - 1] = truncateToWidth(`${statusLines[MAX_STATUS_LINES - 1]}…`, width - 1);
 		}
 		const lines: string[] = [...statusLines.map(line => theme.fg(status.tone, ` ${line}`)), ""];
+		if (this.#searching || this.#search.getValue()) {
+			lines.push(truncateToWidth(` Search: ${sanitizeDisplaySingleLine(this.#search.getValue())}`, width), "");
+		}
 		this.#listRowStart = lines.length;
 		const selected = this.#selected();
 		const detailLines: string[] = [];
@@ -662,9 +755,8 @@ export class AccountManagerComponent implements Component {
 			lines.push(truncateToWidth(line, width));
 		}
 		if (this.#rows.length === 0) {
-			const entry = this.#activeEntry();
-			const empty = entry.kind === "page" ? (entry.page?.empty ?? "") : "No stored accounts. Log in with /login.";
-			for (const line of wrapTextWithAnsi(empty, Math.max(1, width - 1))) lines.push(theme.fg("dim", ` ${line}`));
+			for (const line of wrapTextWithAnsi(this.#emptyText(), Math.max(1, width - 1)))
+				lines.push(theme.fg("dim", ` ${line}`));
 		}
 		while (lines.length < rows - detailRows) lines.push("");
 		lines.push(theme.fg("border", "─".repeat(Math.max(1, width))));
@@ -684,16 +776,16 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#footerHint(width: number): string {
-		const enter = formatKeyHint("enter");
-		const cancel = editorKey("tui.select.cancel");
-		const upDown = editorKeys("tui.select.up", "tui.select.down");
-		if (this.#focus === "scope")
-			return `${upDown} providers · ${formatKeyHints(["right", "enter"])} accounts · ${cancel} close`;
 		const account = this.#selected();
-		const shortcuts = (account?.fields ?? []).flatMap(field => (field.key ? [`${field.key} ${field.label}`] : []));
 		const page = account && this.#hintPage?.id === account.id ? this.#hintPage.page : 0;
+		const actions = pickerActionHints(this.#pickerActions(account)).map(
+			hint => `${hint.keys.length ? `${formatKeyHints(hint.keys)} ` : ""}${hint.label}`,
+		);
 		return pagedHints(
-			[`${enter} edit`, ...shortcuts, `${upDown} rows`, `${formatKeyHint("ctrl+r")} reload`, `${cancel} close`],
+			[
+				...actions,
+				`${editorKeys("tui.select.up", "tui.select.down")} ${this.#focus === "scope" ? "providers" : "rows"}`,
+			],
 			width,
 			page,
 		);
@@ -701,6 +793,12 @@ export class AccountManagerComponent implements Component {
 
 	#renderFooter(width: number): string {
 		const strip = this.#strip;
+		if (this.#confirm) {
+			return truncateToWidth(
+				`${this.#confirm.text} · ${formatKeyHint("enter")} confirm · ${editorKey("tui.select.cancel")} cancel`,
+				width,
+			);
+		}
 		return this.#frame.renderFooter(
 			width,
 			this.#footerHint(width),
@@ -750,6 +848,7 @@ export class AccountManagerComponent implements Component {
 			return described;
 		}
 		const footer: NativeChild[] = [];
+		if (this.#confirm) footer.push(text([span(this.#confirm.text, "warning")]));
 		const strip = this.#describeStrip();
 		if (strip) footer.push(strip);
 		footer.push(hintsRow(this.#footerHints()));
@@ -829,6 +928,8 @@ export class AccountManagerComponent implements Component {
 			...(account.name === undefined ? { tone: "muted" as const } : {}),
 			...(multiProvider && account.provider ? { mark: providerMark(account.provider) } : {}),
 			facts: this.#rowFacts(account),
+			badges: account.badges.map(text => ({ text })),
+			hits: pickerHits(account.name ?? "(unnamed)", this.#search.getValue().toLowerCase().split(/\s+/)),
 		}));
 		const props: TspPickerProps = {
 			title: "Accounts",
@@ -838,15 +939,19 @@ export class AccountManagerComponent implements Component {
 			size: "lg",
 			layout: "rows",
 			preview: "side",
-			query: null,
+			...pickerQuery(this.#searching || this.#search.getValue() ? this.#search : null),
+			placeholder: "Search accounts…",
 			scopes: this.#pickerScopes(),
 			scope: entry.id,
 			columns,
 			items,
 			order: this.#pickerOrder(multiProvider),
 			selected: selected ? accountItemId(selected) : null,
-			total: this.#rows.length,
-			empty: entry.kind === "page" ? (entry.page?.empty ?? "") : "No stored accounts. Log in with /login.",
+			total: this.#rowTotal,
+			empty: this.#emptyText(),
+			state: this.#busy ? "loading" : this.#notice?.tone === "error" ? "error" : "ready",
+			message: this.#busy || this.#notice ? status.text : undefined,
+			confirm: this.#confirm ? { text: this.#confirm.text, act: "confirm", label: "Confirm" } : null,
 			actions: this.#pickerActions(selected),
 			strip: strip ? this.#pickerStrip(strip) : null,
 			focus: strip ? "strip" : this.#focus === "scope" ? "scopes" : "list",
@@ -932,6 +1037,11 @@ export class AccountManagerComponent implements Component {
 	/** The action bar: the open strip's apply/back, else edit, each field's shortcut, reload and close. */
 	#pickerActions(selected: AccountManagerAccount | undefined): TspPickerAction[] {
 		const strip = this.#strip;
+		if (this.#confirm)
+			return [
+				pickerAction("confirm", "Confirm", "enter", { primary: true, danger: true }),
+				pickerAction("cancel", "Cancel", "escape"),
+			];
 		if (strip?.kind === "input") {
 			return [
 				pickerAction("stripSubmit", "Save", "enter", { primary: true }),
@@ -940,27 +1050,39 @@ export class AccountManagerComponent implements Component {
 		}
 		if (strip) {
 			return [
-				pickerAction("stripApply", strip.field ? "Apply" : "Open", "enter", { primary: true }),
+				pickerAction("stripApply", strip.field ? "Apply" : "Open", "enter", {
+					primary: true,
+					danger: strip.chips[strip.index]?.action.confirm !== undefined,
+					disabled: strip.chips[strip.index]?.action.readOnly,
+				}),
 				pickerAction("cancel", "Back", "escape"),
 			];
 		}
+		if (this.#searching)
+			return [pickerAction("searchDone", "Done searching", "enter"), { ...CLOSE_ACTION, label: "Clear search" }];
+		if (this.#focus === "scope")
+			return [
+				pickerAction("focusList", "Accounts", "enter"),
+				pickerAction("search", "Search", "/"),
+				pickerAction("reload", "Reload", "ctrl+r"),
+				this.#search.getValue() ? { ...CLOSE_ACTION, label: "Clear search" } : CLOSE_ACTION,
+			];
 		const actions: TspPickerAction[] = [];
 		if (selected) {
 			actions.push(pickerAction("edit", "Edit", "enter", { primary: true }));
 			for (const field of selected.fields) {
 				if (!field.key) continue;
 				actions.push(
-					pickerAction(
-						`field:${field.id}`,
-						field.label,
-						field.key,
-						field.readOnly ? { disabled: field.readOnly } : undefined,
-					),
+					pickerAction(`field:${field.id}`, field.label, field.key, {
+						...(field.readOnly ? { disabled: field.readOnly } : {}),
+						...(field.confirm ? { danger: true } : {}),
+					}),
 				);
 			}
 		}
-		if (this.#deps.refresh) actions.push(pickerAction("reload", "Reload", "ctrl+r"));
-		actions.push(CLOSE_ACTION);
+		actions.push(pickerAction("search", "Search", "/"));
+		actions.push(pickerAction("reload", "Reload", "ctrl+r"));
+		actions.push(this.#search.getValue() ? { ...CLOSE_ACTION, label: "Clear search" } : CLOSE_ACTION);
 		return actions;
 	}
 
@@ -979,6 +1101,12 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#handlePickerEvent(event: PickerEvent): void {
+		if (this.#confirm) {
+			if (event.kind === "action" && event.act === "confirm") this.#confirmApply();
+			else if (event.kind === "action" && (event.act === "cancel" || event.act === CLOSE_ACTION.id))
+				this.#confirm = undefined;
+			return;
+		}
 		if (event.kind !== "action") {
 			if (this.#strip) return;
 			const index = this.#rows.findIndex(account => accountItemId(account) === event.item);
@@ -992,9 +1120,18 @@ export class AccountManagerComponent implements Component {
 		const strip = this.#strip;
 		if (act === CLOSE_ACTION.id) {
 			if (strip) this.#stripBack(strip);
-			else this.#close();
+			else if (!this.#clearSearch()) this.#close();
 		} else if (act === "cancel") {
 			if (strip) this.#stripBack(strip);
+		} else if (act === "search") {
+			if (!strip) {
+				this.#searching = true;
+				this.#focus = "list";
+			}
+		} else if (act === "searchDone") {
+			this.#searching = false;
+		} else if (act === "focusList") {
+			if (!strip) this.#focus = "list";
 		} else if (act === "scope") {
 			const entry = this.#entries.find(candidate => candidate.id === value);
 			if (strip || !entry || entry.kind === "separator") return;
@@ -1112,29 +1249,7 @@ export class AccountManagerComponent implements Component {
 		return [span(chip.label, "value" in action ? "accent" : "muted")];
 	}
 
-	#footerHints(): (NativeHint | undefined)[] {
-		const cancel = (label: string) => actionHint("tui.select.cancel", label);
-		const strip = this.#strip;
-		if (strip?.kind === "input")
-			return [{ keys: ["enter"], label: strip.action.input?.hint ?? "apply" }, cancel("back")];
-		if (strip) {
-			return [
-				{ keys: ["left", "right"], label: "choose" },
-				{ keys: ["enter"], label: strip.field ? "apply" : "open" },
-				cancel("back"),
-			];
-		}
-		const upDown = actionHint(["tui.select.up", "tui.select.down"], this.#focus === "scope" ? "providers" : "rows");
-		if (this.#focus === "scope") return [upDown, { keys: ["right", "enter"], label: "accounts" }, cancel("close")];
-		const shortcuts: NativeHint[] = (this.#selected()?.fields ?? []).flatMap(field =>
-			field.key ? [{ keys: [field.key], label: field.label }] : [],
-		);
-		return [
-			{ keys: ["enter"], label: "edit" },
-			...shortcuts,
-			upDown,
-			{ keys: ["ctrl+r"], label: "reload" },
-			cancel("close"),
-		];
+	#footerHints(): NativeHint[] {
+		return pickerActionHints(this.#pickerActions(this.#selected()));
 	}
 }
