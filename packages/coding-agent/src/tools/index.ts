@@ -377,6 +377,8 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** Explicit memory-only caller binding for tool sessions without a peer registry. */
+	memoryContext?: Pick<ToolSession, "settings" | "getMnemopiSessionState" | "isDisposed">;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Parent cache identity for sibling sharing, only when the parent model opts in. */

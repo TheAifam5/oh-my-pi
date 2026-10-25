@@ -478,9 +478,8 @@ export async function resolveEffectiveSubagentPolicy(
 		enableIrc:
 			preparedSeance === undefined &&
 			!planMode &&
-			(request.enableIrc ??
-				(request.session.enableIrc !== false &&
-					isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0))),
+			request.session.enableIrc !== false &&
+			(request.enableIrc ?? isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0)),
 	};
 }
 

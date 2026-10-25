@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { AdvisorFindingsLedger, renderFindingsDigest } from "../../src/advisor";
+import { isolateAdvisorToolSession } from "../../src/advisor/tool-session";
 import { Settings } from "../../src/config/settings";
 import type { AgentSession } from "../../src/session/agent-session";
 import { SessionAdvisors, type SessionAdvisorsHost } from "../../src/session/session-advisors";
@@ -48,6 +49,58 @@ function toolSession(ledger: AdvisorFindingsLedger, enabled = true, persist?: (d
 }
 
 describe("advisor findings management", () => {
+	it("does not construct configured findings-management tools for an advisor", async () => {
+		const ledger = new AdvisorFindingsLedger();
+		record(ledger);
+		const primary = toolSession(ledger);
+		const advisor = isolateAdvisorToolSession(primary);
+		const configuredTools = ["advisor_findings"];
+		const advisorTools = [AdvisorFindingsTool.createIf(advisor)].filter(
+			(tool): tool is AdvisorFindingsTool => tool !== null && configuredTools.includes(tool.name),
+		);
+		expect(advisorTools).toEqual([]);
+		expect(advisor.listAdvisorFindings).toBeUndefined();
+		expect(advisor.getAdvisorFinding).toBeUndefined();
+		expect(advisor.resolveAdvisorFindings).toBeUndefined();
+		expect(advisor.reopenAdvisorFindings).toBeUndefined();
+		const tool = new AdvisorFindingsTool(advisor);
+		for (const op of ["list", "get", "resolve", "reopen"] as const) {
+			await expect(
+				tool.execute("advisor-management", { op, id: "F1", ids: ["F1"], reason: "Changed" }),
+			).rejects.toThrow("Advisor findings are unavailable for this session.");
+		}
+		expect(ledger.get("F1")?.status).toBe("open");
+		expect(AdvisorFindingsTool.createIf(primary)).not.toBeNull();
+		await new AdvisorFindingsTool(primary).execute("primary-resolve", {
+			op: "resolve",
+			ids: ["F1"],
+			reason: "Primary verified the fix",
+		});
+		expect(ledger.get("F1")?.status).toBe("resolved");
+	});
+
+	it("keeps management and slash-command findings local to each owning session", async () => {
+		const mainLedger = new AdvisorFindingsLedger();
+		const childLedger = new AdvisorFindingsLedger();
+		record(mainLedger, "logic");
+		record(childLedger, "security");
+		await new AdvisorFindingsTool(toolSession(childLedger)).execute("child-resolve", {
+			op: "resolve",
+			ids: ["F1"],
+			reason: "Child verified the fix",
+		});
+		expect(childLedger.get("F1")?.status).toBe("resolved");
+		expect(mainLedger.get("F1")?.status).toBe("open");
+		const mainUi = runAdvisorFindingsCommand(sessionAdvisors(mainLedger), "all");
+		const childUi = runAdvisorFindingsCommand(sessionAdvisors(childLedger), "all");
+		expect(mainUi).toContain("logic");
+		expect(mainUi).not.toContain("security");
+		expect(mainUi).not.toContain("Child verified the fix");
+		expect(childUi).toContain("security");
+		expect(childUi).not.toContain("logic");
+		expect(childUi).toContain("Child verified the fix");
+	});
+
 	it("persists agent closure and exposes the author and reason to list, get, and advisor digests", async () => {
 		let snapshot: unknown;
 		const ledger = new AdvisorFindingsLedger({

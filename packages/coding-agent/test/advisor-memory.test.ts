@@ -2,9 +2,11 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { isolateAdvisorToolSession } from "@oh-my-pi/pi-coding-agent/advisor/tool-session";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
+import { MemoryProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/memory-protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -177,6 +179,19 @@ describe("advisor memory context", () => {
 				}
 				const id = session.getMnemopiSessionState()?.rememberInScope("Advisor scoped memory marker.");
 				if (!id) throw new Error("Expected a stored memory id");
+				const memoryToolSession = isolateAdvisorToolSession({
+					cwd: tempDir.path(),
+					hasUI: false,
+					settings: session.settings,
+					getSessionFile: () => null,
+					getSessionSpawns: () => null,
+					getMnemopiSessionState: () => session?.getMnemopiSessionState(),
+					isDisposed: () => session?.isDisposed ?? true,
+				});
+				expect(await new MemoryProtocolHandler().complete("", { session: memoryToolSession })).toContainEqual({
+					value: "<memory-id>",
+					description: "Full mnemopi memory by id (from recall)",
+				});
 				const row = await read.execute("advisor-memory-read", { path: `memory://${id}` });
 				expect(JSON.stringify(row.content)).toContain("Advisor scoped memory marker.");
 				const match = await grep.execute("advisor-memory-grep", {

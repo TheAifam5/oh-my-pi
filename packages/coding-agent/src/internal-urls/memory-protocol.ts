@@ -189,6 +189,7 @@ interface MemoryCallerBinding {
 	readonly session: AgentSession | undefined;
 	readonly backend: string | undefined;
 	readonly legacy: boolean;
+	readonly mnemopiState?: MnemopiSessionState;
 }
 
 /**
@@ -216,6 +217,17 @@ function findCallerSession(context: ResolveContext): AgentSession | undefined {
 
 function resolveMemoryCaller(context?: ResolveContext): MemoryCallerBinding {
 	if (!context) return { session: undefined, backend: undefined, legacy: true };
+	const memoryContext = context.session?.memoryContext;
+	if (memoryContext) {
+		const disposed = memoryContext.isDisposed?.() === true;
+		const state = disposed ? undefined : memoryContext.getMnemopiSessionState?.();
+		return {
+			session: undefined,
+			backend: disposed ? "off" : cfgMemoryBackend.get(memoryContext.settings),
+			legacy: false,
+			mnemopiState: state?.aliasOf ?? state,
+		};
+	}
 	const session = findCallerSession(context);
 	// The caller's own session owns the backend decision: not every tool threads
 	// its settings blob, and a same-cwd peer's backend is not an answer.
@@ -402,7 +414,8 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 			if (!caller.legacy) {
 				if (backend === "hindsight") throw new Error(HINDSIGHT_UNADDRESSABLE);
 				if (backend === "mnemopi") {
-					const hit = caller.session ? callerMnemopiState(caller.session)?.getScopedMemory(namespace) : undefined;
+					const state = caller.mnemopiState ?? (caller.session ? callerMnemopiState(caller.session) : undefined);
+					const hit = state?.getScopedMemory(namespace);
 					if (hit) return renderMnemopiMemory(url, hit);
 					throw new Error(
 						`Mnemopi memory ${namespace} not found in the calling session's scoped bank. Use \`recall\` to list available ids.`,
@@ -474,8 +487,8 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 		const mnemopiAvailable = caller.legacy
 			? mnemopiSessionStatesFromRegistry().length > 0
 			: caller.backend === "mnemopi" &&
-				caller.session !== undefined &&
-				callerMnemopiState(caller.session) !== undefined;
+				(caller.mnemopiState !== undefined ||
+					(caller.session !== undefined && callerMnemopiState(caller.session) !== undefined));
 		if (mnemopiAvailable) {
 			completions.push({
 				value: "<memory-id>",

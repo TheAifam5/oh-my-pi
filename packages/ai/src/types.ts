@@ -404,8 +404,12 @@ export function coerceServiceTierByFamily(value: unknown): ServiceTierByFamily |
 }
 
 export interface ProviderSessionState {
+	/** Dispose all provider state and connections owned by this record. */
 	close(): void;
-	/** Release one routing session after its final request, preserving shared provider fallbacks. */
+	/**
+	 * Release the named routing session's retained state without disposing other sessions.
+	 * Provider implementations may cancel that session's pending or active requests.
+	 */
 	releaseSession?(sessionId: string): void;
 }
 

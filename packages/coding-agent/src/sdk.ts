@@ -95,6 +95,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { bindEffects, combine } from "./config/registry";
 import { Settings } from "./config/settings";
+import { isolateAdvisorToolSession } from "./advisor/tool-session";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -5185,12 +5186,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// primary, while edit/bash/write stay fully functional: the advisor is a full
 		// agent and its config's `tools` selects which of these it actually gets
 		// (defaulting to read/grep/glob).
-		const advisorToolSession: ToolSession = {
+		const advisorToolSession = isolateAdvisorToolSession({
 			...toolSession,
-			listAdvisorFindings: undefined,
-			getAdvisorFinding: undefined,
-			resolveAdvisorFindings: undefined,
-			reopenAdvisorFindings: undefined,
 			// The primary may carry a dormant xd:// write transport. Advisors use
 			// their own configured tool slate, so a selected write is always full.
 			deviceOnlyWrite: undefined,
@@ -5222,7 +5219,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Descriptions follow the primary's frozen roster, like `isToolActive` above.
 			isToolAdvertised: name => toolSession.isToolAdvertised?.(name),
 			getAdvertisedToolSettings: () => toolSession.getAdvertisedToolSettings?.(),
-		};
+		});
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {
 			advisorToolBuilds.push(BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS](advisorToolSession));

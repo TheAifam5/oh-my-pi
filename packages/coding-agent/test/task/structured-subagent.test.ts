@@ -137,6 +137,24 @@ afterEach(() => {
 });
 
 describe("structured subagent primitive", () => {
+	it.each([
+		{ parent: false, requested: true, expected: false },
+		{ parent: false, requested: undefined, expected: false },
+		{ parent: true, requested: true, expected: true },
+		{ parent: undefined, requested: true, expected: true },
+		{ parent: true, requested: false, expected: false },
+		{ parent: undefined, requested: undefined, expected: true },
+	])(
+		"applies the session IRC ceiling before request overrides ($parent, $requested)",
+		async ({ parent, requested, expected }) => {
+			mockDiscovery();
+			const owner = session();
+			owner.enableIrc = parent;
+			const policy = await resolveEffectiveSubagentPolicy(request({ session: owner, enableIrc: requested }));
+			expect(policy.enableIrc).toBe(expected);
+		},
+	);
+
 	it("resolves user-tagged model agents for task and eval but rejects untagged names", async () => {
 		mockDiscovery();
 		const taggedSession = session();

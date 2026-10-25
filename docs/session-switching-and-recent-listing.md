@@ -188,6 +188,22 @@ Failures after the snapshot restore the previous manager and runtime state, reco
 
 The recorded model resolves as in startup resume: the first role/default candidate that is registered, enabled, and has credentials configured, retried once after a provider-scoped discovery refresh. When none resolves for a different session, the switch throws `Could not restore model <provider/id>` before `session_switch` and rolls back. A session created with `hasUI` and `allowSessionModelFallback` (the TUI) instead keeps its current model when `retry.modelFallback` is on, and reports `Could not restore model <provider/id>. Using <provider/id>` through `onModelFallback` or a `notice` event. A same-file reload keeps the current model. Callers that choose the model pass `model` (RPC `open_session`/`switch_session` with `provider`/`modelId`); collab replicas pass `keepModel`, since the host's state supplies theirs.
 
+## Codex provider connection ownership
+
+Primary model changes, including same-model reselection, history rewrites, and stale-replay
+resets, release only the primary routing session's Codex connections and replay metadata.
+Concurrent advisors and side requests with different routing session IDs keep their connections.
+The shared provider-state map remains owned by the conversation.
+
+Routing-session release cancels requests preparing payloads, active requests, pending handshakes,
+queued sends, and isolated compaction transports for that routing session. Released requests terminate with a non-retriable
+`session_disposed` abort and cannot reconnect. A later request using the same routing session ID
+starts fresh connection and replay state.
+
+Conversation replacement and disposal close all provider connections owned by the conversation,
+including advisor and isolated compaction connections. In-flight requests cannot reconnect after
+their connection owner closes.
+
 ## UI state rebuild after interactive switch
 
 `SelectorController.handleResumeSession` invokes `switchSession` first. If it returns `false`, the selector stops before applying any new-session UI updates and leaves the existing session/UI unchanged. After a successful switch, it:

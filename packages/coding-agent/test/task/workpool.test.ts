@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { isolateAdvisorToolSession } from "../../src/advisor/tool-session";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { AgentRegistry } from "../../src/registry/agent-registry";
@@ -6,6 +7,7 @@ import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import type { AgentSession } from "../../src/session/agent-session";
 import { WaitTool } from "../../src/tools/wait";
 import type { CustomMessage } from "../../src/session/messages";
+import * as discovery from "../../src/task/discovery";
 import * as executor from "../../src/task/executor";
 import type { EffectiveSubagentPolicy, StructuredSubagentResult } from "../../src/task/structured-subagent";
 import * as structured from "../../src/task/structured-subagent";
@@ -150,6 +152,31 @@ afterEach(async () => {
 });
 
 describe("WorkPool dispatch", () => {
+	it.each([
+		{ label: "isolated advisor", enableIrc: false, expected: false },
+		{ label: "enabled primary", enableIrc: true, expected: true },
+		{ label: "default primary", enableIrc: undefined, expected: true },
+	])("preserves the $label IRC ceiling through worker launch", async ({ enableIrc, expected }) => {
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({
+			agents: [{ ...AGENT, model: ["anthropic/claude-sonnet-4"] }],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi.spyOn(executor, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "missing";
+			markIdle(id);
+			return singleResult(id);
+		});
+		const primary = makeSession();
+		primary.enableIrc = enableIrc;
+		const session =
+			enableIrc === false ? isolateAdvisorToolSession({ ...primary, getAgentId: () => "advisor" }) : primary;
+		const workpool = pool(session, "irc-ceiling");
+		workpool.push(["Inspect one item."]);
+		await finishPool(session, workpool);
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].enableIrc).toBe(expected);
+	});
+
 	it("spawns while there is room, then queues round-robin, and dispatches to an idle agent", async () => {
 		const cards: CustomMessage[] = [];
 		const session = makeSession(cards);

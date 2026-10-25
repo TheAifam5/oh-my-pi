@@ -481,11 +481,17 @@ interface CodexTurnStateCell {
 	value?: string;
 }
 
+interface CodexRoutingSessionLease {
+	closed: boolean;
+}
+
 interface CodexProviderSessionState extends ProviderSessionState {
 	/** Set by `close()`; a closed state is replaced, never reused, by the next request. */
 	closed: boolean;
 	/** Isolated transport states serving this state's session; closed with it. */
-	childStates: Set<CodexProviderSessionState>;
+	childStates: Map<CodexProviderSessionState, string | undefined>;
+	/** Requests capture a routing lease before asynchronous payload preparation. */
+	routingSessionLeases: Map<string, CodexRoutingSessionLease>;
 	webSocketSessions: Map<string, CodexWebSocketSessionState>;
 	webSocketPublicToPrivate: Map<string, string>;
 	metadataSessions: Map<string, CodexMetadataSessionState>;
@@ -1065,22 +1071,36 @@ interface CodexStreamCompletion {
 }
 
 /**
- * Create a provider-session state. A `parent` (the shared session state an
- * isolated compaction transport serves) closes this state when it closes;
- * closing this state first detaches it from the parent.
+ * Create provider state. Parent closure or release of the child's routing
+ * session closes an isolated compaction transport; closing the child detaches it.
  */
-function createCodexProviderSessionState(parent?: CodexProviderSessionState): CodexProviderSessionState {
+function createCodexProviderSessionState(
+	parent?: CodexProviderSessionState,
+	sessionId?: string,
+): CodexProviderSessionState {
 	const state: CodexProviderSessionState = {
 		webSocketSessions: new Map(),
 		webSocketPublicToPrivate: new Map(),
 		metadataSessions: new Map(),
 		effortControls: new Map(),
+		routingSessionLeases: new Map(),
 		releaseSession: sessionId => {
 			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
 			if (!normalizedSessionId) return;
+			const lease = state.routingSessionLeases.get(normalizedSessionId);
+			if (lease) {
+				lease.closed = true;
+			}
+			state.routingSessionLeases.delete(normalizedSessionId);
+			for (const [child, ownerSessionId] of state.childStates) {
+				if (ownerSessionId === normalizedSessionId) {
+					child.close();
+				}
+			}
 			for (const [key, session] of state.webSocketSessions) {
 				if (session.sessionId !== normalizedSessionId) continue;
-				session.connection?.close("session_disposed");
+				session.closedReason ??= "session_disposed";
+				session.connection?.cancel("session_disposed");
 				state.webSocketSessions.delete(key);
 				for (const [publicKey, privateKey] of state.webSocketPublicToPrivate) {
 					if (privateKey === key) state.webSocketPublicToPrivate.delete(publicKey);
@@ -1089,13 +1109,17 @@ function createCodexProviderSessionState(parent?: CodexProviderSessionState): Co
 			state.metadataSessions.delete(normalizedSessionId);
 			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
 		},
-		childStates: new Set(),
+		childStates: new Map(),
 		closed: false,
 		close: () => {
 			state.closed = true;
+			for (const lease of state.routingSessionLeases.values()) {
+				lease.closed = true;
+			}
+			state.routingSessionLeases.clear();
 			parent?.childStates.delete(state);
-			// Each child detaches itself while closing; Set iteration tolerates that deletion.
-			for (const child of state.childStates) child.close();
+			// Each child detaches itself while closing; Map iteration tolerates that deletion.
+			for (const child of state.childStates.keys()) child.close();
 			for (const session of state.webSocketSessions.values()) {
 				session.closedReason ??= "session_disposed";
 				session.connection?.cancel("session_disposed");
@@ -1106,7 +1130,7 @@ function createCodexProviderSessionState(parent?: CodexProviderSessionState): Co
 			state.effortControls.clear();
 		},
 	};
-	parent?.childStates.add(state);
+	parent?.childStates.set(state, sessionId);
 	return state;
 }
 
@@ -1133,6 +1157,31 @@ function getCodexProviderSessionState(
 	const created = createCodexProviderSessionState();
 	providerSessionState.set(CODEX_PROVIDER_SESSION_STATE_KEY, created);
 	return created;
+}
+
+function getCodexRoutingSessionLease(
+	state: CodexProviderSessionState | undefined,
+	sessionId: string | undefined,
+): CodexRoutingSessionLease | undefined {
+	const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
+	if (!state || !normalizedSessionId) return undefined;
+	let lease = state.routingSessionLeases.get(normalizedSessionId);
+	if (!lease) {
+		lease = { closed: false };
+		state.routingSessionLeases.set(normalizedSessionId, lease);
+	}
+	return lease;
+}
+
+function assertCodexRoutingSessionLeaseOpen(
+	state: CodexProviderSessionState | undefined,
+	lease: CodexRoutingSessionLease | undefined,
+): void {
+	if (state?.closed || lease?.closed) {
+		throw new CodexSessionClosedError(
+			"Codex request cancelled because the session closed its provider connection (session_disposed)",
+		);
+	}
 }
 
 /**
@@ -1555,7 +1604,7 @@ function createCodexRequestContext(
 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
 	const isolatedTransportState =
 		contextOptions.isolateCompactionTransport && options?.codexCompaction
-			? createCodexProviderSessionState(providerSessionState)
+			? createCodexProviderSessionState(providerSessionState, transportSessionId)
 			: undefined;
 	const transportProviderSessionState = isolatedTransportState ?? providerSessionState;
 	const responsesLite = resolveCodexResponsesLite(options?.responsesLite);
@@ -1625,8 +1674,19 @@ async function buildCodexRequestContext(
 	context: Context,
 	options: OpenAICodexResponsesOptions | undefined,
 ): Promise<CodexRequestContext> {
+	const providerState = getCodexProviderSessionState(options?.providerSessionState);
+	const lease = getCodexRoutingSessionLease(providerState, options?.sessionId);
 	const promptCacheKey = getOpenAIPromptCacheKey(options);
-	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
+	const transformedBody = await prepareCodexRequestBody(
+		model,
+		context,
+		options,
+		promptCacheKey,
+		undefined,
+		providerState,
+		lease,
+	);
+	assertCodexRoutingSessionLeaseOpen(providerState, lease);
 	return createCodexRequestContext(model, transformedBody, options, {
 		isolateCompactionTransport: true,
 		startNewTurn: options?.codexCompaction ? undefined : !isCodexWithinTurnContinuation(context),
@@ -1657,6 +1717,18 @@ export async function buildTransformedCodexRequestBody(
 	options: OpenAICodexResponsesOptions | undefined,
 	promptCacheKey = getOpenAIPromptCacheKey(options),
 	inputPrefix?: InputItem[],
+): Promise<RequestBody> {
+	return prepareCodexRequestBody(model, context, options, promptCacheKey, inputPrefix);
+}
+
+async function prepareCodexRequestBody(
+	model: Model<"openai-codex-responses">,
+	context: Context,
+	options: OpenAICodexResponsesOptions | undefined,
+	promptCacheKey: string | undefined,
+	inputPrefix?: InputItem[],
+	providerState?: CodexProviderSessionState,
+	lease?: CodexRoutingSessionLease,
 ): Promise<RequestBody> {
 	const input = convertMessages(model, context);
 	const params: RequestBody = {
@@ -1703,6 +1775,7 @@ export async function buildTransformedCodexRequestBody(
 	};
 
 	const body = await transformRequestBody(params, model, codexOptions, { developerMessages });
+	assertCodexRoutingSessionLeaseOpen(providerState, lease);
 	applyCodexStableEffort(model, body, options);
 	return body;
 }

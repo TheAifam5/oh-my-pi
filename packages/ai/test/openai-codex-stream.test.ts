@@ -6207,6 +6207,150 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).not.toMatch(/^(?:Request was aborted|The operation was aborted)\.?$/);
 	});
 
+	it.each([
+		"preparation",
+		"compaction-preparation",
+		"owner-preparation",
+		"owner-compaction-preparation",
+		"attestation",
+		"handshake",
+		"queued-send",
+		"streaming",
+		"compaction",
+	] as const)("cancels requests within their ownership boundary during %s", async phase => {
+		const duringPreparation = phase.endsWith("preparation");
+		const closesOwner = phase.startsWith("owner-");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const advisorSent = Promise.withResolvers<void>();
+		const primaryReady = Promise.withResolvers<void>();
+		const sockets: OwnerWebSocket[] = [];
+		let released = false;
+		let primarySent = false;
+		const primaryAbort = new AbortController();
+		const advisorAbort = new AbortController();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("Disposed routing requests must not replay over SSE");
+		});
+		class OwnerWebSocket extends MockWebSocket {
+			readonly index: number;
+
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.index = sockets.length;
+				sockets.push(this);
+				if (!released && this.index === 1 && phase === "handshake") {
+					primaryReady.resolve();
+				} else {
+					this.scheduleOpen();
+				}
+			}
+
+			override send(): void {
+				if (released) {
+					this.emitCodexResponse({ messageId: "msg_fresh", responseId: "resp_fresh", text: "Fresh" });
+				} else if (this.index === 0) {
+					advisorSent.resolve();
+				} else {
+					primarySent = true;
+					primaryReady.resolve();
+				}
+			}
+
+			override close(): void {
+				super.close();
+				this.emit("close", { code: 1000 } as unknown as Event);
+			}
+		}
+		global.WebSocket = OwnerWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const options = { apiKey: createCodexTestToken(), providerSessionState, fetch: fetchMock as FetchImpl };
+		const advisor = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			...options,
+			sessionId: "advisor",
+			signal: advisorAbort.signal,
+		}).result();
+		await advisorSent.promise;
+		const release = () => {
+			for (const state of providerSessionState.values()) {
+				if (closesOwner) {
+					state.close();
+				} else {
+					state.releaseSession?.("primary");
+				}
+			}
+		};
+		if (phase === "attestation") {
+			setCodexAttestationProvider(async () => {
+				release();
+				return undefined;
+			});
+		}
+		try {
+			if (duringPreparation) {
+				await prewarmOpenAICodexResponses(model, { ...options, sessionId: "primary" });
+			}
+			const owner = providerSessionState.get("openai-codex-responses");
+			const primary = streamOpenAICodexResponses(model, createCodexTestContext(), {
+				...options,
+				sessionId: "primary",
+				signal: primaryAbort.signal,
+				onPayload:
+					phase === "queued-send"
+						? payload => {
+								release();
+								return payload;
+							}
+						: undefined,
+				codexCompaction: phase.includes("compaction")
+					? {
+							operationId: "primary-compaction",
+							trigger: "auto",
+							reason: "context_limit",
+							implementation: "responses",
+							phase: "pre_turn",
+							strategy: "memento",
+						}
+					: undefined,
+			}).result();
+			if (duringPreparation) {
+				release();
+			}
+			if (phase === "handshake" || phase === "streaming" || phase === "compaction") {
+				await primaryReady.promise;
+				release();
+			}
+			const result = await primary;
+			expect(result.errorMessage).toContain("session_disposed");
+			expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+			expect(AIError.retriable(result.errorId)).toBe(false);
+			expect(primaryAbort.signal.aborted).toBe(false);
+			expect(advisorAbort.signal.aborted).toBe(false);
+			if (duringPreparation) {
+				expect(primarySent).toBe(false);
+				expect(sockets).toHaveLength(2);
+				expect(providerSessionState.get("openai-codex-responses")).toBe(owner);
+			}
+			if (closesOwner) {
+				expect((await advisor).errorMessage).toContain("session_disposed");
+			} else {
+				expect(sockets[0].readyState).toBe(MockWebSocket.OPEN);
+				sockets[0].emitCodexResponse({ messageId: "msg_advisor", responseId: "resp_advisor", text: "Review" });
+				expect((await advisor).stopReason).toBe("stop");
+			}
+			setCodexAttestationProvider(undefined);
+			released = true;
+			const fresh = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+				...options,
+				sessionId: "primary",
+			}).result();
+			expect(fresh.stopReason).toBe("stop");
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			setCodexAttestationProvider(undefined);
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
 	describe("session closes its provider state before the request streams", () => {
 		type CloseWindow = "attestation" | "connecting" | "before-stream" | "request-debug";
 

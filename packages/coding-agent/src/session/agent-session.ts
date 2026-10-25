@@ -12777,7 +12777,11 @@ export class AgentSession implements SettingsScope {
 			if (!state) continue;
 
 			try {
-				state.close();
+				if (providerKey === "openai-codex-responses") {
+					state.releaseSession?.(this.sessionId);
+				} else {
+					state.close();
+				}
 			} catch (error) {
 				logger.warn("Failed to close provider session state during model switch", {
 					providerKey,
@@ -12785,7 +12789,9 @@ export class AgentSession implements SettingsScope {
 				});
 			}
 
-			this.#providerSessionState.delete(providerKey);
+			if (providerKey !== "openai-codex-responses") {
+				this.#providerSessionState.delete(providerKey);
+			}
 		}
 
 		if (completionsPrefixToEvict !== undefined) {

@@ -67,6 +67,8 @@
 
 ### Fixed
 
+- Fixed advisor tools inheriting the primary session's peer messaging and findings-management capabilities and primary-bound eval tool lookups; directly granted filesystem tools and normal `advise` delivery remain available
+- Fixed primary model switches and Codex replay resets cancelling concurrent advisor requests with `session_disposed`; only the primary routing session is reset, while conversation teardown still cancels all owned connections
 - Advisors no longer replay no-finding chatter or fail quiet reviews on repeated output; loop failures retain bounded recovery without suppressing models session-wide
 - `/account` and `omp account` no longer list or resolve MCP connector OAuth credentials; manage those with `/mcp`
 - Advisor quota reserves are rechecked on each request, not only at preflight

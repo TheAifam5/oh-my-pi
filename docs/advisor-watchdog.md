@@ -175,6 +175,14 @@ A `WATCHDOG.yml` roster entry may select any subset of built-ins that were actua
 
 Advisor tools are built against the isolated advisor `ToolSession` and wrapped with `ExtensionToolWrapper`, so `tools.approvalMode`, per-tool approval policies, and `autoApprove` apply just as they do to registry tools. Cursor's server-side exec bridge uses the same approval context and only exposes delete/edit/search capabilities when the corresponding advisor grant exists.
 
+Advisor tool sessions have no peer registry or IRC capability, even when `write` is granted. Writes to `agent://<id>` and `agent://all` are rejected without delivering peer messages; directly granted filesystem writes still follow normal approval policies. Advisor `eval` has no built-in tool lookup bridge: calls through that bridge are unavailable even when the corresponding tool is granted directly. Enabled eval preludes remain separate from this tool lookup bridge. Findings reach the owning session through `advise`, not peer messaging.
+
+Children launched through an advisor's granted `task` tool or eval workpool inherit its explicit no-IRC setting. Structured child dispatch cannot override that setting with an IRC-enabled request. These restrictions cover supported peer-messaging and findings-management tool routes; they are not an arbitrary-code sandbox for explicitly granted shell or code-execution tools.
+
+Advisor tool sessions retain live working-directory and skill-visibility accessors. Memory URL reads use an explicit memory-only binding to the owner's configured backend and scoped Mnemopi state, without exposing its peer registry; disposed owners cannot supply memory data.
+
+`/advisor findings` and the findings overlay display and manage only the current session's ledger; child sessions have separate ledgers, and finding IDs are session-local. Advisor tool sessions do not expose the owner's findings-management callbacks or the `advisor_findings` tool, even if it is named in a tool grant. Advisors report through `advise` and receive the owning ledger's digest.
+
 The `advise` tool accepts one structured finding:
 
 | Field      | Required                                                               | Meaning                                                                                                                        |

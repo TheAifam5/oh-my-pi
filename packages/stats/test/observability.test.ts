@@ -5,11 +5,12 @@ import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { initDb } from "../src/db";
 import { getObservabilityStats, headroom, percentile, replayFindings } from "../src/observability";
+import { refreshObservabilityIndex } from "../src/observability-index";
 import type { FindingSnapshot, HeadroomPolicy } from "../src/observability-types";
 import { handleApi, startServer } from "../src/server";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
-installStatsTestIsolation("@pi-stats-observability-");
+const isolation = installStatsTestIsolation("@pi-stats-observability-");
 
 function finding(status: string, by?: string): FindingSnapshot["findings"][number] {
 	return {
@@ -147,6 +148,58 @@ it("serves explicit empty coverage with no source ledgers", async () => {
 	expect(result.routing).toEqual([]);
 	expect(result.findings.observed).toBe(0);
 	expect(result.models).toEqual([]);
+});
+
+it("keeps matching finding and branch IDs in main and child files independent before aggregating totals", async () => {
+	const directory = isolation.current();
+	if (!directory) throw new Error("Missing test directory");
+	const mainFile = directory.join("main.jsonl");
+	const childFile = directory.join("main", "Worker.jsonl");
+	mkdirSync(dirname(childFile), { recursive: true });
+	const now = Date.now();
+	const snapshot = (id: string, parentId: string | null, turn: number, status: string, by?: string) => ({
+		id,
+		parentId,
+		customType: "advisor_findings",
+		timestamp: new Date(now - 10000 + turn * 1000).toISOString(),
+		data: { v: 2, turn, findings: [finding(status, by)] },
+	});
+	await Bun.write(
+		mainFile,
+		[snapshot("a", null, 1, "open"), snapshot("b", "a", 4, "resolved", "user")]
+			.map(entry => JSON.stringify(entry))
+			.join("\n"),
+	);
+	await Bun.write(
+		childFile,
+		[snapshot("a", null, 1, "open"), snapshot("b", "a", 4, "open"), snapshot("c", "a", 2, "open")]
+			.map(entry => JSON.stringify(entry))
+			.join("\n"),
+	);
+	const database = await initDb();
+	for (const file of [mainFile, childFile]) {
+		database
+			.query("INSERT INTO file_offsets (session_file, last_modified, offset) VALUES (?, ?, ?)")
+			.run(file, now, Bun.file(file).size);
+	}
+	await refreshObservabilityIndex(database);
+	const result = await getObservabilityStats("24h");
+	expect(result.coverage.files).toBe(2);
+	expect(result.coverage.snapshots).toBe(5);
+	expect(result.findings.observed).toBe(2);
+	expect(result.findings.resolved).toEqual({ user: 1 });
+	expect(result.findings.reopened).toBe(0);
+	expect(result.findings.open).toEqual([
+		{ severity: "blocker", category: "correctness", owner: "reviewer", count: 1 },
+	]);
+	expect(result.findings.rows).toContainEqual({
+		severity: "blocker",
+		category: "correctness",
+		owner: "reviewer",
+		status: "resolved",
+		count: 1,
+	});
+	expect(result.findings.rows.reduce((sum, row) => sum + row.count, 0)).toBe(2);
 });
 
 it("uses the Overview cache hit-rate definition and excludes writes from its denominator", async () => {

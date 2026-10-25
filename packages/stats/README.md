@@ -93,6 +93,8 @@ The observability endpoint and mutating API requests return HTTP 403 unless the 
 
 Findings and recovery metadata are projected into the stats database after session ingestion releases its synchronization lock. Targeted syncs project only the selected transcripts. Unchanged files require no transcript reads; appended files read the new tail and bounded identity checkpoints. Checkpoints are stored as SHA-256 digests; obsolete raw-checkpoint projections are dropped on access. Pending and unreadable transcript counts are shown with findings coverage. Snapshot disappearance does not establish resolution; v1 resolution actors are unrecorded. Resolution duration measures elapsed time from the first observed open snapshot to the observed resolution, with separate reopened episodes; missing timestamps are excluded. Cost per resolved concern/blocker is an aggregate ratio, not a measured causal benefit or an exact review attribution.
 
+Findings totals aggregate independent ledgers from indexed main and subagent sessions. Snapshots and branch ancestry are replayed separately for each transcript before totals are combined; matching finding IDs in different session files do not identify the same finding. Advisor owner labels identify category owners within those session-local ledgers. The dashboard aggregate does not change the session-local `/advisor findings` UI.
+
 ## License
 
 MIT

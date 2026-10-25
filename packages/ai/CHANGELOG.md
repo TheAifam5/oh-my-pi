@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Fixed Codex routing-session release leaving requests preparing payloads, active requests, pending handshakes, and isolated compaction connections alive; released requests now end with a non-retriable session-closed abort without affecting other routing sessions
 - Assistant-text loop errors now report an output loop instead of a thinking loop, with unchanged retry classification
 - Request quota reserves now apply to pinned, preferred, and ordered accounts
 - Exclusive account pins no longer report a credential switch they forbid

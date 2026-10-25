@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { isolateAdvisorToolSession } from "@oh-my-pi/pi-coding-agent/advisor/tool-session";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -117,6 +118,36 @@ describe("task spawn routing", () => {
 		}
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+	});
+
+	it.each([
+		{ label: "advisor parent", enableIrc: false, expected: false },
+		{ label: "enabled primary", enableIrc: true, expected: true },
+		{ label: "default primary", enableIrc: undefined, expected: true },
+	])("preserves the IRC capability ceiling for a $label at launch", async ({ enableIrc, expected }) => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+			projectAgentsDir: null,
+		});
+		const runSpy = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const manager = createManager();
+		const primary = createSession({ manager, settings: { "task.maxRecursionDepth": 2 } });
+		primary.enableIrc = enableIrc;
+		const session =
+			enableIrc === false ? isolateAdvisorToolSession({ ...primary, getAgentId: () => "advisor" }) : primary;
+		const tool = await TaskTool.create(session);
+		const result = await tool.execute("irc-ceiling", {
+			agent: "task",
+			name: "IrcChild",
+			task: "Inspect the project.",
+		} as TaskParams);
+		const job = manager.getJob(result.details?.async?.jobId ?? "");
+		if (!job) throw new Error("Expected a launched child job");
+		await job.promise;
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(runSpy.mock.calls[0]?.[0].enableIrc).toBe(expected);
 	});
 
 	it("returns immediately on spawn and delivers the follow-up hint when the job completes", async () => {

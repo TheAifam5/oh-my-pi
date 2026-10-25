@@ -106,10 +106,11 @@ export function FindingsPanel({ data }: { data: ObservabilityStats }) {
 				/>
 			</StatGrid>
 			<p className="micro dim">
-				Compared with the preceding equal-length period. {data.coverage.files} transcripts indexed ·{" "}
-				{data.coverage.pendingFiles} awaiting indexing · {data.coverage.unreadable} unreadable. Snapshots record
-				observed transitions; missing snapshots and disappearing findings do not establish resolution. v1 resolver
-				is unrecorded.
+				Aggregated across indexed main and subagent session ledgers, not a shared findings ledger. Finding IDs are
+				local to the owning session; advisor owners identify category owners within those ledgers. Compared with the
+				preceding equal-length period. {data.coverage.files} transcripts indexed · {data.coverage.pendingFiles}{" "}
+				awaiting indexing · {data.coverage.unreadable} unreadable. Snapshots record observed transitions; missing
+				snapshots and disappearing findings do not establish resolution. v1 resolver is unrecorded.
 			</p>
 			{!data.coverage.snapshots ? (
 				<EmptyState
@@ -119,8 +120,8 @@ export function FindingsPanel({ data }: { data: ObservabilityStats }) {
 			) : (
 				<div className="grid grid-2 findings-split">
 					<Card
-						title="Findings ledger"
-						description={`${formatInteger(open)} open · grouped by severity, owner, category and latest status`}
+						title="Session ledger totals"
+						description={`${formatInteger(open)} open across owning sessions · grouped by severity, advisor owner, category and latest status`}
 						flush
 					>
 						<div className="findings-table" tabIndex={0} role="region" aria-label="Findings by latest status">
@@ -149,7 +150,7 @@ export function FindingsPanel({ data }: { data: ObservabilityStats }) {
 										),
 									},
 									{ key: "category", header: "Category", render: row => title(row.category) },
-									{ key: "owner", header: "Owner", render: row => title(row.owner) },
+									{ key: "owner", header: "Advisor owner", render: row => title(row.owner) },
 									{
 										key: "status",
 										header: "Status",

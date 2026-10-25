@@ -392,7 +392,9 @@ export class WorkPool {
 							workPoolYieldItems,
 							keepAlive: true,
 							retainArtifacts: true,
-							enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+							enableIrc:
+								this.session.enableIrc !== false &&
+								isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 							signal,
 							onProgress,
 						});
