@@ -155,6 +155,8 @@ export interface ModelHubPoolTarget {
 /** A role or chain entry that references a model group, with the profile its own value selects. */
 export interface ModelHubGroupReference extends ModelHubPoolTarget {
 	profile?: string;
+	/** The reference is stored in the global layer, even when another layer shadows it. */
+	global?: boolean;
 }
 
 /** One pool member as the hub shows it. */
@@ -1382,7 +1384,9 @@ export class ModelHubComponent implements Component {
 		this.#referenceCache.clear();
 		this.#billingCache.clear();
 		const rows: RolesRow[] = [];
-		const groupsView = this.#activeEntryId === "groups";
+		const groupsView =
+			this.#activeEntryId === "groups" ||
+			(this.#assigning?.kind === "poolMember" && this.#assigning.target.kind === "group");
 		this.#rowsBuiltFor = groupsView ? "groups" : "roles";
 		if (groupsView) {
 			for (const name of [...this.#modelGroupNames()].sort()) {
@@ -1875,7 +1879,7 @@ export class ModelHubComponent implements Component {
 						: undefined;
 				const assignedHere =
 					!!scopedModel && scopedModel.provider === item.model.provider && scopedModel.id === item.model.id;
-				const roleLabel = (info.tag ?? info.name ?? role).toLowerCase();
+				const roleLabel = sanitizeDisplayLine(info.tag ?? info.name ?? role).toLowerCase();
 				const label = scopedStorage ? `${scope} ${roleLabel}` : roleLabel;
 				chips.push({
 					label,
@@ -2328,7 +2332,7 @@ export class ModelHubComponent implements Component {
 			return `+${sanitizeDisplayLine(assign.target.key)}`;
 		}
 		const info = this.#settings.getRoleInfo(assign.role);
-		return info.tag ?? info.name ?? assign.role;
+		return sanitizeDisplayLine(info.tag ?? info.name ?? assign.role);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2400,6 +2404,7 @@ export class ModelHubComponent implements Component {
 		} catch (failure) {
 			error = failure instanceof Error ? failure.message : String(failure);
 		}
+		if (error === undefined) this.#referenceCache.clear();
 		return error === undefined ? undefined : sanitizeDisplayLine(error);
 	}
 
@@ -3089,9 +3094,8 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
-	 * Rename `modelGroups.<from>` to `to`: write the definition `raw` under `to`, point every entry
-	 * that references `from` at `to` (keeping its profile), then remove `from`. Refused, writing
-	 * nothing, when `to` exists or a referencing entry comes from a layer above global.
+	 * Rename a group and its writable references, including shadowed global references.
+	 * Failed writes restore repointed references before removing the new definition.
 	 */
 	#renameGroup(from: string, to: string, raw: Readonly<Record<string, unknown>>): string | undefined {
 		if (to === from) return undefined;
@@ -3100,21 +3104,39 @@ export class ModelHubComponent implements Component {
 		if (this.#modelGroupNames().includes(to)) return `modelGroups.${to} already exists`;
 		const references = this.#groupReferences(from);
 		for (const reference of references) {
-			const blocker = this.#settings.poolWriteBlocker?.(reference);
+			const blocker = reference.global ? undefined : this.#settings.poolWriteBlocker?.(reference);
 			if (blocker !== undefined) return `${this.#entryPath(reference)} uses +${from} and is ${blocker}`;
 		}
 		const created = this.#savePool({ kind: "group", key: to }, raw);
 		if (created !== undefined) return created;
+		const repointed: ModelHubGroupReference[] = [];
+		const rollback = (failure: string): string => {
+			const errors: string[] = [];
+			for (const reference of repointed.toReversed()) {
+				const error = this.#savePool(
+					reference,
+					reference.profile === undefined ? { use: from } : { use: from, profile: reference.profile },
+				);
+				if (error !== undefined) errors.push(error);
+			}
+			if (errors.length === 0) {
+				const error = this.#savePool({ kind: "group", key: to }, undefined);
+				if (error !== undefined) errors.push(error);
+			}
+			this.#refreshAfterMutation();
+			return errors.length ? `${failure}; rollback failed: ${errors.join("; ")}` : failure;
+		};
 		for (const reference of references) {
 			const profile = reference.profile;
 			const error = this.#savePool(reference, profile === undefined ? { use: to } : { use: to, profile });
-			if (error !== undefined) {
-				this.#refreshAfterMutation();
-				return error;
-			}
+			if (error !== undefined) return rollback(error);
+			repointed.push(reference);
 		}
 		const removed = this.#savePool({ kind: "group", key: from }, undefined);
+		if (removed !== undefined) return rollback(removed);
 		this.#refreshAfterMutation();
+		const index = this.#rolesRows.findIndex(row => row.kind === "group" && row.role === to);
+		if (index >= 0) this.#roleIndex = index;
 		return removed;
 	}
 
@@ -3283,9 +3305,8 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
-	 * `R` on a profile row: rename it. The new name is added first, every entry that references the
-	 * old one is pointed at it, then the old one is removed, so no entry ever names a missing profile.
-	 * Refused, writing nothing, when a referencing entry comes from a layer above global.
+	 * Rename a profile without leaving references to a missing profile.
+	 * Shadowed global references are writable; failed writes restore earlier references.
 	 */
 	#startRenameProfile(group: string, profile: string): void {
 		const target: ModelHubPoolTarget = { kind: "group", key: group };
@@ -3302,26 +3323,53 @@ export class ModelHubComponent implements Component {
 			if (this.#groupProfiles(group).some(entry => entry.name === to)) return `@${to} already exists`;
 			const references = this.#profileReferences(group, profile);
 			for (const reference of references) {
-				const blocker = this.#settings.poolWriteBlocker?.(reference);
+				const blocker = reference.global ? undefined : this.#settings.poolWriteBlocker?.(reference);
 				if (blocker !== undefined) {
 					return `${this.#entryPath(reference)} uses +${group}@${profile} and is ${blocker}`;
 				}
+			}
+			if (this.#groupProfiles(group).length >= 32 && references.length > 0) {
+				return "Cannot safely rename a referenced profile at the 32-profile limit; remove a profile first";
+			}
+			if (this.#groupProfiles(group).length >= 32) {
+				const error = this.#editPoolFromField(target, draft => {
+					const profiles = draftRecord(draft, "profiles");
+					profiles[to] = profiles[profile];
+					delete profiles[profile];
+				});
+				if (error === undefined) this.#landOnProfile(group, to);
+				return error;
 			}
 			const added = this.#editPoolFromField(target, draft => {
 				const profiles = draftRecord(draft, "profiles");
 				profiles[to] = structuredClone(draftRecord(profiles, profile));
 			});
 			if (added !== undefined) return added;
+			const repointed: ModelHubGroupReference[] = [];
+			const rollback = (failure: string): string => {
+				const errors: string[] = [];
+				for (const reference of repointed.toReversed()) {
+					const error = this.#savePool(reference, { use: group, profile });
+					if (error !== undefined) errors.push(error);
+				}
+				if (errors.length === 0) {
+					const error = this.#editPoolFromField(target, draft => {
+						delete draftRecord(draft, "profiles")[to];
+					});
+					if (error !== undefined) errors.push(error);
+				}
+				this.#refreshAfterMutation();
+				return errors.length ? `${failure}; rollback failed: ${errors.join("; ")}` : failure;
+			};
 			for (const reference of references) {
 				const error = this.#savePool(reference, { use: group, profile: to });
-				if (error !== undefined) {
-					this.#refreshAfterMutation();
-					return error;
-				}
+				if (error !== undefined) return rollback(error);
+				repointed.push(reference);
 			}
 			const removed = this.#editPoolFromField(target, draft => {
 				delete draftRecord(draft, "profiles")[profile];
 			});
+			if (removed !== undefined) return rollback(removed);
 			if (removed === undefined) this.#landOnProfile(group, to);
 			return removed;
 		});
@@ -3471,10 +3519,10 @@ export class ModelHubComponent implements Component {
 		const assignment = this.#roles[role];
 		if (!assignment) return { model: "—" };
 		const selector = `${assignment.model.provider}/${assignment.model.id}`;
-		if (assignment.autoSelected) return { model: `auto → ${selector}` };
+		if (assignment.autoSelected) return { model: `auto → ${sanitizeDisplayLine(selector)}` };
 		const billing = this.#billing(selector);
 		return {
-			model: selector,
+			model: sanitizeDisplayLine(selector),
 			...(assignment.thinkingLevel !== ThinkingLevel.Inherit
 				? { thinking: getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label }
 				: {}),
@@ -3497,7 +3545,7 @@ export class ModelHubComponent implements Component {
 				const assignment = this.#roles[row.role];
 				const glyph = assignment ? thinkingLevelGlyph(assignment.thinkingLevel, theme) : "";
 				return {
-					name: `  ${info.tag ?? info.name ?? row.role}`,
+					name: `  ${sanitizeDisplayLine(info.tag ?? info.name ?? row.role)}`,
 					cells: cells.thinking && glyph ? { ...cells, thinking: `${glyph} ${cells.thinking}` } : cells,
 				};
 			}
@@ -4058,7 +4106,9 @@ export class ModelHubComponent implements Component {
 			case "fallback":
 				if (row?.kind === "newFallback") this.#startAssignFallbackKey();
 				else if (row?.kind === "group") {
-					this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
+					const refused = this.#groupEditRefusal(row.role);
+					if (refused !== undefined) this.#poolNotice(refused);
+					else this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
 				} else if (row?.kind === "poolMember" && row.target.kind !== "role") {
 					this.#startAssignPoolMember(row.role, row.target, null);
 				} else if (
@@ -4426,7 +4476,7 @@ export class ModelHubComponent implements Component {
 				text = `Model roles — ${formatKeyHint("f")} adds a retry fallback, cleared roles fall back to auto-selection`;
 				break;
 			case "groups":
-				text = `Model groups — shared pools roles use as +name; ${formatKeyHint("n")} adds one`;
+				text = `Model groups — shared pools roles use as +name${this.#callbacks.onPoolChange ? `; ${formatKeyHint("n")} adds one` : ""}`;
 				break;
 			case "provider":
 				if (entry.locked) {
@@ -4471,6 +4521,17 @@ export class ModelHubComponent implements Component {
 	 * listing only keys that act on it; undefined for any other row. Both footers render these.
 	 */
 	#poolRowHints(row: RolesRow | undefined): { label: string; keys: KeyName[] }[] | undefined {
+		if (row?.kind === "newGroup")
+			return this.#callbacks.onPoolChange ? [{ label: "new group", keys: ["enter"] }] : [];
+		if (row?.kind === "profile") {
+			if (this.#groupEditRefusal(row.role) !== undefined) return [];
+			return [
+				{ label: "edit efforts", keys: ["enter"] },
+				{ label: "rename", keys: ["shift+r"] },
+				{ label: "delete", keys: ["x"] },
+				{ label: "new profile", keys: ["@"] },
+			];
+		}
 		const target = this.#rowPoolTarget(row);
 		if (!row || !target) return undefined;
 		const editable = this.#rowEditablePool(row) !== undefined;
@@ -4494,7 +4555,7 @@ export class ModelHubComponent implements Component {
 				editable && { label: "add member", keys: ["enter"] },
 				editable && { label: "rename", keys: ["shift+r"] },
 				this.#poolClearable(target) && { label: "delete", keys: ["x"] },
-				{ label: "new group", keys: ["n"] },
+				this.#callbacks.onPoolChange !== undefined && { label: "new group", keys: ["n"] },
 				editable && { label: "new profile", keys: ["@"] },
 				...routing,
 			);
@@ -4652,7 +4713,7 @@ export class ModelHubComponent implements Component {
 			}
 
 			if (rowDef.kind === "chainKey") {
-				const key = rowDef.role;
+				const key = sanitizeDisplayLine(rowDef.role);
 				const slash = key.lastIndexOf("/");
 				const tail = key.slice(slash + 1);
 				const keyStyled = theme.fg("dim", key.slice(0, slash + 1)) + (selected ? theme.fg("accent", tail) : tail);
@@ -4734,7 +4795,7 @@ export class ModelHubComponent implements Component {
 					selectedRow && "role" in selectedRow && selectedRow.kind !== "chainKey" ? selectedRow.role : "";
 				const activeIndex = cycleOrder.indexOf(selectedRole);
 				const track = renderSegmentTrack(
-					cycleOrder.map(role => ({ label: role })),
+					cycleOrder.map(role => ({ label: sanitizeDisplayLine(role) })),
 					activeIndex,
 				);
 				lines[rows - 1] = truncateToWidth(`  ${theme.fg("dim", `${cycleKey} cycle:`)} ${track}`, width);
@@ -4837,6 +4898,7 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (isRolesView(entry.kind)) {
 			if (this.#focus !== "list") {
+				if (entry.kind === "groups") return `${upDown} providers · ${enterRight} groups · ${cancel} close`;
 				const presets =
 					this.#presets().names.length > 0 ? ` · ${formatKeyHints(["ctrl+left", "ctrl+right"])} preset` : "";
 				return `${upDown} providers · ${enterRight} roles · ${altLeftRight} tabs${presets} · ${cancel} close`;
@@ -4872,16 +4934,6 @@ export class ModelHubComponent implements Component {
 			}
 			if (row?.kind === "newFallback") {
 				return `${upDown} rows · ${enter} new model/provider fallback chain · ${left} providers`;
-			}
-			if (row?.kind === "newGroup" || row?.kind === "group") {
-				const pick =
-					row.kind === "newGroup"
-						? `${enter} new group`
-						: `${formatKeyHint("x")} delete · ${formatKeyHint("n")} new group`;
-				return `${upDown} rows · ${pick} · ${left} providers`;
-			}
-			if (row?.kind === "profile") {
-				return `${upDown} rows · ${enter} edit efforts · ${formatKeyHint("shift+r")} rename · ${formatKeyHint("x")} delete · ${formatKeyHint("@")} new profile · ${left} providers`;
 			}
 			// Same rule as fallback rows: advertise `t` only where a strip would
 			// open — an assigned role whose model has thinking levels to offer.
@@ -4948,11 +5000,13 @@ export class ModelHubComponent implements Component {
 		}
 
 		let prefix: string;
-		if (strip.kind === "pool") prefix = `${theme.fg("accent", strip.title)}${theme.fg("dim", " →")} `;
-		else if (strip.kind === "role") prefix = `${theme.fg("accent", strip.item.id)}${theme.fg("dim", " →")} `;
+		if (strip.kind === "pool")
+			prefix = `${theme.fg("accent", sanitizeDisplayLine(strip.title))}${theme.fg("dim", " →")} `;
+		else if (strip.kind === "role")
+			prefix = `${theme.fg("accent", sanitizeDisplayLine(strip.item.id))}${theme.fg("dim", " →")} `;
 		else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
-			prefix = `${theme.fg(info.color ?? "muted", (info.tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${strip.item.id} →`)} `;
+			prefix = `${theme.fg(info.color ?? "muted", sanitizeDisplayLine(info.tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${sanitizeDisplayLine(strip.item.id)} →`)} `;
 		}
 
 		// Horizontal window: once the strip overflows, drop leading chips behind
@@ -5069,6 +5123,7 @@ export class ModelHubComponent implements Component {
 					break;
 				}
 				case "roleTabs": {
+					if (this.#activeEntryId === "groups") return;
 					const tab = ROLE_TABS.find(candidate => candidate === event.item);
 					if (!tab) return;
 					this.#roleTab = tab;
@@ -5299,8 +5354,8 @@ export class ModelHubComponent implements Component {
 					{
 						label: [
 							span(`${theme.status.shadowed} `, "dim"),
-							span(rowDef.role.slice(0, slash + 1), "dim"),
-							span(rowDef.role.slice(slash + 1)),
+							span(sanitizeDisplayLine(rowDef.role.slice(0, slash + 1)), "dim"),
+							span(sanitizeDisplayLine(rowDef.role.slice(slash + 1))),
 						],
 					},
 					undefined,
@@ -5336,7 +5391,7 @@ export class ModelHubComponent implements Component {
 		const role = rowDef.role;
 		const info = this.#settings.getRoleInfo(role);
 		const assignment = this.#roles[role];
-		const tag = info.tag ?? info.name ?? role;
+		const tag = sanitizeDisplayLine(info.tag ?? info.name ?? role);
 		let label: TspSpan[];
 		let detail: TspSpan[];
 		const value: TspSpan[] = [];
@@ -5350,7 +5405,10 @@ export class ModelHubComponent implements Component {
 		} else if (assignment && !assignment.autoSelected) {
 			const color = info.color ?? "muted";
 			label = [span(`${theme.status.enabled} `, color), span(tag, color)];
-			detail = [span(`${assignment.model.provider}/`, "dim"), span(assignment.model.id)];
+			detail = [
+				span(`${sanitizeDisplayLine(assignment.model.provider)}/`, "dim"),
+				span(sanitizeDisplayLine(assignment.model.id)),
+			];
 			if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
 				const glyph = thinkingLevelGlyph(assignment.thinkingLevel, theme);
 				const levelLabel = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
@@ -5359,7 +5417,12 @@ export class ModelHubComponent implements Component {
 		} else {
 			label = [span(`${theme.status.shadowed} `, "dim"), span(tag, "dim")];
 			detail = assignment
-				? [span(`auto → ${assignment.model.provider}/${assignment.model.id}`, "dim")]
+				? [
+						span(
+							`auto → ${sanitizeDisplayLine(assignment.model.provider)}/${sanitizeDisplayLine(assignment.model.id)}`,
+							"dim",
+						),
+					]
 				: [span("—", "dim")];
 		}
 		// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
@@ -5392,7 +5455,7 @@ export class ModelHubComponent implements Component {
 		const track: TspSpan[] = [];
 		for (const role of cycleOrder) {
 			if (track.length > 0) track.push(span(" › ", "dim"));
-			track.push(span(role, role === selectedRole ? "accent strong" : "muted"));
+			track.push(span(sanitizeDisplayLine(role), role === selectedRole ? "accent strong" : "muted"));
 		}
 		return node(
 			"row",
@@ -5583,6 +5646,7 @@ export class ModelHubComponent implements Component {
 		}
 		if (this.#configError && entry.kind !== "provider") return [span(this.#configError, "error")];
 		if (this.#poolStatus && rolesView) return [span(this.#poolStatus.text, this.#poolStatus.tone)];
+		if (entry.kind === "groups") return "Shared model groups";
 		if (entry.kind === "provider" && entry.providerId && this.#refreshingProviders.has(entry.providerId)) {
 			return `${entry.label} · refreshing model list…`;
 		}
@@ -5830,31 +5894,6 @@ export class ModelHubComponent implements Component {
 				case "newRole":
 					actions.push(roleAction("pick", "New role", "enter", true));
 					break;
-				case "newGroup":
-					actions.push(roleAction("pick", "New group", "enter", true));
-					break;
-				case "profile": {
-					// A group another layer owns, or an invalid one, lists its profiles read-only.
-					const refused = this.#groupEditRefusal(row.role);
-					const gate = (action: TspPickerAction): TspPickerAction =>
-						refused === undefined ? action : { ...action, disabled: refused };
-					actions.push(
-						gate(roleAction("pick", "Edit efforts", "enter", true)),
-						gate(roleAction("rename", "Rename", "shift+r")),
-						gate(roleAction("clear", "Delete", "x")),
-						gate(roleAction("newProfile", "New profile", "@")),
-					);
-					break;
-				}
-				case "group":
-					// An invalid group has no editable pool: offer delete and new only.
-					actions.push(
-						this.#poolClearable({ kind: "group", key: row.role })
-							? roleAction("clear", "Delete", "x")
-							: undefined,
-						roleAction("new", "New group", "n"),
-					);
-					break;
 			}
 			if (this.#groupsAvailable(row)) actions.push(roleAction("groups", "Model group", "shift+g"));
 			return compact([...actions, CLOSE_ACTION]);
@@ -5909,21 +5948,21 @@ export class ModelHubComponent implements Component {
 		}
 		let label: TspSpan[];
 		if (strip.kind === "pool") {
-			label = [span(strip.title, "muted")];
+			label = [span(sanitizeDisplayLine(strip.title), "muted")];
 		} else if (strip.kind === "role") {
 			// The second step of "New fallback chain…" reuses the role strip with key chips only.
 			const keyStrip = strip.chips.every(chip => chip.label.startsWith("for "));
 			label = keyStrip
 				? [span("New fallback chain", "muted")]
-				: [span("Assign ", "muted"), span(strip.item.id, "mono"), span(" to", "muted")];
+				: [span("Assign ", "muted"), span(sanitizeDisplayLine(strip.item.id), "mono"), span(" to", "muted")];
 		} else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
-			const roleLabel = (info.tag ?? strip.role ?? "").toLowerCase();
+			const roleLabel = sanitizeDisplayLine(info.tag ?? strip.role ?? "").toLowerCase();
 			label = [
 				span(strip.kind === "thinking" ? "Thinking for " : "Save ", "muted"),
 				span(roleLabel, "strong"),
 				span(" · ", "muted"),
-				span(strip.item.id, "mono"),
+				span(sanitizeDisplayLine(strip.item.id), "mono"),
 				...(strip.kind === "scope" ? [span(" to", "muted")] : []),
 			];
 		}
@@ -6005,7 +6044,13 @@ export class ModelHubComponent implements Component {
 					return;
 				}
 				case "chainKey":
-					items.push({ id, label: row.role, mono: true, icon: "git-branch", detail: "fallback chain" });
+					items.push({
+						id,
+						label: sanitizeDisplayLine(row.role),
+						mono: true,
+						icon: "git-branch",
+						detail: "fallback chain",
+					});
 					return;
 				case "fallback":
 					items.push({
@@ -6039,14 +6084,14 @@ export class ModelHubComponent implements Component {
 					break;
 			}
 			const info = this.#settings.getRoleInfo(row.role);
-			const tag = info.tag ?? info.name ?? row.role;
+			const tag = sanitizeDisplayLine(info.tag ?? info.name ?? row.role);
 			const assignment = this.#roles[row.role];
 			const facts = rolesCellFacts(this.#roleCells(row.role));
 			const cycleIndex = cycleOrder.indexOf(row.role);
 			items.push({
 				id,
 				label: tag,
-				...(info.name && info.name !== tag ? { detail: info.name } : {}),
+				...(info.name && info.name !== tag ? { detail: sanitizeDisplayLine(info.name) } : {}),
 				facts,
 				...(assignment && !assignment.autoSelected ? {} : { tone: "muted" as const }),
 				...(cycleIndex >= 0
@@ -6110,7 +6155,14 @@ export class ModelHubComponent implements Component {
 			const chain = this.#fallbackChains()[key] ?? [];
 			if (chain.length === 0) return undefined;
 			return node("section", { head: "Fallback chain" }, [
-				md(chain.map((selector, index) => `${index + 1}. \`${selector}\``).join("\n")),
+				md(
+					chain
+						.map(
+							(selector, index) =>
+								`${index + 1}. ${sanitizeDisplayLine(selector).replace(/[\\`*_[\]<>]/g, "\\$&")}`,
+						)
+						.join("\n"),
+				),
 			]);
 		};
 		const chainPool = (key: string): NativeChild[] =>
@@ -6132,7 +6184,7 @@ export class ModelHubComponent implements Component {
 				const rolePool = this.#rolePool(row.role);
 				if (rolePool) {
 					children.push(
-						text(info.name, { role: "omp.picker.title" }),
+						text(sanitizeDisplayLine(info.name), { role: "omp.picker.title" }),
 						...this.#poolPreview(rolePool, "Role pool"),
 					);
 				} else if (assignment) {
@@ -6140,7 +6192,7 @@ export class ModelHubComponent implements Component {
 					children.push(
 						node("kv", {
 							items: [
-								{ k: [span("Role", "muted")], v: info.name },
+								{ k: [span("Role", "muted")], v: sanitizeDisplayLine(info.name) },
 								{
 									k: [span("Thinking", "muted")],
 									v: getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label,
@@ -6152,7 +6204,7 @@ export class ModelHubComponent implements Component {
 					);
 				} else {
 					children.push(
-						text(info.name, { role: "omp.picker.title" }),
+						text(sanitizeDisplayLine(info.name), { role: "omp.picker.title" }),
 						text([span("Not assigned; no available model fits this role.", "muted")], { wrap: "word" }),
 					);
 				}
@@ -6164,7 +6216,7 @@ export class ModelHubComponent implements Component {
 			case "fallback": {
 				const resolved = this.#resolveFallbackEntry(row.role, row.chainIndex);
 				if (resolved) children.push(...this.#browser.modelPreview(resolved.item, "full", this.#currentSelector));
-				else children.push(text([span(row.selector, "mono")], { role: "omp.picker.title" }));
+				else children.push(text([span(sanitizeDisplayLine(row.selector), "mono")], { role: "omp.picker.title" }));
 				const billing = billingRow(row.selector);
 				if (billing.length > 0) children.push(node("kv", { items: billing }));
 				const chain = chainList(row.role);
@@ -6172,7 +6224,7 @@ export class ModelHubComponent implements Component {
 				break;
 			}
 			case "chainKey": {
-				children.push(text([span(row.role, "mono")], { role: "omp.picker.title" }));
+				children.push(text([span(sanitizeDisplayLine(row.role), "mono")], { role: "omp.picker.title" }));
 				const chain = chainList(row.role);
 				if (chain) children.push(chain);
 				children.push(...chainPool(row.role));
@@ -6180,7 +6232,7 @@ export class ModelHubComponent implements Component {
 			}
 			case "pool":
 				children.push(
-					text([span(row.role, "mono")], { role: "omp.picker.title" }),
+					text([span(sanitizeDisplayLine(row.role), "mono")], { role: "omp.picker.title" }),
 					...this.#poolPreview(this.#chainPool(row.role), "Fallback pool"),
 				);
 				break;
@@ -6365,6 +6417,7 @@ export class ModelHubComponent implements Component {
 				this.#clickSidebarEntry(this.#entries.find(candidate => candidate.id === value));
 				return;
 			case "tab":
+				if (entry.kind === "groups") return;
 				if (rolesView) {
 					const tab = ROLE_TABS.find(candidate => candidate === value);
 					if (!tab) return;
@@ -6501,14 +6554,14 @@ export class ModelHubComponent implements Component {
 		}
 		let prefix: TspSpan[];
 		if (strip.kind === "pool") {
-			prefix = [span(strip.title, "accent"), span(" →", "dim")];
+			prefix = [span(sanitizeDisplayLine(strip.title), "accent"), span(" →", "dim")];
 		} else if (strip.kind === "role") {
-			prefix = [span(strip.item.id, "accent"), span(" →", "dim")];
+			prefix = [span(sanitizeDisplayLine(strip.item.id), "accent"), span(" →", "dim")];
 		} else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
 			prefix = [
-				span((info.tag ?? strip.role ?? "").toLowerCase(), info.color ?? "muted"),
-				span(` · ${strip.item.id} →`, "dim"),
+				span(sanitizeDisplayLine(info.tag ?? strip.role ?? "").toLowerCase(), info.color ?? "muted"),
+				span(` · ${sanitizeDisplayLine(strip.item.id)} →`, "dim"),
 			];
 		}
 		return node(
@@ -6585,6 +6638,8 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (isRolesView(entry.kind)) {
 			if (this.#focus !== "list") {
+				if (entry.kind === "groups")
+					return [upDown("providers"), keys("groups", "enter", "right"), cancel("close")];
 				return [
 					upDown("providers"),
 					keys("roles", "enter", "right"),
@@ -6645,22 +6700,6 @@ export class ModelHubComponent implements Component {
 			}
 			if (row?.kind === "newFallback") {
 				return [upDown("rows"), keys("new model/provider fallback chain", "enter"), keys("providers", "left")];
-			}
-			if (row?.kind === "newGroup") {
-				return [upDown("rows"), keys("new group", "enter"), keys("providers", "left")];
-			}
-			if (row?.kind === "profile") {
-				return [
-					upDown("rows"),
-					keys("edit efforts", "enter"),
-					keys("rename", "shift+r"),
-					keys("delete", "x"),
-					keys("new profile", "@"),
-					keys("providers", "left"),
-				];
-			}
-			if (row?.kind === "group") {
-				return [upDown("rows"), keys("delete", "x"), keys("new group", "n"), keys("providers", "left")];
 			}
 			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
 			return [

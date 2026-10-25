@@ -2805,6 +2805,150 @@ describe("ModelHub", () => {
 				expect(source.poolWriteBlocker?.({ kind: "group", key: "fast" })).toBe("set in the runtime layer");
 			});
 
+			test("pool writes refuse runtime overrides without changing global values", () => {
+				const raw = { strategy: "random", models: { a: { model: "test/model-a" } } };
+				const settings = Settings.isolated({ modelGroups: { fast: raw }, modelRoles: { engineer: raw } });
+				const before = structuredClone(settings.getGlobalSettings());
+				expect(writeModelHubPool(settings, { kind: "group", key: "fast" }, raw)).toContain("runtime layer");
+				expect(writeModelHubPool(settings, { kind: "role", key: "engineer" }, raw)).toContain("runtime layer");
+				expect(settings.getGlobalSettings()).toEqual(before);
+			});
+
+			test("a failed group reference write restores earlier references and removes the new group", () => {
+				const settings = Settings.isolated();
+				const raw = { strategy: "random", models: { a: { model: "test/model-a" } } };
+				settings.setModelGroup("fast", raw);
+				settings.setModelRoleSpec("smol", "+fast");
+				settings.setModelRoleSpec("engineer", "+fast");
+				const { hub } = createHub({
+					models: twoModels(),
+					scoped: true,
+					settings,
+					callbacks: {
+						onPoolChange: (target, value) =>
+							target.kind === "role" && target.key === "engineer" && value?.use === "new"
+								? "reference refused"
+								: writeModelHubPool(settings, target, value),
+					},
+				});
+				hub.handleInput(UP);
+				hub.handleInput("\n");
+				hub.handleInput("R");
+				for (let i = 0; i < 4; i++) hub.handleInput(BACKSPACE);
+				type(hub, "new");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: raw });
+				expect(settings.getGlobalSettings().modelRoles).toMatchObject({ smol: "+fast", engineer: "+fast" });
+				expect(normalize(hub.render(220))).toContain("reference refused");
+			});
+
+			test("a failed profile reference write restores earlier references and removes the new profile", () => {
+				const settings = Settings.isolated();
+				const raw = {
+					strategy: "random",
+					models: { a: { model: "test/model-a" } },
+					profiles: { low: { a: { effort: "low" } } },
+				};
+				settings.setModelGroup("fast", raw);
+				settings.setModelRoleSpec("smol", "+fast@low");
+				settings.setModelRoleSpec("engineer", "+fast@low");
+				const { hub } = createHub({
+					models: twoModels(),
+					scoped: true,
+					settings,
+					callbacks: {
+						onPoolChange: (target, value) =>
+							target.kind === "role" && target.key === "engineer" && value?.profile === "quick"
+								? "reference refused"
+								: writeModelHubPool(settings, target, value),
+					},
+				});
+				hub.handleInput(UP);
+				hub.handleInput("\n");
+				hub.handleInput(DOWN);
+				hub.handleInput(DOWN);
+				hub.handleInput("R");
+				for (let i = 0; i < 3; i++) hub.handleInput(BACKSPACE);
+				type(hub, "quick");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: raw });
+				expect(settings.getGlobalSettings().modelRoles).toMatchObject({ smol: "+fast@low", engineer: "+fast@low" });
+				expect(normalize(hub.render(220))).toContain("reference refused");
+			});
+
+			test("profile renames at the limit refuse referenced profiles before writing", () => {
+				const settings = Settings.isolated();
+				const profiles = Object.fromEntries(
+					Array.from({ length: 32 }, (_, index) => [`p${index}`, { a: { effort: "low" } }]),
+				);
+				const raw = { strategy: "random", models: { a: { model: "test/model-a" } }, profiles };
+				settings.setModelGroup("fast", raw);
+				settings.setModelRoleSpec("smol", "+fast@p0");
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				hub.handleInput(UP);
+				hub.handleInput("\n");
+				hub.handleInput(DOWN);
+				hub.handleInput(DOWN);
+				hub.handleInput("R");
+				for (let i = 0; i < 2; i++) hub.handleInput(BACKSPACE);
+				type(hub, "quick");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: raw });
+				expect(settings.getGlobalSettings().modelRoles).toMatchObject({ smol: "+fast@p0" });
+				expect(normalize(hub.render(220))).toContain("32-profile limit");
+				settings.setModelRoleSpec("smol", undefined);
+				hub.refreshAfterExternalMutation();
+				hub.handleInput("\n");
+				const renamed = structuredClone(profiles);
+				delete renamed.p0;
+				renamed.quick = { a: { effort: "low" } };
+				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: { ...raw, profiles: renamed } });
+				expect(pickerProps(hub).selected).toBe("profile:fast:quick");
+			});
+
+			test("group and profile renames rewrite global references shadowed by project roles and chain records", async () => {
+				const tmp = TempDir.createSync("@pi-model-hub-rename-project-");
+				try {
+					await Bun.write(
+						tmp.join(".omp", "config.yml"),
+						"modelRoles:\n  engineer: test/model-b\nretry:\n  fallbackChains:\n    other: [test/model-b]\n",
+					);
+					const settings = await fileSettings(tmp, "{}");
+					settings.setModelGroup("fast", {
+						strategy: "random",
+						models: { a: { model: "test/model-a" } },
+						profiles: { low: { a: { effort: "low" } } },
+					});
+					settings.setModelRoleSpec("engineer", "+fast@low");
+					settings.setFallbackChainSpec("smol", "+fast@low");
+					const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+					hub.handleInput(UP);
+					hub.handleInput("\n");
+					hub.handleInput("R");
+					for (let i = 0; i < 4; i++) hub.handleInput(BACKSPACE);
+					type(hub, "quick");
+					hub.handleInput("\n");
+					expect(pickerProps(hub).selected).toBe("group:quick");
+					hub.handleInput(DOWN);
+					hub.handleInput(DOWN);
+					hub.handleInput("R");
+					for (let i = 0; i < 3; i++) hub.handleInput(BACKSPACE);
+					type(hub, "high");
+					hub.handleInput("\n");
+					expect(settings.getGlobalSettings().modelRoles).toMatchObject({ engineer: "+quick@high" });
+					expect(settings.getGlobalSettings().retry).toMatchObject({ fallbackChains: { smol: "+quick@high" } });
+					expect(settings.getModelRole("engineer")).toBe("test/model-b");
+					expect(cfgRetryFallbackChains.get(settings).other).toEqual(["test/model-b"]);
+					expect(settings.getGlobalSettings().modelGroups).toMatchObject({
+						quick: { profiles: { high: { a: { effort: "low" } } } },
+					});
+					await settings.flush();
+				} finally {
+					AgentStorage.close();
+					tmp.removeSync();
+				}
+			});
+
 			test("renaming a profile in the Groups view repoints the roles that use it, keeping their shorthand", () => {
 				const settings = Settings.isolated();
 				settings.setModelGroup("fast", {
@@ -2842,7 +2986,7 @@ describe("ModelHub", () => {
 				});
 			});
 
-			test("a profile a shadowed global entry still uses can be neither renamed nor deleted", () => {
+			test("renaming a profile rewrites shadowed global references while deletion remains refused", () => {
 				const settings = Settings.isolated();
 				const group = {
 					strategy: "random",
@@ -2851,6 +2995,8 @@ describe("ModelHub", () => {
 				};
 				settings.setModelGroup("fast", group);
 				settings.setFallbackChainSpec("smol", "+fast@low");
+				settings.setModelRoleSpec("engineer", "+fast@low");
+				settings.setProjectModelRole("engineer", "test/model-b");
 				// The effective chain is a plain list, so only the global entry still names @low.
 				cfgRetryFallbackChains.override(settings, { smol: ["test/model-b"] });
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
@@ -2858,45 +3004,55 @@ describe("ModelHub", () => {
 				hub.handleInput("\n"); // +fast
 				hub.handleInput(DOWN); // member a
 				hub.handleInput(DOWN); // profile @low
-				expect(normalize(hub.render(220))).toMatch(/· @low .*used by retry\.fallbackChains\.smol/);
+				expect(normalize(hub.render(220))).toMatch(
+					/· @low .*used by modelRoles\.engineer, retry\.fallbackChains\.smol/,
+				);
 
 				hub.handleInput("x");
 				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: group });
-				expect(normalize(hub.render(220))).toContain("+fast@low is used by retry.fallbackChains.smol");
+				expect(normalize(hub.render(220))).toContain("retry.fallbackChains.smol");
 
 				hub.handleInput("R");
 				for (let i = 0; i < "low".length; i++) hub.handleInput("\x7f");
 				type(hub, "quick");
 				hub.handleInput("\n");
-				expect(settings.getGlobalSettings().modelGroups).toEqual({ fast: group });
-				expect(normalize(hub.render(220))).toContain("retry.fallbackChains.smol uses +fast@low and is set in");
+				expect(settings.getGlobalSettings().modelGroups).toMatchObject({
+					fast: { profiles: { quick: { a: { effort: "low" } } } },
+				});
+				expect(settings.getGlobalSettings().modelRoles).toMatchObject({ engineer: "+fast@quick" });
+				expect(settings.getGlobalSettings().retry).toMatchObject({ fallbackChains: { smol: "+fast@quick" } });
+				expect(settings.getModelRole("engineer")).toBe("test/model-b");
+				expect(cfgRetryFallbackChains.get(settings).smol).toEqual(["test/model-b"]);
 			});
 
-			test("G declines renaming or deleting a group a shadowed global entry still references", () => {
+			test("G renames shadowed global references but refuses deleting a referenced group", () => {
 				const settings = Settings.isolated();
 				settings.setModelGroup("shared", { strategy: "random", models: { a: { model: "test/model-a" } } });
 				settings.setModelRoleSpec("smol", { use: "shared" });
 				settings.setFallbackChainSpec("smol", { use: "shared" });
+				settings.setModelRoleSpec("engineer", "+shared");
+				settings.setProjectModelRole("engineer", "test/model-b");
 				cfgRetryFallbackChains.override(settings, { smol: ["test/model-b"] });
-				expect(createModelBrowserSource(settings).modelGroupReferences?.("shared")).toEqual([
-					{ kind: "role", key: "smol" },
-					{ kind: "chain", key: "smol" },
-				]);
+				expect(createModelBrowserSource(settings).modelGroupReferences?.("shared")).toEqual(
+					expect.arrayContaining([{ kind: "chain", key: "smol", global: true }]),
+				);
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 				hub.handleInput("G");
 				hub.handleInput(RIGHT);
 				hub.handleInput("\n"); // delete +shared
-				expect(normalize(hub.render(220))).toContain("+shared is still used by retry.fallbackChains.smol");
+				expect(normalize(hub.render(220))).toContain("retry.fallbackChains.smol");
 				hub.handleInput("G");
 				hub.handleInput("\n"); // rename +shared…
 				type(hub, "-2");
 				hub.handleInput("\n");
-				expect(footerLine(hub.render(220))).toContain(
-					"retry.fallbackChains.smol uses +shared and is set in the runtime layer",
-				);
-				expect(Object.keys(settings.getGlobalSettings().modelGroups as object)).toEqual(["shared"]);
+				expect(Object.keys(settings.getGlobalSettings().modelGroups as object)).toEqual(["shared-2"]);
+				expect(settings.getGlobalSettings().modelRoles).toMatchObject({ engineer: "+shared-2" });
+				expect(settings.getGlobalSettings().retry).toMatchObject({
+					fallbackChains: { smol: { use: "shared-2" } },
+				});
+				expect(settings.getModelRole("engineer")).toBe("test/model-b");
 			});
 
 			test("G turns a pool into a model group, points a chain at it, renames it, and deletes it", () => {

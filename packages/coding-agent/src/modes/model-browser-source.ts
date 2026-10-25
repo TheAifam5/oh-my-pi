@@ -194,6 +194,7 @@ function trustedAccountNames(settings: Settings): string[] {
  * `modelRoles` entry, the `retry.fallbackChains` entry, or the `modelGroups` entry; `undefined`
  * removes it. Account order and drain names the edit adds must belong to the trusted account-policy
  * layer; names already stored in the same account-routing field are kept.
+ * Shadowed writes are refused except pure group-reference rewrites of stored global references.
  *
  * @returns the refusal message for an invalid value or newly added untrusted account name; nothing is written then.
  */
@@ -203,6 +204,21 @@ export function writeModelHubPool(
 	value: Readonly<Record<string, unknown>> | undefined,
 ): string | undefined {
 	try {
+		const blocker = poolWriteBlocker(settings, target);
+		const stored = storedGlobalPool(settings, target);
+		const referenceRewrite =
+			target.kind !== "group" &&
+			isModelGroupForm(stored) &&
+			(typeof stored === "string" || (isRecord(stored) && typeof stored.use === "string")) &&
+			value !== undefined &&
+			typeof value.use === "string" &&
+			(value.profile === undefined || typeof value.profile === "string") &&
+			Object.keys(value).every(key => key === "use" || key === "profile");
+		if (blocker !== undefined && !referenceRewrite) {
+			const path =
+				target.kind === "group" ? "modelGroups" : target.kind === "role" ? "modelRoles" : "retry.fallbackChains";
+			return `${path}.${target.key} is ${blocker}`;
+		}
 		const added = routingAccountNames(value);
 		if (added.length > 0) {
 			const stored = new Set(
@@ -285,11 +301,12 @@ function parsePoolLimitSpec(spec: string): ModelHubLimitSpecResult {
  */
 function modelGroupReferences(settings: Settings, name: string): ModelHubGroupReference[] {
 	const references = new Map<string, ModelHubGroupReference>();
-	const add = (target: ModelHubPoolTarget, spec: ParsedModelValue | undefined) => {
+	const add = (target: ModelHubPoolTarget, spec: ParsedModelValue | undefined, global = false) => {
 		if (spec?.kind !== "ref" || spec.ref.use !== name) return;
 		const profile = spec.ref.profile;
 		references.set(`${target.kind}:${target.key}:${profile ?? ""}`, {
 			...target,
+			global,
 			...(profile !== undefined ? { profile } : {}),
 		});
 	};
@@ -303,12 +320,12 @@ function modelGroupReferences(settings: Settings, name: string): ModelHubGroupRe
 	const roles = isRecord(global.modelRoles) ? global.modelRoles : {};
 	for (const [role, value] of Object.entries(roles)) {
 		const parsed = isModelGroupForm(value) ? parseModelRoleValue(role, value, "tolerant") : undefined;
-		add({ kind: "role", key: role }, parsed?.ok ? parsed.value : undefined);
+		add({ kind: "role", key: role }, parsed?.ok ? parsed.value : undefined, true);
 	}
 	const chains = isRecord(global.retry) && isRecord(global.retry.fallbackChains) ? global.retry.fallbackChains : {};
 	for (const [key, value] of Object.entries(chains)) {
 		const parsed = isModelGroupForm(value) ? parseFallbackChainValue(key, value, "tolerant") : undefined;
-		add({ kind: "chain", key }, parsed?.ok ? parsed.value : undefined);
+		add({ kind: "chain", key }, parsed?.ok ? parsed.value : undefined, true);
 	}
 	return [...references.values()];
 }

@@ -51,6 +51,7 @@ import type { NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { sameItems } from "../native/memo";
 import { plainText } from "../native/spans";
 import { MODEL_ROLE_IDS } from "./model-role-ids";
+import { sanitizeDisplayLine } from "./extensions/display-text";
 
 export * from "./model-role-ids";
 
@@ -2134,11 +2135,11 @@ export class ModelBrowser implements Component {
 					? getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label
 					: undefined;
 			return node("badge", {
-				text: (info.tag ?? info.name ?? role).toLowerCase(),
+				text: sanitizeDisplayLine(info.tag ?? info.name ?? role).toLowerCase(),
 				...(assignment ? { tone: assignment.autoSelected ? "muted" : "accent" } : {}),
 				title: assignment
-					? `${info.name}${assignment.autoSelected ? " (auto-selected)" : ""}${level ? ` · thinking ${level}` : ""}`
-					: `${info.name}: not assigned`,
+					? `${sanitizeDisplayLine(info.name)}${assignment.autoSelected ? " (auto-selected)" : ""}${level ? ` · thinking ${level}` : ""}`
+					: `${sanitizeDisplayLine(info.name)}: not assigned`,
 			});
 		};
 
@@ -2158,8 +2159,12 @@ export class ModelBrowser implements Component {
 		}
 
 		const children: NativeChild[] = [
-			text(model.name, { role: "omp.picker.title" }),
-			text([span(selector, "mono")], { actions: { click: "copy" }, title: "Copy model id", truncate: "middle" }),
+			text(sanitizeDisplayLine(model.name), { role: "omp.picker.title" }),
+			text([span(sanitizeDisplayLine(selector), "mono")], {
+				actions: { click: "copy" },
+				title: "Copy model id",
+				truncate: "middle",
+			}),
 		];
 		const badges: NativeChild[] = [];
 		if (item.selector === current) badges.push(node("badge", { text: "current", tone: "success" }));

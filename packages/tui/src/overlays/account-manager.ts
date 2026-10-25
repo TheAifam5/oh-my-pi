@@ -991,7 +991,8 @@ export class AccountManagerComponent implements Component {
 		const { act, value } = event;
 		const strip = this.#strip;
 		if (act === CLOSE_ACTION.id) {
-			this.#close();
+			if (strip) this.#stripBack(strip);
+			else this.#close();
 		} else if (act === "cancel") {
 			if (strip) this.#stripBack(strip);
 		} else if (act === "scope") {

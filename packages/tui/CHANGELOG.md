@@ -40,6 +40,15 @@
 
 ### Fixed
 
+- Model pool edits refuse writes hidden by higher configuration layers.
+- Group and profile renames update shadowed global references without changing project overrides.
+- Roles labels, fallback selectors, chain keys, and assigned model names display as safe single-line text.
+- Closing an account editor returns to the account list instead of closing the overlay.
+- Failed group and profile renames restore earlier references; profile-limit refusals leave settings unchanged.
+- Groups no longer offers role tabs or preset actions and only advertises available group edits.
+- Adding a member to a read-only group shows its refusal reason.
+- Group renames retain the renamed row selection, and background refreshes preserve group-member navigation.
+- Group reference displays refresh after successful pool edits.
 - `t` on a member of a role that uses `+group@profile` sets that profile's effort instead of the group default the profile overrides
 - Renaming a model group or profile in `/models` keeps references written as `+group@profile` in that shorthand instead of rewriting them as objects
 - Native tool approvals in Tern now wait for the 500 ms arming delay

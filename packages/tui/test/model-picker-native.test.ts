@@ -453,6 +453,8 @@ describe("Groups view", () => {
 		locked.handleNativeEvent({ type: "activate", key: "", item: "group:shared" });
 		const subtitle = JSON.stringify(props(locked.describe(withPicker)).subtitle);
 		expect(subtitle).toContain("modelGroups.shared is set in the project layer");
+		locked.handleInput("f");
+		expect(JSON.stringify(props(locked.describe(withPicker)).subtitle)).toBe(subtitle);
 	});
 
 	test("x deletes only an unused group; a used one is refused with its users", () => {
@@ -466,6 +468,25 @@ describe("Groups view", () => {
 		hub.handleNativeEvent({ type: "select", key: "", item: "group:spare" });
 		act("roles:clear");
 		expect(writes).toEqual([[{ kind: "group", key: "spare" }, undefined]]);
+	});
+
+	test("Groups ignores role tabs and preserves its selected group across a member-pick refresh", () => {
+		const { hub } = groupsHub();
+		hub.handleNativeEvent({ type: "select", key: "", item: "group:spare" });
+		const before = props(hub.describe(withPicker));
+		hub.handleNativeEvent({ type: "action", key: "", act: "tab", value: "kind", mods: [] });
+		hub.handleNativeEvent({ type: "select", key: "roleTabs", item: "kind" });
+		const after = props(hub.describe(withPicker));
+		expect(after.selected).toBe(before.selected);
+		expect(after.items).toEqual(before.items);
+		expect(after.tabs).toBeUndefined();
+		expect(JSON.stringify(after.subtitle)).not.toMatch(/Preset|Cleared roles/);
+		hub.handleNativeEvent({ type: "activate", key: "", item: "group:spare" });
+		hub.refreshAfterExternalMutation();
+		hub.handleInput("\x1b");
+		const returned = props(hub.describe(withPicker));
+		expect(returned.scope).toBe("groups");
+		expect(returned.selected).toBe("group:spare");
 	});
 
 	test("a group's member edits write the modelGroups entry, and New group writes its first member", () => {
@@ -1013,4 +1034,54 @@ test("pool availability refreshes native disabled state without changing the que
 	expect(recovered.query).toBe(initial.query);
 	expect(recovered.selected).toBe(initial.selected);
 	expect(recovered.items?.find(item => item.id === member.selector)?.disabled).toBeUndefined();
+});
+
+test("Roles renders hostile labels, keys and fallback selectors as single-line display text", () => {
+	const unsafe = "\x1b]0;title\x07\x1b[31m\t\r\n";
+	const role = `custom${unsafe}`;
+	const chain = `provider/${unsafe}model`;
+	const selector = `demo/${unsafe}missing`;
+	const assigned = model(`provider${unsafe}`, `assigned${unsafe}`);
+	const hub = new ModelHubComponent(
+		ui,
+		{
+			...source({ [role]: `${assigned.provider}/${assigned.id}` }, []),
+			resolveRoleValue: () => ({ model: assigned, explicitThinkingLevel: false }),
+			knownRoleIds: [role],
+			getRoleInfo: () => ({ tag: `tag${unsafe}`, name: `name${unsafe}`, section: "chat", accepts: () => true }),
+			fallbackChains: { [role]: [selector], [chain]: [selector] },
+			cycleOrder: [role],
+		},
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	const control = /[\x00-\x1f\x7f]/;
+	for (const line of hub.render(180)) expect(Bun.stripANSI(line)).not.toMatch(control);
+	const displayed = (value: unknown): void => {
+		if (typeof value === "string") {
+			expect(value).not.toMatch(control);
+		} else if (Array.isArray(value)) {
+			for (const child of value) displayed(child);
+		} else if (value && typeof value === "object") {
+			for (const [key, child] of Object.entries(value)) {
+				if (["id", "key", "selected", "order", "act", "actions"].includes(key)) continue;
+				displayed(child);
+			}
+		}
+	};
+	for (const cx of [withPicker, withoutPicker]) {
+		const described = hub.describe(cx);
+		displayed(described);
+	}
+	hub.handleInput("\x1b[C");
+	hub.handleInput("t");
+	expect(props(hub.describe(withPicker)).strip).not.toBeNull();
+	for (const cx of [withPicker, withoutPicker]) displayed(hub.describe(cx));
+	for (const line of hub.render(180)) expect(Bun.stripANSI(line)).not.toMatch(control);
+	hub.handleInput("\x1b");
+	hub.handleInput("\x1b[B");
+	displayed(hub.describe(withPicker));
 });

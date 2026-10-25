@@ -405,6 +405,7 @@ describe("AccountManager", () => {
 		];
 		function pickerManager(rows: AccountManagerAccount[]) {
 			const applied: [string, string, string | undefined][] = [];
+			const closed: boolean[] = [];
 			const manager = new AccountManagerComponent(
 				tuiStub,
 				{
@@ -415,14 +416,18 @@ describe("AccountManager", () => {
 						return { message: "saved" };
 					},
 				},
-				{ onCancel: () => {} },
+				{
+					onCancel: () => {
+						closed.push(true);
+					},
+				},
 			);
 			const props = () => {
 				const root = manager.describe(withPicker);
 				expect(root.k).toBe("picker");
 				return root.p as TspPickerProps;
 			};
-			return { manager, props, applied };
+			return { manager, props, applied, closed };
 		}
 
 		test("rows carry one cell per declared column some row fills, grouped by provider under All accounts", () => {
@@ -444,7 +449,7 @@ describe("AccountManager", () => {
 		});
 
 		test("field actions and the chip strip apply through the host", async () => {
-			const { manager, props, applied } = pickerManager([
+			const { manager, props, applied, closed } = pickerManager([
 				account("a", "anthropic", { facts: { state: "enabled" } }),
 			]);
 			const act = (id: string, value?: string) =>
@@ -454,6 +459,11 @@ describe("AccountManager", () => {
 			await settle();
 			expect(applied).toEqual([["a", "drain", "on"]]);
 
+			act("edit");
+			act("close");
+			expect(props().strip).toBeNull();
+			expect(closed).toEqual([]);
+			expect(props().selected).toBe("account:a");
 			act("edit");
 			const strip = props().strip;
 			expect(strip?.items.map(item => item.id)).toEqual(["0", "1"]);
