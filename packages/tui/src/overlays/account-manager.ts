@@ -1,26 +1,14 @@
-/**
- * Fullscreen /account manager, shown on the alternate screen like /models.
- *
- * A sidebar of providers (All accounts, then one entry per provider, then the
- * host's pages such as global limits and project pins), a body listing the
- * stored accounts or page rows with the selected row's details below, and
- * a footer that turns into a chip strip while editing. Enter on a row
- * opens its field strip; a field either applies at once (toggles), opens a
- * text input, or opens a second strip of choices. Every field also has a
- * single-key shortcut from the list. The host owns meaning and persistence:
- * fields arrive described by {@link AccountManagerDeps.load} and
- * {@link AccountManagerDeps.pages}, and edits go back through
- * {@link AccountManagerDeps.apply} by action id.
- */
+import { HubPrefs, type HubPrefsField, type HubPrefsValue } from "./hub-prefs";
+/** Fullscreen account list and typed account, limit, and project pin preference sheets. */
 
 import type {
+	TspPrefsControl,
 	TspPickerAction,
 	TspPickerColumn,
 	TspPickerGroup,
 	TspPickerItem,
 	TspPickerProps,
 	TspPickerScope,
-	TspSpan,
 } from "@oh-my-pi/pi-wire";
 import {
 	type Component,
@@ -33,7 +21,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "../index";
-import { col, node, row, span, text } from "../native/describe";
+import { node, span, text } from "../native/describe";
 import {
 	CLOSE_ACTION,
 	type PickerEvent,
@@ -57,12 +45,9 @@ import {
 	describeHubFrame,
 	describeHubSidebar,
 	HubFrame,
-	moveStripSelection,
 	pagedHints,
 	type SidebarEntry as HubSidebarEntry,
 	type SidebarStyle,
-	type StripChip as HubStripChip,
-	type StripState as HubStripState,
 } from "./hub-frame";
 
 /** Most body lines the status or notice wraps to before it is cut with an ellipsis. */
@@ -83,6 +68,7 @@ export interface AccountManagerAction {
 	expect?: string;
 	/** Target-specific confirmation required before applying this action. */
 	confirm?: string;
+	control?: TspPrefsControl;
 }
 
 /** One editable property of an account, offered as a footer chip. */
@@ -91,7 +77,7 @@ export interface AccountManagerField extends AccountManagerAction {
 	value: string;
 	/** Single-key shortcut from the account list. */
 	key?: KeyId;
-	/** Opens a second strip of these actions instead of applying the field itself. */
+	/** Actions presented as typed controls within the account's preference sheet. */
 	choices?: AccountManagerAction[];
 }
 /** One column of the Tern account table: its cells are each row's {@link AccountManagerAccount.facts}`[id]`. */
@@ -167,12 +153,6 @@ interface SidebarEntry extends HubSidebarEntry<"all" | "provider" | "page" | "se
 	page?: AccountManagerPage;
 }
 
-type StripChip = HubStripChip<AccountManagerAction & { choices?: AccountManagerAction[] }>;
-
-type StripState =
-	| (HubStripState<StripChip> & { kind: "chips"; accountId: string; field?: AccountManagerField })
-	| { kind: "input"; accountId: string; action: AccountManagerAction; input: Input };
-
 type Notice = { tone: "success" | "warning" | "error"; text: string };
 
 /** `account` with every host string made single-line display text, so no renderer passes embedded escapes through. */
@@ -230,7 +210,7 @@ export class AccountManagerComponent implements Component {
 	#rowTotal = 0;
 	#rowIndex = 0;
 	#listScroll = 0;
-	#strip: StripState | null = null;
+	#prefs: HubPrefs | undefined;
 	#notice: Notice | null = null;
 	#busy = false;
 	#search = new Input();
@@ -274,6 +254,7 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#requestRender(): void {
+		if (this.#closed) return;
 		this.#nativeVersion++;
 		this.#tui.requestRender();
 	}
@@ -389,93 +370,114 @@ export class AccountManagerComponent implements Component {
 	// Edits
 	// ═══════════════════════════════════════════════════════════════════════
 
-	#openFieldStrip(account: AccountManagerAccount): void {
-		this.#strip = {
-			kind: "chips",
-			accountId: account.id,
-			chips: account.fields.map(field => ({
-				label: `${field.label}: ${field.value}`,
-				styled: `${theme.fg(field.readOnly ? "dim" : "accent", field.label)}${theme.fg("dim", `: ${sanitizeDisplaySingleLine(field.value)}`)}`,
-				action: field,
-			})),
-			index: 0,
+	#openPrefs(account: AccountManagerAccount, focus?: string): void {
+		this.#prefs = new HubPrefs(
+			this.#accountTitle(account),
+			() => this.#accountFields(account.id),
+			() => {
+				this.#prefs = undefined;
+				this.#requestRender();
+			},
+			() => this.#requestRender(),
+		);
+		if (focus) {
+			const field = this.#accountFields(account.id).find(field => field.id === focus);
+			if (field?.control.k === "text" || field?.control.k === "number") this.#prefs.startEditing(focus);
+			else this.#prefs.focus(focus);
+		}
+	}
+
+	#accountFields(accountId: string): HubPrefsField[] {
+		const account = this.#account(accountId);
+		if (!account) return [];
+		const rows: HubPrefsField[] = [];
+		const add = (action: AccountManagerAction, parent?: AccountManagerField) => {
+			const control: TspPrefsControl =
+				action.control ??
+				(action.on !== undefined
+					? { k: "switch", on: action.on }
+					: action.input
+						? { k: "text", value: action.input.initial }
+						: { k: "action", label: action.label, act: action.id });
+			rows.push({
+				id: action.id,
+				label: parent ? `${parent.label}: ${action.label}` : action.label,
+				hint: action.input?.hint,
+				disabled: parent?.readOnly ?? action.readOnly,
+				control,
+				initial: control.k === "number" ? action.input?.initial : undefined,
+				apply: async value => {
+					if (action.confirm) {
+						this.#confirm = {
+							accountId,
+							action,
+							value: typeof value === "boolean" ? (value ? "on" : "off") : undefined,
+							text: sanitizeDisplaySingleLine(
+								`${action.confirm} — ${this.#accountTitle(account)} (${account.identity})`,
+							),
+						};
+						this.#prefs = undefined;
+						return undefined;
+					}
+					return this.#apply(accountId, action, value);
+				},
+			});
 		};
+		for (const field of account.fields) {
+			if (field.choices && (field.id === "auto-redeem" || field.id === "pin:account")) {
+				const choices = field.choices;
+				rows.push({
+					id: field.id,
+					label: field.label,
+					disabled: field.readOnly,
+					control: {
+						k: "choice",
+						value: choices.find(choice => choice.on)?.id ?? "",
+						options: choices.map(choice => ({ value: choice.id, label: choice.label })),
+					},
+					apply: value => {
+						const action = choices.find(choice => choice.id === value);
+						return action ? this.#apply(accountId, action, null) : "Unknown choice";
+					},
+				});
+			} else if (field.choices) {
+				for (const choice of field.choices) add(choice, field);
+			} else add(field);
+		}
+		return rows;
 	}
 
-	#openChoiceStrip(account: AccountManagerAccount, field: AccountManagerField): void {
-		const choices = field.choices ?? [];
-		this.#strip = {
-			kind: "chips",
-			accountId: account.id,
-			field,
-			chips: choices.map(choice => ({
-				label: choice.label,
-				styled: choice.readOnly
-					? theme.fg("dim", sanitizeDisplaySingleLine(choice.label))
-					: choice.on
-						? theme.fg("accent", `${theme.status.enabled} ${sanitizeDisplaySingleLine(choice.label)}`)
-						: theme.fg("muted", sanitizeDisplaySingleLine(choice.label)),
-				action: choice,
-			})),
-			index: 0,
-		};
-	}
-
-	/** Run the field or choice `action` of `account`: open its choices or input, refuse it, or apply it. */
-	#activate(
-		account: AccountManagerAccount,
-		action: AccountManagerAction & { choices?: AccountManagerAction[] },
-	): void {
-		if (action.readOnly) {
-			this.#notice = { tone: "warning", text: `${action.label}: ${action.readOnly}` };
-			this.#strip = null;
-			this.#frame.chipRanges = [];
-			return;
-		}
-		if (action.choices) {
-			this.#openChoiceStrip(account, action as AccountManagerField);
-			return;
-		}
-		if (action.input) {
-			const input = new Input();
-			input.setValue(action.input.initial);
-			this.#strip = { kind: "input", accountId: account.id, action, input };
-			return;
-		}
-		if (action.confirm) {
-			this.#strip = null;
-			this.#confirm = {
-				accountId: account.id,
-				action,
-				value: action.on === undefined ? undefined : action.on ? "off" : "on",
-				text: `${action.confirm} — ${this.#accountTitle(account)} (${account.identity})`,
-			};
-			return;
-		}
-		void this.#apply(account.id, action, action.on === undefined ? undefined : action.on ? "off" : "on");
-	}
-
-	async #apply(accountId: string, action: AccountManagerAction, value?: string): Promise<void> {
-		this.#strip = null;
-		this.#frame.chipRanges = [];
+	async #apply(accountId: string, action: AccountManagerAction, value?: HubPrefsValue): Promise<string | undefined> {
 		this.#busy = true;
+		let refusal: string | undefined;
 		try {
-			const result = await this.#deps.apply(accountId, action.id, value, action.expect);
-			this.#notice = result.error
-				? { tone: "error", text: result.error }
-				: result.warning
-					? { tone: "warning", text: [result.message, result.warning].filter(Boolean).join(" ") }
-					: result.message
-						? { tone: "success", text: result.message }
-						: null;
+			const result = await this.#deps.apply(
+				accountId,
+				action.id,
+				value === null || value === undefined
+					? undefined
+					: typeof value === "boolean"
+						? value
+							? "on"
+							: "off"
+						: String(value),
+				action.expect,
+			);
+			refusal = result.error;
+			this.#notice = result.warning
+				? { tone: "warning", text: [result.message, result.warning].filter(Boolean).join(" ") }
+				: result.message
+					? { tone: "success", text: result.message }
+					: null;
 		} catch (error) {
-			this.#notice = { tone: "error", text: error instanceof Error ? error.message : String(error) };
+			refusal = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.#busy = false;
 		}
-		if (this.#closed) return;
-		this.#reload();
+		if (this.#closed) return refusal;
+		if (!refusal) this.#reload();
 		this.#requestRender();
+		return refusal;
 	}
 
 	#close(): void {
@@ -498,25 +500,6 @@ export class AccountManagerComponent implements Component {
 		this.#requestRender();
 	}
 
-	#activateStripChip(): void {
-		const strip = this.#strip;
-		if (strip?.kind !== "chips") return;
-		const chip = strip.chips[strip.index];
-		const account = this.#account(strip.accountId);
-		if (chip && account) this.#activate(account, chip.action);
-	}
-
-	/** Esc on a strip: a choice strip or input steps back to the field strip, the field strip closes. */
-	#stripBack(strip: StripState): void {
-		const account = this.#account(strip.accountId);
-		if (account && (strip.kind === "input" || strip.field)) {
-			this.#openFieldStrip(account);
-			return;
-		}
-		this.#strip = null;
-		this.#frame.chipRanges = [];
-	}
-
 	// ═══════════════════════════════════════════════════════════════════════
 	// Input
 	// ═══════════════════════════════════════════════════════════════════════
@@ -533,21 +516,12 @@ export class AccountManagerComponent implements Component {
 			this.#requestRender();
 			return;
 		}
-		if (data.startsWith("\x1b[<")) {
-			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
-			this.#requestRender();
+		if (this.#prefs) {
+			this.#prefs.handleInput(data);
 			return;
 		}
-		const strip = this.#strip;
-		if (strip) {
-			if (matchesSelectCancel(data)) {
-				this.#stripBack(strip);
-			} else if (strip.kind === "input") {
-				if (isEnter(data)) void this.#apply(strip.accountId, strip.action, strip.input.getValue().trim());
-				else strip.input.handleInput(data);
-			} else if (!moveStripSelection(strip, data) && isEnter(data)) {
-				this.#activateStripChip();
-			}
+		if (data.startsWith("\x1b[<")) {
+			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
 			this.#requestRender();
 			return;
 		}
@@ -591,14 +565,14 @@ export class AccountManagerComponent implements Component {
 		} else if (isEnter(data)) {
 			const account = this.#selected();
 			if (this.#focus === "scope") this.#focus = "list";
-			else if (account) this.#openFieldStrip(account);
+			else if (account) this.#openPrefs(account);
 		} else if (this.#focus === "list") {
 			const account = this.#selected();
 			const field = account?.fields.find(
 				candidate => candidate.key !== undefined && matchesKey(data, candidate.key),
 			);
 			if (account && field) {
-				this.#activate(account, field);
+				this.#openPrefs(account, field.id);
 			} else if (account && data === "?") {
 				const page = this.#hintPage?.id === account.id ? this.#hintPage.page + 1 : 1;
 				this.#hintPage = { id: account.id, page };
@@ -641,13 +615,7 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#routeMouseEvent(event: SgrMouseEvent): boolean {
-		const { footerColumn, bodyHeight, contentLine, overSidebar, overBody } = this.#frame.locate(event.row, event.col);
-		const strip = this.#strip;
-		if (footerColumn !== undefined && strip?.kind === "chips") {
-			if (event.leftClick && this.#frame.selectChipAt(strip, footerColumn)) this.#activateStripChip();
-			return true;
-		}
-		if (strip) return true;
+		const { bodyHeight, contentLine, overSidebar, overBody } = this.#frame.locate(event.row, event.col);
 		if (event.wheel !== null) {
 			if (overSidebar) this.#frame.scrollSidebar(event.wheel, bodyHeight, this.#entries.length);
 			else if (overBody) {
@@ -667,7 +635,7 @@ export class AccountManagerComponent implements Component {
 			const index = contentLine - this.#listRowStart + this.#listScroll;
 			const account = this.#rows[index];
 			if (account) {
-				if (index === this.#rowIndex) this.#openFieldStrip(account);
+				if (index === this.#rowIndex) this.#openPrefs(account);
 				else this.#rowIndex = index;
 			}
 		}
@@ -792,41 +760,17 @@ export class AccountManagerComponent implements Component {
 	}
 
 	#renderFooter(width: number): string {
-		const strip = this.#strip;
 		if (this.#confirm) {
 			return truncateToWidth(
 				`${this.#confirm.text} · ${formatKeyHint("enter")} confirm · ${editorKey("tui.select.cancel")} cancel`,
 				width,
 			);
 		}
-		return this.#frame.renderFooter(
-			width,
-			this.#footerHint(width),
-			strip ? () => this.#renderStrip(width, strip) : undefined,
-		);
-	}
-
-	#stripPrefix(strip: StripState): string {
-		const account = this.#account(strip.accountId);
-		const name = account ? this.#accountTitle(account) : "";
-		if (strip.kind === "input") return `${name} · ${strip.action.label}:`;
-		return strip.field ? `${name} · ${strip.field.label} →` : `${name} →`;
-	}
-
-	#renderStrip(width: number, strip: StripState): string {
-		const prefix = this.#stripPrefix(strip);
-		if (strip.kind === "input") {
-			const hint = theme.fg("dim", sanitizeDisplaySingleLine(strip.action.input?.hint ?? ""));
-			const inputWidth = Math.max(16, Math.min(48, width - visibleWidth(prefix) - visibleWidth(hint) - 2));
-			return truncateToWidth(
-				`${theme.fg("accent", prefix)} ${strip.input.render(inputWidth)[0] ?? ""} ${hint}`,
-				width,
-			);
-		}
-		return this.#frame.renderChips(width, `${theme.fg("accent", prefix)} `, strip);
+		return this.#frame.renderFooter(width, this.#footerHint(width));
 	}
 
 	render(width: number): readonly string[] {
+		if (this.#prefs) return this.#prefs.render(width);
 		return this.#frame.render(width, this.#terminalRows(), this.#entries, this.#renderFooter(width - 4));
 	}
 
@@ -839,6 +783,7 @@ export class AccountManagerComponent implements Component {
 	}
 
 	describe(cx: DescribeContext): NativeNode {
+		if (this.#prefs) return this.#prefs.describe(cx);
 		const usePicker = cx.supports("picker");
 		const cached = this.#nativeCache;
 		if (cached?.version === this.#nativeVersion && cached.picker === usePicker) return cached.node;
@@ -849,8 +794,6 @@ export class AccountManagerComponent implements Component {
 		}
 		const footer: NativeChild[] = [];
 		if (this.#confirm) footer.push(text([span(this.#confirm.text, "warning")]));
-		const strip = this.#describeStrip();
-		if (strip) footer.push(strip);
 		footer.push(hintsRow(this.#footerHints()));
 		const described = describeHubFrame(
 			"omp.hub.accounts",
@@ -864,6 +807,14 @@ export class AccountManagerComponent implements Component {
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#busy) {
+			if (event.type === "action" && event.act === CLOSE_ACTION.id) this.#close();
+			return;
+		}
+		if (this.#prefs) {
+			this.#prefs.handleNativeEvent(event);
+			return;
+		}
 		const picked = pickerEvent(event);
 		if (picked) {
 			if (this.#busy && !(picked.kind === "action" && picked.act === CLOSE_ACTION.id)) return;
@@ -871,36 +822,16 @@ export class AccountManagerComponent implements Component {
 			this.#requestRender();
 			return;
 		}
-		const strip = this.#strip;
-		if (event.key.endsWith("stripInput") && strip?.kind === "input") {
-			if (event.type === "edit" || event.type === "undo") {
-				strip.input.handleNativeEvent(event);
-			} else if (event.type === "send" || (event.type === "action" && event.act === "submit")) {
-				void this.#apply(strip.accountId, strip.action, strip.input.getValue().trim());
-			} else {
-				return;
-			}
-			this.#requestRender();
-			return;
-		}
 		if ((event.type !== "select" && event.type !== "activate") || this.#busy) return;
 		const target = event.key.slice(event.key.lastIndexOf("/") + 1);
 		const activate = event.type === "activate";
-		if (target === "strip") {
-			const strip = this.#strip;
-			const index = Number(event.item);
-			if (strip?.kind !== "chips" || !Number.isInteger(index) || !strip.chips[index]) return;
-			strip.index = index;
-			if (activate) this.#activateStripChip();
-		} else if (target === "accounts") {
-			if (this.#strip) return;
+		if (target === "accounts") {
 			const index = this.#rows.findIndex(account => accountItemId(account) === event.item);
 			if (index < 0) return;
 			this.#focus = "list";
 			this.#rowIndex = index;
-			if (activate) this.#openFieldStrip(this.#rows[index]!);
+			if (activate) this.#openPrefs(this.#rows[index]!);
 		} else if (target === "providers") {
-			if (this.#strip) return;
 			const entry = this.#entries.find(candidate => candidate.id === event.item);
 			if (!entry || entry.kind === "separator") return;
 			this.#selectEntry(entry);
@@ -914,11 +845,10 @@ export class AccountManagerComponent implements Component {
 	// ─── Tern picker table ───────────────────────────────────────────────
 
 	/** The Tern account table: providers and pages as scopes, rows with one column per fact, the selected row's details as preview. */
-	#describePicker(cx: DescribeContext): NativeNode {
+	#describePicker(_cx: DescribeContext): NativeNode {
 		const entry = this.#activeEntry();
 		const selected = this.#selected();
 		const status = this.#statusText();
-		const strip = this.#strip;
 		const columns = this.#pickerColumns();
 		const multiProvider = entry.kind === "all";
 		const items: TspPickerItem[] = this.#rows.map(account => ({
@@ -953,22 +883,9 @@ export class AccountManagerComponent implements Component {
 			message: this.#busy || this.#notice ? status.text : undefined,
 			confirm: this.#confirm ? { text: this.#confirm.text, act: "confirm", label: "Confirm" } : null,
 			actions: this.#pickerActions(selected),
-			strip: strip ? this.#pickerStrip(strip) : null,
-			focus: strip ? "strip" : this.#focus === "scope" ? "scopes" : "list",
+			focus: this.#focus === "scope" ? "scopes" : "list",
 		};
 		const preview: NativeChild[] = [this.#detailSection(selected)];
-		if (strip?.kind === "input") {
-			preview.unshift(
-				row(
-					[
-						text([span(this.#stripPrefix(strip), "accent")]),
-						col([{ ...strip.input.describe(cx), key: "stripInput" }], { grow: 1 }),
-						text([span(strip.action.input?.hint ?? "", "dim")], { wrap: "word" }),
-					],
-					{ gap: "sm", align: "center" },
-				),
-			);
-		}
 		return picker(props, preview);
 	}
 
@@ -1034,30 +951,13 @@ export class AccountManagerComponent implements Component {
 		return scopes;
 	}
 
-	/** The action bar: the open strip's apply/back, else edit, each field's shortcut, reload and close. */
+	/** Account actions, field shortcuts, reload, and close. */
 	#pickerActions(selected: AccountManagerAccount | undefined): TspPickerAction[] {
-		const strip = this.#strip;
 		if (this.#confirm)
 			return [
 				pickerAction("confirm", "Confirm", "enter", { primary: true, danger: true }),
 				pickerAction("cancel", "Cancel", "escape"),
 			];
-		if (strip?.kind === "input") {
-			return [
-				pickerAction("stripSubmit", "Save", "enter", { primary: true }),
-				pickerAction("cancel", "Back", "escape"),
-			];
-		}
-		if (strip) {
-			return [
-				pickerAction("stripApply", strip.field ? "Apply" : "Open", "enter", {
-					primary: true,
-					danger: strip.chips[strip.index]?.action.confirm !== undefined,
-					disabled: strip.chips[strip.index]?.action.readOnly,
-				}),
-				pickerAction("cancel", "Back", "escape"),
-			];
-		}
 		if (this.#searching)
 			return [pickerAction("searchDone", "Done searching", "enter"), { ...CLOSE_ACTION, label: "Clear search" }];
 		if (this.#focus === "scope")
@@ -1086,20 +986,6 @@ export class AccountManagerComponent implements Component {
 		return actions;
 	}
 
-	/** The open strip as the picker's chip strip; an input strip shows its prompt here and its field in the preview. */
-	#pickerStrip(strip: StripState): NonNullable<TspPickerProps["strip"]> {
-		if (strip.kind === "input") return { label: [span(this.#stripPrefix(strip), "muted")], items: [] };
-		return {
-			label: [span(this.#stripPrefix(strip), "muted")],
-			items: strip.chips.map((chip, index) => ({
-				id: String(index),
-				label: this.#chipSpans(chip),
-				...(chip.action.on ? { on: true } : {}),
-			})),
-			selected: String(strip.index),
-		};
-	}
-
 	#handlePickerEvent(event: PickerEvent): void {
 		if (this.#confirm) {
 			if (event.kind === "action" && event.act === "confirm") this.#confirmApply();
@@ -1108,54 +994,42 @@ export class AccountManagerComponent implements Component {
 			return;
 		}
 		if (event.kind !== "action") {
-			if (this.#strip) return;
 			const index = this.#rows.findIndex(account => accountItemId(account) === event.item);
 			if (index < 0) return;
 			this.#focus = "list";
 			this.#rowIndex = index;
-			if (event.kind === "activate") this.#openFieldStrip(this.#rows[index]!);
+			if (event.kind === "activate") this.#openPrefs(this.#rows[index]!);
 			return;
 		}
 		const { act, value } = event;
-		const strip = this.#strip;
 		if (act === CLOSE_ACTION.id) {
-			if (strip) this.#stripBack(strip);
-			else if (!this.#clearSearch()) this.#close();
+			if (!this.#clearSearch()) this.#close();
 		} else if (act === "cancel") {
-			if (strip) this.#stripBack(strip);
+			this.#prefs = undefined;
 		} else if (act === "search") {
-			if (!strip) {
+			{
 				this.#searching = true;
 				this.#focus = "list";
 			}
 		} else if (act === "searchDone") {
 			this.#searching = false;
 		} else if (act === "focusList") {
-			if (!strip) this.#focus = "list";
+			this.#focus = "list";
 		} else if (act === "scope") {
 			const entry = this.#entries.find(candidate => candidate.id === value);
-			if (strip || !entry || entry.kind === "separator") return;
+			if (!entry || entry.kind === "separator") return;
 			this.#selectEntry(entry);
 			this.#focus = "list";
-		} else if (act === "strip") {
-			const index = Number(value);
-			if (strip?.kind !== "chips" || !Number.isInteger(index) || !strip.chips[index]) return;
-			strip.index = index;
-			this.#activateStripChip();
-		} else if (act === "stripApply") {
-			this.#activateStripChip();
-		} else if (act === "stripSubmit") {
-			if (strip?.kind === "input") void this.#apply(strip.accountId, strip.action, strip.input.getValue().trim());
 		} else if (act === "reload") {
-			if (!strip) void this.#refresh();
-		} else if (!strip) {
+			void this.#refresh();
+		} else {
 			const account = this.#selected();
 			if (!account) return;
 			this.#focus = "list";
-			if (act === "edit") this.#openFieldStrip(account);
+			if (act === "edit") this.#openPrefs(account);
 			else if (act.startsWith("field:")) {
 				const field = account.fields.find(candidate => `field:${candidate.id}` === act);
-				if (field) this.#activate(account, field);
+				if (field) this.#openPrefs(account, field.id);
 			}
 		}
 	}
@@ -1217,36 +1091,6 @@ export class AccountManagerComponent implements Component {
 		];
 		children.push(this.#detailSection(selected));
 		return node("col", { gap: "sm", grow: 1 }, children, "body");
-	}
-
-	#describeStrip(): NativeNode | undefined {
-		const strip = this.#strip;
-		if (!strip) return undefined;
-		const prefix = text([span(this.#stripPrefix(strip), "accent")]);
-		if (strip.kind === "input") return row([prefix, col([strip.input], { grow: 1 })], { gap: "sm", align: "center" });
-		return row(
-			[
-				prefix,
-				node(
-					"tabs",
-					{
-						items: strip.chips.map((chip, index) => ({ id: String(index), label: this.#chipSpans(chip) })),
-						active: String(strip.index),
-						actions: { click: "activate" },
-					},
-					undefined,
-					"strip",
-				),
-			],
-			{ gap: "sm", align: "center" },
-		);
-	}
-
-	#chipSpans(chip: StripChip): TspSpan[] {
-		const action = chip.action;
-		if (action.readOnly) return [span(chip.label, "dim")];
-		if (action.on) return [span(`${theme.status.enabled} ${chip.label}`, "accent")];
-		return [span(chip.label, "value" in action ? "accent" : "muted")];
 	}
 
 	#footerHints(): NativeHint[] {

@@ -370,19 +370,23 @@ function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubP
 		}
 		const view = { ...describeGroup(group, spec.ref.profile), source };
 		const blocker = modelGroupWriteBlocker(settings, spec.ref.use);
-		if (blocker !== undefined) return { ...view, readOnly: `modelGroups.${spec.ref.use} is ${blocker}` };
 		const raw = cfgModelGroups.get(settings)[spec.ref.use];
+		if (blocker !== undefined)
+			return {
+				...view,
+				...(isRecord(raw) ? { effective: raw } : {}),
+				readOnly: `modelGroups.${spec.ref.use} is ${blocker}`,
+			};
 		return isRecord(raw) ? { ...view, raw } : { ...view, readOnly: `modelGroups.${spec.ref.use} is not a mapping` };
 	}
 	const view = { ...describeGroup(spec.group, spec.group.profile), source: { kind: "inline" as const } };
 	const blocker = poolWriteBlocker(settings, target);
-	if (blocker !== undefined) return { ...view, readOnly: blocker };
 	const raw =
 		target.kind === "role"
 			? settings.getModelRoleEntries()[target.key]
 			: (cfgRetryFallbackChains.get(settings) as Record<string, unknown>)[target.key];
 	if (!isRecord(raw)) return { ...view, readOnly: "not an inline group" };
-	return { ...view, raw };
+	return blocker !== undefined ? { ...view, effective: raw, readOnly: blocker } : { ...view, raw };
 }
 
 /**
@@ -407,7 +411,7 @@ function modelGroupPool(settings: Settings, name: string): ModelHubPool | undefi
 	}
 	const view = { ...describeGroup(group, undefined), source: { kind: "inline" as const } };
 	const blocker = modelGroupWriteBlocker(settings, name);
-	if (blocker !== undefined) return { ...view, readOnly: blocker };
+	if (blocker !== undefined) return { ...view, ...(isRecord(raw) ? { effective: raw } : {}), readOnly: blocker };
 	return isRecord(raw) ? { ...view, raw } : { ...view, readOnly: "not a mapping" };
 }
 

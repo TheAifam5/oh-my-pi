@@ -891,27 +891,56 @@ A role or fallback chain whose value is a model group (see `modelGroups` in [Set
 | `Enter` | pooled role, fallback pool | Adds a member picked from the catalog. |
 | `f` | pooled role or role whose chain is a pool | Adds a member to the fallback pool (a list chain keeps its usual fallback append). |
 | `Enter` / `x` | member | Replaces / removes the member. |
-| `t` / `w` | member | Sets the member's `defaultEffort` / cycles its weight (weighted-random only, alone or as the last entry of a strategy list). |
+| `t` / `w` | member | Opens the member's effort choice / numeric weight in the pool preference sheet. |
 | `[` / `]` | member | Moves the member in a priority or round-robin order, alone or as the last entry of a strategy list. |
-| `g` | pooled row | Cycles the strategy through priority, round-robin, weighted-random, random, quota, cheapest, least-used, least-loaded, p2c, and shuffle-bag, whatever the funding order and spending policy. Leaving a strategy drops its `strategyOptions`: leaving quota drops its `tolerance`, and leaving weighted-random also drops member weights. least-used always gets the default window; set `strategyOptions.window` in config, and a quota `tolerance` with `e`. A pool with a strategy list keeps its strategy; change the list with `e`. A strategy list shows as its entries joined by `→`. On a member row the cursor stays on that member. |
-| `o` | pooled row | Sets and then cycles the funding order (`included`, `included → free`, `free → included`, `free`); a configured `metered` stays last. It never removes the funding order: a pool without one applies no billing filter, which is wider than any listed order. |
+| `g` / `o` | pooled row | Opens the pool preference sheet at its ordered strategy / funding control. |
 | `x` | pooled role / fallback pool | Clears the role / removes the chain. |
 | `Enter` / `x` | invalid pooled role | Replaces the entry with one model / removes it. |
-| `a` / `h` | pooled row | Toggles `routing.cache.affinity` / `routing.cache.pricing` on, and back off by removing it. |
-| `u` | pooled row | Cycles `routing.quota.unknown` through `exclude`, `allow`, and unset. |
-| `r` | pooled row | Cycles `routing.quota.reserveFraction` through 0.05, 0.1, 0.2, 0.3, and unset (the global reserve). |
-| `e` | pooled row | Opens the routing editors, listed below. |
+| `a` / `h` | pooled row | Opens the pool preference sheet at cache affinity / cache pricing. |
+| `u` / `r` | pooled row | Opens the pool preference sheet at unknown-quota handling / numeric reserve. |
+| `e` | pooled row | Opens all pool preferences, listed below. |
 | `⇧G` | pool-capable role, fallback chain, or pooled row | Opens the model-group editor, described below. |
 
-The routing editors open as a chip strip; toggling editors stay open across edits, and `Esc` closes them:
+Pool routing and profile overrides use object-scoped preference sheets. Tern renders typed controls;
+the terminal uses an Up/Down settings list. Enter edits a text or numeric value, cycles a choice,
+toggles a switch, or opens a multi-select. In a multi-select, Space toggles an option, `[` / `]`
+reorders a selected value when ordering is supported, and Enter saves. Escape cancels a draft
+before closing the sheet. A refused submission retains its field warning, draft, and cursor.
+Unset numeric values open as blank inherited drafts; confirming them unchanged writes nothing.
 
-- **account order**: each named account (`auth.accountPolicies[].name`) toggles in or out of `routing.accounts.order`, appended at the end; chips show their position.
-- **drain**: sets `routing.accounts.drain` to one named account, or `none`.
-- **drain spend** / **return when**: toggle the `routing.accounts.spend` classes (`plan`, `credits`, `money`) / `returnWhen` triggers (`reset`, `credits-added`, `money-available`). A billing trigger needs its `spend` class.
-- **metered**: `provider-managed`, or `local hard budget…` typed as `<id> <perRequestMax> <maxSpend> <window>` (window `<n>m`, `<n>h`, `<n>d`; USD, such as `daily 0.50 5.00 1d`), sets `routing.spending` and appends `metered` to the funding order (which starts as `included` when the pool has none). `off` removes both, so the validator refuses it where `metered` is the only funding class.
-- **limits**: each limit chip removes that `routing.limits` entry; `add…` takes a limit in the `/account` limit syntax, `<usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip]`.
-- **strategies**: each strategy toggles in or out of the strategy list, appended at the end; chips show their position. One remaining entry is written as a plain strategy. `strategyOptions` keeps only the fields a remaining entry consumes; a new priority or round-robin entry orders the members in their current order; dropping weighted-random drops member weights.
-- **quota tolerance**: sets `strategyOptions.tolerance`, a number in (0, 0.5]; empty removes it.
+| Pool field | Control and persisted value |
+| --- | --- |
+| Strategies | Ordered multi-select for `strategy`; one selected strategy is stored as a string. The validator checks allowed combinations. Leaving quota or least-used removes their options; leaving weighted-random removes member weights. |
+| Member order | Ordered multi-select for `strategyOptions.order`; priority and round-robin require every member exactly once. |
+| Quota tolerance | Number for `strategyOptions.tolerance`, in (0, 0.5]; clear to inherit. |
+| Quota objective / capacity metric | Choices for `strategyOptions.objective` (`balance`) and `capacityMetric` (`fraction`), with inherit. |
+| Least-used window | Number in milliseconds for `strategyOptions.window.durationMs`, with rolling type; clear to inherit. |
+| Funding order | Ordered multi-select for `routing.funding.order`; the validator checks billing-class ordering. Removing metered also removes its spending policy. |
+| Metered spending / local hard budget | Policy choice and text budget `<id> <perRequestMax> <maxSpend> <window>`; window is `<n>m`, `<n>h`, or `<n>d`, amounts are USD, for example `daily 0.50 5.00 1d`. Enabling a spending policy appends metered; disabling it removes metered and is refused if no funding class remains. |
+| Quota reserve / observation age / unknown | Numbers for `routing.quota.reserveFraction` ([0, 1)) and `maxObservationAgeMs`, plus an inherit/allow/exclude choice for `unknown`. Clear numeric values to inherit. |
+| Account order / drain account | Ordered multi-select for `routing.accounts.order` and a choice for `drain`, using trusted account names. |
+| Drain spend / return when | Multi-selects for `routing.accounts.spend` and `returnWhen`; a billing trigger requires its corresponding spend class. |
+| Cache affinity / pricing | Switches for `routing.cache.affinity` and `pricing`. |
+| Limits | Text edit/add controls for each `routing.limits` entry and an explicit remove action. Syntax: `<usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip]`. |
+| Member weight / effort | Number for each member's `weight` and a supported-effort choice for `defaultEffort`, with inherit. A profile sheet instead writes its member effort overrides. |
+
+`/account` uses the same preference sheets. Enter opens the selected account, global-limit scope,
+or project pin. Field shortcuts focus their matching control; text and numeric shortcuts open the
+draft directly. The account controls map to the existing host actions:
+
+| Account or policy field | Control |
+| --- | --- |
+| Name | Text |
+| Priority / reserve | Numbers; reserve is a percentage in [0, 100] |
+| Drain / spend classes / return triggers / reset windows | Switches, including the any-reset-window option |
+| Return margin / cooldown | Numbers, in percent and minutes respectively |
+| Auto-redeem | Choice of the host's modes |
+| Session pin / project pin / pool membership / enabled | Switches; disabling an account still requires confirmation |
+| Account and global limits | Text edit/add controls and explicit remove actions; scope creation uses the existing scope-and-limit syntax |
+| Project pin account / removal | Account choice and an explicit remove action |
+
+Read-only controls show their layer reason and never submit a write. Pool and account validation
+errors appear on the field that submitted the value; correcting the value and saving clears the error.
 
 The model-group editor on a role or chain entry lists `use +<name>` for each other `modelGroups` entry, pointing the entry at it. On an inline pool, `new group…` names a new `modelGroups` entry holding the pool and points the entry at it (an inline `profile` stays on the reference). On a pool that references a group, `rename +<name>…` writes the group under the new name, points every writable role and chain reference at the new name (keeping their profiles), and removes the old name. Renames also rewrite global references that higher layers shadow; a reference supplied only by a higher layer prevents the rename. A failed reference write restores earlier references before removing the new definition; any rollback failure is reported and the new definition is retained while references still need it. `delete +<name>` removes the group and leaves this entry an inline copy of it (with its profile); it is declined while another entry still references the group.
 

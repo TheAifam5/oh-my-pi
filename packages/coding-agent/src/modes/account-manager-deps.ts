@@ -317,6 +317,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				label: "priority",
 				key: "p",
 				value: row.priority === undefined ? "default" : String(row.priority),
+				control: { k: "number", value: row.priority ?? 0, step: 1 },
 				input: {
 					initial: row.priority === undefined ? "" : String(row.priority),
 					hint: "Priority: a number; higher wins",
@@ -328,6 +329,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 				label: "reserve",
 				key: "r",
 				value: row.reservePct === undefined ? "default" : `${row.reservePct}%`,
+				control: { k: "number", value: row.reservePct ?? 0, min: 0, max: 100, step: 1, unit: "%" },
 				input: {
 					initial: row.reservePct === undefined ? "" : String(row.reservePct),
 					hint: "Reserve: percent of quota kept back, 0-100",
@@ -368,6 +370,7 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					{
 						id: "return:margin",
 						label: "margin…",
+						control: { k: "number", value: row.returnMargin ?? 5, min: 0, max: 100, step: 1, unit: "%" },
 						input: {
 							initial: row.returnMargin === undefined ? "" : String(row.returnMargin),
 							hint: "Return margin: percent of quota back, 0-100 (empty: default 5)",
@@ -376,6 +379,13 @@ export function createAccountManagerDeps(host: AccountManagerHost): AccountManag
 					{
 						id: "return:cooldown",
 						label: "cooldown…",
+						control: {
+							k: "number",
+							value: (row.returnCooldownMs ?? 600000) / MINUTE_MS,
+							min: 0,
+							step: 1,
+							unit: "min",
+						},
 						input: {
 							initial: row.returnCooldownMs === undefined ? "" : String(row.returnCooldownMs / MINUTE_MS),
 							hint: "Return cooldown in minutes (empty: default 10)",

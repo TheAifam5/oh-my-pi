@@ -1,3 +1,4 @@
+import { HubPrefs, type HubPrefsField, type HubPrefsValue } from "./hub-prefs";
 import {
 	parseModelString,
 	splitThinkingSuffix,
@@ -97,8 +98,6 @@ import {
 	accountOrder,
 	appendPoolLimit,
 	BUDGET_SPEC_USAGE,
-	cycleQuotaReserve,
-	cycleQuotaUnknown,
 	draftRecord,
 	formatBudgetSpec,
 	POOL_DRAIN_RETURN,
@@ -110,9 +109,6 @@ import {
 	setQuotaTolerance,
 	spendingPolicy,
 	strategyNames,
-	toggleAccountEntry,
-	toggleCacheField,
-	toggleStrategy,
 	parseBudgetSpec,
 } from "./model-hub-routing";
 
@@ -215,6 +211,8 @@ export interface ModelHubPool {
 	 * pool, the `modelGroups.<group>` definition for a reference. Edits round-trip through a copy.
 	 */
 	raw?: Readonly<Record<string, unknown>>;
+	/** Effective configuration for disabled preference rows; never used for writes. */
+	effective?: Readonly<Record<string, unknown>>;
 }
 
 /** A pool limit parsed from the `<metric> <max> [<window>] [warn|skip]` syntax, or why it does not parse. */
@@ -385,15 +383,16 @@ interface SidebarAnchor {
 }
 
 interface StripChip extends HubStripChip<
-	"assign" | "unassign" | "fallback" | "fallbackModel" | "fallbackProvider" | "scope" | "thinking" | "pool"
+	"assign" | "unassign" | "fallback" | "fallbackModel" | "fallbackProvider" | "scope" | "thinking"
 > {
 	role?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	scope?: ModelRoleSelectionScope;
-	/** A pool editor chip's edit, or the editor it opens. */
-	apply?: () => void;
-	/** A pool editor chip whose entry is selected. */
-	on?: boolean;
+}
+
+interface GroupAction {
+	label: string;
+	apply: () => void;
 }
 
 type StripState =
@@ -403,11 +402,6 @@ type StripState =
 			role?: string;
 			/** Set when a thinking strip edits a fallback-chain entry instead of a role assignment. */
 			fallbackIndex?: number;
-			/**
-			 * Set when a thinking strip edits a pool member's effort: `profile` names the group profile
-			 * whose override it sets; absent sets the member's `defaultEffort`.
-			 */
-			poolMember?: { target: ModelHubPoolTarget; alias: string; profile?: string };
 			scope?: ModelRoleSelectionScope;
 			/** Where to land when a scope or thinking strip closes. */
 			returnToRoles: boolean;
@@ -433,22 +427,6 @@ type StripState =
 			error?: string;
 			confirm?: { value: string; message: string };
 			preview?: { value: string; text: string | undefined };
-	  }
-	| (HubStripState<StripChip> & {
-			/** A pool editor: chips that edit a pool or open another editor. */
-			kind: "pool";
-			title: string;
-			/** Rebuilds the chips after an edit; set on editors that stay open across edits. */
-			refresh?: () => StripChip[];
-	  })
-	| {
-			/** Footer text input of a pool editor; `submit` returns why the text was refused, keeping it open. */
-			kind: "field";
-			label: string;
-			hint: string;
-			input: Input;
-			error?: string;
-			submit: (value: string) => string | undefined;
 	  };
 
 /** A Roles-view command; keys and the picker's action bar both run {@link ModelHubComponent}'s `#runRolesAction`. */
@@ -519,21 +497,6 @@ const POOL_STRATEGY_CYCLE = [
 	"p2c",
 	"shuffle-bag",
 ] as const;
-
-/**
- * Funding orders `o` cycles through. There is no empty state: a pool without `routing.funding`
- * applies no billing filter, which is wider than any listed order. `metered` stays as configured
- * because it needs a spending policy.
- */
-const POOL_FUNDING_CYCLE: readonly (readonly string[])[] = [
-	["included"],
-	["included", "free"],
-	["free", "included"],
-	["free"],
-];
-
-/** Weights `w` cycles a weighted-random member through; `undefined` leaves the strategy default. */
-const POOL_WEIGHT_CYCLE: readonly (number | undefined)[] = [undefined, 1, 2, 3, 5, 10];
 
 /** Pool limit syntax, the `/account` limit syntax without provider evidence. */
 const LIMIT_SPEC_HINT = "<usd|requests|tokens> <max> <day|week|month|<n>m|<n>h|<n>d> [warn|skip]";
@@ -823,6 +786,7 @@ export class ModelHubComponent implements Component {
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
+	#prefs: HubPrefs | undefined;
 	#assignmentPending = false;
 	/**
 	 * Last preset ctrl+←/→ tried in this hub, with the settings revision after the
@@ -2159,22 +2123,9 @@ export class ModelHubComponent implements Component {
 
 	#activateStripChip(): void {
 		const strip = this.#strip;
-		if (!strip || strip.kind === "name" || strip.kind === "field") return;
+		if (!strip || strip.kind === "name") return;
 		const chip = strip.chips[strip.index];
 		if (!chip) return;
-		if (strip.kind === "pool") {
-			chip.apply?.();
-			// An editor that opened another editor has handed the footer over.
-			if (this.#strip !== strip) return;
-			const chips = strip.refresh?.() ?? [];
-			if (chips.length === 0) {
-				this.#closeStrip();
-				return;
-			}
-			strip.chips = chips;
-			strip.index = Math.min(strip.index, chips.length - 1);
-			return;
-		}
 		switch (chip.action) {
 			case "assign":
 				if (chip.role) {
@@ -2210,13 +2161,6 @@ export class ModelHubComponent implements Component {
 				}
 				return;
 			case "thinking": {
-				if (chip.thinkingLevel !== undefined && strip.poolMember !== undefined) {
-					this.#strip = null;
-					this.#frame.chipRanges = [];
-					const { target, alias, profile } = strip.poolMember;
-					this.#setPoolMemberEffort(target, alias, chip.thinkingLevel, profile);
-					return;
-				}
 				if (strip.role && chip.thinkingLevel !== undefined && strip.fallbackIndex !== undefined) {
 					this.#setFallbackThinking(strip.role, strip.fallbackIndex, chip.thinkingLevel);
 					this.#strip = null;
@@ -2505,7 +2449,7 @@ export class ModelHubComponent implements Component {
 		return edit !== undefined && this.#writePool(edit.write, edit.draft);
 	}
 
-	/** {@link #editPool} for a footer field: the refusal, which the field shows, instead of a status-row message. */
+	/** Persist a preference edit and return its field-level refusal. */
 	#editPoolFromField(
 		target: ModelHubPoolTarget,
 		mutate: (draft: Record<string, unknown>) => void,
@@ -2514,7 +2458,7 @@ export class ModelHubComponent implements Component {
 			mutate(draft);
 			return true;
 		});
-		if (!edit) return undefined;
+		if (!edit) return this.#pool(target)?.readOnly ?? "Pool is no longer editable";
 		const error = this.#savePool(edit.write, edit.draft);
 		this.#refreshAfterMutation();
 		return error;
@@ -2646,69 +2590,7 @@ export class ModelHubComponent implements Component {
 		return strategy === "priority" || strategy === "round-robin";
 	}
 
-	/**
-	 * `g`: step through {@link POOL_STRATEGY_CYCLE}; leaving a strategy drops the `strategyOptions`
-	 * and, leaving weighted-random, the member weights that only it accepts. A strategy list is left
-	 * for config, so `g` declines to change it.
-	 */
-	#cyclePoolStrategy(target: ModelHubPoolTarget): void {
-		const pool = this.#pool(target);
-		if (pool && Array.isArray(pool.raw?.strategy)) {
-			this.#poolNotice(`strategy list ${pool.strategy} is not in the hub's strategy cycle; change it with e`);
-			return;
-		}
-		this.#editPool(target, draft => {
-			const order = draftOrder(draft) ?? (pool?.members ?? []).map(member => member.alias);
-			const current = POOL_STRATEGY_CYCLE.findIndex(name => name === draft.strategy);
-			const next = POOL_STRATEGY_CYCLE[(current + 1) % POOL_STRATEGY_CYCLE.length]!;
-			draft.strategy = next;
-			if (next === "priority" || next === "round-robin") draft.strategyOptions = { order: [...order] };
-			else delete draft.strategyOptions;
-			if (next !== "weighted-random") {
-				for (const member of Object.values(draftRecord(draft, "models")))
-					if (isRecord(member)) delete member.weight;
-			}
-			return true;
-		});
-	}
-
-	/** `o`: step the non-metered part of the funding order through {@link POOL_FUNDING_CYCLE}. */
-	#cyclePoolFunding(target: ModelHubPoolTarget): void {
-		this.#editPool(target, draft => {
-			const routing = isRecord(draft.routing) ? draft.routing : undefined;
-			const funding = routing && isRecord(routing.funding) ? routing.funding.order : undefined;
-			const classes = Array.isArray(funding)
-				? funding.filter((entry): entry is string => typeof entry === "string")
-				: [];
-			const metered = classes.includes("metered");
-			const prefix = classes.filter(entry => entry !== "metered");
-			const current = POOL_FUNDING_CYCLE.findIndex(
-				order => order.length === prefix.length && order.every((entry, index) => entry === prefix[index]),
-			);
-			const next = [
-				...POOL_FUNDING_CYCLE[(current + 1) % POOL_FUNDING_CYCLE.length]!,
-				...(metered ? ["metered"] : []),
-			];
-			draftRecord(draft, "routing").funding = { order: next };
-			return true;
-		});
-	}
-
-	/** `w`: step a weighted-random member's weight through {@link POOL_WEIGHT_CYCLE}. */
-	#cyclePoolWeight(target: ModelHubPoolTarget, alias: string): void {
-		if (poolTailStrategy(this.#pool(target)) !== "weighted-random") return;
-		this.#editPool(target, draft => {
-			const member = draftRecord(draft, "models")[alias];
-			if (!isRecord(member)) return false;
-			const current = POOL_WEIGHT_CYCLE.indexOf(typeof member.weight === "number" ? member.weight : undefined);
-			const next = POOL_WEIGHT_CYCLE[(current + 1) % POOL_WEIGHT_CYCLE.length];
-			if (next === undefined) delete member.weight;
-			else member.weight = next;
-			return true;
-		});
-	}
-
-	/** Catalog entry of a member the effort strip can edit; undefined when the model is unknown or has no effort ladder. */
+	/** Catalog entry whose supported efforts can be edited; undefined for unknown or non-reasoning models. */
 	#poolMemberEffortItem(row: RolesRow | undefined): ModelBrowserItem | undefined {
 		if (row?.kind !== "poolMember" || !this.#rowEditablePool(row)) return undefined;
 		const member = this.#pool(row.target)?.members.find(entry => entry.alias === row.alias);
@@ -2718,114 +2600,75 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
-	 * `t` on a member row: the effort strip. A member of a pool that references a group through a
+	 * `t` on a member row opens its effort preference. A reference through a group
 	 * profile edits that profile's override (inherit removes it), else its `defaultEffort` (inherit
 	 * clears it).
 	 */
-	#openPoolEffortStrip(row: RolesRow | undefined): void {
+	#openPoolEffortPrefs(row: RolesRow | undefined): void {
 		if (row?.kind !== "poolMember") return;
 		const source = this.#pool(row.target)?.source;
-		this.#openMemberEffortStrip(row.role, row.target, row.alias, source?.kind === "ref" ? source.profile : undefined);
-	}
-
-	/** The effort strip of member `alias` of the pool at `target`, for `profile` or its default. */
-	#openMemberEffortStrip(role: string, target: ModelHubPoolTarget, alias: string, profile: string | undefined): void {
-		const pool = this.#pool(target);
-		if (!this.#poolEditable(pool)) return;
-		const member = pool.members.find(entry => entry.alias === alias);
-		const parsed = member ? parseModelString(member.model) : undefined;
-		const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
-		if (!item || getSupportedEfforts(item.model).length === 0) return;
-		const options: ConfiguredThinkingLevel[] = [ThinkingLevel.Inherit, ...getSupportedEfforts(item.model)];
-		// A profile row edits the override itself; a member row shows the effort it runs at.
-		const shown =
-			profile !== undefined && target.kind === "group"
-				? pool.profiles?.find(entry => entry.name === profile)?.efforts[alias]
-				: member?.effort;
-		const current = options.find(level => level === shown) ?? ThinkingLevel.Inherit;
-		this.#strip = {
-			kind: "thinking",
-			item,
-			role,
-			poolMember: { target, alias, ...(profile !== undefined ? { profile } : {}) },
-			chips: this.#thinkingChips(options),
-			index: Math.max(0, options.indexOf(current)),
-			returnToRoles: true,
-		};
-	}
-
-	#setPoolMemberEffort(
-		target: ModelHubPoolTarget,
-		alias: string,
-		level: ConfiguredThinkingLevel,
-		profile: string | undefined,
-	): void {
-		this.#editPool(target, draft => {
-			if (profile === undefined) {
-				const member = draftRecord(draft, "models")[alias];
-				if (!isRecord(member)) return false;
-				if (level === ThinkingLevel.Inherit) delete member.defaultEffort;
-				else member.defaultEffort = level;
-				return true;
-			}
-			const overrides = draftRecord(draftRecord(draft, "profiles"), profile);
-			if (level === ThinkingLevel.Inherit) delete overrides[alias];
-			else overrides[alias] = { effort: level };
-			return true;
-		});
+		if (source?.kind === "ref" && source.profile !== undefined) {
+			this.#openProfilePrefs(source.group, source.profile);
+			this.#prefs?.focus(`effort:${row.alias}`);
+		} else this.#openRoutingMenu(row.target, `effort:${row.alias}`);
 	}
 
 	// ─── Routing editors ────────────────────────────────────────────────────
 
-	/** A pool editor chip: `apply` runs on Enter, `on` marks a selected entry. */
-	#poolChip(label: string, apply: () => void, on = false): StripChip {
-		const shown = sanitizeDisplayLine(label);
-		return {
-			label: shown,
-			styled: on ? theme.fg("accent", `${theme.status.enabled} ${shown}`) : theme.fg("muted", shown),
-			action: "pool",
-			apply,
-			...(on ? { on: true } : {}),
-		};
+	#groupAction(label: string, apply: () => void): GroupAction {
+		return { label: sanitizeDisplayLine(label), apply };
 	}
 
-	/**
-	 * Open a chip editor titled `title`; with `stay`, it stays open across edits and rebuilds its
-	 * chips from `chips` after each. Returns false, opening nothing, when there are no chips.
-	 */
-	#openPoolStrip(title: string, chips: () => StripChip[], stay: boolean): boolean {
-		const built = chips();
-		if (built.length === 0) return false;
-		this.#strip = { kind: "pool", title: sanitizeDisplayLine(title), chips: built, index: 0 };
-		if (stay) this.#strip.refresh = chips;
+	/** Open a group action sheet. Returns false when there are no actions. */
+	#openGroupActions(title: string, chips: () => GroupAction[]): boolean {
+		if (chips().length === 0) return false;
+		const prefs = new HubPrefs(
+			title,
+			() =>
+				chips().map((chip, index) => ({
+					id: String(index),
+					label: chip.label,
+					control: { k: "action", label: chip.label, act: `pool:${index}` },
+					apply: () => {
+						chip.apply?.();
+						if (this.#prefs === prefs) this.#prefs = undefined;
+						return undefined;
+					},
+				})),
+			() => {
+				this.#prefs = undefined;
+				this.#requestRender();
+			},
+			() => this.#requestRender(),
+		);
+		this.#prefs = prefs;
 		return true;
 	}
 
-	/** Open a footer field prefilled with `value`; `submit` returns why the text was refused. */
-	#openPoolField(label: string, hint: string, value: string, submit: (value: string) => string | undefined): void {
-		const input = new Input();
-		input.setValue(value);
-		this.#strip = { kind: "field", label: sanitizeDisplayLine(label), hint, input, submit };
-	}
-
-	/** Run the open field's submit: close it when accepted, else show why it was refused. */
-	#submitField(): void {
-		const strip = this.#strip;
-		if (strip?.kind !== "field") return;
-		const error = strip.submit(strip.input.getValue());
-		if (this.#strip !== strip) return;
-		if (error === undefined) this.#closeStrip();
-		else strip.error = sanitizeDisplayLine(error);
-	}
-
-	/** Apply a draft edit to the editable pool at `target` from a chip. */
-	#poolEdit(target: ModelHubPoolTarget, mutate: (draft: Record<string, unknown>) => void): () => void {
-		return () => {
-			this.#editPool(target, draft => {
-				mutate(draft);
-				return true;
-			});
-		};
+	/** Open a text preference prefilled with `value`; `submit` returns why the text was refused. */
+	#openPoolTextPrefs(label: string, hint: string, value: string, submit: (value: string) => string | undefined): void {
+		this.#prefs = new HubPrefs(
+			label,
+			() => [
+				{
+					id: "value",
+					label: sanitizeDisplayLine(label),
+					hint,
+					control: { k: "text", value },
+					apply: input => {
+						const error = submit(String(input ?? ""));
+						if (error === undefined) this.#prefs = undefined;
+						return error;
+					},
+				},
+			],
+			() => {
+				this.#prefs = undefined;
+				this.#requestRender();
+			},
+			() => this.#requestRender(),
+		);
+		this.#prefs.startEditing("value");
 	}
 
 	#accountNames(): readonly string[] {
@@ -2844,135 +2687,286 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
-	/** `e`: the routing editors of the editable pool at `target`. */
-	#openRoutingMenu(target: ModelHubPoolTarget): void {
-		this.#openPoolStrip(
-			"Routing",
-			() => [
-				this.#poolChip("account order", () => this.#openAccountOrder(target)),
-				this.#poolChip("drain", () => this.#openAccountDrain(target)),
-				this.#poolChip("drain spend", () => this.#openAccountList(target, "spend")),
-				this.#poolChip("return when", () => this.#openAccountList(target, "returnWhen")),
-				this.#poolChip("metered", () => this.#openMetered(target)),
-				this.#poolChip("limits", () => this.#openLimits(target)),
-				this.#poolChip("strategies", () => this.#openStrategies(target)),
-				this.#poolChip("quota tolerance", () => this.#openTolerance(target)),
-			],
-			false,
-		);
-	}
-
-	/** `routing.accounts.order`: each named account toggles in or out, appended at the end. */
-	#openAccountOrder(target: ModelHubPoolTarget): void {
-		const opened = this.#openPoolStrip(
-			"Account order",
+	#openRoutingMenu(target: ModelHubPoolTarget, focus?: string): void {
+		const accounts = this.#accountNames();
+		this.#prefs = new HubPrefs(
+			`Pool ${target.key}`,
+			() => this.#poolPrefsFields(target, accounts),
 			() => {
-				const order = accountOrder(this.#pool(target)?.raw);
-				return [...new Set([...order, ...this.#accountNames()])].map(name => {
-					const at = order.indexOf(name);
-					const edit = this.#poolEdit(target, draft => toggleAccountEntry(draft, "order", name));
-					return this.#poolChip(at >= 0 ? `${at + 1} ${name}` : name, edit, at >= 0);
-				});
+				this.#prefs = undefined;
+				this.#requestRender();
 			},
-			true,
+			() => this.#requestRender(),
 		);
-		if (!opened) this.#poolNotice("No named accounts; name one with /account first");
+		if (focus) this.#prefs.focus(focus);
 	}
 
-	/** `routing.accounts.drain`: one named account, or none. */
-	#openAccountDrain(target: ModelHubPoolTarget): void {
-		const drain = accountDrain(this.#pool(target)?.raw);
-		const names = [...new Set([...(drain === undefined ? [] : [drain]), ...this.#accountNames()])];
-		if (names.length === 0) {
-			this.#poolNotice("No named accounts; name one with /account first");
-			return;
-		}
-		this.#openPoolStrip(
-			"Drain",
-			() => [
-				this.#poolChip(
-					"none",
-					this.#poolEdit(target, draft => setAccountDrain(draft, undefined)),
-					drain === undefined,
-				),
-				...names.map(name =>
-					this.#poolChip(
-						name,
-						this.#poolEdit(target, draft => setAccountDrain(draft, name)),
-						name === drain,
-					),
-				),
-			],
-			false,
-		);
-	}
-
-	/** `routing.accounts.spend` or `returnWhen`: each class or trigger toggles. */
-	#openAccountList(target: ModelHubPoolTarget, field: "spend" | "returnWhen"): void {
-		const values = field === "spend" ? POOL_DRAIN_SPEND : POOL_DRAIN_RETURN;
-		this.#openPoolStrip(
-			field === "spend" ? "Drain spend" : "Return when",
-			() => {
-				const selected = accountList(this.#pool(target)?.raw, field);
-				return values.map(value =>
-					this.#poolChip(
-						value,
-						this.#poolEdit(target, draft => toggleAccountEntry(draft, field, value)),
-						selected.includes(value),
-					),
-				);
-			},
-			true,
-		);
-	}
-
-	/** `metered` funding with its spending policy, or neither. */
-	#openMetered(target: ModelHubPoolTarget): void {
-		const policy = spendingPolicy(this.#pool(target)?.raw);
-		this.#openPoolStrip(
-			"Metered",
-			() => [
-				this.#poolChip(
-					"provider-managed",
-					this.#poolEdit(target, draft => setMeteredSpending(draft, { policy: "provider-managed" })),
-					policy === "provider-managed",
-				),
-				this.#poolChip("local hard budget…", () => this.#openBudget(target), policy === "local-hard-budget"),
-				this.#poolChip(
-					"off",
-					this.#poolEdit(target, draft => setMeteredSpending(draft, undefined)),
-					!policy,
-				),
-			],
-			false,
-		);
-	}
-
-	#openBudget(target: ModelHubPoolTarget): void {
-		this.#openPoolField("Budget:", BUDGET_SPEC_USAGE, formatBudgetSpec(this.#pool(target)?.raw), value => {
-			const parsed = parseBudgetSpec(value);
-			if ("error" in parsed) return parsed.error;
-			return this.#editPoolFromField(target, draft => setMeteredSpending(draft, parsed.spending));
+	#poolPrefsFields(target: ModelHubPoolTarget, accounts: readonly string[]): HubPrefsField[] {
+		const pool = this.#pool(target);
+		const raw = pool?.raw ?? pool?.effective ?? {};
+		const routing = isRecord(raw.routing) ? raw.routing : {};
+		const quota = isRecord(routing.quota) ? routing.quota : {};
+		const cache = isRecord(routing.cache) ? routing.cache : {};
+		const options = isRecord(raw.strategyOptions) ? raw.strategyOptions : {};
+		const aliases = (pool?.members ?? []).map(member => member.alias);
+		const disabled =
+			pool?.readOnly ?? pool?.invalid ?? (!pool?.raw ? "Pool is not editable in this layer" : undefined);
+		const rows: HubPrefsField[] = [];
+		const add = (
+			id: string,
+			label: string,
+			control: HubPrefsField["control"],
+			mutate: (draft: Record<string, unknown>, value: HubPrefsValue) => void,
+			hint?: string,
+			initial?: string,
+		) => {
+			rows.push({
+				id,
+				label,
+				control,
+				hint,
+				disabled,
+				initial,
+				apply: value => this.#editPoolFromField(target, draft => mutate(draft, value)),
+			});
+		};
+		const strings = (value: unknown): string[] =>
+			Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+		const multi = (
+			values: readonly string[],
+			choices: readonly string[],
+			ordered = false,
+		): HubPrefsField["control"] => ({
+			k: "multi",
+			values,
+			options: [...new Set([...values, ...choices])].map(value => ({ value, label: value })),
+			ordered,
 		});
-	}
-
-	/** `routing.limits`: each limit chip removes it; the last chip adds one typed in the `/account` limit syntax. */
-	#openLimits(target: ModelHubPoolTarget): void {
-		const opened = this.#openPoolStrip(
-			"Limits",
-			() => {
-				const chips = poolLimitList(this.#pool(target)?.raw).map((limit, index) =>
-					this.#poolChip(
-						`remove ${this.#limitLabel(limit)}`,
-						this.#poolEdit(target, draft => removePoolLimit(draft, index)),
-					),
-				);
-				if (this.#settings.parseLimitSpec) chips.push(this.#poolChip("add…", () => this.#openLimitField(target)));
-				return chips;
+		const choice = (value: string, choices: readonly string[]): HubPrefsField["control"] => ({
+			k: "choice",
+			value,
+			options: [...new Set([...choices, value])].map(value => ({ value, label: value || "inherit" })),
+		});
+		const number = (
+			value: unknown,
+			min: number,
+			max?: number,
+			step = 1,
+			unit?: string,
+		): HubPrefsField["control"] => ({
+			k: "number",
+			value: typeof value === "number" ? value : min,
+			min,
+			max,
+			step,
+			unit,
+		});
+		const set = (path: readonly string[], value: unknown, draft: Record<string, unknown>) => {
+			let parent = draft;
+			for (const [index, key] of path.slice(0, -1).entries()) {
+				if (path[0] === "models" && index === 1 && typeof parent[key] === "string")
+					parent[key] = { model: parent[key] };
+				parent = draftRecord(parent, key);
+			}
+			const key = path[path.length - 1]!;
+			if (value === null || value === "" || (Array.isArray(value) && value.length === 0)) delete parent[key];
+			else parent[key] = value;
+		};
+		const numeric = (value: HubPrefsValue) => (value === null || value === "" ? null : Number(value));
+		add(
+			"strategy",
+			"Strategies",
+			multi(strategyNames(raw), POOL_STRATEGY_CYCLE, true),
+			(draft, value) => {
+				const names = strings(value);
+				draft.strategy = names.length === 1 ? names[0] : names;
+				const options = draftRecord(draft, "strategyOptions");
+				if (names.includes("priority") || names.includes("round-robin")) options.order ??= aliases;
+				else delete options.order;
+				if (!names.includes("quota")) {
+					delete options.tolerance;
+					delete options.objective;
+					delete options.capacityMetric;
+				}
+				if (!names.includes("least-used")) delete options.window;
+				if (!names.includes("weighted-random")) {
+					for (const member of Object.values(draftRecord(draft, "models")))
+						if (isRecord(member)) delete member.weight;
+				}
+				if (Object.keys(options).length === 0) delete draft.strategyOptions;
 			},
-			true,
+			"Ordered strategies; the pool validator checks allowed combinations",
 		);
-		if (!opened) this.#poolNotice("This pool has no limits, and limits cannot be typed here");
+		add("order", "Member order", multi(strings(options.order), aliases, true), (draft, value) =>
+			set(["strategyOptions", "order"], value, draft),
+		);
+		add(
+			"tolerance",
+			"Quota tolerance",
+			number(options.tolerance, 0, 0.5, 0.01),
+			(draft, value) => setQuotaTolerance(draft, numeric(value) ?? undefined),
+			"(0, 0.5]; clear to inherit",
+			options.tolerance === undefined ? "" : undefined,
+		);
+		add(
+			"objective",
+			"Quota objective",
+			choice(typeof options.objective === "string" ? options.objective : "", ["", "balance"]),
+			(draft, value) => set(["strategyOptions", "objective"], value, draft),
+		);
+		add(
+			"capacityMetric",
+			"Quota capacity metric",
+			choice(typeof options.capacityMetric === "string" ? options.capacityMetric : "", ["", "fraction"]),
+			(draft, value) => set(["strategyOptions", "capacityMetric"], value, draft),
+		);
+		const window = isRecord(options.window) ? options.window : {};
+		add(
+			"window",
+			"Least-used window",
+			number(window.durationMs, 1, 31536000000, 1000, "ms"),
+			(draft, value) =>
+				set(
+					["strategyOptions", "window"],
+					value === null || value === "" ? null : { type: "rolling", durationMs: Number(value) },
+					draft,
+				),
+			"Rolling window; clear to inherit",
+			window.durationMs === undefined ? "" : undefined,
+		);
+		const funding = isRecord(routing.funding) ? strings(routing.funding.order) : [...(pool?.funding ?? [])];
+		add("funding", "Funding order", multi(funding, ["included", "free", "metered"], true), (draft, value) => {
+			set(["routing", "funding", "order"], value, draft);
+			if (!strings(value).includes("metered")) delete draftRecord(draft, "routing").spending;
+			else if (!isRecord(draftRecord(draft, "routing").spending))
+				draftRecord(draft, "routing").spending = { policy: "provider-managed" };
+		});
+		add(
+			"spending",
+			"Metered spending",
+			choice(spendingPolicy(raw) ?? "off", ["off", "provider-managed", "local-hard-budget"]),
+			(draft, value) => {
+				if (value === "off") setMeteredSpending(draft, undefined);
+				else if (value === "provider-managed") setMeteredSpending(draft, { policy: "provider-managed" });
+				else {
+					const parsed = parseBudgetSpec(formatBudgetSpec(raw));
+					if ("spending" in parsed) setMeteredSpending(draft, parsed.spending);
+					else set(["routing", "spending"], { policy: "local-hard-budget" }, draft);
+				}
+			},
+			"Set a valid budget below to enable local-hard-budget",
+		);
+		rows.push({
+			id: "budget",
+			label: "Local hard budget",
+			hint: BUDGET_SPEC_USAGE,
+			disabled,
+			control: { k: "text", value: formatBudgetSpec(raw) },
+			apply: value => {
+				const parsed = parseBudgetSpec(String(value ?? ""));
+				return "error" in parsed
+					? parsed.error
+					: this.#editPoolFromField(target, draft => setMeteredSpending(draft, parsed.spending));
+			},
+		});
+		add(
+			"reserve",
+			"Quota reserve",
+			number(quota.reserveFraction, 0, 0.999999, 0.01, " fraction"),
+			(draft, value) => set(["routing", "quota", "reserveFraction"], numeric(value), draft),
+			"[0, 1); clear to inherit",
+			quota.reserveFraction === undefined ? "" : undefined,
+		);
+		add(
+			"maxAge",
+			"Quota observation age",
+			number(quota.maxObservationAgeMs, 1, undefined, 1000, "ms"),
+			(draft, value) => set(["routing", "quota", "maxObservationAgeMs"], numeric(value), draft),
+			"Clear to inherit",
+			quota.maxObservationAgeMs === undefined ? "" : undefined,
+		);
+		add(
+			"unknown",
+			"Unknown quota",
+			choice(typeof quota.unknown === "string" ? quota.unknown : "", ["", "allow", "exclude"]),
+			(draft, value) => set(["routing", "quota", "unknown"], value, draft),
+		);
+		add("accounts.order", "Account order", multi(accountOrder(raw), accounts, true), (draft, value) =>
+			set(["routing", "accounts", "order"], value, draft),
+		);
+		add("accounts.drain", "Drain account", choice(accountDrain(raw) ?? "", ["", ...accounts]), (draft, value) =>
+			setAccountDrain(draft, value ? String(value) : undefined),
+		);
+		for (const field of ["spend", "returnWhen"] as const) {
+			add(
+				`accounts.${field}`,
+				field === "spend" ? "Drain spend" : "Return when",
+				multi(accountList(raw, field), field === "spend" ? POOL_DRAIN_SPEND : POOL_DRAIN_RETURN),
+				(draft, value) => set(["routing", "accounts", field], value, draft),
+			);
+		}
+		for (const field of ["affinity", "pricing"] as const) {
+			add(`cache.${field}`, `Cache ${field}`, { k: "switch", on: cache[field] === true }, (draft, value) =>
+				set(["routing", "cache", field], value, draft),
+			);
+		}
+		for (const [index, limit] of poolLimitList(raw).entries()) {
+			rows.push({
+				id: `limit:${index}`,
+				label: `Limit ${index + 1}`,
+				disabled,
+				control: { k: "text", value: this.#limitLabel(limit) },
+				apply: value => {
+					const parsed = this.#settings.parseLimitSpec?.(String(value ?? ""));
+					if (!parsed) return "Limit parser is unavailable";
+					if ("error" in parsed) return parsed.error;
+					return this.#editPoolFromField(target, draft => {
+						const limits = [...poolLimitList(draft)];
+						limits[index] = parsed.limit;
+						draftRecord(draft, "routing").limits = limits;
+					});
+				},
+			});
+			add(
+				`limit:remove:${index}`,
+				`Remove limit ${index + 1}`,
+				{ k: "action", label: "Remove", act: `remove-limit:${index}` },
+				draft => removePoolLimit(draft, index),
+			);
+		}
+		rows.push({
+			id: "limit:add",
+			label: "Add limit",
+			disabled: disabled ?? (!this.#settings.parseLimitSpec ? "Limit parser is unavailable" : undefined),
+			hint: LIMIT_SPEC_HINT,
+			control: { k: "text", value: "" },
+			apply: value => {
+				const parsed = this.#settings.parseLimitSpec?.(String(value ?? ""));
+				if (!parsed) return "Limit parser is unavailable";
+				return "error" in parsed
+					? parsed.error
+					: this.#editPoolFromField(target, draft => appendPoolLimit(draft, parsed.limit));
+			},
+		});
+		for (const member of pool?.members ?? []) {
+			add(
+				`weight:${member.alias}`,
+				`${member.alias} weight`,
+				number(member.weight, 1, undefined, 1),
+				(draft, value) => set(["models", member.alias, "weight"], numeric(value), draft),
+				"Clear to inherit",
+				member.weight === undefined ? "" : undefined,
+			);
+			const parsed = parseModelString(member.model);
+			const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
+			add(
+				`effort:${member.alias}`,
+				`${member.alias} effort`,
+				choice(member.effort ?? "", ["", ...(item ? getSupportedEfforts(item.model) : [])]),
+				(draft, value) => set(["models", member.alias, "defaultEffort"], value, draft),
+			);
+		}
+		return rows;
 	}
 
 	#limitLabel(limit: unknown): string {
@@ -2983,50 +2977,6 @@ export class ModelHubComponent implements Component {
 			label = undefined;
 		}
 		return label ?? JSON.stringify(limit) ?? "limit";
-	}
-
-	#openLimitField(target: ModelHubPoolTarget): void {
-		this.#openPoolField("Limit:", LIMIT_SPEC_HINT, "", value => {
-			let parsed: ModelHubLimitSpecResult | undefined;
-			try {
-				parsed = this.#settings.parseLimitSpec?.(value);
-			} catch (error) {
-				return error instanceof Error ? error.message : String(error);
-			}
-			if (!parsed) return undefined;
-			if ("error" in parsed) return parsed.error;
-			return this.#editPoolFromField(target, draft => appendPoolLimit(draft, parsed.limit));
-		});
-	}
-
-	/** Strategy list: each strategy toggles, appended at the end; the list order is the chip numbering. */
-	#openStrategies(target: ModelHubPoolTarget): void {
-		this.#openPoolStrip(
-			"Strategies",
-			() => {
-				const pool = this.#pool(target);
-				const names = strategyNames(pool?.raw);
-				const aliases = (pool?.members ?? []).map(member => member.alias);
-				return POOL_STRATEGY_CYCLE.map(name => {
-					const at = names.indexOf(name);
-					const edit = this.#poolEdit(target, draft => toggleStrategy(draft, name, aliases));
-					return this.#poolChip(at >= 0 ? `${at + 1} ${name}` : name, edit, at >= 0);
-				});
-			},
-			true,
-		);
-	}
-
-	/** `strategyOptions.tolerance` of a quota strategy; empty removes it. */
-	#openTolerance(target: ModelHubPoolTarget): void {
-		const options = this.#pool(target)?.raw?.strategyOptions;
-		const current = isRecord(options) && typeof options.tolerance === "number" ? String(options.tolerance) : "";
-		this.#openPoolField("Quota tolerance:", "a number in (0, 0.5] · empty removes", current, value => {
-			const text = value.trim();
-			const tolerance = text.length === 0 ? undefined : Number(text);
-			if (tolerance !== undefined && !Number.isFinite(tolerance)) return "Tolerance must be a number in (0, 0.5]";
-			return this.#editPoolFromField(target, draft => setQuotaTolerance(draft, tolerance));
-		});
 	}
 
 	// ─── Model groups ───────────────────────────────────────────────────────
@@ -3068,10 +3018,10 @@ export class ModelHubComponent implements Component {
 	}
 
 	/**
-	 * Chips of the `G` editor on `entry`: point it at each other model group; turn its inline pool into
+	 * Actions of the `G` editor on `entry`: point it at each other model group; turn its inline pool into
 	 * a new group; rename or delete the group it references.
 	 */
-	#groupChips(entry: ModelHubPoolTarget): StripChip[] {
+	#groupActions(entry: ModelHubPoolTarget): GroupAction[] {
 		const pool = this.#pool(entry);
 		const current = pool?.source.kind === "ref" ? pool.source.group : undefined;
 		const currentProfile = pool?.source.kind === "ref" ? pool.source.profile : undefined;
@@ -3080,7 +3030,7 @@ export class ModelHubComponent implements Component {
 			[undefined, ...this.#groupProfiles(name).map(entry => entry.name)]
 				.filter(profile => name !== current || profile !== currentProfile)
 				.map(profile =>
-					this.#poolChip(`use +${name}${profile === undefined ? "" : `@${profile}`}`, () =>
+					this.#groupAction(`use +${name}${profile === undefined ? "" : `@${profile}`}`, () =>
 						this.#writePool(entry, profile === undefined ? { use: name } : { use: name, profile }),
 					),
 				),
@@ -3088,12 +3038,12 @@ export class ModelHubComponent implements Component {
 		if (!this.#poolEditable(pool)) return chips;
 		const raw = pool.raw;
 		if (current === undefined) {
-			chips.push(this.#poolChip("new group…", () => this.#openNewGroup(entry, raw)));
+			chips.push(this.#groupAction("new group…", () => this.#openNewGroup(entry, raw)));
 		} else {
 			const profile = pool.source.kind === "ref" ? pool.source.profile : undefined;
 			chips.push(
-				this.#poolChip(`rename +${current}…`, () => this.#openRenameGroup(current, raw)),
-				this.#poolChip(`delete +${current}`, () => this.#deleteGroup(entry, current, raw, profile)),
+				this.#groupAction(`rename +${current}…`, () => this.#openRenameGroup(current, raw)),
+				this.#groupAction(`delete +${current}`, () => this.#deleteGroup(entry, current, raw, profile)),
 			);
 		}
 		return chips;
@@ -3102,18 +3052,18 @@ export class ModelHubComponent implements Component {
 	/** Whether `G` on `row` opens an editor with something to do. */
 	#groupsAvailable(row: RolesRow | undefined): boolean {
 		const entry = this.#groupEntry(row);
-		return entry !== undefined && this.#groupChips(entry).length > 0;
+		return entry !== undefined && this.#groupActions(entry).length > 0;
 	}
 
 	/** `G`: the model-group editor of the entry `row` edits. */
-	#openGroupStrip(row: RolesRow | undefined): void {
+	#openGroupPrefs(row: RolesRow | undefined): void {
 		const entry = this.#groupEntry(row);
-		if (entry) this.#openPoolStrip(`Group of ${entry.key}`, () => this.#groupChips(entry), false);
+		if (entry) this.#openGroupActions(`Group of ${entry.key}`, () => this.#groupActions(entry));
 	}
 
 	/** Name a new `modelGroups` entry holding the inline pool `raw`, and point `entry` at it. */
 	#openNewGroup(entry: ModelHubPoolTarget, raw: Readonly<Record<string, unknown>>): void {
-		this.#openPoolField("New group name:", NAME_HINT, "", value => {
+		this.#openPoolTextPrefs("New group name:", NAME_HINT, "", value => {
 			const name = value.trim();
 			const refused = this.#nameRefusal("group", name);
 			if (refused !== undefined) return refused;
@@ -3129,7 +3079,9 @@ export class ModelHubComponent implements Component {
 	}
 
 	#openRenameGroup(from: string, raw: Readonly<Record<string, unknown>>): void {
-		this.#openPoolField(`Rename +${from} to:`, NAME_HINT, from, value => this.#renameGroup(from, value.trim(), raw));
+		this.#openPoolTextPrefs(`Rename +${from} to:`, NAME_HINT, from, value =>
+			this.#renameGroup(from, value.trim(), raw),
+		);
 	}
 
 	/** Why `name` cannot name a group or profile: empty, too long, outside the grammar, or reserved. */
@@ -3238,7 +3190,7 @@ export class ModelHubComponent implements Component {
 	/** Groups view `n`: name a new `modelGroups` entry, then browse the catalog for its first member. */
 	#startNewGroup(): void {
 		if (!this.#callbacks.onPoolChange) return;
-		this.#openPoolField("New group name:", NAME_HINT, "", value => {
+		this.#openPoolTextPrefs("New group name:", NAME_HINT, "", value => {
 			const name = value.trim();
 			const refused = this.#nameRefusal("group", name);
 			if (refused !== undefined) return refused;
@@ -3319,26 +3271,42 @@ export class ModelHubComponent implements Component {
 		return this.#pool({ kind: "group", key: group })?.profiles ?? [];
 	}
 
-	/** Enter on a profile row: one chip per member with its override; a chip opens that member's effort strip. */
-	#openProfileStrip(group: string, profile: string): void {
+	#openProfilePrefs(group: string, profile: string): void {
 		const target: ModelHubPoolTarget = { kind: "group", key: group };
-		const pool = this.#pool(target);
-		if (!this.#poolEditable(pool)) {
-			this.#poolNotice(this.#groupEditRefusal(group) ?? `modelGroups.${group} is not editable here`);
-			return;
-		}
-		const efforts = pool.profiles?.find(entry => entry.name === profile)?.efforts ?? {};
-		this.#openPoolStrip(
+		this.#prefs = new HubPrefs(
 			`Profile @${profile} of +${group}`,
-			() =>
-				pool.members.map(member =>
-					this.#poolChip(
-						`${member.alias}: ${efforts[member.alias] ?? "default"}`,
-						() => this.#openMemberEffortStrip(group, target, member.alias, profile),
-						efforts[member.alias] !== undefined,
-					),
-				),
-			false,
+			() => {
+				const pool = this.#pool(target);
+				const efforts = pool?.profiles?.find(entry => entry.name === profile)?.efforts ?? {};
+				return (pool?.members ?? []).map(member => {
+					const parsed = parseModelString(member.model);
+					const item = parsed ? this.#findFallbackModel(parsed.provider, parsed.id) : undefined;
+					return {
+						id: `effort:${member.alias}`,
+						label: member.alias,
+						disabled: pool?.readOnly ?? (!pool?.raw ? "Profile is not editable in this layer" : undefined),
+						control: {
+							k: "choice" as const,
+							value: efforts[member.alias] ?? "",
+							options: ["", ...(item ? getSupportedEfforts(item.model) : [])].map(value => ({
+								value,
+								label: value || "inherit",
+							})),
+						},
+						apply: (value: HubPrefsValue) =>
+							this.#editPoolFromField(target, draft => {
+								const overrides = draftRecord(draftRecord(draft, "profiles"), profile);
+								if (value === "" || value === null) delete overrides[member.alias];
+								else overrides[member.alias] = { effort: value };
+							}),
+					};
+				});
+			},
+			() => {
+				this.#prefs = undefined;
+				this.#requestRender();
+			},
+			() => this.#requestRender(),
 		);
 	}
 
@@ -3350,7 +3318,7 @@ export class ModelHubComponent implements Component {
 			this.#poolNotice(refused);
 			return;
 		}
-		this.#openPoolField(`New profile of +${group}:`, NAME_HINT, "", value => {
+		this.#openPoolTextPrefs(`New profile of +${group}:`, NAME_HINT, "", value => {
 			const name = value.trim();
 			const invalid = this.#nameRefusal("profile", name);
 			if (invalid !== undefined) return invalid;
@@ -3374,7 +3342,7 @@ export class ModelHubComponent implements Component {
 			this.#poolNotice(refused);
 			return;
 		}
-		this.#openPoolField(`Rename @${profile} of +${group} to:`, NAME_HINT, profile, value => {
+		this.#openPoolTextPrefs(`Rename @${profile} of +${group} to:`, NAME_HINT, profile, value => {
 			const to = value.trim();
 			if (to === profile) return undefined;
 			const invalid = this.#nameRefusal("profile", to);
@@ -3819,6 +3787,10 @@ export class ModelHubComponent implements Component {
 				this.#confirmRoleClear();
 			return;
 		}
+		if (this.#prefs) {
+			this.#prefs.handleInput(data);
+			return;
+		}
 		if (data.startsWith("\x1b[<")) {
 			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
 			return;
@@ -3999,15 +3971,6 @@ export class ModelHubComponent implements Component {
 			if (strip.purpose === "compaction") strip.error = undefined;
 			return;
 		}
-		if (strip.kind === "field") {
-			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
-				this.#submitField();
-				return;
-			}
-			strip.input.handleInput(data);
-			strip.error = undefined;
-			return;
-		}
 		if (moveStripSelection(strip, data)) return;
 		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
 			this.#activateStripChip();
@@ -4064,7 +4027,7 @@ export class ModelHubComponent implements Component {
 				this.#startNewGroup();
 				return;
 			case "profile":
-				this.#openProfileStrip(row.role, row.profile);
+				this.#openProfilePrefs(row.role, row.profile);
 				return;
 			case "poolMember":
 				this.#startAssignPoolMember(row.role, row.target, row.alias);
@@ -4246,35 +4209,30 @@ export class ModelHubComponent implements Component {
 				this.#convertToPool(row);
 				return;
 			case "strategy":
-				if (!editable) return;
-				this.#cyclePoolStrategy(editable.target);
-				// The new strategy may list members in another order; the cursor stays on its member.
-				if (row?.kind === "poolMember") this.#landOnPoolMember(row.target, row.alias);
-				return;
 			case "funding":
-				if (editable) this.#cyclePoolFunding(editable.target);
-				return;
 			case "weight":
-				if (row?.kind === "poolMember" && editable) this.#cyclePoolWeight(row.target, row.alias);
-				return;
 			case "affinity":
 			case "pricing":
-				if (editable) {
-					const field = action === "affinity" ? "affinity" : "pricing";
-					this.#poolEdit(editable.target, draft => toggleCacheField(draft, field))();
+			case "quotaUnknown":
+			case "reserve":
+			case "routing":
+				{
+					const target = this.#rowPoolTarget(row);
+					if (target)
+						this.#openRoutingMenu(
+							target,
+							action === "quotaUnknown"
+								? "unknown"
+								: action === "affinity" || action === "pricing"
+									? `cache.${action}`
+									: action === "weight" && row?.kind === "poolMember"
+										? `weight:${row.alias}`
+										: action,
+						);
 				}
 				return;
-			case "quotaUnknown":
-				if (editable) this.#poolEdit(editable.target, cycleQuotaUnknown)();
-				return;
-			case "reserve":
-				if (editable) this.#poolEdit(editable.target, cycleQuotaReserve)();
-				return;
-			case "routing":
-				if (editable) this.#openRoutingMenu(editable.target);
-				return;
 			case "groups":
-				this.#openGroupStrip(row);
+				this.#openGroupPrefs(row);
 				return;
 			case "new":
 				if (this.#activeEntryId === "groups") this.#startNewGroup();
@@ -4312,9 +4270,9 @@ export class ModelHubComponent implements Component {
 				} else if (row?.kind === "fallback") {
 					this.#openFallbackThinkingStrip(row);
 				} else if (row?.kind === "poolMember") {
-					this.#openPoolEffortStrip(row);
+					this.#openPoolEffortPrefs(row);
 				} else if (row?.kind === "profile") {
-					this.#openProfileStrip(row.role, row.profile);
+					this.#openProfilePrefs(row.role, row.profile);
 				}
 				return;
 		}
@@ -4358,12 +4316,7 @@ export class ModelHubComponent implements Component {
 		// Footer strip chips (columns stay in frame coordinates).
 		if (footerColumn !== undefined && this.#strip) {
 			const strip = this.#strip;
-			if (
-				event.leftClick &&
-				strip.kind !== "name" &&
-				strip.kind !== "field" &&
-				this.#frame.selectChipAt(strip, footerColumn)
-			) {
+			if (event.leftClick && strip.kind !== "name" && this.#frame.selectChipAt(strip, footerColumn)) {
 				this.#activateStripChip();
 			}
 			return true;
@@ -4742,9 +4695,7 @@ export class ModelHubComponent implements Component {
 	#rolesDetail(width: number, maxLines: number): string[] {
 		if (maxLines <= 0) return [];
 		const lines: string[] = [];
-		const strip = this.#strip;
-		const error =
-			strip?.kind === "field" ? strip.error : this.#poolStatus?.tone === "error" ? this.#poolStatus.text : undefined;
+		const error = this.#poolStatus?.tone === "error" ? this.#poolStatus.text : undefined;
 		if (error !== undefined) {
 			for (const line of wrapTextWithAnsi(error, Math.max(1, width - 2))) {
 				lines.push(truncateToWidth(`  ${theme.fg("error", line)}`, width));
@@ -5033,20 +4984,9 @@ export class ModelHubComponent implements Component {
 			}
 			return truncateToWidth(`${label} ${inputLine} ${hint}`, width);
 		}
-		if (strip.kind === "field") {
-			const message =
-				strip.error !== undefined
-					? theme.fg("error", strip.error)
-					: theme.fg("dim", sanitizeDisplayLine(strip.hint));
-			const inputWidth = Math.max(16, Math.min(40, width - visibleWidth(strip.label) - visibleWidth(message) - 2));
-			const inputLine = strip.input.render(inputWidth)[0] ?? "";
-			return truncateToWidth(`${theme.fg("accent", strip.label)} ${inputLine} ${message}`, width);
-		}
 
 		let prefix: string;
-		if (strip.kind === "pool")
-			prefix = `${theme.fg("accent", sanitizeDisplayLine(strip.title))}${theme.fg("dim", " →")} `;
-		else if (strip.kind === "role")
+		if (strip.kind === "role")
 			prefix = `${theme.fg("accent", sanitizeDisplayLine(strip.item.id))}${theme.fg("dim", " →")} `;
 		else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
@@ -5081,6 +5021,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		if (this.#prefs) return this.#prefs.render(width);
 		const height = Math.max(16, this.#tui.terminal?.rows || process.stdout.rows || 40);
 		return this.#frame.render(width, height, this.#entries, this.#renderFooter(width - 4));
 	}
@@ -5095,6 +5036,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	describe(cx: DescribeContext): NativeNode {
+		if (this.#prefs) return this.#prefs.describe(cx);
 		const usePicker = cx.supports("picker");
 		const cached = this.#nativeCache;
 		const billing = this.#settings.billingRevision;
@@ -5103,8 +5045,7 @@ export class ModelHubComponent implements Component {
 		}
 		if (usePicker) {
 			const pickerNode = this.#describePicker();
-			const field = this.#strip?.kind === "field" ? this.#describeStrip(cx) : undefined;
-			const described = field ? { ...pickerNode, c: [field, ...(pickerNode.c ?? [])] } : pickerNode;
+			const described = pickerNode;
 			this.#nativeCache = { version: this.#nativeVersion, picker: true, billing, node: described };
 			return described;
 		}
@@ -5125,6 +5066,10 @@ export class ModelHubComponent implements Component {
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#prefs) {
+			this.#prefs.handleNativeEvent(event);
+			return;
+		}
 		const picked = pickerEvent(event);
 		if (picked) {
 			this.#handlePickerEvent(picked);
@@ -5134,19 +5079,6 @@ export class ModelHubComponent implements Component {
 		// Same gate as the mouse router: nothing is interactive while an assignment applies.
 		if (this.#assignmentPending) return;
 		const target = event.key.slice(event.key.lastIndexOf("/") + 1);
-		const strip = this.#strip;
-		if (target === "fieldInput" && strip?.kind === "field") {
-			if (event.type === "edit" || event.type === "undo") {
-				strip.input.handleNativeEvent(event);
-				strip.error = undefined;
-			} else if (event.type === "send" || (event.type === "action" && event.act === "submit")) {
-				this.#submitField();
-			} else {
-				return;
-			}
-			this.#requestRender();
-			return;
-		}
 		if (event.type === "action") {
 			const entry = this.#activeEntry();
 			if (target !== "login" || event.act !== "login") return;
@@ -5188,7 +5120,7 @@ export class ModelHubComponent implements Component {
 					// A chip click picks and applies it, like the footer mouse path.
 					const strip = this.#strip;
 					const index = Number(event.item);
-					if (!strip || strip.kind === "name" || strip.kind === "field") return;
+					if (!strip || strip.kind === "name") return;
 					if (!Number.isInteger(index) || !strip.chips[index]) return;
 					strip.index = index;
 					this.#activateStripChip();
@@ -5838,15 +5770,6 @@ export class ModelHubComponent implements Component {
 			return [pickerAction("confirm", "Remove", "enter", { primary: true, danger: true }), cancel("Cancel")];
 		if (this.#assignmentPending) return [CLOSE_ACTION];
 		if (strip) {
-			if (strip.kind === "field") {
-				return [pickerAction("poolField", "Save", "enter", { primary: true }), cancel("Cancel")];
-			}
-			if (strip.kind === "pool") {
-				return [
-					pickerAction("stripApply", strip.refresh ? "Toggle" : "Apply", "enter", { primary: true }),
-					cancel(strip.refresh ? "Done" : "Cancel"),
-				];
-			}
 			const apply =
 				strip.kind === "name"
 					? strip.purpose === "compaction"
@@ -6064,16 +5987,8 @@ export class ModelHubComponent implements Component {
 				items: [],
 			};
 		}
-		if (strip.kind === "field") {
-			return {
-				label: [span(strip.label, "muted")],
-				items: [],
-			};
-		}
 		let label: TspSpan[];
-		if (strip.kind === "pool") {
-			label = [span(sanitizeDisplayLine(strip.title), "muted")];
-		} else if (strip.kind === "role") {
+		if (strip.kind === "role") {
 			// The second step of "New fallback chain…" reuses the role strip with key chips only.
 			const keyStrip = strip.chips.every(chip => chip.label.startsWith("for "));
 			label = keyStrip
@@ -6102,7 +6017,6 @@ export class ModelHubComponent implements Component {
 							: undefined;
 				const dot = level !== undefined ? thinkingDotToken(level) : undefined;
 				const on =
-					chip.on === true ||
 					chip.action === "unassign" ||
 					(strip.kind === "thinking" &&
 						chip.thinkingLevel !== undefined &&
@@ -6586,7 +6500,7 @@ export class ModelHubComponent implements Component {
 			case "strip": {
 				const strip = this.#strip;
 				const index = Number(value);
-				if (!strip || strip.kind === "name" || strip.kind === "field") return;
+				if (!strip || strip.kind === "name") return;
 				if (!Number.isInteger(index) || !strip.chips[index]) return;
 				strip.index = index;
 				this.#activateStripChip();
@@ -6603,9 +6517,6 @@ export class ModelHubComponent implements Component {
 				return;
 			case "compactionPoint":
 				this.#submitNameStrip();
-				return;
-			case "poolField":
-				this.#submitField();
 				return;
 			case "cancel":
 				if (this.#strip) this.#closeStrip();
@@ -6648,14 +6559,12 @@ export class ModelHubComponent implements Component {
 				const glyph = chip.thinkingLevel === undefined ? "" : thinkingLevelGlyph(chip.thinkingLevel, theme);
 				return glyph ? [span(glyph, "accent"), span(` ${chip.label}`)] : [span(chip.label)];
 			}
-			case "pool":
-				return chip.on ? [span(`${theme.status.enabled} ${chip.label}`, "accent")] : [span(chip.label, "muted")];
 			default:
 				return [span(plainText(chip.styled), "muted")];
 		}
 	}
 
-	#describeStrip(cx?: DescribeContext): NativeNode | undefined {
+	#describeStrip(_cx?: DescribeContext): NativeNode | undefined {
 		const strip = this.#strip;
 		if (!strip) return undefined;
 		if (strip.kind === "name") {
@@ -6684,29 +6593,8 @@ export class ModelHubComponent implements Component {
 				preset ? "presetName" : "roleName",
 			);
 		}
-		if (strip.kind === "field") {
-			return node(
-				"row",
-				{ gap: "sm", align: "center" },
-				[
-					text([span(strip.label, "accent")]),
-					col([cx ? { ...strip.input.describe(cx), key: "fieldInput" } : strip.input], { grow: 1 }),
-					text(
-						[
-							strip.error !== undefined
-								? span(strip.error, "error")
-								: span(sanitizeDisplayLine(strip.hint), "dim"),
-						],
-						{ wrap: "word" },
-					),
-				],
-				"poolField",
-			);
-		}
 		let prefix: TspSpan[];
-		if (strip.kind === "pool") {
-			prefix = [span(sanitizeDisplayLine(strip.title), "accent"), span(" →", "dim")];
-		} else if (strip.kind === "role") {
+		if (strip.kind === "role") {
 			prefix = [span(sanitizeDisplayLine(strip.item.id), "accent"), span(" →", "dim")];
 		} else {
 			const info = this.#settings.getRoleInfo(strip.role ?? "");
@@ -6742,7 +6630,7 @@ export class ModelHubComponent implements Component {
 		const hints: (NativeHint | undefined)[] = pickerActionHints(actions);
 		if (!this.#roleConfirm) {
 			hints.push(actionHint(["tui.select.up", "tui.select.down"], this.#focus === "scope" ? "providers" : "rows"));
-			if (this.#strip && this.#strip.kind !== "name" && this.#strip.kind !== "field") {
+			if (this.#strip && this.#strip.kind !== "name") {
 				hints.push({ keys: ["left", "right"], label: "choose" });
 			} else if (!this.#strip) {
 				hints.push({ keys: ["tab"], label: "providers / rows" });

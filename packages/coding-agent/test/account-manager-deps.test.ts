@@ -13,6 +13,10 @@ import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
 import { retryFallbackBillingRegistry } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { AccountManagerComponent, type AccountManagerResult } from "@oh-my-pi/pi-tui/overlays/account-manager";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { TUI } from "@oh-my-pi/pi-tui";
+import type { TspPrefsProps } from "@oh-my-pi/pi-wire";
 
 const workPolicy = { provider: "anthropic", name: "work", account: { email: "a@example.com" } };
 
@@ -76,6 +80,63 @@ describe("account manager deps", () => {
 		const openai = deps.load().find(account => account.provider === "openai")!;
 		expect(openai.identity).toMatch(/^API key [0-9a-f]{16}$/);
 		expect(JSON.stringify(openai)).not.toContain("sk-test-secret");
+	});
+
+	it("typed account preferences persist through the validated host and retain refused drafts", async () => {
+		await initTheme(false);
+		const { settings, deps } = await open({ auth: { accountPolicies: [workPolicy] } });
+		vi.spyOn(authStorage.usage, "canFetchOAuthUsage").mockReturnValue(true);
+		let pending: Promise<AccountManagerResult> | undefined;
+		const manager = new AccountManagerComponent(
+			{ requestRender: () => {}, terminal: { rows: 40 } } as unknown as TUI,
+			{
+				...deps,
+				apply: (id, action, value, expected) => {
+					pending = deps.apply(id, action, value, expected);
+					return pending;
+				},
+			},
+			{ onCancel: () => {} },
+		);
+		const context = { cols: 120, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+		const prefs = () => manager.describe(context).p as TspPrefsProps;
+		manager.handleInput("\r");
+		const save = async (item: string, value: string | number | boolean) => {
+			pending = undefined;
+			manager.handleNativeEvent({ type: "change", key: "", item, value });
+			expect(pending).toBeDefined();
+			await pending;
+			await Promise.resolve();
+			await Promise.resolve();
+		};
+		await save("priority", 7);
+		await save("reserve", 20);
+		await save("drain", true);
+		await save("return:margin", 10);
+		await save("return:cooldown", 2);
+		await save("auto-redeem", "auto-redeem:no");
+		expect(settings.getGlobalSettings().auth).toMatchObject({
+			accountPolicies: [
+				{
+					...workPolicy,
+					priority: 7,
+					drain: true,
+					reservePct: 20,
+					returnMargin: 10,
+					returnCooldownMs: 120000,
+					autoRedeem: "no",
+				},
+			],
+		});
+		const before = structuredClone(settings.getGlobalSettings());
+		await save("name", "invalid name");
+		expect(prefs().editing).toMatchObject({ row: "name", draft: "invalid name", cursor: 12 });
+		expect(prefs().sections?.[0]?.rows.find(row => row.id === "name")?.warning).toBeTruthy();
+		expect(settings.getGlobalSettings()).toEqual(before);
+		await save("name", "renamed");
+		expect(prefs().editing).toBeNull();
+		expect(prefs().sections?.[0]?.rows.find(row => row.id === "name")?.warning).toBeUndefined();
+		expect(settings.getGlobalSettings().auth).toMatchObject({ accountPolicies: [{ name: "renamed" }] });
 	});
 
 	it("shows the warning of a reserve whose usage only the broker reports", async () => {

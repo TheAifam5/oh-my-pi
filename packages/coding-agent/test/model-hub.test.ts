@@ -24,7 +24,7 @@ import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme"
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
-import type { TspPickerProps } from "@oh-my-pi/pi-wire";
+import type { TspPickerProps, TspPrefsProps } from "@oh-my-pi/pi-wire";
 
 import {
 	cfgAuthAccountPolicies,
@@ -63,6 +63,23 @@ function pickerProps(hub: ModelHubComponent): TspPickerProps {
 	const root = hub.describe(PICKER_CX);
 	if (root.k !== "picker" || !root.p) throw new Error(`expected a picker root, got ${root.k}`);
 	return root.p as TspPickerProps;
+}
+function prefsProps(hub: ModelHubComponent): TspPrefsProps {
+	const root = hub.describe(PICKER_CX);
+	expect(root.k).toBe("prefs");
+	return root.p as TspPrefsProps;
+}
+
+function prefsChange(
+	hub: ModelHubComponent,
+	item: string,
+	value: string | number | boolean | readonly string[] | null,
+): void {
+	hub.handleNativeEvent({ type: "change", key: "", item, value });
+}
+
+function prefsAction(hub: ModelHubComponent, act: string, value?: string): void {
+	hub.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
 }
 
 function makeModel(
@@ -1537,7 +1554,7 @@ describe("ModelHub", () => {
 			}
 		});
 
-		test("g cycles a pool through every strategy, including quota, and back to priority", () => {
+		test("strategy preferences select every supported strategy through the writer", () => {
 			const settings = pooledSettings();
 			const { hub } = createHub({
 				models: [makeModel("test", "model-a"), makeModel("test", "model-b")],
@@ -1546,9 +1563,22 @@ describe("ModelHub", () => {
 			});
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
+			hub.handleInput("g");
+			const strategies = [
+				"random",
+				"quota",
+				"cheapest",
+				"least-used",
+				"least-loaded",
+				"p2c",
+				"shuffle-bag",
+				"priority",
+				"round-robin",
+				"weighted-random",
+			];
 			const seen: string[] = [];
-			for (let i = 0; i < 10; i++) {
-				hub.handleInput("g");
+			for (const strategy of strategies) {
+				prefsChange(hub, "strategy", [strategy]);
 				seen.push(smolGroup(settings).strategy.name);
 			}
 			expect(seen).toEqual([
@@ -1584,13 +1614,13 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput("g");
+			prefsChange(hub, "strategy", ["quota"]);
 			expect(settings.getModelRoleEntries().smol).toEqual({
 				strategy: "quota",
 				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
 				routing,
 			});
-			expect(normalize(hub.render(220))).toMatch(/SMOL pool · 2 models .*quota/);
-			hub.handleInput("g");
+			prefsChange(hub, "strategy", ["cheapest"]);
 			expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy: "cheapest", routing });
 		});
 
@@ -1609,6 +1639,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput("g");
+			prefsChange(hub, "strategy", ["cheapest"]);
 			expect(smolGroup(settings).strategy).toEqual({ name: "cheapest" });
 			expect(settings.getModelRoleEntries().smol).not.toHaveProperty("strategyOptions");
 		});
@@ -1628,8 +1659,9 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput(DOWN); // member b, first in round-robin order
-			hub.handleInput("g"); // weighted-random lists members in alias order
-			hub.handleInput("w");
+			hub.handleInput("g");
+			prefsChange(hub, "strategy", ["weighted-random"]);
+			prefsChange(hub, "weight:b", 1);
 			expect(settings.getModelRoleEntries().smol).toMatchObject({
 				strategy: "weighted-random",
 				models: { a: { model: "test/model-a" }, b: { model: "test/model-b", weight: 1 } },
@@ -1674,11 +1706,10 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 				hub.handleInput("e");
-				hub.handleInput("\n"); // account order
-				const strip = footerLine(hub.render(220));
-				expect(strip).toContain("work");
-				expect(strip).not.toContain("projonly");
-				hub.handleInput("\n"); // toggle work
+				const field = prefsProps(hub).sections?.[0]?.rows.find(row => row.id === "accounts.order");
+				expect(field?.control).toMatchObject({ options: [{ value: "work", label: "work" }] });
+				expect(JSON.stringify(field)).not.toContain("projonly");
+				prefsChange(hub, "accounts.order", ["work"]);
 				const roles = settings.getGlobalSettings().modelRoles as Record<string, { routing?: unknown }>;
 				expect(roles.smol?.routing).toEqual({ accounts: { order: ["work"] } });
 			} finally {
@@ -1834,16 +1865,12 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN);
 			hub.handleInput("e");
-			hub.handleInput("\x1b[C");
-			hub.handleInput("\n");
-			hub.handleInput("\x1b[C");
 			cfgAuthAccountPolicies.set(settings, []);
 			const before = structuredClone(settings.getGlobalSettings());
-			hub.handleInput("\n");
-			const rendered = normalize(hub.render(220));
-			expect(rendered).toContain("routing.accounts.drain");
-			expect(rendered).toContain("work");
-			expect(rendered).toContain("trusted auth.accountPolicies");
+			prefsChange(hub, "accounts.drain", "work");
+			const field = prefsProps(hub).sections?.[0]?.rows.find(row => row.id === "accounts.drain");
+			expect(field?.warning ?? field?.disabled).toContain("trusted auth.accountPolicies");
+			expect(field?.warning ?? field?.disabled).toContain("routing.accounts.drain");
 			expect(settings.getGlobalSettings()).toEqual(before);
 		});
 
@@ -1933,7 +1960,11 @@ describe("ModelHub", () => {
 				expect(normalize(hub.render(220))).toContain(strategy.join(" → "));
 				hub.handleInput("g");
 				expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy });
-				expect(normalize(hub.render(220))).toContain("change it with e");
+				expect(prefsProps(hub).sections?.[0]?.rows.find(row => row.id === "strategy")?.control).toMatchObject({
+					k: "multi",
+					ordered: true,
+					values: strategy,
+				});
 			}
 		});
 
@@ -1987,6 +2018,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput("g");
+			prefsChange(hub, "strategy", ["least-loaded"]);
 			expect(smolGroup(settings).strategy).toEqual({ name: "least-loaded" });
 			expect(settings.getModelRoleEntries().smol).not.toHaveProperty("strategyOptions");
 		});
@@ -2419,13 +2451,6 @@ describe("ModelHub", () => {
 				for (const ch of text) hub.handleInput(ch);
 			}
 
-			/** Open the `e` routing menu on the selected row and run its `index`-th editor. */
-			function openRoutingEditor(hub: ModelHubComponent, index: number): void {
-				hub.handleInput("e");
-				for (let i = 0; i < index; i++) hub.handleInput(RIGHT);
-				hub.handleInput("\n");
-			}
-
 			function smolRouting(settings: Settings): Record<string, unknown> | undefined {
 				const entry = settings.getModelRoleEntries().smol as Record<string, unknown>;
 				return entry.routing as Record<string, unknown> | undefined;
@@ -2528,26 +2553,21 @@ describe("ModelHub", () => {
 				expect(footerLine(hub.render(400))).toContain("a Cache affinity");
 
 				hub.handleInput("a");
-				expect(smolRouting(settings)?.cache).toEqual({ affinity: true });
-				hub.handleInput("h");
+				expect(prefsProps(hub).focus).toBe("cache.affinity");
+				prefsChange(hub, "cache.affinity", true);
+				prefsChange(hub, "cache.pricing", true);
 				expect(smolRouting(settings)?.cache).toEqual({ affinity: true, pricing: true });
-				hub.handleInput("a");
-				hub.handleInput("h");
-				expect(smolRouting(settings)).not.toHaveProperty("cache");
-
-				const unknown: unknown[] = [];
-				for (let i = 0; i < 3; i++) {
-					hub.handleInput("u");
-					unknown.push(smolGroup(settings).routing?.quota?.unknown);
+				prefsChange(hub, "cache.affinity", false);
+				prefsChange(hub, "cache.pricing", false);
+				expect(smolRouting(settings)?.cache).toEqual({ affinity: false, pricing: false });
+				for (const unknown of ["exclude", "allow", ""] as const) {
+					prefsChange(hub, "unknown", unknown);
+					expect(smolGroup(settings).routing?.quota?.unknown).toBe(unknown || undefined);
 				}
-				expect(unknown).toEqual(["exclude", "allow", undefined]);
-				const reserve: unknown[] = [];
-				for (let i = 0; i < 5; i++) {
-					hub.handleInput("r");
-					reserve.push(smolGroup(settings).routing?.quota?.reserveFraction);
+				for (const reserve of [0.05, 0.1, 0.2, 0.3, null]) {
+					prefsChange(hub, "reserve", reserve);
+					expect(smolGroup(settings).routing?.quota?.reserveFraction).toBe(reserve ?? undefined);
 				}
-				expect(reserve).toEqual([0.05, 0.1, 0.2, 0.3, undefined]);
-				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
 			});
 
 			test("e edits routing.accounts from the named accounts, and a refused trigger writes nothing", () => {
@@ -2557,41 +2577,25 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 
-				openRoutingEditor(hub, 0); // account order
-				expect(footerLine(hub.render(220))).toContain("Account order →");
-				hub.handleInput("\n"); // work
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // home
-				hub.handleInput(ESC);
+				hub.handleInput("e");
+				prefsChange(hub, "accounts.order", ["work", "home"]);
 				expect(smolGroup(settings).routing?.accounts).toEqual({ order: ["work", "home"] });
 
-				openRoutingEditor(hub, 1); // drain: none, work, home
-				hub.handleInput(RIGHT);
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n");
-				openRoutingEditor(hub, 2); // drain spend
-				hub.handleInput("\n"); // plan
-				hub.handleInput(ESC);
+				prefsChange(hub, "accounts.drain", "home");
+				prefsChange(hub, "accounts.spend", ["plan"]);
 				expect(smolGroup(settings).routing?.accounts).toEqual({
 					order: ["work", "home"],
 					drain: "home",
 					spend: ["plan"],
 				});
 
-				openRoutingEditor(hub, 3); // return when
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // credits-added needs spend credits
-				expect(normalize(hub.render(220))).toContain("credits-added requires spend to include credits");
+				prefsChange(hub, "accounts.returnWhen", ["credits-added"]);
+				expect(JSON.stringify(prefsProps(hub))).toContain("credits-added requires spend to include credits");
 				expect(smolGroup(settings).routing?.accounts?.returnWhen).toBeUndefined();
-				hub.handleInput(LEFT);
-				hub.handleInput("\n"); // reset
-				hub.handleInput(ESC);
+				prefsChange(hub, "accounts.returnWhen", ["reset"]);
 				expect(smolGroup(settings).routing?.accounts?.returnWhen).toEqual(["reset"]);
 
-				openRoutingEditor(hub, 0);
-				hub.handleInput("\n"); // work out
-				hub.handleInput("\n"); // home out
-				hub.handleInput(ESC);
+				prefsChange(hub, "accounts.order", []);
 				expect(smolGroup(settings).routing?.accounts).toEqual({
 					drain: "home",
 					spend: ["plan"],
@@ -2605,23 +2609,17 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 
-				openRoutingEditor(hub, 4); // metered
-				hub.handleInput("\n"); // provider-managed
+				hub.handleInput("e");
+				prefsChange(hub, "spending", "provider-managed");
 				expect(smolRouting(settings)).toEqual({
 					funding: { order: ["included", "metered"] },
 					spending: { policy: "provider-managed" },
 				});
 
-				openRoutingEditor(hub, 4);
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // local hard budget…
-				type(hub, "daily 9.00 5.00 1d");
-				hub.handleInput("\n");
-				expect(footerLine(hub.render(220))).toContain("perRequestMax exceeds window.maxSpend");
+				prefsChange(hub, "budget", "daily 9.00 5.00 1d");
+				expect(JSON.stringify(prefsProps(hub))).toContain("perRequestMax exceeds window.maxSpend");
 				expect(smolGroup(settings).routing?.spending).toEqual({ policy: "provider-managed" });
-				for (let i = 0; i < 18; i++) hub.handleInput(BACKSPACE);
-				type(hub, "daily $0.50 5.00 1d");
-				hub.handleInput("\n");
+				prefsChange(hub, "budget", "daily $0.50 5.00 1d");
 				expect(smolGroup(settings).routing?.spending).toEqual({
 					policy: "local-hard-budget",
 					budget: {
@@ -2632,10 +2630,7 @@ describe("ModelHub", () => {
 					},
 				});
 
-				openRoutingEditor(hub, 4);
-				hub.handleInput(RIGHT);
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // off
+				prefsChange(hub, "spending", "off");
 				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
 			});
 
@@ -2649,11 +2644,9 @@ describe("ModelHub", () => {
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				openRoutingEditor(hub, 4);
-				hub.handleInput(RIGHT);
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // off
-				expect(normalize(hub.render(220))).toContain(
+				hub.handleInput("e");
+				prefsChange(hub, "spending", "off");
+				expect(JSON.stringify(prefsProps(hub))).toContain(
 					"modelRoles.smol.routing.funding.order: must list billing classes",
 				);
 				expect(smolGroup(settings).routing?.spending).toEqual({ policy: "provider-managed" });
@@ -2665,31 +2658,20 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 
-				openRoutingEditor(hub, 5); // limits: add…
-				hub.handleInput("\n");
-				type(hub, "requests 100 1h warn");
-				hub.handleInput("\n");
+				hub.handleInput("e");
+				prefsChange(hub, "limit:add", "requests 100 1h warn");
 				expect(smolGroup(settings).routing?.limits).toEqual([
 					{ metric: "requests", max: 100, window: { type: "rolling", durationMs: 3_600_000 }, onLimit: "warn" },
 				]);
 
-				openRoutingEditor(hub, 5);
-				expect(footerLine(hub.render(220))).toContain("remove requests 100 1h warn");
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // add…
-				type(hub, "usage 0.5");
-				hub.handleInput("\n");
-				expect(footerLine(hub.render(220))).toContain("usage is only allowed on auth.accountPolicies limits");
-				for (let i = 0; i < 9; i++) hub.handleInput(BACKSPACE);
-				type(hub, "bogus");
-				hub.handleInput("\n");
-				expect(footerLine(hub.render(220))).toContain("Limit: <usd|requests|tokens>");
-				hub.handleInput(ESC);
+				expect(prefsProps(hub).sections?.[0]?.rows.some(row => row.id === "limit:remove:0")).toBe(true);
+				prefsChange(hub, "limit:add", "usage 0.5");
+				expect(JSON.stringify(prefsProps(hub))).toContain("usage is only allowed on auth.accountPolicies limits");
+				prefsChange(hub, "limit:add", "bogus");
+				expect(JSON.stringify(prefsProps(hub))).toContain("Limit: <usd|requests|tokens>");
 				expect(smolGroup(settings).routing?.limits).toHaveLength(1);
 
-				openRoutingEditor(hub, 5);
-				hub.handleInput("\n"); // remove the limit
-				hub.handleInput(ESC);
+				prefsAction(hub, "remove-limit:0");
 				expect(smolRouting(settings)).toEqual({ funding: { order: ["included"] } });
 			});
 
@@ -2704,35 +2686,21 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 
-				openRoutingEditor(hub, 6); // strategies, in the order g cycles them
-				for (let i = 0; i < 4; i++) hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // quota
+				hub.handleInput("e");
+				prefsChange(hub, "strategy", ["cheapest", "quota"]);
 				expect(smol().strategy).toEqual(["cheapest", "quota"]);
-				hub.handleInput(RIGHT);
-				hub.handleInput("\n"); // cheapest out
+				prefsChange(hub, "strategy", ["quota"]);
 				expect(smol().strategy).toBe("quota");
-				for (let i = 0; i < 5; i++) hub.handleInput(LEFT);
-				hub.handleInput("\n"); // priority
-				hub.handleInput(ESC);
+				prefsChange(hub, "strategy", ["quota", "priority"]);
 				expect(smol()).toMatchObject({ strategy: ["quota", "priority"], strategyOptions: { order: ["a", "b"] } });
 
-				openRoutingEditor(hub, 7); // quota tolerance
-				type(hub, "0.2");
-				hub.handleInput("\n");
+				prefsChange(hub, "tolerance", 0.2);
 				expect(smol().strategyOptions).toEqual({ order: ["a", "b"], tolerance: 0.2 });
 
-				openRoutingEditor(hub, 7);
-				for (let i = 0; i < 3; i++) hub.handleInput(BACKSPACE);
-				type(hub, "0.9");
-				hub.handleInput("\n");
-				expect(footerLine(hub.render(220))).toContain("must be a number in (0, 0.5]");
+				prefsChange(hub, "tolerance", 0.9);
+				expect(JSON.stringify(prefsProps(hub))).toContain("Must be at most 0.5");
 				expect(smol().strategyOptions).toEqual({ order: ["a", "b"], tolerance: 0.2 });
-				const body = hub
-					.render(140)
-					.slice(0, -2)
-					.map(line => stripVTControlCharacters(line))
-					.join("\n");
-				expect(body).toContain("must be a number in (0, 0.5]");
+				expect(normalize(hub.render(140))).toContain("Must be at most 0.5");
 			});
 
 			test("a pool field keeps its hint and error readable at 80 columns", () => {
@@ -2745,27 +2713,106 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 
-				openRoutingEditor(hub, 7); // quota tolerance
-				const hint = footerLine(hub.render(80));
-				expect(hint).toContain("Quota tolerance:");
-				expect(hint).toContain("a number in (0, 0.5] · empty removes");
-				type(hub, "abc");
-				hub.handleInput("\n");
+				hub.handleInput("e");
+				prefsAction(hub, "edit", "tolerance");
+				const hint = normalize(hub.render(80));
+				expect(hint).toContain("Quota tolerance");
+				expect(hint).toContain("(0, 0.5]; clear to inherit");
+				prefsChange(hub, "tolerance", "abc");
 				const error = hub.render(80);
-				expect(footerLine(error)).toContain("Tolerance must be a number in (0, 0.5]");
+				expect(normalize(error)).toContain("Enter a finite number");
 				for (const line of error) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 			});
 
-			test("the picker shows a pool editor as its strip with toggle actions", () => {
+			test("pool routing is a typed preference sheet with ordered strategy choices", () => {
 				const settings = pooledSettings();
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				openRoutingEditor(hub, 6); // strategies
-				const props = pickerProps(hub);
-				expect(props.strip?.label).toEqual([{ t: "Strategies", s: "muted" }]);
-				expect(props.strip?.items.find(item => item.on)?.label).toBe("1 weighted-random");
-				expect(props.actions?.map(action => action.label)).toEqual(["Toggle", "Done"]);
+				hub.handleInput("e");
+				const rows = prefsProps(hub).sections?.[0]?.rows ?? [];
+				expect(rows.find(row => row.id === "strategy")?.control).toMatchObject({
+					k: "multi",
+					ordered: true,
+					values: ["weighted-random"],
+				});
+				expect(rows.find(row => row.id === "reserve")?.control.k).toBe("number");
+				expect(rows.find(row => row.id === "cache.affinity")?.control.k).toBe("switch");
+			});
+
+			test("confirming untouched inherited numeric preferences writes nothing", () => {
+				const settings = pooledSettings();
+				settings.setModelRoleSpec("smol", {
+					strategy: "weighted-random",
+					models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
+				});
+				let writes = 0;
+				const { hub } = createHub({
+					models: twoModels(),
+					scoped: true,
+					settings,
+					callbacks: {
+						onPoolChange: (target, value) => {
+							writes++;
+							return writeModelHubPool(settings, target, value);
+						},
+					},
+				});
+				enterRolesView(hub);
+				hub.handleInput(DOWN);
+				hub.handleInput("e");
+				const before = structuredClone(settings.getGlobalSettings());
+				for (const field of ["maxAge", "reserve", "tolerance", "window", "weight:a"]) {
+					prefsAction(hub, "edit", field);
+					expect(prefsProps(hub).editing).toMatchObject({ row: field, draft: "" });
+					hub.handleInput("\r");
+				}
+				expect(writes).toBe(0);
+				expect(settings.getGlobalSettings()).toEqual(before);
+				prefsAction(hub, "edit", "maxAge");
+				prefsChange(hub, "maxAge", "");
+				expect(writes).toBe(0);
+				prefsChange(hub, "maxAge", 60000);
+				expect(writes).toBe(1);
+				expect(settings.getModelRoleEntries().smol).toHaveProperty("routing.quota.maxObservationAgeMs", 60000);
+			});
+			test("numeric, choice, ordered, and effort preferences persist through the real pool writer", () => {
+				const model = getBundledModel("openai", "gpt-5.5");
+				if (!model) throw new Error("Expected bundled OpenAI model");
+				const settings = Settings.isolated();
+				settings.setModelRoleSpec("smol", {
+					strategy: ["quota", "weighted-random"],
+					models: { a: { model: `${model.provider}/${model.id}` }, b: { model: "test/model-b" } },
+				});
+				const { hub } = createHub({ models: [model, makeModel("test", "model-b")], scoped: true, settings });
+				enterRolesView(hub);
+				hub.handleInput(DOWN);
+				hub.handleInput("e");
+				prefsChange(hub, "objective", "balance");
+				prefsChange(hub, "capacityMetric", "fraction");
+				prefsChange(hub, "tolerance", 0.2);
+				prefsChange(hub, "reserve", 0.12);
+				prefsChange(hub, "maxAge", 60000);
+				prefsChange(hub, "unknown", "exclude");
+				prefsChange(hub, "weight:a", 3);
+				prefsChange(hub, "effort:a", "high");
+				expect(settings.getModelRoleEntries().smol).toMatchObject({
+					strategyOptions: { objective: "balance", capacityMetric: "fraction", tolerance: 0.2 },
+					routing: { quota: { reserveFraction: 0.12, maxObservationAgeMs: 60000, unknown: "exclude" } },
+					models: { a: { model: `${model.provider}/${model.id}`, weight: 3, defaultEffort: "high" } },
+				});
+				prefsChange(hub, "strategy", ["least-used", "priority"]);
+				prefsChange(hub, "window", 123456);
+				prefsChange(hub, "order", ["b", "a"]);
+				prefsChange(hub, "funding", ["included", "free"]);
+				expect(settings.getModelRoleEntries().smol).toMatchObject({
+					strategy: ["least-used", "priority"],
+					strategyOptions: { order: ["b", "a"], window: { type: "rolling", durationMs: 123456 } },
+					routing: { funding: { order: ["included", "free"] } },
+				});
+				expect(settings.getModelRoleEntries().smol).not.toHaveProperty("models.a.weight");
+				prefsChange(hub, "effort:a", "");
+				expect(settings.getModelRoleEntries().smol).not.toHaveProperty("models.a.defaultEffort");
 			});
 
 			test("a pool that references a model group edits the global group, unless another layer defines it", () => {
@@ -2778,6 +2825,8 @@ describe("ModelHub", () => {
 				expect(normalize(hub.render(220))).toMatch(/SMOL pool \+fast · 1 model .*random/);
 
 				hub.handleInput("a");
+				prefsChange(hub, "cache.affinity", true);
+				prefsAction(hub, "close");
 				hub.handleInput("\n"); // add a member
 				type(hub, "model-b");
 				hub.handleInput("\n");
@@ -2797,6 +2846,17 @@ describe("ModelHub", () => {
 				const pool = createModelBrowserSource(runtime).getPool?.({ kind: "role", key: "smol" });
 				expect(pool?.readOnly).toBe("modelGroups.fast is set in the runtime layer");
 				expect(pool?.raw).toBeUndefined();
+				const readonlyHub = createHub({ models: twoModels(), scoped: true, settings: runtime }).hub;
+				enterRolesView(readonlyHub);
+				readonlyHub.handleInput(DOWN);
+				readonlyHub.handleInput("e");
+				const rows = prefsProps(readonlyHub).sections?.[0]?.rows ?? [];
+				expect(rows.every(row => row.disabled === pool?.readOnly)).toBe(true);
+				const before = structuredClone(runtime.getGlobalSettings());
+				prefsChange(readonlyHub, "cache.affinity", true);
+				prefsChange(readonlyHub, "strategy", ["quota"]);
+				readonlyHub.handleInput("\n");
+				expect(runtime.getGlobalSettings()).toEqual(before);
 			});
 
 			test("the Groups view edits an unreferenced group in place and deletes it; a runtime-layer group stays read-only", () => {

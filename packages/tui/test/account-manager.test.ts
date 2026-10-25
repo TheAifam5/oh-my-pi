@@ -6,8 +6,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { type TUI, visibleWidth } from "../src/index";
 import type { KeyId } from "../src/keys";
-import type { TspPickerProps } from "@oh-my-pi/pi-wire";
-import type { NativeChild, NativeNode } from "../src/native/node";
+import type { TspPickerProps, TspPrefsProps } from "@oh-my-pi/pi-wire";
 import {
 	type AccountManagerAccount,
 	AccountManagerComponent,
@@ -18,6 +17,15 @@ import { initTheme } from "../src/theme";
 const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ENTER = "\r";
 
+const nativeContext = { cols: 140, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+function prefs(manager: AccountManagerComponent): TspPrefsProps {
+	const root = manager.describe(nativeContext);
+	expect(root.k).toBe("prefs");
+	return root.p as TspPrefsProps;
+}
+function change(manager: AccountManagerComponent, item: string, value: string | number | boolean): void {
+	manager.handleNativeEvent({ type: "change", key: "", item, value });
+}
 // Narrow TUI stub: the manager only reads terminal rows and requests renders.
 const tuiStub = { requestRender: () => {}, terminal: { rows: 30 } } as unknown as TUI;
 
@@ -92,23 +100,26 @@ describe("AccountManager", () => {
 			manager.handleInput(`\x1b[<0;70;${row + 1}M`);
 		};
 		clickRow(0);
-		manager.handleInput("\x1b[C");
-		manager.handleInput(ENTER);
+		change(manager, "drain", true);
 		await settle();
 		expect(applied.at(-1)?.[0]).toBe("account-0");
+		manager.handleInput("\x1b");
 		clickRow(1);
 		manager.handleInput("d");
+		manager.handleInput(ENTER);
 		await settle();
 		expect(applied.at(-1)?.[0]).toBe("account-1");
+		manager.handleInput("\x1b");
 		for (let i = 0; i < 25; i++) manager.handleInput("\x1b[B");
 		manager.render(140);
 		clickRow(25);
 		manager.handleInput("d");
+		manager.handleInput(ENTER);
 		await settle();
 		expect(applied.at(-1)?.[0]).toBe("account-25");
+		manager.handleInput("\x1b");
 		clickRow(25);
-		manager.handleInput("\x1b[C");
-		manager.handleInput(ENTER);
+		change(manager, "drain", true);
 		await settle();
 		expect(applied.at(-1)?.[0]).toBe("account-25");
 	});
@@ -120,6 +131,7 @@ describe("AccountManager", () => {
 		manager.handleInput(ENTER);
 		await settle();
 		expect(applied).toEqual([["a", "priority", "7"]]);
+		manager.handleInput("\x1b");
 		expect(screen()).toContain("Set priority 7.");
 	});
 
@@ -128,7 +140,7 @@ describe("AccountManager", () => {
 			error: "auth.accountPolicies[0].drain applies to OAuth accounts only",
 		});
 		manager.handleInput(ENTER);
-		manager.handleInput("\x1b[C"); // drain chip
+		manager.handleInput("\x1b[B");
 		manager.handleInput(ENTER);
 		await settle();
 		expect(applied).toEqual([["a", "drain", "on"]]);
@@ -152,7 +164,7 @@ describe("AccountManager", () => {
 		manager.handleInput("p");
 		await settle();
 		expect(applied).toEqual([]);
-		expect(screen()).toContain("priority: auth.accountPolicies is set in the overlay layer");
+		expect(screen()).toContain("auth.accountPolicies is set in the overlay layer");
 	});
 
 	test("ignores field shortcuts while the provider sidebar has focus", async () => {
@@ -165,7 +177,6 @@ describe("AccountManager", () => {
 
 	test("renders host strings with control sequences as single plain lines", async () => {
 		const hostile = "\x1b]0;owned\x07\x1b[2Jevil\nline";
-		const clean = createManager([account("a", "anthropic")]);
 		const { manager } = createManager(
 			[
 				account("a", "anthropic", {
@@ -177,6 +188,7 @@ describe("AccountManager", () => {
 			{ error: hostile },
 		);
 		manager.handleInput("d");
+		manager.handleInput(ENTER);
 		await settle();
 		const raw = manager.render(140);
 		const text = raw.join("\n");
@@ -184,7 +196,7 @@ describe("AccountManager", () => {
 		expect(text).not.toContain("\x1b]");
 		expect(text).not.toContain("\x1b[2J");
 		expect(text.replace(ANSI_PATTERN, "")).toContain("evil line");
-		expect(text.split("\n").length).toBe(clean.manager.render(140).join("\n").split("\n").length);
+		expect(prefs(manager).sections?.[0]?.rows.find(row => row.id === "drain")?.warning).toContain("evil line");
 	});
 
 	test("lists host pages after the providers and applies a page row's field by row id", async () => {
@@ -230,6 +242,7 @@ describe("AccountManager", () => {
 		manager.handleInput(ENTER);
 		await settle();
 		expect(applied).toEqual([["limits:*", "limit:add", "usd 5 day"]]);
+		manager.handleInput("\x1b");
 		expect(screen()).toContain("* has 2 limits.");
 
 		manager.handleInput("\x1b[D");
@@ -280,25 +293,16 @@ describe("AccountManager", () => {
 			expect(all).toContain("Reload");
 		});
 
-		test("keeps every selected field and choice visible in the footer", () => {
-			const choices = Array.from({ length: 16 }, (_, i) => ({
-				id: `choice-${i}`,
-				label: `choice-${i}`,
-				value: "",
-				on: false,
-			}));
-			const fields = [...manyFields, { id: "pool", label: "pool", value: "", choices }];
+		test("keeps every selected field visible while scrolling a preference sheet", () => {
+			const fields = Array.from({ length: 30 }, (_, index) => keyed("d", `field-${index}`));
 			const { manager } = createManager([account("a", "anthropic", { name: "a".repeat(120), fields })]);
 			manager.handleInput(ENTER);
 			for (const field of fields) {
-				expect(footer(narrow(manager))).toContain(`[ ${field.label}`);
-				manager.handleInput("\x1b[C");
-			}
-			manager.handleInput("\x1b[D");
-			manager.handleInput(ENTER);
-			for (const choice of choices) {
-				expect(footer(narrow(manager))).toContain(`[ ${choice.label}`);
-				manager.handleInput("\x1b[C");
+				const lines = narrow(manager);
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+				expect(lines.join(" ")).toContain(field.label);
+				expect(prefs(manager).focus).toBe(field.id);
+				manager.handleInput("\x1b[B");
 			}
 		});
 
@@ -316,7 +320,7 @@ describe("AccountManager", () => {
 			await settle();
 			const lines = narrow(manager);
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
-			expect(flat(lines)).toContain(`limits: ${reason}`);
+			expect(lines.join(" ").replace(/\s+/g, " ")).toContain(reason);
 		});
 
 		test("native notices wrap without truncating sanitized refusal reasons", async () => {
@@ -328,34 +332,12 @@ describe("AccountManager", () => {
 			]);
 			manager.handleInput("l");
 			await settle();
-			const findStatus = (child: NativeChild): NativeNode | undefined => {
-				if (!child || !("k" in child)) return undefined;
-				if (child.key === "status") return child;
-				for (const nested of child.c ?? []) {
-					const found = findStatus(nested);
-					if (found) return found;
-				}
-				return undefined;
-			};
-			const status = findStatus(
-				manager.describe({
-					cols: 80,
-					reduceMotion: false,
-					dark: true,
-					supports: kind => kind !== "picker",
-					feature: () => true,
-				}),
-			);
-			expect(status?.k).toBe("text");
-			if (status?.k !== "text") throw new Error("Missing native notice");
-			expect(status.p?.wrap).toBe("word");
-			expect(status.p?.truncate).toBeUndefined();
-			const spans = JSON.stringify(status.p?.spans);
-			expect(spans).toContain("limits:");
-			expect(spans.replace(/\s+/g, " ")).toContain("A long account policy refusal with unsafe spacing.");
-			expect(spans.match(/A long account policy refusal/g)).toHaveLength(6);
-			expect(spans).not.toContain("\\t");
-			expect(spans).not.toContain("\\n");
+			const rows = prefs(manager).sections?.[0]?.rows ?? [];
+			const disabled = rows.find(row => row.id === "limits")?.disabled;
+			expect(disabled?.replace(/\s+/g, " ")).toContain("A long account policy refusal with unsafe spacing.");
+			expect(disabled?.match(/A long account policy refusal/g)).toHaveLength(6);
+			expect(disabled).not.toContain("\t");
+			expect(disabled).not.toContain("\n");
 		});
 
 		test("wraps an empty page's guidance", () => {
@@ -392,7 +374,7 @@ describe("AccountManager", () => {
 				}),
 			]);
 			manager.handleInput("a");
-			expect(footer(narrow(manager))).toContain("<usd|requests> <max> <day|week>");
+			expect(narrow(manager).join(" ")).toContain("<usd|requests> <max> <day|week>");
 		});
 	});
 
@@ -448,12 +430,10 @@ describe("AccountManager", () => {
 			);
 		});
 
-		test("field actions and the chip strip apply through the host", async () => {
+		test("field actions open typed preferences and changes apply through the host", async () => {
 			const { manager, props, applied, closed } = pickerManager([
 				account("a", "anthropic", { facts: { state: "enabled" } }),
 			]);
-			const act = (id: string, value?: string) =>
-				manager.handleNativeEvent({ type: "action", key: "", act: id, ...(value ? { value } : {}), mods: [] });
 			expect(props().actions?.map(action => action.id)).toEqual([
 				"edit",
 				"field:priority",
@@ -462,22 +442,17 @@ describe("AccountManager", () => {
 				"reload",
 				"close",
 			]);
-			act("field:drain");
+			manager.handleNativeEvent({ type: "action", key: "", act: "field:drain", mods: [] });
+			expect(prefs(manager).focus).toBe("drain");
+			expect(applied).toEqual([]);
+			change(manager, "drain", true);
 			await settle();
 			expect(applied).toEqual([["a", "drain", "on"]]);
-
-			act("edit");
-			act("close");
-			expect(props().strip).toBeNull();
+			manager.handleNativeEvent({ type: "action", key: "", act: "close", mods: [] });
 			expect(closed).toEqual([]);
 			expect(props().selected).toBe("account:a");
-			act("edit");
-			const strip = props().strip;
-			expect(strip?.items.map(item => item.id)).toEqual(["0", "1"]);
-			act("strip", "1");
-			await settle();
-			expect(applied.at(-1)).toEqual(["a", "drain", "on"]);
-			expect(props().strip).toBeNull();
+			manager.handleNativeEvent({ type: "action", key: "", act: "edit", mods: [] });
+			expect(prefs(manager).sections?.[0]?.rows.map(row => row.id)).toEqual(["priority", "drain"]);
 		});
 
 		test("search matches account name, identity and provider, preserves selection and highlights labels", () => {
@@ -560,15 +535,18 @@ describe("AccountManager", () => {
 			]);
 			expect(props().actions?.find(action => action.id === "field:enabled")?.danger).toBe(true);
 			manager.handleNativeEvent({ type: "action", key: "", act: "field:enabled", mods: [] });
+			change(manager, "enabled", false);
 			expect(props().confirm?.text).toContain("work (a@example.com)");
 			expect(applied).toEqual([]);
 			manager.handleNativeEvent({ type: "action", key: "", act: "close", mods: [] });
 			expect(applied).toEqual([]);
 			manager.handleInput("e");
+			manager.handleInput(ENTER);
 			expect(Bun.stripANSI(manager.render(220).join("\n"))).toContain("Disable account? — work (a@example.com)");
 			manager.handleInput("\x1b");
 			expect(applied).toEqual([]);
 			manager.handleInput("e");
+			manager.handleInput(ENTER);
 			manager.handleInput(ENTER);
 			await settle();
 			expect(applied).toEqual([["a", "enabled", "off"]]);
@@ -587,12 +565,11 @@ test("account save exposes loading state until the host completes", async () => 
 		{ onCancel: () => {} },
 	);
 	manager.handleInput("d");
-	const context = { cols: 160, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
-	expect(manager.describe(context).p).toMatchObject({ state: "loading", message: "Saving…" });
-	expect(Bun.stripANSI(manager.render(180).join("\n"))).toContain("Saving…");
+	manager.handleInput(ENTER);
+	expect(prefs(manager).sections?.[0]?.rows.every(row => row.disabled === "Saving…")).toBe(true);
 	pending.resolve({ message: "Saved" });
 	await settle();
-	expect(manager.describe(context).p).toMatchObject({ state: "ready", message: "Saved" });
+	expect(prefs(manager).sections?.[0]?.rows.some(row => row.disabled === "Saving…")).toBe(false);
 });
 
 test("pasted C1 controls are removed from the account terminal query line", () => {

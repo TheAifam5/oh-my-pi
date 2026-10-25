@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { TspPickerProps } from "@oh-my-pi/pi-wire";
-import type { DescribeContext, NativeNode } from "../src/native/node";
+import type { TspPrefsProps } from "@oh-my-pi/pi-wire";
+import type { DescribeContext } from "../src/native/node";
 import {
 	ModelHubComponent,
 	type ModelHubPool,
@@ -81,9 +81,10 @@ function registry(models: typeof MODELS): ModelHubRegistry {
 		refreshProvider: async () => {},
 	} as unknown as ModelHubRegistry;
 }
-function props(root: NativeNode): TspPickerProps {
-	expect(root.k).toBe("picker");
-	return root.p as TspPickerProps;
+function prefs(hub: ModelHubComponent): TspPrefsProps {
+	const root = hub.describe(withPicker);
+	expect(root.k).toBe("prefs");
+	return root.p as TspPrefsProps;
 }
 
 describe("model hub native field editors", () => {
@@ -120,90 +121,72 @@ describe("model hub native field editors", () => {
 		hub.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
 	}
 
-	function field(hub: ModelHubComponent): { key: string; node: NativeNode } {
-		function find(root: NativeNode, path: string): { key: string; node: NativeNode } | undefined {
-			if (root.k === "input") return { key: path, node: root };
-			for (const [index, child] of (root.c ?? []).entries()) {
-				if (!("k" in child)) continue;
-				const found = find(child, [path, child.key ?? String(index)].filter(Boolean).join("/"));
-				if (found) return found;
-			}
-			return undefined;
-		}
-		const result = find(hub.describe(withPicker), "");
-		expect(result).toBeDefined();
-		return result!;
+	function openTolerance(hub: ModelHubComponent): void {
+		action(hub, "roles:routing");
+		action(hub, "edit", "tolerance");
 	}
 
 	function edit(hub: ModelHubComponent, text: string): void {
-		const current = field(hub);
-		const value = String(current.node.p && Reflect.get(current.node.p, "text"));
+		const editing = prefs(hub).editing;
+		expect(editing).toBeTruthy();
 		hub.handleNativeEvent({
 			type: "edit",
-			key: current.key,
+			key: "",
 			from: 0,
-			to: value.length,
-			len: value.length,
+			to: editing?.draft?.length ?? 0,
+			len: editing?.draft?.length ?? 0,
 			text,
 			cursor: text.length,
 		});
 	}
 
-	function openTolerance(hub: ModelHubComponent): void {
-		action(hub, "roles:routing");
-		const index = props(hub.describe(withPicker)).strip?.items.findIndex(item => item.label === "quota tolerance");
-		expect(index).toBeGreaterThanOrEqual(0);
-		action(hub, "strip", String(index));
-	}
-
-	test("native quota edits and undo share the ANSI field and Save writer", () => {
+	test("native quota drafts and undo share the ANSI editor and writer", () => {
 		const { hub, writes } = editableHub();
 		openTolerance(hub);
-		expect(field(hub).node.p).toMatchObject({ text: "0.1", cursor: 3 });
+		expect(prefs(hub).editing).toMatchObject({ draft: "0.1", cursor: 3 });
 		edit(hub, "0.25");
-		expect(field(hub).node.p).toMatchObject({ text: "0.25", cursor: 4 });
+		expect(prefs(hub).editing).toMatchObject({ draft: "0.25", cursor: 4 });
 		expect(Bun.stripANSI(hub.render(160).join("\n"))).toContain("0.25");
-		hub.handleNativeEvent({ type: "undo", key: field(hub).key });
-		expect(field(hub).node.p).toMatchObject({ text: "0.1" });
-		edit(hub, "0.3");
-		action(hub, "poolField");
+		hub.handleNativeEvent({ type: "undo", key: "" });
+		expect(prefs(hub).editing).toMatchObject({ draft: "0.1" });
+		hub.handleNativeEvent({ type: "change", key: "", item: "tolerance", value: "0.3" });
 		expect(writes).toEqual([
 			{
 				target: { kind: "role", key: "default" },
 				value: expect.objectContaining({ strategyOptions: { tolerance: 0.3 } }),
 			},
 		]);
-		expect(props(hub.describe(withPicker)).strip).toBeNull();
+		expect(prefs(hub).editing).toBeNull();
 	});
 
-	test("invalid native quota edits show an error without writing and can be corrected", () => {
+	test("invalid numeric drafts retain their value, cursor, and field warning until correction", () => {
 		const { hub, writes } = editableHub();
 		openTolerance(hub);
 		edit(hub, "not-a-number");
-		action(hub, "poolField");
+		hub.handleInput("\r");
 		expect(writes).toEqual([]);
-		expect(JSON.stringify(hub.describe(withPicker))).toContain("Tolerance must be a number");
-		expect(Bun.stripANSI(hub.render(160).join("\n"))).toContain("Tolerance must be a number");
+		expect(prefs(hub).editing).toMatchObject({ draft: "not-a-number", cursor: 12 });
+		expect(JSON.stringify(prefs(hub))).toContain("Enter a finite number");
+		expect(Bun.stripANSI(hub.render(160).join("\n"))).toContain("Enter a finite number");
 		edit(hub, "0.2");
-		expect(JSON.stringify(hub.describe(withPicker))).not.toContain("Tolerance must be a number");
-		hub.handleNativeEvent({ type: "action", key: field(hub).key, act: "submit", mods: [] });
+		hub.handleInput("\r");
 		expect(writes).toHaveLength(1);
+		expect(JSON.stringify(prefs(hub))).not.toContain("Enter a finite number");
 	});
 
 	test("native new-group edits persist the definition and reference through the pool writer", () => {
 		const { hub, writes, pool } = editableHub();
 		action(hub, "roles:groups");
-		action(hub, "strip", "0");
-		expect(field(hub).node.p).toMatchObject({ text: "", cursor: 0 });
-		edit(hub, "shared");
-		action(hub, "poolField");
+		action(hub, "pool:0");
+		expect(prefs(hub).editing).toMatchObject({ draft: "", cursor: 0 });
+		hub.handleNativeEvent({ type: "change", key: "", item: "value", value: "shared" });
 		expect(writes).toEqual([
 			{ target: { kind: "group", key: "shared" }, value: pool.raw },
 			{ target: { kind: "role", key: "default" }, value: { use: "shared" } },
 		]);
 	});
 
-	test("ANSI typing and submission keep using the same field writer", () => {
+	test("ANSI typing and submission use the same field writer", () => {
 		const { hub, writes } = editableHub();
 		openTolerance(hub);
 		hub.handleInput("\x01");

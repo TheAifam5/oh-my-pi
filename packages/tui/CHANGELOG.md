@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `/models` pool routing and profile overrides and `/account` account, limit, and pin editors use typed object-scoped preference sheets in Tern and settings lists in the terminal; refused text and numeric edits keep their draft, cursor, and field warning
 - `/account` in Tern is a table: providers and policy pages as scopes, accounts grouped by provider with Billing, State, Type, Routing, Pins and Limits columns, and each field as an action
 - `/models` Roles view shows pools, pool members and fallbacks in separate Model, Thinking, Billing and Routing columns, aligned in the TUI and as table columns in Tern
 - `/models` Roles and Groups and `/account` offer explicit `/` search with matching-row selection preservation, highlighted Tern label hits, and no-results text; Enter restores row shortcuts and Escape clears the search first
@@ -22,8 +23,8 @@
 - Added the `tui.settings.cycleScope` keybinding (default `Ctrl+S`) and write scopes to the settings panel: `SettingsHost` gains optional `ready`, `targets`, `target`, `selectTarget()`, `provenance()`, and `shadowWarning()`, `set`/`unset` may return promises, and `SettingItem.provenance` shows a source badge without changing the editable value
 - Added expandable role-pool and model-group members to the session model picker, with concrete model ids and current availability
 - Added rule model selectors to the extensions inspector and `fallback` to the advisor configuration type
-- Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and keys to turn a selector role into a pool, add, replace, remove, and reorder members, and cycle the strategy (including `quota`) and funding order; an invalid pool shows its validation problem and can be removed or replaced
-- Added routing editors to model hub pools: `a`/`h` toggle cache affinity and pricing, `u`/`r` cycle quota unknown handling and reserve, and `e` edits account order, drain target, drain spend, return triggers, metered funding with its spending policy or local budget, local limits, strategy lists, and quota tolerance; pool summaries show quota, accounts, and cache routing
+- Added model pools to the model hub Roles view: pool summaries, members in scheduling order with effort, weight, live billing, and local limits, and controls to turn selectors into pools and add, replace, remove, and reorder members; an invalid pool shows its validation problem and can be removed or replaced
+- Added pool preferences for ordered strategies and funding, quota tolerance, objective, capacity metric, reserve and observation age, least-used windows, account routing, cache switches, spending policies and local budgets, local limits, member weights, and effort overrides
 - Added model-group editing to the model hub: a pool that references `modelGroups.<name>` edits the global group, and `⇧G` points a role or chain at a group, turns an inline pool into a new group, renames a group with its references, or deletes it into an inline copy
 - Added the account manager overlay behind `/account`, listing stored accounts by provider with name, priority, reserve, drain and spend classes, pins, limits with usage, remaining quota with reset countdowns, and balances with spending projections
 - Added host pages (`AccountManagerDeps.pages`) to the account manager, listed after the providers

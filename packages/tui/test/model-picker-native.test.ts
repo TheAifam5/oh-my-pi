@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { TspPickerGroup, TspPickerProps } from "@oh-my-pi/pi-wire";
+import type { TspPickerGroup, TspPickerProps, TspPrefsProps } from "@oh-my-pi/pi-wire";
 import type { DescribeContext, NativeChild, NativeNode } from "../src/native/node";
 import {
 	ModelHubComponent,
@@ -13,6 +13,16 @@ import {
 import { ModelPickerComponent } from "../src/overlays/model-picker";
 import { initTheme } from "../src/theme";
 import type { TUI } from "../src/tui";
+
+function prefs(hub: ModelHubComponent): TspPrefsProps {
+	const root = hub.describe(withPicker);
+	expect(root.k).toBe("prefs");
+	return root.p as TspPrefsProps;
+}
+
+function changePref(hub: ModelHubComponent, item: string, value: string | readonly string[]): void {
+	hub.handleNativeEvent({ type: "change", key: "", item, value });
+}
 
 const withPicker: DescribeContext = {
 	cols: 120,
@@ -472,7 +482,7 @@ describe("Groups view", () => {
 		for (const char of "Bad Name") hub.handleInput(char);
 		hub.handleInput("\r");
 		// Still naming: the refusal shows in the field and no browse started.
-		expect(props(hub.describe(withPicker)).scope).toBe("groups");
+		expect(prefs(hub).editing).toMatchObject({ row: "value", draft: "Bad Name" });
 		expect(JSON.stringify(hub.describe(withPicker))).toContain("lowercase letters, digits, - and _, starting with");
 		expect(writes).toEqual([]);
 
@@ -545,7 +555,10 @@ describe("Groups view", () => {
 		const { hub, writes } = groupsHub();
 		hub.handleNativeEvent({ type: "select", key: "", item: "group:fast" });
 		hub.handleInput("g"); // strategy: priority → round-robin
+		expect(writes).toEqual([]);
+		changePref(hub, "strategy", ["round-robin"]);
 		expect(writes.at(-1)).toMatchObject([{ kind: "group", key: "fast" }, { strategy: "round-robin" }]);
+		hub.handleInput("\x1b");
 
 		hub.handleNativeEvent({ type: "select", key: "", item: "newGroup" });
 		hub.handleNativeEvent({ type: "activate", key: "", item: "newGroup" });
@@ -686,13 +699,13 @@ describe("Group profiles", () => {
 	});
 
 	test("t on a member of a role using +fast@low sets the low profile's override, not the group default", () => {
-		const { hub, writes, act, select } = profilesHub("roles");
+		const { hub, writes, select } = profilesHub("roles");
 		select("member:role:smol:mini");
 		hub.handleInput("t");
-		const strip = props(hub.describe(withPicker)).strip;
-		const inherit = strip?.items.find(chip => JSON.stringify(chip.label).includes("inherit"));
-		expect(inherit).toBeDefined();
-		act("strip", inherit?.id);
+		expect(prefs(hub).focus).toBe("effort:mini");
+		const effort = prefs(hub).sections?.[0]?.rows.find(row => row.id === "effort:mini");
+		expect(effort?.control).toMatchObject({ k: "choice", value: "low" });
+		changePref(hub, "effort:mini", "");
 		const [target, value] = writes.at(-1) ?? [];
 		expect(target).toEqual({ kind: "group", key: "fast" });
 		// Inherit removes the profile's override; the member keeps its default.
@@ -704,13 +717,14 @@ describe("Group profiles", () => {
 		const { hub, writes, act, select } = profilesHub("roles");
 		select("role:smol");
 		act("roles:groups");
-		const labels = (props(hub.describe(withPicker)).strip?.items ?? []).map(chip => JSON.stringify(chip.label));
+		const rows = prefs(hub).sections?.[0]?.rows ?? [];
+		const labels = rows.map(row => row.label);
 		expect(labels.some(label => label.includes("use +fast@spare"))).toBe(true);
 		expect(labels.some(label => label.includes("use +fast@low"))).toBe(false);
-		const plain = props(hub.describe(withPicker)).strip?.items.find(chip =>
-			JSON.stringify(chip.label).includes('use +fast"'),
-		);
-		act("strip", plain?.id);
+		const plain = rows.find(row => row.label === "use +fast");
+		expect(plain).toBeDefined();
+		if (plain?.control.k !== "action") throw new Error("Missing group action");
+		act(plain.control.act);
 		expect(writes.at(-1)).toEqual([{ kind: "role", key: "smol" }, { use: "fast" }]);
 	});
 });
@@ -795,6 +809,8 @@ test("pools render inside the roles picker and their actions edit only what the 
 	expect(p.actions?.find(action => action.id === "roles:pick")?.label).toBe("Add member");
 	expect(p.actions?.map(action => action.id)).toContain("roles:funding");
 	act("roles:strategy");
+	expect(writes).toEqual([]);
+	changePref(hub, "strategy", ["round-robin"]);
 	expect(writes).toEqual([
 		[
 			{ kind: "role", key: "smol" },
