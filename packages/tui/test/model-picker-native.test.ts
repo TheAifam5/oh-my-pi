@@ -288,7 +288,8 @@ test("pointer events drive the hub through the same paths as its keys", () => {
 	act("scope", "roles");
 	p = props(hub.describe(withPicker));
 	expect(p.items?.find(entry => entry.id === "fallback:default:0")).toMatchObject({
-		label: "openai/gpt-5.6",
+		label: "fallback 1",
+		facts: { model: "openai/gpt-5.6" },
 		depth: 1,
 	});
 	expect(p.items?.find(entry => entry.id === "role:default")?.facts).toEqual({ model: "demo/demo", thinking: "off" });
@@ -396,10 +397,10 @@ test("pools render inside the roles picker and their actions edit only what the 
 	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
 	let p = props(hub.describe(withPicker));
 	const item = (id: string) => p.items?.find(entry => entry.id === id);
-	expect(item("role:smol")?.facts?.model).toBe("pool · 2 models · priority · metered");
-	expect(item("member:role:smol:opus")).toMatchObject({ label: "anthropic/claude-opus-5", depth: 1 });
-	expect(item("member:role:smol:opus")?.facts?.thinking).toBe("high");
-	expect(item("pooled:default")?.label).toContain("read-only: edit modelGroups.fast in config");
+	expect(item("role:smol")?.facts).toMatchObject({ model: "pool · 2 models", routing: "priority · metered" });
+	expect(item("member:role:smol:opus")).toMatchObject({ label: "opus", depth: 1 });
+	expect(item("member:role:smol:opus")?.facts).toMatchObject({ model: "anthropic/claude-opus-5", thinking: "high" });
+	expect(item("pooled:default")?.facts?.routing).toContain("read-only: edit modelGroups.fast in config");
 	expect(item("member:chain:default:mini")).toMatchObject({ depth: 2 });
 	expect(p.total).toBe(p.order?.filter(entry => typeof entry === "string").length);
 	// The generic native frame lists the same pool rows.
@@ -556,18 +557,23 @@ describe("model hub billing", () => {
 		const item = (id: string) => p.items?.find(entry => entry.id === id);
 		expect(item("role:default")?.facts).toEqual({ model: "demo/demo", thinking: "off", billing: "free unknown" });
 		// The host text is sanitized onto one line.
-		expect(item("fallback:default:0")?.facts).toEqual({ billing: "metered available $1.00" });
-		expect(p.columns?.map(column => column.id)).toEqual(["model", "thinking", "billing"]);
+		expect(item("fallback:default:0")?.facts).toMatchObject({ billing: "metered available $1.00" });
+		expect(p.columns?.map(column => column.id)).toEqual(["model", "thinking", "billing", "routing"]);
 
+		// Without billing the column is dropped; the pool's strategy keeps Routing.
 		const none = billingHub(() => undefined, { value: 1 }).hub;
-		expect(props(none.describe(withPicker)).columns?.map(column => column.id)).toEqual(["model", "thinking"]);
+		expect(props(none.describe(withPicker)).columns?.map(column => column.id)).toEqual([
+			"model",
+			"thinking",
+			"routing",
+		]);
 	});
 
 	test("a pool member row and the role preview show the member's and the role's billing", () => {
 		const { hub } = billingHub(byProvider, { value: 1 });
 		const root = hub.describe(withPicker);
-		expect(props(root).items?.find(entry => entry.id === "member:role:smol:gpt")?.facts?.thinking).toBe(
-			"billing metered available $1.00",
+		expect(props(root).items?.find(entry => entry.id === "member:role:smol:gpt")?.facts?.billing).toBe(
+			"metered available $1.00",
 		);
 		// The selected role row is `default`; its preview lists a Billing row.
 		const kvItems = (root.c ?? []).flatMap(child => (prop(child, "items") as { k: unknown; v: unknown }[]) ?? []);

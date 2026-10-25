@@ -510,17 +510,41 @@ const POOL_ALIAS_MAX_LENGTH = 48;
 /** Member aliases the group grammar reserves. */
 const POOL_RESERVED_ALIASES: readonly string[] = ["window", "__proto__", "constructor", "prototype"];
 
-/** Picker fact columns of the Roles view. */
+/** Picker fact columns of the Roles view; billing and routing hide first when narrow. */
 const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
-	{ id: "model", head: "Model", format: "text", priority: 2 },
-	{ id: "thinking", head: "Thinking", format: "dim", priority: 1 },
+	{ id: "model", head: "Model", format: "text", priority: 3 },
+	{ id: "thinking", head: "Thinking", format: "dim", priority: 2 },
+	{ id: "billing", head: "Billing", format: "dim", priority: 1 },
+	{ id: "routing", head: "Routing", format: "dim", priority: 0 },
 ];
 
-/** Roles view columns when some row carries billing; billing hides first when narrow. */
-const ROLE_PICKER_BILLING_COLUMNS: readonly TspPickerColumn[] = [
-	...ROLE_PICKER_COLUMNS,
-	{ id: "billing", head: "Billing", format: "dim", priority: 0 },
-];
+/** Roles view fact columns that are shown only when some row carries the fact. */
+const ROLE_PICKER_OPTIONAL_COLUMNS: readonly string[] = ["billing", "routing"];
+
+/** Column cells of one Roles row: model, thinking, billing, routing. */
+interface RolesRowCells {
+	model?: string;
+	thinking?: string;
+	billing?: string;
+	routing?: string;
+}
+
+/** Picker facts of a Roles row's cells; absent and empty cells are omitted. */
+function rolesCellFacts(cells: RolesRowCells): Record<string, string> {
+	const facts: Record<string, string> = {};
+	for (const [key, value] of Object.entries(cells)) {
+		if (value !== undefined && value.length > 0) facts[key] = value;
+	}
+	return facts;
+}
+
+/** Dim value spans of a Roles row's thinking, billing and routing cells; undefined when all are absent. */
+function rolesCellValue(cells: RolesRowCells): TspSpan[] | undefined {
+	const parts = [cells.thinking, cells.billing, cells.routing].filter(
+		(part): part is string => part !== undefined && part.length > 0,
+	);
+	return parts.length > 0 ? [span(parts.join("  "), "dim")] : undefined;
+}
 
 /** Kind tab labels (sentence case; acronyms stay upper). */
 const MODEL_KIND_LABELS: Record<"all" | ModelKind, string> = {
@@ -2969,13 +2993,10 @@ export class ModelHubComponent implements Component {
 
 	// ─── Pool display ───────────────────────────────────────────────────────
 
-	/**
-	 * One-line pool summary: source, members, strategy, a badge per configured routing section,
-	 * and why it is read-only. {@link #poolFacts} carries the full routing.
-	 */
-	#poolSummary(pool: ModelHubPool | undefined): string {
-		if (!pool) return "invalid pool · fix it in config";
-		if (pool.invalid !== undefined) return sanitizeDisplayLine(`invalid pool · skipped · ${pool.invalid}`);
+	/** A pool's column cells: source and member count, funding order, strategy with routing badges. */
+	#poolColumns(pool: ModelHubPool | undefined): { model: string; funding?: string; routing?: string } {
+		if (!pool) return { model: "invalid pool · fix it in config" };
+		if (pool.invalid !== undefined) return { model: sanitizeDisplayLine(`invalid pool · skipped · ${pool.invalid}`) };
 		const source =
 			pool.source.kind === "ref"
 				? `pool +${pool.source.group}${pool.source.profile ? `@${pool.source.profile}` : ""}`
@@ -2988,14 +3009,18 @@ export class ModelHubComponent implements Component {
 			pool.funding.includes("metered") || pool.spending ? "metered" : undefined,
 			pool.limits ? "limits" : undefined,
 		].filter(badge => badge !== undefined);
-		const parts = [
-			source,
-			`${count} model${count === 1 ? "" : "s"}`,
+		const routing = [
 			pool.strategy,
 			badges.length > 0 ? badges.join(" ") : undefined,
 			pool.readOnly ? `read-only: ${pool.readOnly}` : undefined,
-		];
-		return sanitizeDisplayLine(parts.filter(part => part !== undefined && part.length > 0).join(" · "));
+		]
+			.filter(part => part !== undefined && part.length > 0)
+			.join(" · ");
+		return {
+			model: sanitizeDisplayLine(`${source} · ${count} model${count === 1 ? "" : "s"}`),
+			...(pool.funding.length > 0 ? { funding: sanitizeDisplayLine(pool.funding.join(" → ")) } : {}),
+			...(routing.length > 0 ? { routing: sanitizeDisplayLine(routing) } : {}),
+		};
 	}
 
 	/** A pool's labelled facts: strategy, funding, group, spending, limits, quota, accounts, cache, read-only reason. */
@@ -3018,16 +3043,87 @@ export class ModelHubComponent implements Component {
 			.map(fact => ({ key: fact.key, value: sanitizeDisplayLine(fact.value) }));
 	}
 
-	/** A member's state facts: effort, weight, catalog presence, billing. */
-	#poolMemberFacts(member: ModelHubPoolMember): string[] {
-		const facts: string[] = [];
-		if (member.effort) facts.push(member.effort);
-		if (member.weight !== undefined) facts.push(`weight ${member.weight}`);
-		const parsed = parseModelString(member.model);
-		if (!parsed || !this.#findFallbackModel(parsed.provider, parsed.id)) facts.push("not in catalog");
-		const billing = this.#billingFact(member.model);
-		if (billing) facts.push(billing);
-		return facts.map(sanitizeDisplayLine);
+	/** Column cells of a non-role Roles row (pool, pool member, fallback); undefined for other kinds. */
+	#rolesRowCells(row: RolesRow): RolesRowCells | undefined {
+		switch (row.kind) {
+			case "pool": {
+				const columns = this.#poolColumns(this.#chainPool(row.role));
+				return { model: columns.model, billing: columns.funding, routing: columns.routing };
+			}
+			case "poolMember": {
+				const member = this.#poolMemberOf(row);
+				if (!member) return {};
+				const routing: string[] = [];
+				if (member.weight !== undefined) routing.push(`weight ${member.weight}`);
+				const parsed = parseModelString(member.model);
+				if (!parsed || !this.#findFallbackModel(parsed.provider, parsed.id)) routing.push("not in catalog");
+				const billing = this.#billing(member.model);
+				return {
+					model: sanitizeDisplayLine(member.model),
+					...(member.effort ? { thinking: sanitizeDisplayLine(member.effort) } : {}),
+					...(billing ? { billing } : {}),
+					...(routing.length > 0 ? { routing: routing.join(" · ") } : {}),
+				};
+			}
+			case "fallback": {
+				const billing = this.#billing(row.selector);
+				return { model: sanitizeDisplayLine(row.selector), ...(billing ? { billing } : {}) };
+			}
+			default:
+				return undefined;
+		}
+	}
+
+	/** Column cells of a role row. */
+	#roleCells(role: string): RolesRowCells {
+		const rolePool = this.#rolePool(role);
+		if (rolePool) {
+			const columns = this.#poolColumns(rolePool);
+			return { model: columns.model, billing: columns.funding, routing: columns.routing };
+		}
+		const assignment = this.#roles[role];
+		if (!assignment) return { model: "—" };
+		const selector = `${assignment.model.provider}/${assignment.model.id}`;
+		if (assignment.autoSelected) return { model: `auto → ${selector}` };
+		const billing = this.#billing(selector);
+		return {
+			model: selector,
+			...(assignment.thinkingLevel !== ThinkingLevel.Inherit
+				? { thinking: getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label }
+				: {}),
+			...(billing ? { billing } : {}),
+		};
+	}
+
+	/**
+	 * A Roles table row for the terminal: its plain name cell (a role's starts with two columns for
+	 * its status dot) and its column cells, a configured thinking level led by its glyph. Undefined
+	 * for separators, "new" rows and chain keys.
+	 */
+	#rolesTableRow(row: RolesRow): { name: string; cells: RolesRowCells } | undefined {
+		switch (row.kind) {
+			case "role": {
+				const info = this.#settings.getRoleInfo(row.role);
+				const cells = this.#roleCells(row.role);
+				const assignment = this.#roles[row.role];
+				const glyph = assignment ? thinkingLevelGlyph(assignment.thinkingLevel, theme) : "";
+				return {
+					name: `  ${info.tag ?? info.name ?? row.role}`,
+					cells: cells.thinking && glyph ? { ...cells, thinking: `${glyph} ${cells.thinking}` } : cells,
+				};
+			}
+			case "pool":
+				return { name: "  ↳ fallback pool", cells: this.#rolesRowCells(row) ?? {} };
+			case "fallback":
+				return { name: `  ↳ fallback ${row.chainIndex + 1}`, cells: this.#rolesRowCells(row) ?? {} };
+			case "poolMember":
+				return {
+					name: `${row.target.kind === "chain" ? "    • " : "  • "}${sanitizeDisplayLine(row.alias)}`,
+					cells: this.#rolesRowCells(row) ?? {},
+				};
+			default:
+				return undefined;
+		}
 	}
 
 	#poolMemberOf(row: RolesRow): ModelHubPoolMember | undefined {
@@ -4047,12 +4143,23 @@ export class ModelHubComponent implements Component {
 		// `bodyLine` has already dropped the status row, leaving the tabs row.
 		this.#rolesRowStart = lines.length;
 
-		let tagWidth = 0;
+		// Aligned columns: name | model | thinking | billing | routing, with widths over every table
+		// row so scrolling keeps the alignment; routing, then billing, then thinking drop when narrow.
+		const tableRows = new Map<RolesRow, { name: string; cells: RolesRowCells }>();
 		for (const rowDef of this.#rolesRows) {
-			if (rowDef.kind !== "role") continue;
-			const info = this.#settings.getRoleInfo(rowDef.role);
-			tagWidth = Math.max(tagWidth, visibleWidth(info.tag ?? info.name ?? rowDef.role));
+			const table = this.#rolesTableRow(rowDef);
+			if (table) tableRows.set(rowDef, table);
 		}
+		const nameWidth = Math.max(0, ...[...tableRows.values()].map(entry => visibleWidth(entry.name)));
+		const cycleWidth = this.#cycleOrder().length > 0 ? 2 + visibleWidth(`${theme.icon.loop} 99`) : 0;
+		const columns = (["model", "thinking", "billing", "routing"] as const)
+			.map(column => ({
+				column,
+				width: Math.max(0, ...[...tableRows.values()].map(entry => visibleWidth(entry.cells[column] ?? ""))),
+			}))
+			.filter(entry => entry.width > 0);
+		const tableWidth = () => 3 + nameWidth + columns.reduce((sum, entry) => sum + 2 + entry.width, 0) + cycleWidth;
+		while (columns.length > 1 && tableWidth() > width) columns.pop();
 
 		const cycleOrder = this.#cycleOrder();
 		const listFocused = this.#focus === "list";
@@ -4098,98 +4205,48 @@ export class ModelHubComponent implements Component {
 				continue;
 			}
 
-			if (rowDef.kind === "pool") {
-				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
-				const label = theme.fg(selected ? "accent" : "muted", this.#poolSummary(this.#chainPool(rowDef.role)));
-				lines.push(this.#finishRolesRow(` ${cursor} ${branch} ${label}`, width, hovered));
-				continue;
-			}
-
-			if (rowDef.kind === "poolMember") {
-				const member = this.#poolMemberOf(rowDef);
-				// Chain members sit under the chain's `↳ pool` row; role members directly under the role.
-				const depth = tagWidth + 3 + (rowDef.target.kind === "chain" ? 2 : 0);
-				const branch = theme.fg("dim", `${"".padEnd(depth)}•`);
-				const alias = theme.fg(selected ? "accent" : "muted", sanitizeDisplayLine(rowDef.alias));
-				const model = member ? sanitizeDisplayLine(member.model) : "";
-				const facts = member ? this.#poolMemberFacts(member).join(" · ") : "";
-				lines.push(
-					this.#finishRolesRow(
-						` ${cursor} ${branch} ${alias}  ${selected ? theme.fg("accent", model) : model}  ${theme.fg("dim", facts)}`,
-						width,
-						hovered,
-					),
-				);
-				continue;
-			}
-
-			if (rowDef.kind === "fallback") {
-				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
-				const selector = selected ? theme.fg("accent", rowDef.selector) : theme.fg("muted", rowDef.selector);
-				const billing = this.#billingFact(rowDef.selector);
-				let line = ` ${cursor} ${branch} ${selector}${billing ? `  ${theme.fg("dim", billing)}` : ""}`;
-				line = this.#finishRolesRow(line, width, hovered);
-				lines.push(line);
-				continue;
-			}
-
-			const role = rowDef.role;
-			const info = this.#settings.getRoleInfo(role);
-			const assignment = this.#roles[role];
-			const tag = (info.tag ?? info.name ?? role).padEnd(tagWidth);
-
-			let dot: string;
-			let tagStyled: string;
-			let value: string;
-			let levelStyled = "";
-			const rolePool = this.#rolePool(role);
-			if (rolePool) {
-				// Members carry their own efforts, so the role-level thinking label stays off.
-				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
-				tagStyled = theme.fg(info.color ?? "muted", tag);
-				value = theme.fg(selected ? "accent" : "muted", this.#poolSummary(rolePool));
-			} else if (assignment && !assignment.autoSelected) {
-				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
-				tagStyled = theme.fg(info.color ?? "muted", tag);
-				value = `${theme.fg("dim", `${assignment.model.provider}/`)}${selected ? theme.fg("accent", assignment.model.id) : assignment.model.id}`;
-				const glyph = thinkingLevelGlyph(assignment.thinkingLevel, theme);
-				const label = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
-				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
-					levelStyled = theme.fg("dim", glyph ? `${glyph} ${label}` : label);
-				}
-			} else if (assignment) {
-				dot = theme.fg("dim", theme.status.shadowed);
-				tagStyled = theme.fg("dim", tag);
-				value = theme.fg("dim", `auto → ${assignment.model.provider}/${assignment.model.id}`);
+			const table = tableRows.get(rowDef);
+			if (!table) continue;
+			const role = rowDef.kind === "role" ? rowDef.role : undefined;
+			const assignment = role !== undefined ? this.#roles[role] : undefined;
+			const pooled = rowDef.kind === "pool" || (role !== undefined && this.#rolePool(role) !== undefined);
+			const single = role !== undefined && !pooled && assignment !== undefined && !assignment.autoSelected;
+			const pad = (text: string, cellWidth: number) =>
+				text + " ".repeat(Math.max(0, cellWidth - visibleWidth(text)));
+			let line: string;
+			if (role !== undefined) {
+				const info = this.#settings.getRoleInfo(role);
+				const color = pooled || single ? (info.color ?? "muted") : "dim";
+				const dot = pooled || single ? theme.status.enabled : theme.status.shadowed;
+				line = ` ${cursor} ${theme.fg(color, dot)} ${theme.fg(color, pad(table.name.slice(2), nameWidth - 2))}`;
 			} else {
-				dot = theme.fg("dim", theme.status.shadowed);
-				tagStyled = theme.fg("dim", tag);
-				value = theme.fg("dim", "—");
+				const lead = table.name.length - table.name.trimStart().length + 2;
+				line = ` ${cursor} ${theme.fg("dim", table.name.slice(0, lead))}${theme.fg(selected ? "accent" : "muted", pad(table.name.slice(lead), nameWidth - lead))}`;
 			}
-
+			for (const { column, width: cellWidth } of columns) {
+				const padded = pad(table.cells[column] ?? "", cellWidth);
+				let styled: string;
+				if (column !== "model") styled = theme.fg("dim", padded);
+				else if (single) {
+					const slash = padded.indexOf("/");
+					const id = padded.slice(slash + 1);
+					styled = `${theme.fg("dim", padded.slice(0, slash + 1))}${selected ? theme.fg("accent", id) : id}`;
+				} else if (selected) styled = theme.fg("accent", padded);
+				else if (rowDef.kind === "poolMember") styled = padded;
+				else styled = theme.fg(role !== undefined && !pooled ? "dim" : "muted", padded);
+				line += `  ${styled}`;
+			}
+			line = line.trimEnd();
 			// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
-			const cycleIndex = cycleOrder.indexOf(role);
-			const cycleStyled = cycleIndex >= 0 ? theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`) : "";
-
-			let line = ` ${cursor} ${dot} ${tagStyled}  ${value}`;
-			const right = [levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");
-			const rightWidth = visibleWidth(right);
-			// Billing drops first: it is shown only when it fits beside the thinking and cycle badges.
-			const billing =
-				assignment && !assignment.autoSelected && !rolePool
-					? this.#billingFact(`${assignment.model.provider}/${assignment.model.id}`)
-					: undefined;
-			if (billing) {
-				const suffix = `  ${theme.fg("dim", billing)}`;
-				const reserved = rightWidth > 0 ? rightWidth + 2 : 0;
-				if (visibleWidth(line) + visibleWidth(suffix) + reserved <= width) line += suffix;
+			const cycleIndex = role !== undefined ? cycleOrder.indexOf(role) : -1;
+			if (cycleIndex >= 0) {
+				const badge = theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`);
+				const lineWidth = visibleWidth(line);
+				const badgeWidth = visibleWidth(badge);
+				if (lineWidth + badgeWidth + 2 <= width)
+					line = `${line}${" ".repeat(width - lineWidth - badgeWidth - 1)}${badge}`;
 			}
-			const lineWidth = visibleWidth(line);
-			if (rightWidth > 0 && lineWidth + rightWidth + 2 <= width) {
-				line = `${line}${" ".repeat(width - lineWidth - rightWidth - 1)}${right}`;
-			}
-			line = this.#finishRolesRow(line, width, hovered);
-			lines.push(line);
+			lines.push(this.#finishRolesRow(line, width, hovered));
 		}
 
 		if (overflow) {
@@ -4741,23 +4798,23 @@ export class ModelHubComponent implements Component {
 				);
 			}
 			case "fallback":
-				return node("item", { label: [span("  ↳ ", "dim"), span(rowDef.selector, "muted")] }, undefined, key);
 			case "pool":
-				return node(
-					"item",
-					{ label: [span("  ↳ ", "dim"), span(this.#poolSummary(this.#chainPool(rowDef.role)), "muted")] },
-					undefined,
-					key,
-				);
 			case "poolMember": {
-				const member = this.#poolMemberOf(rowDef);
-				const indent = rowDef.target.kind === "chain" ? "      • " : "    • ";
+				const cells = this.#rolesRowCells(rowDef) ?? {};
+				const indent =
+					rowDef.kind === "poolMember" ? (rowDef.target.kind === "chain" ? "      • " : "    • ") : "  ↳ ";
+				const name =
+					rowDef.kind === "poolMember"
+						? sanitizeDisplayLine(rowDef.alias)
+						: rowDef.kind === "pool"
+							? "fallback pool"
+							: `fallback ${rowDef.chainIndex + 1}`;
 				return node(
 					"item",
 					{
-						label: [span(indent, "dim"), span(sanitizeDisplayLine(rowDef.alias), "muted")],
-						detail: member ? [span(sanitizeDisplayLine(member.model))] : undefined,
-						value: member ? [span(this.#poolMemberFacts(member).join(" · "), "dim")] : undefined,
+						label: [span(indent, "dim"), span(name, "muted")],
+						detail: cells.model ? [span(cells.model, "muted")] : undefined,
+						value: rolesCellValue(cells),
 					},
 					undefined,
 					key,
@@ -4776,8 +4833,10 @@ export class ModelHubComponent implements Component {
 		const rolePool = this.#rolePool(role);
 		if (rolePool) {
 			const color = info.color ?? "muted";
+			const cells = this.#roleCells(role);
 			label = [span(`${theme.status.enabled} `, color), span(tag, color)];
-			detail = [span(this.#poolSummary(rolePool), "muted")];
+			detail = [span(cells.model ?? "", "muted")];
+			value.push(...(rolesCellValue(cells) ?? []));
 		} else if (assignment && !assignment.autoSelected) {
 			const color = info.color ?? "muted";
 			label = [span(`${theme.status.enabled} `, color), span(tag, color)];
@@ -4921,9 +4980,11 @@ export class ModelHubComponent implements Component {
 						).length,
 					})),
 					tab: this.#roleTab,
-					columns: items.some(item => item.facts?.billing !== undefined)
-						? ROLE_PICKER_BILLING_COLUMNS
-						: ROLE_PICKER_COLUMNS,
+					columns: ROLE_PICKER_COLUMNS.filter(
+						column =>
+							!ROLE_PICKER_OPTIONAL_COLUMNS.includes(column.id) ||
+							items.some(item => item.facts?.[column.id] !== undefined),
+					),
 					items,
 					order: this.#rolePickerOrder(),
 					selected: row && row.kind !== "separator" ? rolesRowKey(row, this.#roleIndex) : null,
@@ -5375,60 +5436,41 @@ export class ModelHubComponent implements Component {
 				case "chainKey":
 					items.push({ id, label: row.role, mono: true, icon: "git-branch", detail: "fallback chain" });
 					return;
-				case "fallback": {
-					const billing = this.#billing(row.selector);
+				case "fallback":
 					items.push({
 						id,
-						label: row.selector,
-						mono: true,
+						label: `fallback ${row.chainIndex + 1}`,
 						depth: 1,
-						detail: `fallback ${row.chainIndex + 1}`,
-						...(billing ? { facts: { billing } } : {}),
+						tone: "muted",
+						facts: rolesCellFacts(this.#rolesRowCells(row) ?? {}),
 					});
 					return;
-				}
 				case "pool":
 					items.push({
 						id,
-						label: this.#poolSummary(this.#chainPool(row.role)),
+						label: "fallback pool",
 						depth: 1,
 						tone: "muted",
-						detail: "fallback pool",
+						facts: rolesCellFacts(this.#rolesRowCells(row) ?? {}),
 					});
 					return;
-				case "poolMember": {
-					const member = this.#poolMemberOf(row);
+				case "poolMember":
 					items.push({
 						id,
-						label: member ? sanitizeDisplayLine(member.model) : sanitizeDisplayLine(row.alias),
+						label: sanitizeDisplayLine(row.alias),
 						mono: true,
 						depth: row.target.kind === "chain" ? 2 : 1,
-						detail: sanitizeDisplayLine(row.alias),
-						facts: member ? { thinking: this.#poolMemberFacts(member).join(" · ") } : {},
+						tone: "muted",
+						facts: rolesCellFacts(this.#rolesRowCells(row) ?? {}),
 					});
 					return;
-				}
 				case "role":
 					break;
 			}
 			const info = this.#settings.getRoleInfo(row.role);
 			const tag = info.tag ?? info.name ?? row.role;
 			const assignment = this.#roles[row.role];
-			const facts: Record<string, string> = {};
-			const rolePool = this.#rolePool(row.role);
-			if (rolePool) {
-				facts.model = this.#poolSummary(rolePool);
-			} else if (assignment) {
-				const selector = `${assignment.model.provider}/${assignment.model.id}`;
-				facts.model = assignment.autoSelected ? `auto → ${selector}` : selector;
-				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
-					facts.thinking = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
-				}
-				const billing = this.#billing(selector);
-				if (billing) facts.billing = billing;
-			} else {
-				facts.model = "—";
-			}
+			const facts = rolesCellFacts(this.#roleCells(row.role));
 			const cycleIndex = cycleOrder.indexOf(row.role);
 			items.push({
 				id,

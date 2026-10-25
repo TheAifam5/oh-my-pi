@@ -5,6 +5,7 @@
 ### Changed
 
 - `/account` in Tern is a table: providers and policy pages as scopes, accounts grouped by provider with Billing, State, Type, Routing, Pins and Limits columns, and each field as an action
+- `/models` Roles view shows pools, pool members and fallbacks in separate Model, Thinking, Billing and Routing columns, aligned in the TUI and as table columns in Tern
 
 ### Added
 
