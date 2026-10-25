@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Assistant-text loop errors now report an output loop instead of a thinking loop, with unchanged retry classification
 - Request quota reserves now apply to pinned, preferred, and ordered accounts
 - Exclusive account pins no longer report a credential switch they forbid
 - OpenRouter free-variant requests now rank and block accounts by the effective `:free` model

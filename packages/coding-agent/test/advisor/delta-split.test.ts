@@ -83,9 +83,9 @@ describe("renderAdvisorDeltaChunks (delta-split)", () => {
 		const texts = chunks!.map(c => ((c as { content: unknown }).content as { text: string }[])[0].text);
 		// Marker only in the final chunk; earlier chunks unchanged.
 		for (let i = 0; i < texts.length - 1; i++) {
-			expect(texts[i]).not.toContain("[in progress");
+			expect(texts[i]).not.toContain('<update state="in-progress"/>');
 		}
-		expect(texts[texts.length - 1]).toContain("[in progress — more steps follow]");
+		expect(texts[texts.length - 1].endsWith('<update state="in-progress"/>')).toBe(true);
 	});
 
 	it("splits into multiple user messages for multi-message history", () => {

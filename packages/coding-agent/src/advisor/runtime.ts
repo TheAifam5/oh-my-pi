@@ -400,9 +400,8 @@ export class AdvisorRuntime {
 	 *
 	 * @param messages - Live primary transcript snapshot (defaults to `snapshotMessages()`).
 	 * @param opts.willContinue - When `true` the primary is mid-turn (more tool-call
-	 *   steps will follow). The rendered heading is tagged `[in progress]` so the
-	 *   advisor knows to withhold critique on partial work. The flag is carried on
-	 *   the delta and forwarded to the reprime path so it is never silently dropped.
+	 *   steps will follow). A trailing structured marker identifies in-progress
+	 *   updates. The flag is carried on the delta and forwarded to the reprime path.
 	 * @param opts.dispatch - `false` when review cadence skips this boundary: the
 	 *   delta is still captured now, as the primary saw it, and held until the
 	 *   next dispatching boundary sends every held delta as one review.
@@ -952,7 +951,7 @@ export class AdvisorRuntime {
 		const heading = "### Session update";
 		const mdHead = `${heading}\n\n${md}`;
 		if (!wip) return mdHead;
-		return `${mdHead}\n\n---\n\n[in progress — more steps follow]`;
+		return `${mdHead}\n\n---\n\n<update state="in-progress"/>`;
 	}
 
 	#renderDelta(messages?: AgentMessage[], wip = false): Omit<PendingDelta, "turns" | "overflowRecovery"> | null {
@@ -1128,9 +1127,7 @@ export class AdvisorRuntime {
 		let batchText = initial.map(b => b.text).join("\n\n");
 		let rawMessages = initial.flatMap(b => b.rawMessages);
 		let turns = initial.reduce((sum, b) => sum + b.turns, 0);
-		// Track WIP state of the most recent delta — forwarded to the re-render
-		// so a willContinue:true turn keeps its [in progress] heading. Also
-		// returned to #drain so the retry-requeue path preserves it on failed turns.
+		// Retry batches retain the latest update's in-progress state.
 		let wip = initial.at(-1)?.wip ?? false;
 
 		for (let round = 0; round < MAX_COALESCE_ROUNDS; round++) {
@@ -1375,15 +1372,49 @@ export class AdvisorRuntime {
 					// Agent.#runLoop catches provider/stream failures internally and
 					// resolves prompt() cleanly with stopReason: "error". Treat that
 					// as a failed turn so endpoint rejections trip the retry path.
-					const promptError = this.agent.state.error;
-					if (promptError) throw new Error(promptError);
-					// A content-less stop is a deliberate silent review — the documented
-					// verifier behavior ("prefer silence when the agent is on track") — and
-					// completes the turn. Sessions can legitimately have nothing to advise
-					// on for any number of consecutive turns, so silence is never warned
-					// about (#5216 did, spamming "Advisor unavailable" at quiet models).
-					const turnError = getAdvisorTurnError(this.agent.state.messages.slice(messageSnapshot));
-					if (turnError) throw turnError;
+					const terminalFailure = this.#terminalAssistantFailure(messageSnapshot);
+					const turnMessages = this.agent.state.messages.slice(messageSnapshot);
+					const silentOutputLoop =
+						terminalFailure !== undefined &&
+						AIError.is(AIError.classifyMessage(terminalFailure), AIError.Flag.ThinkingLoop) &&
+						terminalFailure.loopGuardFailure === "text" &&
+						!turnMessages.some(
+							message =>
+								message.role === "assistant" && message.content.some(block => block.type === "toolCall"),
+						);
+					if (silentOutputLoop) {
+						const count = this.agent.state.messages.indexOf(terminalFailure);
+						if (this.agent.rollbackTo) this.agent.rollbackTo(count);
+						else {
+							this.agent.state.messages.splice(count);
+							this.agent.state.error = undefined;
+						}
+					} else {
+						const promptError = this.agent.state.error;
+						if (promptError) throw new Error(promptError);
+						const turnError = getAdvisorTurnError(turnMessages);
+						if (turnError) throw turnError;
+						const messages = this.agent.state.messages;
+						const boundary = messages.findLastIndex(message => {
+							if (message.role === "compactionSummary") return true;
+							const payload = "providerPayload" in message ? message.providerPayload : undefined;
+							if (payload?.type === "anthropicCompaction") return true;
+							return (
+								payload?.type === "openaiResponsesHistory" &&
+								(!payload.dt || payload.items.some(item => item.type === "compaction"))
+							);
+						});
+						for (let i = Math.max(messageSnapshot, boundary + 1); i < messages.length; i++) {
+							const message = messages[i];
+							if (message.role !== "assistant" || message.content.some(block => block.type === "toolCall"))
+								continue;
+							messages[i] = {
+								...message,
+								content: [{ type: "text", text: "" }],
+								providerPayload: undefined,
+							};
+						}
+					}
 					success = true;
 					this.#seenContextInFlight = undefined;
 					this.#hasReviewed = true;
@@ -1422,6 +1453,9 @@ export class AdvisorRuntime {
 					const rawErrorId = AIError.classify(err);
 					const terminalFailureId =
 						terminalFailure === undefined ? undefined : AIError.classifyMessage(terminalFailure);
+					const loopFailure =
+						AIError.is(rawErrorId, AIError.Flag.ThinkingLoop) ||
+						(terminalFailureId !== undefined && AIError.is(terminalFailureId, AIError.Flag.ThinkingLoop));
 					const classifierRefusal =
 						(terminalFailure !== undefined && isClassifierRefusal(terminalFailure)) ||
 						(!AIError.is(rawErrorId, AIError.Flag.AccountPolicy) &&
@@ -1549,7 +1583,7 @@ export class AdvisorRuntime {
 					}
 					// Epoch guard after the async error hook.
 					if (this.#epoch !== epoch) continue;
-					if (recovered) {
+					if (recovered && !loopFailure) {
 						this.#consecutiveFailures = 0;
 						this.#failureNotified = false;
 						this.#pending.unshift({

@@ -51,11 +51,11 @@ it("sends the parent's recalled system prompt unchanged from a /tan clone", asyn
 	);
 	// Sessions start Mnemopi in the background: [parent, clone] settle as each start finishes.
 	const mnemopiStarts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	const startCompletions = mnemopiStarts.values();
 	const realStart = mnemopiBackend.start;
-	let startCount = 0;
 	vi.spyOn(mnemopiBackend, "start").mockImplementation(async options => {
 		await realStart.call(mnemopiBackend, options);
-		mnemopiStarts[startCount++]?.resolve();
+		startCompletions.next().value?.resolve();
 	});
 	const settings = Settings.isolated({
 		"async.enabled": true,

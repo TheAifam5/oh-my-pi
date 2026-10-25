@@ -2356,7 +2356,7 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
-		it("tags in-progress turns with [in progress] heading", async () => {
+		it("tags in-progress turns with a trailing structured marker", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const updateStates: boolean[] = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
@@ -2380,7 +2380,7 @@ describe("advisor", () => {
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
-			expect(promptText(promptInputs[0])).toContain("[in progress — more steps follow]");
+			expect(promptText(promptInputs[0]).endsWith('<update state="in-progress"/>')).toBe(true);
 			expect(updateStates).toEqual([true]);
 		});
 
@@ -2409,7 +2409,7 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(1);
 			expect(promptText(promptInputs[0])).toContain("### Session update\n");
-			expect(promptText(promptInputs[0])).not.toContain("[in progress");
+			expect(promptText(promptInputs[0])).not.toContain('<update state="in-progress"/>');
 			expect(updateStates).toEqual([false]);
 		});
 

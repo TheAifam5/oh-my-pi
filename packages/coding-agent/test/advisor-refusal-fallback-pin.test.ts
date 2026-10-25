@@ -3,6 +3,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { guardThinkingLoopStream } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -55,7 +56,10 @@ describe("advisor classifier-refusal fallback", () => {
 		modelRegistry.clearSuppressedSelectors();
 	});
 
-	async function startSession(primaryFailure: "refusal" | "overloaded", scenario: { fallbackRefuses?: boolean } = {}) {
+	async function startSession(
+		primaryFailure: "refusal" | "overloaded" | "loop",
+		scenario: { fallbackRefuses?: boolean } = {},
+	) {
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			pi => {
@@ -124,10 +128,18 @@ describe("advisor classifier-refusal fallback", () => {
 				} else if (overloads) {
 					providerFailed = true;
 					advisorMock.push({ throw: "overloaded_error: provider returned error 503" });
+				} else if (model.id === advisorPrimary.id && primaryFailure === "loop") {
+					advisorMock.push({
+						content: [
+							{ type: "toolCall", id: "read-started", name: "read", arguments: {} },
+							{ type: "thinking", thinking: "[**in progress — more steps follow**]".repeat(5) },
+						],
+					});
 				} else {
 					advisorMock.push({ content: ["advisor ok"] });
 				}
-				return advisorMock.stream(model, context, options);
+				const stream = advisorMock.stream(model, context, options);
+				return primaryFailure === "loop" ? guardThinkingLoopStream(stream, model, new AbortController()) : stream;
 			},
 		});
 		vi.spyOn(modelRegistry.authStorage.limits, "markReached").mockResolvedValue({ switched: false });
@@ -147,6 +159,14 @@ describe("advisor classifier-refusal fallback", () => {
 		await fellBack.promise;
 		return { s, advisorRequests, review, controls };
 	}
+
+	it("falls back after a tool-started loop without suppressing the failed selector", async () => {
+		const suppress = vi.spyOn(modelRegistry, "suppressSelector");
+		const { s, advisorRequests } = await startSession("loop");
+		expect(advisorRequests).toContain(advisorPrimary.id);
+		expect(s.getAdvisorAgent()?.state.model.id).toBe(advisorFallback.id);
+		expect(suppress).not.toHaveBeenCalled();
+	});
 
 	it("keeps a refusal fallback past the cooldown a provider failure would observe", async () => {
 		const { s, advisorRequests, review } = await startSession("refusal");

@@ -1379,6 +1379,8 @@ export interface AssistantMessage {
 	errorStatus?: number;
 	/** Structured machine-readable error classifier; see `utils/error-id.ts` for bit layout and helpers. */
 	errorId?: number;
+	/** Content channel that tripped the stream loop guard; classification remains ThinkingLoop. */
+	loopGuardFailure?: "thinking" | "text";
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection

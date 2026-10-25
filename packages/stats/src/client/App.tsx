@@ -17,6 +17,7 @@ import {
 	TracesRoute,
 } from "./routes";
 import { RequestDrawer } from "./ui/RequestDrawer";
+import { ObservabilityRoute } from "./routes/ObservabilityRoute";
 
 export default function App() {
 	return (
@@ -40,6 +41,10 @@ function Dashboard() {
 	const render = (target: DashboardSection) => {
 		const active = target === section;
 		switch (target) {
+			case "observability":
+				return <ObservabilityRoute active={active} range={range} />;
+			case "routing":
+				return <ObservabilityRoute active={active} range={range} routing />;
 			case "overview":
 				return <OverviewRoute active={active} range={range} onRequestClick={setSelectedRequestId} />;
 			case "requests":

@@ -15,6 +15,8 @@ import {
 
 export type DashboardSection =
 	| "overview"
+	| "observability"
+	| "routing"
 	| "models"
 	| "providers"
 	| "costs"
@@ -62,6 +64,8 @@ export const NAV: readonly NavGroup[] = [
 		heading: "Insights",
 		items: [
 			{ id: "tools", label: "Tools", icon: Wrench, hotkey: "l" },
+			{ id: "observability", label: "Findings", icon: Activity, hotkey: "b" },
+			{ id: "routing", label: "Routing", icon: PlugZap, hotkey: "u" },
 			{ id: "frustration", label: "Frustration", icon: Frown, hotkey: "f" },
 			{ id: "projects", label: "Projects", icon: FolderGit2, hotkey: "j" },
 			{ id: "gain", label: "Gain", icon: Sparkles, hotkey: "g" },

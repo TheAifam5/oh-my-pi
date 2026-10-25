@@ -2474,6 +2474,7 @@ export class SessionAdvisors {
 	/** Restore an advisor's configured primary once its fallback cooldown expires. */
 	async #maybeRestoreAdvisorRetryFallbackPrimary(advisor: ActiveAdvisor, signal: AbortSignal): Promise<void> {
 		const fallback = advisor.retryFallback;
+		if (advisor.retryFallbackPendingSuccess) return;
 		if (!fallback || fallback.pinned || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") {
 			return;
 		}
@@ -2699,7 +2700,9 @@ export class SessionAdvisors {
 			assistantFailure !== undefined &&
 			isClassifierRefusal(assistantFailure) &&
 			(advisor.retryFallback === undefined || advisor.retryFallback.originalSelector === currentSelector);
-		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		if (!primaryRefused && !AIError.is(errorId, AIError.Flag.ThinkingLoop)) {
+			this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		}
 		const lookups: RetryFallbackHealthLookups = new Map();
 		for (const role of chainKeys) {
 			const candidates = await this.#host.orderedRetryFallbackCandidates(role, currentSelector, currentModel, {

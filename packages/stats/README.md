@@ -63,6 +63,7 @@ console.log(stats.byModel[0].avgTokensPerSecond);
 | `GET /api/stats/models` | Per-model statistics |
 | `GET /api/stats/folders` | Per-folder/project statistics |
 | `GET /api/stats/timeseries` | Hourly time series data |
+| `GET /api/stats/observability` | Local-only headroom, findings, advisor economics, cache and served-call routing aggregates |
 | `GET /api/events` | Server-sent live status: sync progress, data version, rollup backlog |
 | `GET /api/status` | Current live status (same shape as the events) |
 | `POST /api/sync` | Start a background sync; progress arrives on `/api/events` |
@@ -80,7 +81,15 @@ Range queries read `message_rollup` / `tool_rollup` / `session_rollup`, maintain
 
 ## Dashboard
 
-Pages: Overview, Models, Providers, Costs, Requests, Errors, Traces, Tools, Frustration, Projects and Gain. `1`–`6` pick the time range; `g` then a letter jumps to a page. Every page revalidates when the live data version moves, so there is no refresh button.
+Pages: Overview, Models, Providers, Costs, Requests, Errors, Traces, Tools, Findings, Routing, Frustration, Projects and Gain. `1`–`6` pick the time range; `g` then a letter jumps to a page. Every page revalidates when the live data version moves, so there is no refresh button.
+
+Overview includes cache token composition and estimated savings. Models includes latency and TTFT percentiles, timing samples, observed recovery annotations, and cache-adjusted cost per request. Providers includes current budget and limit headroom. Costs includes advisor/model economics and main/advisor/subagent spend. Findings shows a KPI row with previous-period comparisons, a scrollable latest-status ledger, a resolver funnel, severity/category mix, and a resolution-duration histogram. Routing shows completed usage-bearing calls by pool, served model, and anonymized account; it does not count selection attempts or failed calls without usage.
+
+Filters reuse the time-range segmented control with radio-group semantics, arrow-key selection, Home/End navigation, visible focus, and wrapping labels. Provider, window, tool, project, and pool choices are visible without opening a dropdown.
+
+The observability endpoint and mutating API requests return HTTP 403 unless the server is bound to loopback and the request URL, Host, and any Origin match the dashboard's actual host and port. Account identities, account policy names, credential payloads, finding report text, and full session/request identifiers are not returned. Accounts use per-provider ordinal aliases. Effective local caps require launch through `omp stats`; standalone `omp-stats` shows an unavailable-configuration state. Provider-evidence account caps without readable evidence remain unavailable rather than zero.
+
+Findings and recovery metadata are projected into the stats database after session ingestion releases its synchronization lock. Targeted syncs project only the selected transcripts. Unchanged files require no transcript reads; appended files read the new tail and bounded identity checkpoints. Checkpoints are stored as SHA-256 digests; obsolete raw-checkpoint projections are dropped on access. Pending and unreadable transcript counts are shown with findings coverage. Snapshot disappearance does not establish resolution; v1 resolution actors are unrecorded. Resolution duration measures elapsed time from the first observed open snapshot to the observed resolution, with separate reopened episodes; missing timestamps are excluded. Cost per resolved concern/blocker is an aggregate ratio, not a measured causal benefit or an exact review attribution.
 
 ## License
 

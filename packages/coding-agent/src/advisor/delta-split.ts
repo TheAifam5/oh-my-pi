@@ -110,7 +110,7 @@ export function renderAdvisorDeltaChunks(
 	chunks[0].content[0].text = `${heading}\n\n${chunks[0].content[0].text}`;
 	if (opts.wip) {
 		const last = chunks[chunks.length - 1];
-		last.content[0].text += `\n\n---\n\n[in progress — more steps follow]`;
+		last.content[0].text += `\n\n---\n\n<update state="in-progress"/>`;
 	}
 	return chunks as AgentMessage[];
 }

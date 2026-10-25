@@ -30,6 +30,7 @@ import {
 } from "./frustration";
 import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
+import { getObservabilityStats } from "./observability";
 import {
 	prepareStatsPort,
 	recoverStatsPort,
@@ -166,12 +167,34 @@ const STATS_ACTION_HEADER = "X-Omp-Stats-Action";
 /**
  * Handle API requests.
  */
-export async function handleApi(req: Request): Promise<Response> {
+export async function handleApi(
+	req: Request,
+	bindHostname = STATS_DASHBOARD_HOSTNAME,
+	bindPort = 80,
+): Promise<Response> {
 	const url = new URL(req.url);
 	const path = url.pathname;
+	const sensitive = path === "/api/stats/observability" || req.method === "POST";
+	if (sensitive) {
+		const expected = new URL(formatStatsDashboardUrl(bindHostname, bindPort));
+		const host = req.headers.get("host") ?? url.host;
+		const origin = req.headers.get("origin");
+		if (
+			!isStatsLoopbackHost(bindHostname) ||
+			url.origin !== expected.origin ||
+			host !== expected.host ||
+			(origin !== null && origin !== expected.origin)
+		) {
+			return Response.json({ error: "A same-origin loopback dashboard request is required" }, { status: 403 });
+		}
+	}
 
 	// Stats reads are DB-only; ingest runs in the background (see `live.ts`).
 	const range = url.searchParams.get("range");
+
+	if (path === "/api/stats/observability") {
+		return Response.json(await getObservabilityStats(range));
+	}
 
 	if (path === "/api/status") {
 		return Response.json(statsLive().status());
@@ -367,6 +390,12 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
+export function isStatsLoopbackHost(hostname: string): boolean {
+	return (
+		hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(hostname)
+	);
+}
+
 function createDashboardServer(port: number, hostname: string): Server<undefined> {
 	const server = Bun.serve({
 		port,
@@ -396,7 +425,7 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 				let response: Response;
 
 				if (path.startsWith("/api/")) {
-					response = await handleApi(req);
+					response = await handleApi(req, hostname, server.port);
 				} else {
 					response = await handleStatic(path);
 				}

@@ -1,0 +1,138 @@
+.findings-panel {
+	gap: 16px;
+}
+
+.findings-panel > p {
+	margin: 0;
+	line-height: 1.6;
+}
+
+.findings-split {
+	align-items: start;
+}
+
+.findings-split > *,
+.findings-charts {
+	min-width: 0;
+}
+
+.findings-table {
+	max-height: 860px;
+	overflow: auto;
+}
+
+.findings-table .table-wrap {
+	overflow: visible;
+}
+
+.findings-table th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--card);
+}
+
+.findings-table td {
+	padding-top: 10px;
+	padding-bottom: 10px;
+}
+
+@media (max-width: 1100px) {
+	.findings-table {
+		max-height: 480px;
+	}
+}
+
+.findings-funnel {
+	display: grid;
+	gap: 18px;
+}
+
+.findings-funnel-total,
+.findings-actor-label {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	align-items: center;
+}
+
+.findings-funnel-total {
+	padding: 12px 14px;
+	border: 1px solid var(--line-3);
+	border-radius: var(--r-control);
+	background: var(--raised);
+	font-size: 13px;
+}
+
+.findings-funnel strong {
+	font-family: var(--font-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+.findings-actors {
+	display: grid;
+	gap: 12px;
+	margin: 0;
+	padding: 0 14px;
+	list-style: none;
+}
+
+.findings-actor-label {
+	font-size: 12px;
+	color: var(--ink-2);
+	margin-bottom: 6px;
+}
+
+.findings-actor-track {
+	height: 6px;
+	border-radius: var(--r-control);
+	background: var(--raised);
+	overflow: hidden;
+}
+
+.findings-actor-track > div {
+	height: 100%;
+	border-radius: inherit;
+}
+
+.findings-funnel p {
+	margin: 0;
+}
+
+.findings-table:focus-visible {
+	outline: 2px solid var(--focus);
+	outline-offset: -2px;
+}
+
+.findings-category-bars {
+	display: grid;
+	gap: 14px;
+	padding: 0;
+	margin: 0 0 18px;
+	list-style: none;
+}
+
+.findings-category-label {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	font-size: 12px;
+	color: var(--ink-2);
+	margin-bottom: 6px;
+}
+
+.findings-category-label strong {
+	font-family: var(--font-mono);
+}
+
+.findings-category-track {
+	display: flex;
+	height: 8px;
+	background: var(--raised);
+	border-radius: var(--r-control);
+	overflow: hidden;
+}
+
+.findings-category-track span {
+	height: 100%;
+}

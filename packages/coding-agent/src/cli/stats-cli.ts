@@ -9,6 +9,7 @@ import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { openStandaloneJudge } from "../judgment/standalone";
 import { openPath } from "../utils/open";
+import { statsHeadroomPolicies } from "./stats-policy";
 
 /**
  * Single-line TTY progress bar. On a non-TTY stream we just stay quiet -
@@ -76,6 +77,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 		getTotalMessageCount,
 		printStatsSummary,
 		refreshRollups,
+		setHeadroomPolicyProvider,
 		startServer,
 		syncAllSessions,
 	} = await import("@oh-my-pi/omp-stats");
@@ -101,6 +103,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	// streaming progress to the page. The judge (settings, auth, registry)
 	// resolves on the first Frustration estimate/run and lives until exit.
 	const cwd = process.cwd();
+	setHeadroomPolicyProvider(() => statsHeadroomPolicies(cwd));
 	const { hostname, port } = await startServer(cmd.port, cmd.host, {
 		judge: async () => (await openStandaloneJudge(cwd, "stats_frustration")).judge,
 	});

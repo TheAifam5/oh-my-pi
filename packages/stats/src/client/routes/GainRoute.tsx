@@ -1,3 +1,4 @@
+import { Segmented } from "../ui/Segmented";
 import { useMemo, useState } from "react";
 import { getGainDashboardStats } from "../api";
 import { Chart, type ChartSeries, Legend } from "../charts";
@@ -92,20 +93,15 @@ export function GainRoute({ active, range }: GainRouteProps) {
 				description={`Tokens snapcompact kept out of context${scope} in ${meta.windowLabel}.`}
 				actions={
 					projectOptions.length > 0 && (
-						<select
-							className="input"
+						<Segmented
 							aria-label="Project"
 							value={project ?? ""}
-							onChange={e => setProject(e.target.value || null)}
-							style={{ maxWidth: 320 }}
-						>
-							<option value="">All projects</option>
-							{projectOptions.map(p => (
-								<option key={p} value={p}>
-									{p}
-								</option>
-							))}
-						</select>
+							onChange={value => setProject(value || null)}
+							options={[
+								{ value: "", label: "All projects" },
+								...projectOptions.map(project => ({ value: project, label: project })),
+							]}
+						/>
 					)
 				}
 			/>

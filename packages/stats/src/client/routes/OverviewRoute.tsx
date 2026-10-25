@@ -1,3 +1,4 @@
+import { ObservabilityRoute } from "./ObservabilityRoute";
 import { ArrowRight } from "lucide-react";
 import { useMemo, useState } from "react";
 import { getOverviewStats, getRecentRequests } from "../api";
@@ -272,6 +273,7 @@ export function OverviewRoute({ active, range, onRequestClick }: OverviewRoutePr
 					)}
 				</QueryView>
 			</Card>
+			<ObservabilityRoute active={active} range={range} panel="cache" />
 		</div>
 	);
 }

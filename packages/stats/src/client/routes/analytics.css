@@ -1,0 +1,172 @@
+.analytics-panel {
+	gap: 16px;
+	min-width: 0;
+}
+
+.analytics-heading h2 {
+	font-size: 16px;
+	font-weight: 550;
+	letter-spacing: -0.02em;
+	margin: 0 0 4px;
+}
+
+.analytics-heading p,
+.analytics-note {
+	color: var(--ink-3);
+	font-size: 12px;
+	line-height: 1.6;
+	margin: 0;
+}
+
+.analytics-split {
+	align-items: start;
+}
+
+.analytics-split > * {
+	min-width: 0;
+}
+
+.analytics-table {
+	max-height: 540px;
+	overflow: auto;
+}
+
+.analytics-table .table-wrap {
+	overflow: visible;
+}
+
+.analytics-table th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--card);
+}
+
+.analytics-table td {
+	padding-top: 10px;
+	padding-bottom: 10px;
+}
+
+.analytics-table:focus-visible {
+	outline: 2px solid var(--focus);
+	outline-offset: -2px;
+}
+
+.analytics-panel .card-header {
+	flex-wrap: wrap;
+}
+
+.analytics-panel .card-actions {
+	max-width: 100%;
+}
+
+.tools-explorer {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+}
+
+.tools-explorer-detail {
+	border-top: 1px solid var(--line-2);
+	min-width: 0;
+}
+
+.tools-explorer-title {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 16px;
+}
+
+.tools-explorer-title h3 {
+	font-size: 13px;
+	font-weight: 550;
+	margin: 0;
+}
+
+@media (max-width: 600px) {
+	.analytics-table {
+		max-height: 420px;
+	}
+
+	.analytics-panel .stat-foot .truncate {
+		white-space: normal;
+	}
+}
+
+.analytics-fit .table,
+.routing-ledger {
+	table-layout: fixed;
+}
+
+.analytics-fit .table th:first-child {
+	width: 58%;
+}
+
+.analytics-fit .cell-primary,
+.analytics-fit .cell-secondary {
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+.capacity-state {
+	display: grid;
+	gap: 6px;
+	font-size: 11px;
+	color: var(--ink-2);
+}
+
+.routing-ledger thead th:first-child {
+	width: 64%;
+}
+
+.routing-ledger td {
+	white-space: normal;
+	overflow-wrap: anywhere;
+	vertical-align: top;
+}
+
+.routing-ledger th:last-child {
+	text-align: right;
+}
+
+.routing-ledger .routing-pool-row th {
+	position: static;
+	text-align: left;
+	background: var(--raised);
+	color: var(--ink-1);
+	font-size: 12px;
+}
+
+.routing-pool-row th span {
+	float: right;
+	font-family: var(--font-mono);
+	color: var(--ink-2);
+}
+
+.routing-model {
+	font-size: 12px;
+	line-height: 1.5;
+	margin-bottom: 6px;
+}
+
+.routing-value {
+	text-align: right;
+	font-family: var(--font-mono);
+}
+
+.routing-value strong,
+.routing-value span {
+	display: block;
+}
+
+.routing-value span {
+	margin-top: 6px;
+	font-size: 11px;
+	color: var(--ink-3);
+}
+
+.analytics-fit .meter-cell {
+	flex-wrap: wrap;
+	gap: 6px;
+}

@@ -55,7 +55,7 @@ test("keeps Gemini 3.6 advisor context and accepts a silent review", async () =>
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		const advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("advisor did not start");
-		await advisor.prompt("### Session update [in progress — more steps follow]\nImplement an order book.");
+		await advisor.prompt('### Session update\nImplement an order book.\n\n<update state="in-progress"/>');
 		expect(advisor.state.error).toBeUndefined();
 		expect(bodies).toHaveLength(1);
 		expect(bodies[0]).toMatchObject({

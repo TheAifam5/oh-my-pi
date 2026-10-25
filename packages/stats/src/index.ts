@@ -23,6 +23,8 @@ export { refreshRollups } from "./rollup";
 export type { StatsJudge, StatsJudgeProvider } from "./frustration";
 export { getGainDashboardStats } from "./gain-aggregator";
 export { formatStatsDashboardUrl, type StartServerOptions, startServer } from "./server";
+export { setHeadroomPolicyProvider } from "./observability";
+export type { HeadroomPolicy } from "./observability-types";
 export type { GainDashboardStats, GainSource, GainSourceTotals, GainTimeSeriesPoint } from "./shared-types";
 export type {
 	AggregatedStats,

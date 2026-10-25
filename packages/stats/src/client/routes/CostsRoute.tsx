@@ -1,3 +1,4 @@
+import { ObservabilityRoute } from "./ObservabilityRoute";
 import "./costs.css";
 import { useMemo, useState } from "react";
 import { getCostDashboardStats } from "../api";
@@ -177,6 +178,7 @@ export function CostsRoute({ active, range }: CostsRouteProps) {
 					}
 				</QueryView>
 			</Card>
+			<ObservabilityRoute active={active} range={range} panel="economics" />
 		</div>
 	);
 }

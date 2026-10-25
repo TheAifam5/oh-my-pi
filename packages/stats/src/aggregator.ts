@@ -56,6 +56,8 @@ import type {
 	ToolDashboardStats,
 } from "./types";
 import { computeUsageWindowStats, fetchUsageData, type UsageDataSnapshot } from "./usage-windows";
+import { refreshObservabilityIndex } from "./observability-index";
+import { currentDb } from "./db";
 
 const STATS_SYNC_LOCK_RETRY_MS = 25;
 const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
@@ -246,7 +248,7 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * bar walks at a steady rate).
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
-	return withStatsSyncLock(getStatsDbPath(), async () => {
+	const result = await withStatsSyncLock(getStatsDbPath(), async () => {
 		let processed = 0;
 		let files = 0;
 		while (true) {
@@ -256,6 +258,9 @@ export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: 
 			if (!result.reconcile) return { processed, files };
 		}
 	});
+	const database = currentDb();
+	if (database) await refreshObservabilityIndex(database, { files: opts?.files });
+	return result;
 }
 
 /** Recency tiers for {@link orderForIngest}, newest first. */
@@ -288,7 +293,7 @@ async function orderForIngest(files: string[]): Promise<string[]> {
 			});
 		}
 	}
-	ranked.sort((a, b) => a.tier - b.tier || a.born - b.born || a.index - b.index);
+	ranked.sort((a, b) => a.tier - b.tier || a.born - b.born || a.file.localeCompare(b.file) || a.index - b.index);
 	return ranked.map(entry => entry.file);
 }
 
@@ -337,14 +342,14 @@ async function syncAllSessionsLocked(
 		for (const { sessionFile } of batch) report(sessionFile);
 	};
 
-	const finish = () => {
+	const finish = async () => {
 		flush();
-		// A targeted sync cannot settle reconciliation or backfills (they need
-		// every transcript); leave their markers for the next full sync.
-		if (opts?.files) return { processed: totalProcessed, files: filesProcessed, reconcile: false };
-		completeSessionSync(reconcile);
-		markSessionBackfillsComplete();
-		return { processed: totalProcessed, files: filesProcessed, reconcile };
+		// Targeted syncs leave reconciliation and backfill markers for a full sync.
+		if (!opts?.files) {
+			completeSessionSync(reconcile);
+			markSessionBackfillsComplete();
+		}
+		return { processed: totalProcessed, files: filesProcessed, reconcile: opts?.files ? false : reconcile };
 	};
 	if (files.length === 0) return finish();
 

@@ -54,9 +54,10 @@ import * as AIError from "../error";
 import type { Api, AssistantMessage, Model, StreamOptions } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 
-/** Stable lead phrase of the guard's error message; exported for tests. The
- *  message also carries "stream stall" so the session + transport retry
- *  classifiers treat it as a transient (retryable) stop without bespoke rules. */
+/** Lead phrase of thinking-channel loop errors; text-channel errors lead with
+ *  "Output loop detected". Both messages carry "stream stall" and the
+ *  `ThinkingLoop` error flag, which the session + transport retry classifiers
+ *  use to treat the stop as transient (retryable). */
 export const THINKING_LOOP_ERROR_MARKER = "Thinking loop detected";
 
 /** Rolling tail retained for exact suffix-cycle detection. */
@@ -431,6 +432,7 @@ export function guardThinkingLoopStream(
 					firstDeltaAt = Date.now();
 				}
 				let detail: string | null = null;
+				let outputLoop = false;
 				if (event.type === "thinking_delta") {
 					// Re-arm after thinking_end / toolcall_start unless visible answer
 					// text has already latched the detector off. Grok/xAI Responses can
@@ -454,6 +456,7 @@ export function guardThinkingLoopStream(
 					}
 					if (textArmed) {
 						detail = textDetector.push(event.delta);
+						outputLoop = detail !== null;
 					}
 				} else if (event.type === "toolcall_start" || event.type === "toolcall_delta") {
 					textArmed = false;
@@ -462,22 +465,25 @@ export function guardThinkingLoopStream(
 						detail = thinkingDetector.flush();
 					}
 					if (textArmed) {
-						detail = detail || textDetector.flush();
+						const textDetail = textDetector.flush();
+						if (!detail && textDetail) {
+							detail = textDetail;
+							outputLoop = true;
+						}
 					}
 				}
 				if (detail) {
-					logger.warn("Thinking loop detected; aborting stream for retry.", {
+					const marker = outputLoop ? "Output loop detected" : THINKING_LOOP_ERROR_MARKER;
+					logger.warn(`${marker}; aborting stream for retry.`, {
 						model: model.id,
 						provider: model.provider,
 						detail,
 					});
-					controller.abort(
-						AIError.attach(new Error(THINKING_LOOP_ERROR_MARKER), AIError.create(AIError.Flag.ThinkingLoop)),
-					);
+					controller.abort(AIError.attach(new Error(marker), AIError.create(AIError.Flag.ThinkingLoop)));
 					outer.push({
 						type: "error",
 						reason: "error",
-						error: buildThinkingLoopError(model, detail, snapshot, firstDeltaAt),
+						error: buildThinkingLoopError(model, detail, snapshot, firstDeltaAt, outputLoop),
 					});
 					return;
 				}
@@ -536,7 +542,9 @@ function buildThinkingLoopError(
 	detail: string,
 	snapshot: AssistantMessage | undefined,
 	firstDeltaAt: number | undefined,
+	outputLoop: boolean,
 ): AssistantMessage {
+	const marker = outputLoop ? "Output loop detected" : THINKING_LOOP_ERROR_MARKER;
 	const now = Date.now();
 	const duration = snapshot ? (snapshot.duration ?? now - snapshot.timestamp) : undefined;
 	const ttft =
@@ -565,8 +573,9 @@ function buildThinkingLoopError(
 		stopReason: "error",
 		// "stream stall" makes the transport/session retry classifiers treat this
 		// as a transient (retryable) failure with no bespoke rule.
-		errorMessage: `${THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical content (${detail}). Treating as a stream stall and retrying.`,
+		errorMessage: `${marker}: the model repeated near-identical content (${detail}). Treating as a stream stall and retrying.`,
 		errorId: AIError.create(AIError.Flag.ThinkingLoop),
+		loopGuardFailure: outputLoop ? "text" : "thinking",
 		...(snapshot?.responseId && { responseId: snapshot.responseId }),
 		...(duration !== undefined && { duration }),
 		...(ttft !== undefined && { ttft }),

@@ -1,6 +1,8 @@
 import "./models.css";
 import { ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
+import type { ModelObservation } from "../../observability-types";
+import { fetchObservability } from "./ObservabilityRoute";
 import { getModelDashboardStats } from "../api";
 import { type ChartSeries, Legend, Sparkline, TimeChart, useHiddenSeries } from "../charts";
 import { buildModelColorLookup, modelKey, OTHER_COLOR } from "../data/colors";
@@ -63,6 +65,9 @@ export function ModelsRoute({ active, range }: ModelsRouteProps) {
 	const query = useQuery(["models", range], ({ signal }) => getModelDashboardStats(range, signal), {
 		enabled: active,
 	});
+	const observations = useQuery(["observability", range], ({ signal }) => fetchObservability(range, signal), {
+		enabled: active,
+	});
 	const meta = rangeMeta(range);
 	const [mode, setMode] = useState<ShareMode>("share");
 	const [hidden, toggleSeries] = useHiddenSeries();
@@ -71,8 +76,8 @@ export function ModelsRoute({ active, range }: ModelsRouteProps) {
 	const bucketWord = bucketName(meta.bucketMs);
 	// Stable columns: a fresh array would make Table re-sort on every render.
 	const columns = useMemo(
-		() => (view ? buildModelColumns(view, expandedKey, bucketWord) : []),
-		[view, expandedKey, bucketWord],
+		() => (view ? buildModelColumns(view, expandedKey, bucketWord, observations.data?.models ?? []) : []),
+		[view, expandedKey, bucketWord, observations.data],
 	);
 	const isEmpty = (data: ModelDashboardStats) => data.byModel.length === 0;
 	const empty = <EmptyState title="No model usage in this range" hint="Pick a wider range in the top bar." />;
@@ -316,7 +321,12 @@ function modelLabels(models: readonly ModelStats[]): Map<string, string> {
 	);
 }
 
-function buildModelColumns(view: ModelsView, expandedKey: string | null, bucketWord: string): Column<ModelStats>[] {
+function buildModelColumns(
+	view: ModelsView,
+	expandedKey: string | null,
+	bucketWord: string,
+	observations: ModelObservation[],
+): Column<ModelStats>[] {
 	return [
 		{
 			key: "expand",
@@ -353,6 +363,47 @@ function buildModelColumns(view: ModelsView, expandedKey: string | null, bucketW
 					color={view.swatches.get(modelKey(row.model, row.provider)) ?? OTHER_COLOR}
 				/>
 			),
+		},
+		...(["latency", "ttft"] as const).map(metric => ({
+			key: metric === "latency" ? "latencyPercentiles" : "ttftPercentiles",
+			header: metric === "latency" ? "Response time" : "First token",
+			title: "Median and p95; timed sample count shown below",
+			align: "right" as const,
+			render: (row: ModelStats) => {
+				const item = observations.find(item => item.model === row.model && item.provider === row.provider);
+				const median = metric === "latency" ? item?.p50Latency : item?.p50Ttft;
+				const p95 = metric === "latency" ? item?.p95Latency : item?.p95Ttft;
+				const samples = metric === "latency" ? item?.latencySamples : item?.ttftSamples;
+				return (
+					<LabelCell
+						primary={formatDurationMs(median ?? null)}
+						secondary={`p95 ${formatDurationMs(p95 ?? null)} · ${formatInteger(samples ?? 0)} timed`}
+					/>
+				);
+			},
+		})),
+		{
+			key: "costPerRequest",
+			header: "Cost / request",
+			title: "Observed transcript cost including cache reads and writes divided by requests",
+			sort: row => row.totalCost / Math.max(1, row.totalRequests),
+			render: row => formatEstimatedCost(row.totalCost / Math.max(1, row.totalRequests), row.unpricedRequests),
+		},
+		{
+			key: "recovery",
+			header: "Observed recovery",
+			title: "Recovered annotations / all retry annotations; not all failures have recovery evidence",
+			render: row => {
+				const item = observations.find(item => item.model === row.model && item.provider === row.provider);
+				return item?.recoverySamples ? (
+					<LabelCell
+						primary={formatPercent(item.recovered / item.recoverySamples)}
+						secondary={`${formatInteger(item.recovered)} of ${formatInteger(item.recoverySamples)} retries`}
+					/>
+				) : (
+					<span className="dim">No annotations</span>
+				);
+			},
 		},
 		{
 			key: "cost",

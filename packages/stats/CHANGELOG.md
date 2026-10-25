@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added local-only budget headroom, findings outcomes, advisor economics, cache savings, and served-call routing panels, plus model latency percentiles, recovery coverage, and cache-adjusted cost per request.
+
+### Changed
+
+- Dashboard filters reuse the time-range segmented controls with wrapping options and arrow-key selection. Findings outcomes include previous-period KPI comparisons, a scrollable status ledger, resolver funnel, severity mix, and timestamped resolution histogram.
+- Cache savings and advisor economics use KPI summaries, table-first split layouts, and labeled charts. Routing combines serving cohorts with shared pool and metric filters; tool and model breakdowns share one explorer. Model timing columns group medians, tail latency, and sample coverage.
+- Routing cohorts group models and anonymous accounts under pool headers with inline shares. Cache efficiency uses the Overview hit-rate definition; local headroom excludes subscription quota duplicates. Findings show every category with horizontal severity bars and human-readable resolution durations. Narrow time-range controls remain on one line.
+
+### Fixed
+
+- Sensitive dashboard APIs reject foreign Host and Origin values and mismatched ports. Account headroom labels use anonymous per-provider ordinals instead of configured policy names.
+- Findings indexing reads appended transcript tails with bounded checkpoints, respects targeted file syncs, and runs outside the session-ingestion lock.
+- Transcript projection checkpoints contain SHA-256 digests, not raw transcript fragments; the obsolete projection is dropped and rebuilt.
+
 ## [18.12.0] - 2026-10-17
 
 ### Fixed

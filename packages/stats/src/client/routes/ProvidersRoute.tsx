@@ -1,3 +1,4 @@
+import { ObservabilityRoute } from "./ObservabilityRoute";
 import { format } from "@oh-my-pi/pi-utils/dates";
 import { type ReactNode, useMemo, useState } from "react";
 import { getProviderDashboardStats, getProviderWindowStats } from "../api";
@@ -268,6 +269,7 @@ export function ProvidersRoute({ active, range }: ProvidersRouteProps) {
 				selected={selected}
 				onSelect={setPicked}
 			/>
+			<ObservabilityRoute active={active} range={range} panel="headroom" />
 		</div>
 	);
 }
@@ -516,19 +518,15 @@ function PeakHoursCard({
 					: "Tokens by local hour of day"
 			}
 			actions={
-				<select
-					className="input providers-select"
+				<Segmented
 					value={current}
-					onChange={e => setProvider(e.target.value)}
+					onChange={setProvider}
 					aria-label="Provider"
-				>
-					<option value={ALL_PROVIDERS}>All providers</option>
-					{providers.map(p => (
-						<option key={p.provider} value={p.provider}>
-							{p.provider}
-						</option>
-					))}
-				</select>
+					options={[
+						{ value: ALL_PROVIDERS, label: "All providers" },
+						...providers.map(p => ({ value: p.provider, label: p.provider })),
+					]}
+				/>
 			}
 			stale={stale}
 		>
@@ -811,34 +809,21 @@ function WindowUtilizationCard({
 			actions={
 				selected && (
 					<div className="row" style={{ gap: 6 }}>
-						<select
-							className="input providers-select"
+						<Segmented
 							value={selected.provider}
-							onChange={e => {
-								const next = e.target.value;
+							aria-label="Provider"
+							onChange={next => {
 								const first = insights?.find(i => i.provider === next);
 								if (first) onSelect({ provider: next, windowKey: first.windowKey });
 							}}
-							aria-label="Provider"
-						>
-							{providers.map(p => (
-								<option key={p} value={p}>
-									{p}
-								</option>
-							))}
-						</select>
-						<select
-							className="input providers-select"
+							options={providers.map(provider => ({ value: provider, label: provider }))}
+						/>
+						<Segmented
 							value={selected.windowKey}
-							onChange={e => onSelect({ provider: selected.provider, windowKey: e.target.value })}
 							aria-label="Window"
-						>
-							{windows.map(w => (
-								<option key={w.key} value={w.key}>
-									{w.label}
-								</option>
-							))}
-						</select>
+							onChange={windowKey => onSelect({ provider: selected.provider, windowKey })}
+							options={windows.map(window => ({ value: window.key, label: window.label }))}
+						/>
 					</div>
 				)
 			}

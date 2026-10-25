@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { getToolDashboardStats } from "../api";
 import { Legend, Sparkline, TimeChart, useHiddenSeries } from "../charts";
 import { buildColorLookup, OTHER_COLOR } from "../data/colors";
@@ -35,6 +35,7 @@ import {
 	TableSkeleton,
 } from "../ui";
 import "./tools.css";
+import "./analytics.css";
 
 export interface ToolsRouteProps {
 	active: boolean;
@@ -61,6 +62,7 @@ export function ToolsRoute({ active, range }: ToolsRouteProps) {
 	const [metric, setMetric] = useState<CallMetric>("calls");
 	const [hidden, toggleHidden] = useHiddenSeries();
 	const [pickedTool, setToolFilter] = useState<string | null>(null);
+	const modelHeadingRef = useRef<HTMLHeadingElement>(null);
 	const meta = rangeMeta(range);
 
 	const view = useMemo(() => buildToolsView(tools.data, range), [tools.data, range]);
@@ -184,67 +186,51 @@ export function ToolsRoute({ active, range }: ToolsRouteProps) {
 
 			<Card
 				index={2}
-				title="By tool"
-				description={`${ATTRIBUTION_NOTE}. Select a tool to break it down by model.`}
+				title="Tool explorer"
+				description={`${ATTRIBUTION_NOTE}. Select a tool to inspect its models below.`}
 				flush
 				stale={tools.stale}
 			>
 				<QueryView query={tools} skeleton={<TableSkeleton rows={8} />} isEmpty={isEmpty} empty={NO_CALLS}>
-					{() => (
-						<Table
-							rows={view.rows}
-							rowKey={row => row.tool}
-							columns={view.toolColumns}
-							initialSort={{ key: "calls", dir: "desc" }}
-							limit={20}
-							selectedKey={toolFilter}
-							onRowClick={row => setToolFilter(prev => (prev === row.tool ? null : row.tool))}
-							dense
-						/>
+					{data => (
+						<div className="tools-explorer">
+							<div className="analytics-table" role="region" aria-label="Tool usage" tabIndex={0}>
+								<Table
+									rows={view.rows}
+									rowKey={row => row.tool}
+									columns={view.toolColumns}
+									initialSort={{ key: "calls", dir: "desc" }}
+									limit={20}
+									selectedKey={toolFilter}
+									onRowClick={row => setToolFilter(prev => (prev === row.tool ? null : row.tool))}
+									dense
+								/>
+							</div>
+							<div className="tools-explorer-detail">
+								<div className="tools-explorer-title">
+									<h3 ref={modelHeadingRef} tabIndex={-1}>
+										{toolFilter ? `${toolFilter} · model breakdown` : "All tools · model breakdown"}
+									</h3>
+									{toolFilter !== null && (
+										<button
+											type="button"
+											className="btn"
+											data-size="sm"
+											onClick={() => {
+												setToolFilter(null);
+												modelHeadingRef.current?.focus();
+											}}
+										>
+											<X size={13} /> Clear filter
+										</button>
+									)}
+								</div>
+								<div className="analytics-table" role="region" aria-label="Tool model breakdown" tabIndex={0}>
+									<ToolModelTable rows={data.byToolModel} tool={toolFilter} colors={view.colors} />
+								</div>
+							</div>
+						</div>
 					)}
-				</QueryView>
-			</Card>
-
-			<Card
-				index={3}
-				title="By tool and model"
-				description="Which models call which tools, and how often those calls fail"
-				flush
-				stale={tools.stale}
-				actions={
-					<div className="row" style={{ gap: 6 }}>
-						<select
-							className="input tools-filter"
-							value={toolFilter ?? ""}
-							onChange={e => setToolFilter(e.target.value || null)}
-							aria-label="Filter by tool"
-						>
-							<option value="">All tools</option>
-							{view.toolNames.map(name => (
-								<option key={name} value={name}>
-									{name}
-								</option>
-							))}
-						</select>
-						{toolFilter !== null && (
-							<button
-								type="button"
-								className="btn"
-								data-size="sm"
-								data-variant="ghost"
-								data-icon="true"
-								title="Clear tool filter"
-								aria-label="Clear tool filter"
-								onClick={() => setToolFilter(null)}
-							>
-								<X size={13} />
-							</button>
-						)}
-					</div>
-				}
-			>
-				<QueryView query={tools} skeleton={<TableSkeleton rows={8} />} isEmpty={isEmpty} empty={NO_CALLS}>
-					{data => <ToolModelTable rows={data.byToolModel} tool={toolFilter} colors={view.colors} />}
 				</QueryView>
 			</Card>
 		</div>

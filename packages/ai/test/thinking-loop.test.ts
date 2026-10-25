@@ -471,7 +471,7 @@ describe("thinking-loop guard (stream wrapper)", () => {
 
 			expect(result.stopReason).toBe("error");
 			expect(result.content).toEqual([]);
-			expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+			expect(result.errorMessage).toContain("Output loop detected");
 			expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
 		} finally {
 			clearCustomApis();
@@ -966,8 +966,9 @@ describe("loop guard assistant prose/text loops", () => {
 		// Loop-guard output is replay garbage even when it came through text_delta:
 		// drop it so AgentSession can retry with a clean assistant turn.
 		expect(result.content).toEqual([]);
-		expect(result.errorMessage).toContain(THINKING_LOOP_ERROR_MARKER);
+		expect(result.errorMessage).toContain("Output loop detected");
 		expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
+		expect(result.loopGuardFailure).toBe("text");
 		expect(result.errorMessage).toContain("stream stall");
 		expect(isRetryableError(new Error(result.errorMessage))).toBe(true);
 	});

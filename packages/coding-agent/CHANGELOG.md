@@ -67,6 +67,7 @@
 
 ### Fixed
 
+- Advisors no longer replay no-finding chatter or fail quiet reviews on repeated output; loop failures retain bounded recovery without suppressing models session-wide
 - `/account` and `omp account` no longer list or resolve MCP connector OAuth credentials; manage those with `/mcp`
 - Advisor quota reserves are rechecked on each request, not only at preflight
 - Project `.omp/config.yml` `auth.accountPolicies` is ignored with a warning so repositories cannot authorize saved-reset spending or paid draining
