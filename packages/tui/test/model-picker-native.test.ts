@@ -6,6 +6,7 @@ import type { DescribeContext, NativeChild, NativeNode } from "../src/native/nod
 import {
 	ModelHubComponent,
 	type ModelHubPool,
+	type ModelHubPoolTarget,
 	type ModelHubRegistry,
 	type ModelHubSource,
 } from "../src/overlays/model-hub";
@@ -53,7 +54,12 @@ const MODELS = [
 function source(
 	roles: Record<string, string>,
 	mru: string[],
-	pools: { roles?: Record<string, ModelHubPool>; chains?: Record<string, ModelHubPool> } = {},
+	pools: {
+		roles?: Record<string, ModelHubPool>;
+		chains?: Record<string, ModelHubPool>;
+		groups?: Record<string, ModelHubPool>;
+		groupUsers?: Record<string, ModelHubPoolTarget[]>;
+	} = {},
 ): ModelHubSource {
 	return {
 		revision: 0,
@@ -77,7 +83,10 @@ function source(
 		getProjectModelRole: () => undefined,
 		getGlobalModelRole: role => roles[role],
 		getModelRoleSource: () => "global",
-		getPool: target => (target.kind === "role" ? pools.roles : pools.chains)?.[target.key],
+		getPool: target =>
+			(target.kind === "role" ? pools.roles : target.kind === "chain" ? pools.chains : pools.groups)?.[target.key],
+		modelGroupNames: Object.keys(pools.groups ?? {}),
+		modelGroupReferences: name => pools.groupUsers?.[name] ?? [],
 		roleAcceptsPools: () => true,
 		poolWriteBlocker: () => undefined,
 	};
@@ -158,6 +167,7 @@ test("the model hub describes a data-first picker when the terminal has the kind
 	expect(p).toMatchObject({ size: "lg", layout: "rows", preview: "side", icon: "cpu", title: "Models", scope: "all" });
 	expect(p.scopes?.map(scope => [scope.id, scope.count, scope.group])).toEqual([
 		["roles", 2, undefined],
+		["groups", 0, undefined],
 		["all", 5, undefined],
 		["provider:anthropic", 2, "Providers"],
 		["provider:demo", 1, "Providers"],
@@ -334,13 +344,118 @@ test("the Roles view picker names the active preset and ctrl+←/→ switches it
 		return Array.isArray(subtitle) ? subtitle.map(part => part.t).join("") : subtitle;
 	};
 
-	hub.handleInput("\x1b[A"); // All models → Roles
+	hub.handleInput("\x1b[A"); // All models → Groups
+	hub.handleInput("\x1b[A"); // Groups → Roles
 	expect(subtitleText()).toStartWith("Preset fast");
 	hub.handleInput("\x1b[1;5C");
 	expect(switched).toEqual(["slow"]);
 	expect(subtitleText()).toStartWith("Preset slow");
 	hub.handleInput("\x1b[1;5D");
 	expect(switched).toEqual(["slow", "fast"]);
+});
+
+describe("Groups view", () => {
+	const fastRaw = { strategy: "priority", models: { mini: { model: "openai/gpt-5.6-mini" } } };
+	const groupPools = {
+		groups: {
+			fast: {
+				source: { kind: "inline" },
+				strategy: "priority",
+				members: [{ alias: "mini", model: "openai/gpt-5.6-mini", effort: "low" }],
+				funding: ["included"],
+				raw: fastRaw,
+			},
+			spare: {
+				source: { kind: "inline" },
+				strategy: "random",
+				members: [{ alias: "opus", model: "anthropic/claude-opus-5" }],
+				funding: [],
+				raw: { strategy: "random", models: { opus: { model: "anthropic/claude-opus-5" } } },
+			},
+		},
+		groupUsers: { fast: [{ kind: "role", key: "smol" }] },
+	} satisfies Parameters<typeof source>[2];
+
+	function groupsHub() {
+		const writes: unknown[] = [];
+		const hub = new ModelHubComponent(
+			ui,
+			source({ default: "demo/demo", smol: "+fast" }, [], groupPools),
+			registry(MODELS),
+			MODELS.map(entry => ({ model: entry })),
+			{
+				onAssign: () => {},
+				onUnassign: () => {},
+				onCancel: () => {},
+				onPoolChange: (target, value) => {
+					writes.push([target, value]);
+					return undefined;
+				},
+			},
+		);
+		hubs.push(hub);
+		hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "groups", mods: [] });
+		return { hub, writes };
+	}
+
+	test("lists every modelGroups entry with who uses it, its members and columns, then New group", () => {
+		const { hub } = groupsHub();
+		const p = props(hub.describe(withPicker));
+		expect(p.scopes?.map(scope => scope.id).slice(0, 3)).toEqual(["roles", "groups", "all"]);
+		expect(p.tabs).toBeUndefined();
+		expect(p.order?.filter(entry => typeof entry === "string")).toEqual([
+			"group:fast",
+			"member:group:fast:mini",
+			"group:spare",
+			"member:group:spare:opus",
+			"newGroup",
+		]);
+		const item = (id: string) => p.items?.find(entry => entry.id === id);
+		expect(item("group:fast")).toMatchObject({
+			label: "+fast",
+			detail: "used by modelRoles.smol",
+			facts: { model: "1 model", billing: "included", routing: "priority" },
+		});
+		// An unreferenced group still shows, muted and marked unused.
+		expect(item("group:spare")).toMatchObject({ detail: "unused", tone: "muted" });
+		expect(item("member:group:fast:mini")?.facts).toMatchObject({ model: "openai/gpt-5.6-mini", thinking: "low" });
+	});
+
+	test("x deletes only an unused group; a used one is refused with its users", () => {
+		const { hub, writes } = groupsHub();
+		const act = (act: string) => hub.handleNativeEvent({ type: "action", key: "", act, mods: [] });
+		hub.handleNativeEvent({ type: "select", key: "", item: "group:fast" });
+		act("roles:clear");
+		expect(writes).toEqual([]);
+		expect(JSON.stringify(props(hub.describe(withPicker)).subtitle)).toContain("used by modelRoles.smol");
+
+		hub.handleNativeEvent({ type: "select", key: "", item: "group:spare" });
+		act("roles:clear");
+		expect(writes).toEqual([[{ kind: "group", key: "spare" }, undefined]]);
+	});
+
+	test("a group's member edits write the modelGroups entry, and New group writes its first member", () => {
+		const { hub, writes } = groupsHub();
+		hub.handleNativeEvent({ type: "select", key: "", item: "group:fast" });
+		hub.handleInput("g"); // strategy: priority → round-robin
+		expect(writes.at(-1)).toMatchObject([{ kind: "group", key: "fast" }, { strategy: "round-robin" }]);
+
+		hub.handleNativeEvent({ type: "select", key: "", item: "newGroup" });
+		hub.handleNativeEvent({ type: "activate", key: "", item: "newGroup" });
+		for (const char of "fresh") hub.handleInput(char);
+		hub.handleInput("\r");
+		expect(props(hub.describe(withPicker)).subtitle).toBe("New group +fresh — pick its first model");
+		hub.handleNativeEvent({ type: "activate", key: "", item: "openai/gpt-5.6" });
+		expect(writes.at(-1)).toEqual([
+			{ kind: "group", key: "fresh" },
+			{
+				strategy: "priority",
+				strategyOptions: { order: ["gpt-5-6"] },
+				models: { "gpt-5-6": { model: "openai/gpt-5.6" } },
+			},
+		]);
+		expect(props(hub.describe(withPicker)).scope).toBe("groups");
+	});
 });
 
 test("pools render inside the roles picker and their actions edit only what the pool allows", () => {

@@ -9,6 +9,7 @@
 
 ### Added
 
+- `/models` has a Groups view below Roles that lists every `modelGroups` entry, including unused ones, and creates, renames, edits and deletes groups, in Tern and the TUI
 - `/settings` in Tern shows the active scope and offers a Change scope action
 - `/advisor findings` opens a findings list with detail and resolve/reopen actions, including in Tern
 - `/advisor configure` edits per-advisor quota reserve and reserved action, including in Tern

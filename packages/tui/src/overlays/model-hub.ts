@@ -116,7 +116,8 @@ const MODEL_HUB_BODY_MIN_WIDTH = 28;
  * roles, `provider/model-id`, and `provider/*` keys uniformly. A role whose
  * value is a pool summarizes it on its own row; a chain configured as a pool
  * gets a `pool` summary row in place of its entries. `poolMember` rows list a
- * pool's members under its summary.
+ * pool's members under its summary. The Groups view lists one `group` row per
+ * `modelGroups` entry (`role` holds its name) with its members, then `newGroup`.
  */
 type RolesRow =
 	| { kind: "role"; role: string }
@@ -124,30 +125,31 @@ type RolesRow =
 	| { kind: "fallback"; role: string; chainIndex: number; selector: string }
 	| { kind: "pool"; role: string }
 	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string }
+	| { kind: "group"; role: string }
 	| { kind: "separator" }
 	| { kind: "newFallback" }
-	| { kind: "newRole" };
+	| { kind: "newRole" }
+	| { kind: "newGroup" };
 
 /**
  * What the model browser is currently picking for: a role's model, a slot in
  * a fallback chain (`role` may be a role name, model selector, or `provider/*`
- * key), the primary model a brand-new fallback chain protects, or a pool
- * member (`alias` replaces that member, `null` adds one).
+ * key), the primary model a brand-new fallback chain protects, a pool
+ * member (`alias` replaces that member, `null` adds one), or the first member
+ * of the new `modelGroups.<name>`.
  */
 type AssignTarget =
 	| { kind: "role"; role: string }
 	| { kind: "fallback"; role: string; index: number | null }
 	| { kind: "fallbackKey" }
-	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string | null };
+	| { kind: "poolMember"; role: string; target: ModelHubPoolTarget; alias: string | null }
+	| { kind: "newGroup"; name: string };
 
-/** A pool's settings entry: a role's `modelRoles` value or a `retry.fallbackChains` entry. */
+/** A pool's settings entry: a role's `modelRoles` value, a `retry.fallbackChains` entry, or a `modelGroups` entry. */
 export interface ModelHubPoolTarget {
-	kind: "role" | "chain";
+	kind: "role" | "chain" | "group";
 	key: string;
 }
-
-/** Where a pool edit is written: a role or chain entry, or the `modelGroups.<key>` entry a reference names. */
-export type ModelHubWriteTarget = ModelHubPoolTarget | { kind: "group"; key: string };
 
 /** One pool member as the hub shows it. */
 export interface ModelHubPoolMember {
@@ -292,7 +294,7 @@ export interface ModelHubCallbacks {
 	 * refused and nothing was written.
 	 */
 	onPoolChange?: (
-		target: ModelHubWriteTarget,
+		target: ModelHubPoolTarget,
 		value: Readonly<Record<string, unknown>> | undefined,
 	) => string | undefined;
 	/** Locked provider activation: forward to the /login flow. */
@@ -339,7 +341,7 @@ export interface ModelHubOptions {
 	currentSelector?: string;
 }
 
-interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "all" | "separator" | "provider"> {
+interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "groups" | "all" | "separator" | "provider"> {
 	providerId?: string;
 	locked?: boolean;
 	oauth?: boolean;
@@ -444,7 +446,8 @@ type RolesAction =
 	| "quotaUnknown"
 	| "reserve"
 	| "routing"
-	| "groups";
+	| "groups"
+	| "rename";
 
 /** Printable keys of the Roles view and the command each runs. */
 const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
@@ -470,6 +473,7 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	r: "reserve",
 	e: "routing",
 	G: "groups",
+	R: "rename",
 };
 
 /** Strategies `g` cycles through: each needs no options, or only an `order` the hub derives from the members. */
@@ -615,12 +619,20 @@ function rolesRowKey(row: RolesRow, index: number): string {
 			return `pooled:${row.role}`;
 		case "poolMember":
 			return `member:${row.target.kind}:${row.role}:${row.alias}`;
+		case "group":
+			return `group:${row.role}`;
 		case "separator":
 			return `sep:${index}`;
 		case "newRole":
 		case "newFallback":
+		case "newGroup":
 			return row.kind;
 	}
+}
+
+/** Whether a sidebar entry kind shows the Roles-view rows: Roles itself, or the Groups view built on them. */
+function isRolesView(kind: string): boolean {
+	return kind === "roles" || kind === "groups";
 }
 
 /**
@@ -743,6 +755,8 @@ export class ModelHubComponent implements Component {
 	 */
 	#poolStatus: { text: string; tone: "error" | "warning" } | undefined;
 	#roleIndex = 0;
+	/** Which view `#rolesRows` was built for; switching between Roles and Groups rebuilds them. */
+	#rowsBuiltFor: "roles" | "groups" = "roles";
 	/** Footer hint page `?` selected for the pool row at `index`; page 0 elsewhere. */
 	#poolHintPage: { index: number; page: number } | undefined;
 	#roleHover: number | null = null;
@@ -775,7 +789,7 @@ export class ModelHubComponent implements Component {
 		const rows = Math.max(1, Math.floor(height ?? 10));
 		const lines: string[] = [this.#statusRow(width)];
 		const entry = this.#activeEntry();
-		if (entry.kind === "roles" && this.#assigning === null) {
+		if (isRolesView(entry.kind) && this.#assigning === null) {
 			lines.push(...this.#renderRolesView(width, rows - 1));
 		} else if (entry.kind === "provider" && entry.locked && this.#assigning === null) {
 			lines.push(...this.#renderLockedView(entry, width, rows - 1));
@@ -1054,6 +1068,7 @@ export class ModelHubComponent implements Component {
 				label: "Roles",
 				annotation: `${assignedCount}/${visibleRoles.length}`,
 			},
+			{ id: "groups", kind: "groups", label: "Groups", annotation: String(this.#modelGroupNames().length) },
 			{ id: "all", kind: "all", label: "All models", annotation: String(availableModels.length) },
 		];
 
@@ -1180,6 +1195,12 @@ export class ModelHubComponent implements Component {
 				break;
 			}
 			case "roles":
+			case "groups":
+				if (this.#rowsBuiltFor !== entry.kind) {
+					this.#roleIndex = 0;
+					this.#roleScrollStart = 0;
+					this.#buildRolesRows();
+				}
 				this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRowCount - 1));
 				break;
 			default:
@@ -1322,6 +1343,18 @@ export class ModelHubComponent implements Component {
 		this.#poolCache.clear();
 		this.#billingCache.clear();
 		const rows: RolesRow[] = [];
+		const groupsView = this.#activeEntryId === "groups";
+		this.#rowsBuiltFor = groupsView ? "groups" : "roles";
+		if (groupsView) {
+			for (const name of [...this.#modelGroupNames()].sort()) {
+				const target: ModelHubPoolTarget = { kind: "group", key: name };
+				rows.push({ kind: "group", role: name });
+				rows.push(...this.#poolMemberRows(name, target, this.#pool(target)));
+			}
+			if (this.#callbacks.onPoolChange) rows.push({ kind: "newGroup" });
+			this.#rolesRows = rows;
+			return;
+		}
 		const chains = this.#fallbackChains();
 		const appendChainPool = (key: string): void => {
 			rows.push({ kind: "pool", role: key });
@@ -1463,7 +1496,7 @@ export class ModelHubComponent implements Component {
 	#isHopSkipped(entry: SidebarEntry): boolean {
 		if (entry.kind === "separator") return true;
 		if (!this.#searchCounts) return false;
-		if (entry.kind === "roles") return true;
+		if (isRolesView(entry.kind)) return true;
 		if (entry.kind === "recent") return this.#recentSearchCount === 0;
 		if (entry.kind === "provider") {
 			if (entry.locked) return true;
@@ -1636,6 +1669,8 @@ export class ModelHubComponent implements Component {
 				this.#openFallbackKeyStrip(item);
 			} else if (target.kind === "poolMember") {
 				this.#commitPoolMember(item, target);
+			} else if (target.kind === "newGroup") {
+				this.#commitNewGroup(item, target.name);
 			} else {
 				this.#commitFallback(item, target);
 			}
@@ -2231,10 +2266,26 @@ export class ModelHubComponent implements Component {
 	}
 
 	#cancelAssign(): void {
+		const home = this.#assignHome(this.#assigning);
 		this.#assigning = null;
 		this.#browser.setQuery("");
-		this.#setActiveEntry("roles");
+		this.#setActiveEntry(home);
 		this.#focus = "list";
+	}
+
+	/** The view a pick returns to: Groups for a group's member or a new group, else Roles. */
+	#assignHome(assign: AssignTarget | null): "roles" | "groups" {
+		const group = assign?.kind === "newGroup" || (assign?.kind === "poolMember" && assign.target.kind === "group");
+		return group ? "groups" : "roles";
+	}
+
+	/** What a role, fallback or pool-member pick is for: `+name` for a group's member, else the role's tag. */
+	#assignLabel(assign: Exclude<AssignTarget, { kind: "fallbackKey" } | { kind: "newGroup" }>): string {
+		if (assign.kind === "poolMember" && assign.target.kind === "group") {
+			return `+${sanitizeDisplayLine(assign.target.key)}`;
+		}
+		const info = this.#settings.getRoleInfo(assign.role);
+		return info.tag ?? info.name ?? assign.role;
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2252,6 +2303,8 @@ export class ModelHubComponent implements Component {
 				return this.#isPooledChain(row.role) ? { kind: "chain", key: row.role } : undefined;
 			case "poolMember":
 				return row.target;
+			case "group":
+				return { kind: "group", key: row.role };
 			default:
 				return undefined;
 		}
@@ -2295,7 +2348,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	/** Persist `value` at `target` through the host; the refusal (sanitized) when nothing was written. */
-	#savePool(target: ModelHubWriteTarget, value: Readonly<Record<string, unknown>> | undefined): string | undefined {
+	#savePool(target: ModelHubPoolTarget, value: Readonly<Record<string, unknown>> | undefined): string | undefined {
 		const write = this.#callbacks.onPoolChange;
 		if (!write) return "pool edits are not available here";
 		let error: string | undefined;
@@ -2311,7 +2364,7 @@ export class ModelHubComponent implements Component {
 	 * Persist `value` at `target` through the host. A refused value leaves the
 	 * settings untouched and its validator message in the status row.
 	 */
-	#writePool(target: ModelHubWriteTarget, value: Readonly<Record<string, unknown>> | undefined): boolean {
+	#writePool(target: ModelHubPoolTarget, value: Readonly<Record<string, unknown>> | undefined): boolean {
 		const error = this.#savePool(target, value);
 		this.#poolStatus = error === undefined ? undefined : { text: error, tone: "error" };
 		this.#refreshAfterMutation();
@@ -2331,7 +2384,7 @@ export class ModelHubComponent implements Component {
 	#poolDraft(
 		target: ModelHubPoolTarget,
 		mutate: (draft: Record<string, unknown>) => boolean,
-	): { write: ModelHubWriteTarget; draft: Record<string, unknown> } | undefined {
+	): { write: ModelHubPoolTarget; draft: Record<string, unknown> } | undefined {
 		const pool = this.#pool(target);
 		if (!this.#poolEditable(pool)) return undefined;
 		const draft = structuredClone(pool.raw) as Record<string, unknown>;
@@ -2431,7 +2484,7 @@ export class ModelHubComponent implements Component {
 		// A validator refusal outranks the hub's own note.
 		if (notice !== undefined && this.#poolStatus?.tone !== "error") this.#poolNotice(notice);
 		this.#browser.setQuery("");
-		this.#setActiveEntry("roles");
+		this.#setActiveEntry(assign.target.kind === "group" ? "groups" : "roles");
 		this.#focus = "list";
 		this.#landOnPoolMember(assign.target, landed);
 	}
@@ -2856,6 +2909,8 @@ export class ModelHubComponent implements Component {
 				target = { kind: "chain", key: row.role };
 				break;
 			case "poolMember":
+				// A group's own members define it; pointing a group at another group is not a thing.
+				if (row.target.kind === "group") return undefined;
 				target = row.target;
 				break;
 			default:
@@ -2868,9 +2923,11 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
-	/** Config path of a role or chain entry. */
+	/** Config path of a role, chain or group entry. */
 	#entryPath(target: ModelHubPoolTarget): string {
-		return `${target.kind === "role" ? "modelRoles" : "retry.fallbackChains"}.${target.key}`;
+		const section =
+			target.kind === "role" ? "modelRoles" : target.kind === "chain" ? "retry.fallbackChains" : "modelGroups";
+		return `${section}.${target.key}`;
 	}
 
 	/**
@@ -2991,6 +3048,62 @@ export class ModelHubComponent implements Component {
 		this.#writePool({ kind: "group", key: name }, undefined);
 	}
 
+	/** Groups view `n`: name a new `modelGroups` entry, then browse the catalog for its first member. */
+	#startNewGroup(): void {
+		if (!this.#callbacks.onPoolChange) return;
+		this.#openPoolField("New group name:", "(lowercase letters, digits, - and _)", "", value => {
+			const name = value.trim();
+			if (name.length === 0) return "Enter a group name";
+			if (this.#modelGroupNames().includes(name)) return `modelGroups.${name} already exists`;
+			const blocker = this.#settings.modelGroupWriteBlocker?.(name);
+			if (blocker !== undefined) return `modelGroups.${name} is ${blocker}`;
+			this.#assigning = { kind: "newGroup", name };
+			this.#focus = "scope";
+			this.#browser.setShowProvider(true);
+			this.#setCandidateItems(this.#availableItems);
+			this.#browser.setQuery("");
+			return undefined;
+		});
+	}
+
+	/** Write `modelGroups.<name>` as a priority group whose only member is the picked model, and land on it. */
+	#commitNewGroup(item: ModelBrowserItem, name: string): void {
+		const alias = uniquePoolAlias(item.selector, []);
+		const written = this.#writePool(
+			{ kind: "group", key: name },
+			{ strategy: "priority", strategyOptions: { order: [alias] }, models: { [alias]: { model: item.selector } } },
+		);
+		this.#browser.setQuery("");
+		this.#setActiveEntry("groups");
+		this.#focus = "list";
+		if (written) this.#landOnPoolMember({ kind: "group", key: name }, alias);
+	}
+
+	/** Groups view `x`: remove `modelGroups.<name>`; declined while an entry references it. */
+	#deleteUnusedGroup(name: string): void {
+		const users = this.#groupReferences(name);
+		if (users.length > 0) {
+			const paths = users.map(reference => this.#entryPath(reference)).join(", ");
+			this.#poolNotice(`+${name} is used by ${paths}; point those elsewhere first`);
+			return;
+		}
+		if (!this.#poolClearable({ kind: "group", key: name })) return;
+		this.#writePool({ kind: "group", key: name }, undefined);
+		this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
+	}
+
+	/** Groups view `R`: rename `modelGroups.<name>` and every entry that references it. */
+	#startRenameGroup(name: string): void {
+		const pool = this.#pool({ kind: "group", key: name });
+		if (this.#poolEditable(pool)) this.#openRenameGroup(name, pool.raw);
+	}
+
+	/** The entries that reference `modelGroups.<name>`, as config paths; "unused" when none do. */
+	#groupUsers(name: string): string {
+		const users = this.#groupReferences(name);
+		return users.length > 0 ? users.map(reference => this.#entryPath(reference)).join(", ") : "unused";
+	}
+
 	// ─── Pool display ───────────────────────────────────────────────────────
 
 	/** A pool's column cells: source and member count, funding order, strategy with routing badges. */
@@ -3046,9 +3159,13 @@ export class ModelHubComponent implements Component {
 	/** Column cells of a non-role Roles row (pool, pool member, fallback); undefined for other kinds. */
 	#rolesRowCells(row: RolesRow): RolesRowCells | undefined {
 		switch (row.kind) {
-			case "pool": {
-				const columns = this.#poolColumns(this.#chainPool(row.role));
-				return { model: columns.model, billing: columns.funding, routing: columns.routing };
+			case "pool":
+			case "group": {
+				const pool = row.kind === "pool" ? this.#chainPool(row.role) : this.#pool({ kind: "group", key: row.role });
+				const columns = this.#poolColumns(pool);
+				// A group defines members, so its Model cell is just the count.
+				const model = row.kind === "group" ? columns.model.replace(/^pool · /, "") : columns.model;
+				return { model, billing: columns.funding, routing: columns.routing };
 			}
 			case "poolMember": {
 				const member = this.#poolMemberOf(row);
@@ -3112,6 +3229,8 @@ export class ModelHubComponent implements Component {
 					cells: cells.thinking && glyph ? { ...cells, thinking: `${glyph} ${cells.thinking}` } : cells,
 				};
 			}
+			case "group":
+				return { name: `  +${sanitizeDisplayLine(row.role)}`, cells: this.#rolesRowCells(row) ?? {} };
 			case "pool":
 				return { name: "  ↳ fallback pool", cells: this.#rolesRowCells(row) ?? {} };
 			case "fallback":
@@ -3331,7 +3450,7 @@ export class ModelHubComponent implements Component {
 		}
 
 		const entry = this.#activeEntry();
-		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const rolesView = isRolesView(entry.kind) && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked && this.#assigning === null;
 
 		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
@@ -3345,23 +3464,24 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 		// Ctrl+←/→ in the Roles view steps through saved model presets, wrapping.
-		if (rolesView && (matchesKey(data, "ctrl+left") || matchesKey(data, "ctrl+right"))) {
+		const rolesOnly = rolesView && entry.kind === "roles";
+		if (rolesOnly && (matchesKey(data, "ctrl+left") || matchesKey(data, "ctrl+right"))) {
 			this.#switchPreset(matchesKey(data, "ctrl+left") ? -1 : 1);
 			return;
 		}
 		// Alt+←/→ cycles whichever tab strip is on screen: role tabs in the
-		// Roles view, kind tabs in every browser view. Ctrl+←/→ is unusable on
-		// macOS (Spaces shortcut). macOS terminals (ghostty, Terminal.app,
-		// iTerm) send ESC b / ESC f for Option+←/→, which parse as alt+b /
-		// alt+f — the same aliases the editor's word-motion bindings accept.
+		// Roles view, kind tabs in every browser view; the Groups view has none.
+		// Ctrl+←/→ is unusable on macOS (Spaces shortcut). macOS terminals
+		// (ghostty, Terminal.app, iTerm) send ESC b / ESC f for Option+←/→, which
+		// parse as alt+b / alt+f — the same aliases the editor's word-motion bindings accept.
 		if (matchesKey(data, "alt+left") || matchesKey(data, "alt+b")) {
-			if (rolesView) this.#moveRoleTab(-1);
-			else this.#moveModelKind(-1);
+			if (rolesOnly) this.#moveRoleTab(-1);
+			else if (!rolesView) this.#moveModelKind(-1);
 			return;
 		}
 		if (matchesKey(data, "alt+right") || matchesKey(data, "alt+f")) {
-			if (rolesView) this.#moveRoleTab(1);
-			else this.#moveModelKind(1);
+			if (rolesOnly) this.#moveRoleTab(1);
+			else if (!rolesView) this.#moveModelKind(1);
 			return;
 		}
 
@@ -3506,7 +3626,7 @@ export class ModelHubComponent implements Component {
 			if (entry && !this.#isHopSkipped(entry)) {
 				// Scope changes keep an active assignment (scoping helps find the
 				// model); landing on the Roles view cancels it.
-				if (entry.kind === "roles") this.#assigning = null;
+				if (isRolesView(entry.kind)) this.#assigning = null;
 				this.#setActiveEntry(entry.id);
 				return;
 			}
@@ -3533,6 +3653,12 @@ export class ModelHubComponent implements Component {
 			case "chainKey":
 			case "pool":
 				this.#startAssignFallback(row.role, null);
+				return;
+			case "group":
+				this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
+				return;
+			case "newGroup":
+				this.#startNewGroup();
 				return;
 			case "poolMember":
 				this.#startAssignPoolMember(row.role, row.target, row.alias);
@@ -3641,6 +3767,7 @@ export class ModelHubComponent implements Component {
 				if (role && this.#rolePool(role)) this.#unassignPooledRole(role);
 				else if (role) this.#unassignRole(role);
 				else if (row?.kind === "fallback") this.#removeFallback(row);
+				else if (row?.kind === "group") this.#deleteUnusedGroup(row.role);
 				else if (row?.kind === "poolMember") {
 					if (editable) this.#removePoolMember(row.target, row.alias);
 				} else if (row?.kind === "pool" || (row?.kind === "chainKey" && this.#isPooledChain(row.role))) {
@@ -3651,9 +3778,11 @@ export class ModelHubComponent implements Component {
 				return;
 			case "fallback":
 				if (row?.kind === "newFallback") this.#startAssignFallbackKey();
-				else if (row?.kind === "poolMember" && row.target.kind === "chain") {
+				else if (row?.kind === "group") {
+					this.#startAssignPoolMember(row.role, { kind: "group", key: row.role }, null);
+				} else if (row?.kind === "poolMember" && row.target.kind !== "role") {
 					this.#startAssignPoolMember(row.role, row.target, null);
-				} else if (row && row.kind !== "newRole" && row.kind !== "separator") {
+				} else if (row && row.kind !== "newRole" && row.kind !== "separator" && row.kind !== "newGroup") {
 					this.#startAssignFallback(row.role, null);
 				}
 				return;
@@ -3705,14 +3834,19 @@ export class ModelHubComponent implements Component {
 				this.#openGroupStrip(row);
 				return;
 			case "new":
-				this.#openNameStrip("role");
+				if (this.#activeEntryId === "groups") this.#startNewGroup();
+				else this.#openNameStrip("role");
+				return;
+			case "rename":
+				if (row?.kind === "group") this.#startRenameGroup(row.role);
 				return;
 			case "save":
-				if (this.#callbacks.onSavePreset) this.#openNameStrip("preset");
+				if (this.#callbacks.onSavePreset && this.#activeEntryId === "roles") this.#openNameStrip("preset");
 				return;
 			case "nextPreset":
 			case "prevPreset":
-				this.#switchPreset(action === "nextPreset" ? 1 : -1);
+				// Presets hold role assignments; the Groups view has none to switch.
+				if (this.#activeEntryId === "roles") this.#switchPreset(action === "nextPreset" ? 1 : -1);
 				return;
 			case "compaction":
 				this.#openCompactionStrip();
@@ -3769,7 +3903,7 @@ export class ModelHubComponent implements Component {
 				this.#frame.scrollSidebar(event.wheel, bodyHeight, this.#entries.length);
 				this.#sidebarHover = this.#sidebarEntryIndexAt(contentLine);
 			} else if (overBody) {
-				if (entry.kind === "roles" && this.#assigning === null) {
+				if (isRolesView(entry.kind) && this.#assigning === null) {
 					this.#roleIndex = this.#stepRoleIndex(this.#roleIndex, event.wheel > 0 ? 1 : -1, { wrap: false });
 				} else if (this.#isBrowserView(entry) && bodyLine > 0) {
 					this.#browser.routeMouse(event, bodyLine - 1);
@@ -3780,7 +3914,7 @@ export class ModelHubComponent implements Component {
 
 		if (event.motion) {
 			this.#sidebarHover = overSidebar ? this.#sidebarEntryIndexAt(contentLine) : null;
-			if (overBody && entry.kind === "roles" && this.#assigning === null) {
+			if (overBody && isRolesView(entry.kind) && this.#assigning === null) {
 				const roleLine = bodyLine - this.#rolesRowStart;
 				this.#roleHover =
 					roleLine >= 0 && roleLine < this.#rolesVisibleCount ? roleLine + this.#roleScrollStart : null;
@@ -3806,7 +3940,7 @@ export class ModelHubComponent implements Component {
 		}
 
 		if (overBody) {
-			if (entry.kind === "roles" && this.#assigning === null) {
+			if (isRolesView(entry.kind) && this.#assigning === null) {
 				this.#focus = "list";
 				const listLine = bodyLine - this.#rolesRowStart;
 				if (listLine >= 0 && listLine < this.#rolesVisibleCount) {
@@ -3835,10 +3969,10 @@ export class ModelHubComponent implements Component {
 	#clickSidebarEntry(clicked: SidebarEntry | undefined): void {
 		if (!clicked || clicked.kind === "separator") return;
 		const already = clicked.id === this.#activeEntryId;
-		if (clicked.kind === "roles") this.#assigning = null;
+		if (isRolesView(clicked.kind)) this.#assigning = null;
 		this.#setActiveEntry(clicked.id);
 		// A click on Roles is a deliberate dive into the rows.
-		if (clicked.kind === "roles") this.#focus = "list";
+		if (isRolesView(clicked.kind)) this.#focus = "list";
 		if (already && clicked.kind === "provider" && clicked.locked) {
 			this.#requestLogin(clicked);
 		}
@@ -3880,11 +4014,11 @@ export class ModelHubComponent implements Component {
 			}
 		}
 		// Search-ineligible entries gray out, but keep their place in the viewport.
-		const muted = entry.locked || matchCount === 0 || (searching && entry.kind === "roles");
+		const muted = entry.locked || matchCount === 0 || (searching && isRolesView(entry.kind));
 		let icon: string;
 		if (entry.kind === "recent") {
 			icon = theme.icon.time;
-		} else if (entry.kind === "roles") {
+		} else if (isRolesView(entry.kind)) {
 			icon = theme.icon.extensionSkill;
 		} else if (entry.kind === "all") {
 			icon = theme.icon.model;
@@ -3951,8 +4085,14 @@ export class ModelHubComponent implements Component {
 					width,
 				);
 			}
-			const info = this.#settings.getRoleInfo(this.#assigning.role);
-			const label = info.tag ?? info.name ?? this.#assigning.role;
+			if (this.#assigning.kind === "newGroup") {
+				const name = sanitizeDisplayLine(this.#assigning.name);
+				return truncateToWidth(
+					theme.fg("accent", ` New group +${name} — ${enter} picks its first model, ${cancel} cancels`),
+					width,
+				);
+			}
+			const label = this.#assignLabel(this.#assigning);
 			if (this.#assigning.kind === "poolMember") {
 				return truncateToWidth(
 					theme.fg(
@@ -3987,6 +4127,9 @@ export class ModelHubComponent implements Component {
 			case "roles":
 				text = `Model roles — ${formatKeyHint("f")} adds a retry fallback, cleared roles fall back to auto-selection`;
 				break;
+			case "groups":
+				text = `Model groups — shared pools roles use as +name; ${formatKeyHint("n")} adds one`;
+				break;
 			case "provider":
 				if (entry.locked) {
 					text = `${entry.label} · not configured`;
@@ -4004,7 +4147,7 @@ export class ModelHubComponent implements Component {
 			text = this.#configError;
 			return truncateToWidth(theme.fg("error", ` ${text}`), width);
 		}
-		if (this.#poolStatus && entry.kind === "roles") {
+		if (this.#poolStatus && isRolesView(entry.kind)) {
 			return truncateToWidth(theme.fg(this.#poolStatus.tone, ` ${this.#poolStatus.text}`), width);
 		}
 		return truncateToWidth(theme.fg("muted", ` ${text}`), width);
@@ -4012,7 +4155,7 @@ export class ModelHubComponent implements Component {
 
 	/** Whether `x` may remove the whole entry at `target`: the global layer supplies it, so the removal takes effect. */
 	#poolClearable(target: ModelHubPoolTarget): boolean {
-		if (!this.#callbacks.onPoolChange && target.kind === "chain") return false;
+		if (!this.#callbacks.onPoolChange && target.kind !== "role") return false;
 		try {
 			return this.#settings.poolWriteBlocker?.(target) === undefined;
 		} catch {
@@ -4048,7 +4191,15 @@ export class ModelHubComponent implements Component {
 				: []),
 			...(this.#groupsAvailable(row) ? [{ label: "group", keys: ["shift+g"] as KeyName[] }] : []),
 		];
-		if (row.kind === "role") {
+		if (row.kind === "group") {
+			hints.push(
+				editable && { label: "add member", keys: ["enter"] },
+				editable && { label: "rename", keys: ["shift+r"] },
+				this.#poolClearable(target) && { label: "delete", keys: ["x"] },
+				{ label: "new group", keys: ["n"] },
+				...routing,
+			);
+		} else if (row.kind === "role") {
 			hints.push(
 				editable && { label: "add member", keys: ["enter"] },
 				this.#rolePool(row.role)?.invalid !== undefined && { label: "replace", keys: ["enter"] },
@@ -4065,7 +4216,7 @@ export class ModelHubComponent implements Component {
 			const pool = this.#pool(target);
 			hints.push(
 				editable && { label: "replace", keys: ["enter"] },
-				target.kind === "chain" && editable && { label: "add member", keys: ["f"] },
+				target.kind !== "role" && editable && { label: "add member", keys: ["f"] },
 				target.kind === "role" && this.#fallbackAddable(row.role) && { label: "fallback", keys: ["f"] },
 				editable && { label: "remove", keys: ["x"] },
 				this.#poolMemberEffortItem(row) !== undefined && { label: "effort", keys: ["t"] },
@@ -4085,7 +4236,7 @@ export class ModelHubComponent implements Component {
 
 	/** Status verb of a pool-member pick: which pool it adds to or which member it replaces. */
 	#poolAssignVerb(assign: { target: ModelHubPoolTarget; alias: string | null }): string {
-		const pool = assign.target.kind === "role" ? "pool" : "fallback pool";
+		const pool = assign.target.kind === "role" ? "pool" : assign.target.kind === "chain" ? "fallback pool" : "group";
 		return assign.alias === null
 			? `Adding a member to the ${pool} of`
 			: `Replacing member ${sanitizeDisplayLine(assign.alias)} in the ${pool} of`;
@@ -4138,7 +4289,9 @@ export class ModelHubComponent implements Component {
 
 	#renderRolesView(width: number, rows: number): string[] {
 		const lines: string[] = [];
-		lines.push(this.#renderRoleTabs(width));
+		const groupsView = this.#activeEntryId === "groups";
+		// The Groups view has no tab strip; its blank row keeps the rows where the role tabs leave them.
+		lines.push(groupsView ? "" : this.#renderRoleTabs(width));
 		// First row's offset in bodyLine coordinates: the mouse router's
 		// `bodyLine` has already dropped the status row, leaving the tabs row.
 		this.#rolesRowStart = lines.length;
@@ -4151,14 +4304,14 @@ export class ModelHubComponent implements Component {
 			if (table) tableRows.set(rowDef, table);
 		}
 		const nameWidth = Math.max(0, ...[...tableRows.values()].map(entry => visibleWidth(entry.name)));
-		const cycleWidth = this.#cycleOrder().length > 0 ? 2 + visibleWidth(`${theme.icon.loop} 99`) : 0;
+		// The cycle badge is drawn only where it still fits, so it never costs a column.
 		const columns = (["model", "thinking", "billing", "routing"] as const)
 			.map(column => ({
 				column,
 				width: Math.max(0, ...[...tableRows.values()].map(entry => visibleWidth(entry.cells[column] ?? ""))),
 			}))
 			.filter(entry => entry.width > 0);
-		const tableWidth = () => 3 + nameWidth + columns.reduce((sum, entry) => sum + 2 + entry.width, 0) + cycleWidth;
+		const tableWidth = () => 3 + nameWidth + columns.reduce((sum, entry) => sum + 2 + entry.width, 0);
 		while (columns.length > 1 && tableWidth() > width) columns.pop();
 
 		const cycleOrder = this.#cycleOrder();
@@ -4186,8 +4339,13 @@ export class ModelHubComponent implements Component {
 				continue;
 			}
 
-			if (rowDef.kind === "newRole" || rowDef.kind === "newFallback") {
-				const label = rowDef.kind === "newRole" ? "+ New role…" : "+ New fallback…";
+			if (rowDef.kind === "newRole" || rowDef.kind === "newFallback" || rowDef.kind === "newGroup") {
+				const label =
+					rowDef.kind === "newRole"
+						? "+ New role…"
+						: rowDef.kind === "newGroup"
+							? "+ New group…"
+							: "+ New fallback…";
 				let line = ` ${cursor} ${theme.fg(selected ? "accent" : "dim", label)}`;
 				line = this.#finishRolesRow(line, width, hovered);
 				lines.push(line);
@@ -4219,6 +4377,11 @@ export class ModelHubComponent implements Component {
 				const color = pooled || single ? (info.color ?? "muted") : "dim";
 				const dot = pooled || single ? theme.status.enabled : theme.status.shadowed;
 				line = ` ${cursor} ${theme.fg(color, dot)} ${theme.fg(color, pad(table.name.slice(2), nameWidth - 2))}`;
+			} else if (rowDef.kind === "group") {
+				// A group some entry uses lights its dot; an unused one stays shadowed.
+				const used = this.#groupReferences(rowDef.role).length > 0;
+				const dot = used ? theme.status.enabled : theme.status.shadowed;
+				line = ` ${cursor} ${theme.fg(used ? "accent" : "dim", dot)} ${theme.fg(selected || used ? "accent" : "muted", pad(table.name.slice(2), nameWidth - 2))}`;
 			} else {
 				const lead = table.name.length - table.name.trimStart().length + 2;
 				line = ` ${cursor} ${theme.fg("dim", table.name.slice(0, lead))}${theme.fg(selected ? "accent" : "muted", pad(table.name.slice(lead), nameWidth - lead))}`;
@@ -4264,7 +4427,7 @@ export class ModelHubComponent implements Component {
 		// Live preview of the quick-switch cycle, rendered with the exact
 		// segment track the ctrl+p status uses; the selected role's chip fills.
 		while (lines.length < rows - 1) lines.push("");
-		if (rows >= 2) {
+		if (rows >= 2 && !groupsView) {
 			const cycleKey = editorKey("app.model.cycleForward") || formatKeyHint("ctrl+p");
 			if (cycleOrder.length > 0) {
 				const selectedRow = this.#rolesRows[this.#roleIndex];
@@ -4373,7 +4536,7 @@ export class ModelHubComponent implements Component {
 			}
 		}
 		const entry = this.#activeEntry();
-		if (entry.kind === "roles") {
+		if (isRolesView(entry.kind)) {
 			if (this.#focus !== "list") {
 				const presets =
 					this.#presets().names.length > 0 ? ` · ${formatKeyHints(["ctrl+left", "ctrl+right"])} preset` : "";
@@ -4410,6 +4573,13 @@ export class ModelHubComponent implements Component {
 			}
 			if (row?.kind === "newFallback") {
 				return `${upDown} rows · ${enter} new model/provider fallback chain · ${left} providers`;
+			}
+			if (row?.kind === "newGroup" || row?.kind === "group") {
+				const pick =
+					row.kind === "newGroup"
+						? `${enter} new group`
+						: `${formatKeyHint("x")} delete · ${formatKeyHint("n")} new group`;
+				return `${upDown} rows · ${pick} · ${left} providers`;
 			}
 			// Same rule as fallback rows: advertise `t` only where a strip would
 			// open — an assigned role whose model has thinking levels to offer.
@@ -4587,7 +4757,7 @@ export class ModelHubComponent implements Component {
 					this.#clickSidebarEntry(this.#entries.find(entry => entry.id === event.item));
 					break;
 				case "roles": {
-					if (this.#activeEntry().kind !== "roles" || this.#assigning !== null) return;
+					if (!isRolesView(this.#activeEntry().kind) || this.#assigning !== null) return;
 					const index = this.#rolesRows.findIndex((rowDef, i) => rolesRowKey(rowDef, i) === event.item);
 					const rowDef = this.#rolesRows[index];
 					if (!rowDef || rowDef.kind === "separator") return;
@@ -4641,7 +4811,7 @@ export class ModelHubComponent implements Component {
 	#describeBody(): NativeNode {
 		const children: NativeChild[] = [this.#describeStatus()];
 		const entry = this.#activeEntry();
-		if (entry.kind === "roles" && this.#assigning === null) {
+		if (isRolesView(entry.kind) && this.#assigning === null) {
 			children.push(...this.#describeRolesView());
 		} else if (entry.kind === "provider" && entry.locked && this.#assigning === null) {
 			children.push(this.#describeLockedView(entry));
@@ -4677,9 +4847,10 @@ export class ModelHubComponent implements Component {
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") {
 				spans = [span("New fallback chain — pick the model it protects", "accent")];
+			} else if (assigning.kind === "newGroup") {
+				spans = [span(`New group +${assigning.name} — pick its first model`, "accent")];
 			} else {
-				const info = this.#settings.getRoleInfo(assigning.role);
-				const label = info.tag ?? info.name ?? assigning.role;
+				const label = this.#assignLabel(assigning);
 				const verb =
 					assigning.kind === "role"
 						? "Assigning"
@@ -4696,7 +4867,7 @@ export class ModelHubComponent implements Component {
 		if (this.#configError && entry.kind !== "provider") {
 			return node("text", { spans: [span(this.#configError, "error")], wrap: "word" }, undefined, "status");
 		}
-		if (this.#poolStatus && entry.kind === "roles") {
+		if (this.#poolStatus && isRolesView(entry.kind)) {
 			return node(
 				"text",
 				{ spans: [span(this.#poolStatus.text, this.#poolStatus.tone)], wrap: "word" },
@@ -4714,6 +4885,13 @@ export class ModelHubComponent implements Component {
 					span("Model roles — ", "muted"),
 					span("f", "key"),
 					span(" adds a retry fallback, cleared roles fall back to auto-selection", "muted"),
+				];
+				break;
+			case "groups":
+				spans = [
+					span("Model groups — shared pools roles use as +name; ", "muted"),
+					span("n", "key"),
+					span(" adds one", "muted"),
 				];
 				break;
 			case "provider":
@@ -4770,6 +4948,7 @@ export class ModelHubComponent implements Component {
 			items,
 			"roles",
 		);
+		if (this.#activeEntryId === "groups") return [list];
 		return [tabs, list, this.#describeCycle(cycleOrder)];
 	}
 
@@ -4782,6 +4961,25 @@ export class ModelHubComponent implements Component {
 				return node("item", { label: [span("+ New role…", "dim")] }, undefined, key);
 			case "newFallback":
 				return node("item", { label: [span("+ New fallback…", "dim")] }, undefined, key);
+			case "newGroup":
+				return node("item", { label: [span("+ New group…", "dim")] }, undefined, key);
+			case "group": {
+				const cells = this.#rolesRowCells(rowDef) ?? {};
+				const used = this.#groupReferences(rowDef.role).length > 0;
+				return node(
+					"item",
+					{
+						label: [
+							span(`${used ? theme.status.enabled : theme.status.shadowed} `, used ? "accent" : "dim"),
+							span(`+${sanitizeDisplayLine(rowDef.role)}`, used ? "accent" : "muted"),
+						],
+						detail: cells.model ? [span(cells.model, "muted")] : undefined,
+						value: rolesCellValue(cells),
+					},
+					undefined,
+					key,
+				);
+			}
 			case "chainKey": {
 				const slash = rowDef.role.lastIndexOf("/");
 				return node(
@@ -4944,14 +5142,14 @@ export class ModelHubComponent implements Component {
 
 	#describePicker(): NativeNode {
 		const entry = this.#activeEntry();
-		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const rolesView = isRolesView(entry.kind) && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked === true && this.#assigning === null;
 		const strip = this.#strip;
 		const props: TspPickerProps = {
 			title: "Models",
 			subtitle: this.#pickerSubtitle(entry, rolesView),
 			icon: "cpu",
-			noun: rolesView ? "roles" : "models",
+			noun: rolesView ? (entry.kind === "groups" ? "groups" : "roles") : "models",
 			size: "lg",
 			layout: "rows",
 			preview: "side",
@@ -4969,17 +5167,22 @@ export class ModelHubComponent implements Component {
 		if (rolesView) {
 			const row = this.#rolesRows[this.#roleIndex];
 			const items = this.#rolePickerItems();
+			const groupsView = entry.kind === "groups";
 			return picker(
 				{
 					...props,
-					tabs: ROLE_TABS.map(tab => ({
-						id: tab,
-						label: tab === "all" ? "All" : tab === "chat" ? "Chat" : "Kinds",
-						count: this.#visibleRoleIds().filter(
-							role => tab === "all" || this.#settings.getRoleInfo(role).section === tab,
-						).length,
-					})),
-					tab: this.#roleTab,
+					...(groupsView
+						? {}
+						: {
+								tabs: ROLE_TABS.map(tab => ({
+									id: tab,
+									label: tab === "all" ? "All" : tab === "chat" ? "Chat" : "Kinds",
+									count: this.#visibleRoleIds().filter(
+										role => tab === "all" || this.#settings.getRoleInfo(role).section === tab,
+									).length,
+								})),
+								tab: this.#roleTab,
+							}),
 					columns: ROLE_PICKER_COLUMNS.filter(
 						column =>
 							!ROLE_PICKER_OPTIONAL_COLUMNS.includes(column.id) ||
@@ -4988,7 +5191,7 @@ export class ModelHubComponent implements Component {
 					items,
 					order: this.#rolePickerOrder(),
 					selected: row && row.kind !== "separator" ? rolesRowKey(row, this.#roleIndex) : null,
-					total: this.#allRolesRowCount(),
+					total: groupsView ? this.#rolesRows.length : this.#allRolesRowCount(),
 				},
 				this.#rolePreview(row),
 			);
@@ -5054,8 +5257,8 @@ export class ModelHubComponent implements Component {
 		const assigning = this.#assigning;
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") return "New fallback chain — pick the model it protects";
-			const info = this.#settings.getRoleInfo(assigning.role);
-			const label = info.tag ?? info.name ?? assigning.role;
+			if (assigning.kind === "newGroup") return `New group +${assigning.name} — pick its first model`;
+			const label = this.#assignLabel(assigning);
 			const verb =
 				assigning.kind === "role"
 					? "Assigning"
@@ -5098,6 +5301,9 @@ export class ModelHubComponent implements Component {
 					break;
 				case "roles":
 					scopes.push({ id: entry.id, label: "Roles", icon: "sparkles", count: this.#visibleRoleIds().length });
+					break;
+				case "groups":
+					scopes.push({ id: entry.id, label: "Groups", icon: "layers", count: this.#modelGroupNames().length });
 					break;
 				case "all":
 					scopes.push({
@@ -5312,6 +5518,18 @@ export class ModelHubComponent implements Component {
 				case "newRole":
 					actions.push(roleAction("pick", "New role", "enter", true));
 					break;
+				case "newGroup":
+					actions.push(roleAction("pick", "New group", "enter", true));
+					break;
+				case "group":
+					// An invalid group has no editable pool: offer delete and new only.
+					actions.push(
+						this.#poolClearable({ kind: "group", key: row.role })
+							? roleAction("clear", "Delete", "x")
+							: undefined,
+						roleAction("new", "New group", "n"),
+					);
+					break;
 			}
 			if (this.#groupsAvailable(row)) actions.push(roleAction("groups", "Model group", "shift+g"));
 			return compact([...actions, CLOSE_ACTION]);
@@ -5433,6 +5651,22 @@ export class ModelHubComponent implements Component {
 				case "newFallback":
 					items.push({ id, label: "New fallback chain…", icon: "plus", tone: "muted" });
 					return;
+				case "newGroup":
+					items.push({ id, label: "New group…", icon: "plus", tone: "muted" });
+					return;
+				case "group": {
+					const users = this.#groupUsers(row.role);
+					items.push({
+						id,
+						label: `+${sanitizeDisplayLine(row.role)}`,
+						mono: true,
+						icon: "layers",
+						detail: users === "unused" ? "unused" : `used by ${users}`,
+						...(users === "unused" ? { tone: "muted" as const } : {}),
+						facts: rolesCellFacts(this.#rolesRowCells(row) ?? {}),
+					});
+					return;
+				}
 				case "chainKey":
 					items.push({ id, label: row.role, mono: true, icon: "git-branch", detail: "fallback chain" });
 					return;
@@ -5503,7 +5737,8 @@ export class ModelHubComponent implements Component {
 			head = { group, label, count: 0 };
 			order.push(head);
 		};
-		open(this.#roleTab === "kind" ? "kind" : "chat", this.#roleTab === "kind" ? "Kind roles" : "Chat roles");
+		if (this.#activeEntryId === "groups") open("groups", "Model groups");
+		else open(this.#roleTab === "kind" ? "kind" : "chat", this.#roleTab === "kind" ? "Kind roles" : "Chat roles");
 		this.#rolesRows.forEach((row, index) => {
 			if (row.kind === "separator") {
 				const previous = this.#rolesRows[index - 1];
@@ -5513,7 +5748,7 @@ export class ModelHubComponent implements Component {
 			}
 			order.push(rolesRowKey(row, index));
 			// Heads count roles and chains, not their fallback entries or the "new" rows.
-			if (head && (row.kind === "role" || row.kind === "chainKey")) head.count++;
+			if (head && (row.kind === "role" || row.kind === "chainKey" || row.kind === "group")) head.count++;
 		});
 		return order;
 	}
@@ -5619,9 +5854,13 @@ export class ModelHubComponent implements Component {
 				if (item) children.push(...this.#browser.modelPreview(item, "full", this.#currentSelector));
 				else if (member)
 					children.push(text([span(sanitizeDisplayLine(member.model), "mono")], { role: "omp.picker.title" }));
-				children.push(
-					...this.#poolPreview(this.#pool(row.target), row.target.kind === "role" ? "Role pool" : "Fallback pool"),
-				);
+				const poolLabel =
+					row.target.kind === "role"
+						? "Role pool"
+						: row.target.kind === "chain"
+							? "Fallback pool"
+							: `Group +${row.target.key}`;
+				children.push(...this.#poolPreview(this.#pool(row.target), poolLabel));
 				break;
 			}
 			case "newRole":
@@ -5636,6 +5875,27 @@ export class ModelHubComponent implements Component {
 					text([span("Pick the model (or provider) a new retry fallback chain protects.", "muted")], {
 						wrap: "word",
 					}),
+				);
+				break;
+			case "group":
+				children.push(
+					text([span(`+${sanitizeDisplayLine(row.role)}`, "mono")], { role: "omp.picker.title" }),
+					node("kv", { items: [{ k: [span("Used by", "muted")], v: this.#groupUsers(row.role) }] }),
+					...this.#poolPreview(this.#pool({ kind: "group", key: row.role }), "Group"),
+				);
+				break;
+			case "newGroup":
+				children.push(
+					text("New group", { role: "omp.picker.title" }),
+					text(
+						[
+							span(
+								"Name a shared pool, then pick its first model. Roles and fallback chains use it as +name.",
+								"muted",
+							),
+						],
+						{ wrap: "word" },
+					),
 				);
 				break;
 		}
@@ -5716,7 +5976,7 @@ export class ModelHubComponent implements Component {
 		// Same gate as the keys: only cancel works while an assignment applies.
 		if (this.#assignmentPending) return;
 		const entry = this.#activeEntry();
-		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const rolesView = isRolesView(entry.kind) && this.#assigning === null;
 		if (event.kind !== "action") {
 			if (this.#strip) return;
 			if (rolesView) {
@@ -5964,7 +6224,7 @@ export class ModelHubComponent implements Component {
 		}
 		const presetHint = this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right") : undefined;
 		const entry = this.#activeEntry();
-		if (entry.kind === "roles") {
+		if (isRolesView(entry.kind)) {
 			if (this.#focus !== "list") {
 				return [
 					upDown("providers"),
@@ -6026,6 +6286,12 @@ export class ModelHubComponent implements Component {
 			}
 			if (row?.kind === "newFallback") {
 				return [upDown("rows"), keys("new model/provider fallback chain", "enter"), keys("providers", "left")];
+			}
+			if (row?.kind === "newGroup") {
+				return [upDown("rows"), keys("new group", "enter"), keys("providers", "left")];
+			}
+			if (row?.kind === "group") {
+				return [upDown("rows"), keys("delete", "x"), keys("new group", "n"), keys("providers", "left")];
 			}
 			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
 			return [

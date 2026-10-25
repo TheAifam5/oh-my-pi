@@ -40,6 +40,11 @@ function normalize(lines: readonly string[]): string {
 	return stripVTControlCharacters(lines.join("\n")).replace(/\s+/g, " ").trim();
 }
 
+/** A Roles fallback row as {@link normalize} flattens it: `↳ fallback N` then the entry's selector. */
+function fallbackRow(selector: string): RegExp {
+	return new RegExp(`↳ fallback \\d+ ${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w:@/*.-])`);
+}
+
 /** The footer row (hint line or an active chip strip) of a rendered frame. */
 function footerLine(lines: readonly string[]): string {
 	return stripVTControlCharacters(lines[lines.length - 2] ?? "");
@@ -246,7 +251,8 @@ describe("ModelHub", () => {
 			});
 			const { hub } = createHub({ models: [chat, image], scoped: true, settings });
 
-			hub.handleInput(UP);
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			let lines = hub.render(220).map(line => stripVTControlCharacters(line));
 			const chatIndex = lines.findIndex(line => line.includes("DEFAULT"));
 			const kindIndex = lines.findIndex(line => line.includes("IMAGE"));
@@ -270,7 +276,8 @@ describe("ModelHub", () => {
 			const image = makeModel("test", "image-model", 128_000, undefined, "image");
 			const { hub } = createHub({ models: [chat, image], scoped: true });
 
-			hub.handleInput(UP);
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			hub.handleInput(ALT_RIGHT);
 			hub.handleInput(ALT_RIGHT);
 			hub.handleInput("\n");
@@ -295,7 +302,8 @@ describe("ModelHub", () => {
 				registry: { getAvailable: kind => (kind === "all" ? [chat, judge] : [chat]) },
 			});
 
-			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles.
 			hub.handleInput(OPTION_RIGHT_MAC);
 			hub.handleInput(OPTION_RIGHT_MAC); // Kind roles tab.
 			const judgeRow = hub
@@ -362,7 +370,8 @@ describe("ModelHub", () => {
 			const { hub } = createHub({ models: [model], scoped: true, settings });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			const lines = hub.render(220).map(line => stripVTControlCharacters(line));
 			const defaultRow = lines.find(line => line.includes("DEFAULT"));
 			const smolRow = lines.find(line => line.includes("SMOL"));
@@ -380,7 +389,8 @@ describe("ModelHub", () => {
 			settings.overrideModelRoles({ default: `${effectiveModel.provider}/${effectiveModel.id}` });
 			const { hub, onAssign } = createHub({ models: [storedModel, effectiveModel], scoped: true, settings });
 
-			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles.
 			hub.handleInput("\n"); // Dive into role rows on DEFAULT.
 			hub.handleInput("t");
 			hub.handleInput("\x1b[C"); // Inherit → off.
@@ -407,7 +417,8 @@ describe("ModelHub", () => {
 			});
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (top of the sidebar)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (top of the sidebar)
 			hub.handleInput("\n"); // dive into the role rows
 			hub.handleInput(DOWN); // default → smol row
 			hub.handleInput("x");
@@ -449,9 +460,12 @@ describe("ModelHub", () => {
 			const { hub } = createHub({ models: [model] });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			// The roles view shows as a preview, but arrows keep hopping.
-			hub.handleInput(DOWN); // continues to All models — not a role row
+			hub.handleInput(DOWN); // continues to Groups — not a role row
+			expect(normalize(hub.render(220))).toContain("Model groups");
+			hub.handleInput(DOWN); // then All models
 			expect(normalize(hub.render(220))).toContain("All available models");
 		});
 
@@ -563,7 +577,8 @@ describe("ModelHub", () => {
 			const { hub } = createHub({ models: [model] });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (scope focus)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (scope focus)
 
 			// Typing a search character switches away from Roles to All models and focuses list
 			hub.handleInput("t");
@@ -605,7 +620,8 @@ describe("ModelHub", () => {
 			});
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			hub.handleInput("\n"); // dive into rows; cursor on DEFAULT
 
 			// Default cycle is [smol, default, slow]: c removes default…
@@ -638,7 +654,8 @@ describe("ModelHub", () => {
 			});
 			const { hub } = createHub({ models: [model], scoped: true, settings });
 
-			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles.
 			const defaultRow = hub
 				.render(220)
 				.map(line => stripVTControlCharacters(line))
@@ -652,7 +669,8 @@ describe("ModelHub", () => {
 			const { hub, onAssign } = createHub({ models: [model], scoped: true });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			hub.handleInput("\n"); // dive into rows
 			hub.handleInput(UP); // wraps to the trailing "+ New fallback…" row
 			hub.handleInput(UP); // skips the section divider up to "+ New role…"
@@ -676,7 +694,8 @@ describe("ModelHub", () => {
 			const { hub } = createHub({ models: [model], scoped: true, callbacks: { onSavePreset } });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			hub.handleInput("\n"); // dive into rows
 			expect(footerLine(hub.render(220))).toContain("save preset");
 
@@ -695,7 +714,8 @@ describe("ModelHub", () => {
 			expect(footerLine(hub.render(220))).toContain("Preset name:");
 
 			const { hub: bareHub } = createHub({ models: [model], scoped: true });
-			bareHub.handleInput(UP); // All models → Roles (since Recent is removed)
+			bareHub.handleInput(UP); // All models → Groups
+			bareHub.handleInput(UP); // Groups → Roles (since Recent is removed)
 			bareHub.handleInput("\n"); // dive into rows
 			expect(footerLine(bareHub.render(220))).not.toContain("save preset");
 
@@ -718,7 +738,8 @@ describe("ModelHub", () => {
 			});
 			const { hub } = createHub({ models: [a, b, c], scoped: true, settings, callbacks: { onSwitchPreset } });
 
-			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			expect(normalize(hub.render(220))).toContain("Preset: alpha");
 
 			hub.handleInput(CTRL_RIGHT); // alpha → beta (refused: nothing written)
@@ -744,9 +765,11 @@ describe("ModelHub", () => {
 			hub.handleInput("P"); // alpha → gamma
 			expect(onSwitchPreset).toHaveBeenLastCalledWith("gamma");
 
-			// Outside the Roles view the keys never switch presets.
+			// Outside the Roles view the keys never switch presets, the Groups view included.
 			hub.handleInput(LEFT); // back to the sidebar
-			hub.handleInput(DOWN); // Roles → All models
+			hub.handleInput(DOWN); // Roles → Groups
+			hub.handleInput(CTRL_RIGHT);
+			hub.handleInput(DOWN); // Groups → All models
 			hub.handleInput(CTRL_RIGHT);
 			expect(onSwitchPreset).toHaveBeenCalledTimes(6);
 		});
@@ -756,7 +779,8 @@ describe("ModelHub", () => {
 			const b = makeModel("test", "model-b");
 			const { hub, onAssign } = createHub({ models: [a, b], scoped: true });
 
-			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			hub.handleInput("\n"); // dive into the rows
 			hub.handleInput("\n"); // pick a model for DEFAULT
 			expect(normalize(hub.render(220))).toContain("Assigning DEFAULT");
@@ -825,7 +849,8 @@ describe("ModelHub", () => {
 			const { hub } = createHub({ models: [model], scoped: true, settings });
 			installTestTheme();
 
-			hub.handleInput(UP); // All models → Roles.
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles.
 			hub.handleInput("\n"); // Dive into the role rows.
 			const selected = () =>
 				hub
@@ -1214,7 +1239,8 @@ describe("ModelHub", () => {
 	describe("fallback chains in the roles view", () => {
 		/** Hop to the Roles sidebar entry and dive into its rows. */
 		function enterRolesView(hub: ModelHubComponent): void {
-			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			hub.handleInput("\n"); // dive into the rows
 		}
 
@@ -1228,8 +1254,8 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			const rendered = normalize(hub.render(220));
-			expect(rendered).toContain("↳ test/model-a");
-			expect(rendered).toContain("↳ test/model-b");
+			expect(rendered).toMatch(fallbackRow("test/model-a"));
+			expect(rendered).toMatch(fallbackRow("test/model-b"));
 		});
 
 		test("f on a role opens fallback assignment and Enter appends the picked model", () => {
@@ -1244,7 +1270,7 @@ describe("ModelHub", () => {
 			hub.handleInput("\n"); // focus already on the model rows: pick the only model
 			expect(onFallbackChainChange).toHaveBeenCalledWith("default", ["test/model-a"]);
 			expect(onAssign).not.toHaveBeenCalled(); // no role assignment, no thinking strip
-			expect(normalize(hub.render(220))).toContain("↳ test/model-a");
+			expect(normalize(hub.render(220))).toMatch(fallbackRow("test/model-a"));
 		});
 
 		test("x removes a chain entry and Enter on an entry replaces it", () => {
@@ -1466,7 +1492,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // SMOL
 			hub.handleInput(DOWN); // its only member
-			expect(normalize(hub.render(220))).toContain("a charm-hyper/model-a billing prepaid-credits available $12.30");
+			expect(normalize(hub.render(220))).toMatch(/a charm-hyper\/model-a .*prepaid-credits available \$12\.30/);
 		});
 
 		test("a narrow role row drops its billing before the thinking label", () => {
@@ -1484,7 +1510,7 @@ describe("ModelHub", () => {
 					.render(width)
 					.map(line => stripVTControlCharacters(line))
 					.find(line => line.includes("SMOL")) ?? "";
-			expect(smolRow(220)).toContain("billing prepaid-credits available $12.30");
+			expect(smolRow(220)).toContain("prepaid-credits available $12.30");
 			expect(smolRow(80)).toContain("high");
 			expect(smolRow(80)).not.toContain("billing");
 			// At no width does billing stay while the thinking label goes.
@@ -1546,7 +1572,7 @@ describe("ModelHub", () => {
 				models: { a: { model: "test/model-a" }, b: { model: "test/model-b" } },
 				routing,
 			});
-			expect(normalize(hub.render(220))).toContain("SMOL pool · 2 models · quota");
+			expect(normalize(hub.render(220))).toMatch(/SMOL pool · 2 models .*quota/);
 			hub.handleInput("g");
 			expect(settings.getModelRoleEntries().smol).toMatchObject({ strategy: "cheapest", routing });
 		});
@@ -2065,7 +2091,7 @@ describe("ModelHub", () => {
 				{ kind: "model", alias: "model-a", model: "test/model-a" },
 				{ kind: "model", alias: "model-b", model: "test/model-b", defaultEffort: "high" },
 			]);
-			expect(normalize(hub.render(220))).toContain("SMOL pool · 2 models · priority");
+			expect(normalize(hub.render(220))).toMatch(/SMOL pool · 2 models .*priority/);
 		});
 
 		test("a refused pool edit shows the validator's message and writes nothing", () => {
@@ -2116,7 +2142,8 @@ describe("ModelHub", () => {
 			const a = makeModel("test", "model-a");
 			const { hub } = createHub({ models: [a], scoped: true });
 
-			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			// Derive the pointer row from the frame itself: the fullscreen
 			// overlay paints from screen row 0, so frame index == screen row.
 			const frame = hub.render(220).map(line => stripVTControlCharacters(line));
@@ -2146,7 +2173,7 @@ describe("ModelHub", () => {
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("test/model-a", ["test/model-b"]);
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("test/model-a");
-			expect(rendered).toContain("↳ test/model-b");
+			expect(rendered).toMatch(fallbackRow("test/model-b"));
 		});
 
 		test("provider chip keys the chain by provider/*", () => {
@@ -2199,7 +2226,7 @@ describe("ModelHub", () => {
 			enterRolesView(hub);
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("test/*");
-			expect(rendered).toContain("↳ test/model-a");
+			expect(rendered).toMatch(fallbackRow("test/model-a"));
 			expect(rendered).toContain("+ New fallback…");
 			expect(rendered).toMatch(/─{10,}/); // the roles/fallbacks divider
 
@@ -2208,7 +2235,7 @@ describe("ModelHub", () => {
 			hub.handleInput(UP); // test/* header (separator is skipped)
 			hub.handleInput("x");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("test/*", []);
-			expect(normalize(hub.render(220))).not.toContain("↳ test/model-a");
+			expect(normalize(hub.render(220))).not.toMatch(fallbackRow("test/model-a"));
 		});
 
 		test("t on a fallback entry sets an explicit effort suffix", () => {
@@ -2231,7 +2258,7 @@ describe("ModelHub", () => {
 			hub.handleInput("\x1b[C"); // inherit → off
 			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [`${selector}:off`]);
-			expect(normalize(hub.render(220))).toContain(`↳ ${selector}:off`);
+			expect(normalize(hub.render(220))).toMatch(fallbackRow(`${selector}:off`));
 		});
 
 		test("t on a suffixed fallback entry clears back to inherit", () => {
@@ -2243,7 +2270,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(normalize(hub.render(220))).toContain(`↳ ${selector}:off`);
+			expect(normalize(hub.render(220))).toMatch(fallbackRow(`${selector}:off`));
 
 			hub.handleInput("t");
 			hub.handleInput(LEFT); // off → inherit
@@ -2260,13 +2287,13 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(normalize(hub.render(220))).toContain(`↳ ${routed}`);
+			expect(normalize(hub.render(220))).toMatch(fallbackRow(routed));
 
 			hub.handleInput("t");
 			hub.handleInput("\x1b[C"); // inherit → off
 			hub.handleInput("\n");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [`${routed}:off`]);
-			expect(normalize(hub.render(220))).toContain(`↳ ${routed}:off`);
+			expect(normalize(hub.render(220))).toMatch(fallbackRow(`${routed}:off`));
 		});
 
 		test("t on a routed+suffixed entry clears back to the bare route", () => {
@@ -2291,7 +2318,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its wildcard entry
-			expect(normalize(hub.render(220))).toContain("↳ test/*");
+			expect(normalize(hub.render(220))).toMatch(fallbackRow("test/*"));
 			expect(footerLine(hub.render(220))).not.toContain("t thinking");
 
 			hub.handleInput("t"); // inert: no strip, no chain write
@@ -2307,7 +2334,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(normalize(hub.render(220))).toContain(`↳ ${selector}`);
+			expect(normalize(hub.render(220))).toMatch(fallbackRow(selector));
 
 			hub.handleInput("t");
 			hub.handleInput("\x1b[C"); // inherit → off
@@ -2346,7 +2373,7 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // default → its fallback entry
-			expect(normalize(hub.render(220))).toContain("↳ OpenAI/GPT-5.5");
+			expect(normalize(hub.render(220))).toMatch(fallbackRow("OpenAI/GPT-5.5"));
 			expect(footerLine(hub.render(220))).toContain("t thinking");
 
 			hub.handleInput("t");
@@ -2414,7 +2441,7 @@ describe("ModelHub", () => {
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
 				const rendered = normalize(hub.render(400));
-				expect(rendered).toContain("SMOL pool · 1 model · quota · quota accounts cache metered");
+				expect(rendered).toMatch(/SMOL pool · 1 model .*quota · quota accounts cache metered/);
 				expect(rendered).toContain("Quota reserve 0.1, max age 15m, unknown exclude");
 				expect(rendered).toContain("Accounts order work → home, drain work, spend plan+credits, return reset");
 				expect(rendered).toContain("Cache affinity, pricing off");
@@ -2441,7 +2468,7 @@ describe("ModelHub", () => {
 				hub.handleInput(DOWN); // SMOL
 				const wide = hub.render(140).map(line => stripVTControlCharacters(line));
 				const row = wide.find(line => line.includes("SMOL")) ?? "";
-				expect(row).toContain("pool · 3 models · quota → priority · quota accounts cache");
+				expect(row).toMatch(/pool · 3 models .*quota → priority · quota accounts cache/);
 				expect(row).not.toContain("…");
 				const text = normalize(wide);
 				expect(text).toContain("Quota reserve 0.1, unknown allow");
@@ -2723,7 +2750,7 @@ describe("ModelHub", () => {
 				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
 				enterRolesView(hub);
 				hub.handleInput(DOWN); // SMOL
-				expect(normalize(hub.render(220))).toContain("SMOL pool +fast · 1 model · random");
+				expect(normalize(hub.render(220))).toMatch(/SMOL pool \+fast · 1 model .*random/);
 
 				hub.handleInput("a");
 				hub.handleInput("\n"); // add a member
@@ -2745,6 +2772,37 @@ describe("ModelHub", () => {
 				const pool = createModelBrowserSource(runtime).getPool?.({ kind: "role", key: "smol" });
 				expect(pool?.readOnly).toBe("modelGroups.fast is set in the runtime layer");
 				expect(pool?.raw).toBeUndefined();
+			});
+
+			test("the Groups view edits an unreferenced group in place and deletes it; a runtime-layer group stays read-only", () => {
+				const settings = Settings.isolated();
+				settings.setModelGroup("spare", { strategy: "random", models: { a: { model: "test/model-a" } } });
+				const { hub } = createHub({ models: twoModels(), scoped: true, settings });
+				hub.handleInput(UP); // All models → Groups
+				hub.handleInput("\n"); // dive into the group rows
+				expect(normalize(hub.render(220))).toMatch(/\+spare 1 model .*random/);
+
+				hub.handleInput("\n"); // Enter on the group adds a member
+				type(hub, "model-b");
+				hub.handleInput("\n");
+				expect(settings.getGlobalSettings().modelGroups).toEqual({
+					spare: {
+						strategy: "random",
+						models: { a: { model: "test/model-a" }, "model-b": { model: "test/model-b" } },
+					},
+				});
+
+				hub.handleInput(UP); // back from the new member to the group row
+				hub.handleInput(UP);
+				hub.handleInput("x");
+				expect(Object.hasOwn(settings.getGlobalSettings().modelGroups ?? {}, "spare")).toBe(false);
+
+				const runtime = Settings.isolated({
+					modelGroups: { fast: { strategy: "random", models: { a: { model: "test/model-a" } } } },
+				});
+				const source = createModelBrowserSource(runtime);
+				expect(source.getPool?.({ kind: "group", key: "fast" })?.readOnly).toBe("set in the runtime layer");
+				expect(source.poolWriteBlocker?.({ kind: "group", key: "fast" })).toBe("set in the runtime layer");
 			});
 
 			test("G declines renaming or deleting a group a shadowed global entry still references", () => {
@@ -2898,7 +2956,8 @@ describe("ModelHub", () => {
 		test("wheel in the roles view clamps at the top instead of wrapping to the bottom rows", () => {
 			const { hub } = createHub({ models: [makeModel("test", "model-a")], scoped: true });
 
-			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // All models → Groups
+			hub.handleInput(UP); // Groups → Roles
 			hub.render(220); // establish mouse geometry
 			for (let i = 0; i < 4; i++) hub.handleInput(WHEEL_UP_BODY); // cursor stays on the first role
 			hub.handleInput("\n"); // dive into the rows

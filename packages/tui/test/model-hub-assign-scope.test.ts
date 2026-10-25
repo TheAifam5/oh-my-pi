@@ -105,7 +105,8 @@ const DOWN = "\x1b[B";
 
 /** Enter assign mode for the `web` role: hop up to Roles, dive in, activate the role row. */
 function startWebAssign(key: (data: string) => void): void {
-	key(UP); // all → Roles (scope focus)
+	key(UP); // all → Groups (scope focus)
+	key(UP); // Groups → Roles
 	key("\r"); // dive into the roles rows
 	key("\r"); // activate the `web` role row → assign mode
 }
@@ -119,9 +120,10 @@ describe("model hub assign mode scope filtering (#12692)", () => {
 		const { body, key } = createHub();
 		startWebAssign(key);
 
-		// Sidebar order: Roles, All models, google, litellm. Three Downs hop
+		// Sidebar order: Roles, Groups, All models, google, litellm. Four Downs hop
 		// from Roles to the litellm provider scope.
-		key(DOWN); // Roles → All models
+		key(DOWN); // Roles → Groups
+		key(DOWN); // Groups → All models
 		key(DOWN); // All models → google
 		key(DOWN); // google → litellm
 
@@ -134,7 +136,8 @@ describe("model hub assign mode scope filtering (#12692)", () => {
 		const { body, key } = createHub();
 		startWebAssign(key);
 
-		key(DOWN); // Roles → All models
+		key(DOWN); // Roles → Groups
+		key(DOWN); // Groups → All models
 		key(DOWN); // All models → google
 
 		const rendered = body();

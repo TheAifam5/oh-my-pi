@@ -11,7 +11,6 @@ import type {
 	ModelHubPool,
 	ModelHubPoolTarget,
 	ModelHubSource,
-	ModelHubWriteTarget,
 } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { formatDuration, isRecord } from "@oh-my-pi/pi-utils";
@@ -24,6 +23,7 @@ import {
 	ModelGroupConfigError,
 	type ParsedModelValue,
 	parseFallbackChainValue,
+	parseModelGroupDefinition,
 	parseModelRoleValue,
 	roleAcceptsGroups,
 } from "../config/model-groups";
@@ -198,7 +198,7 @@ function trustedAccountNames(settings: Settings): string[] {
  */
 export function writeModelHubPool(
 	settings: Settings,
-	target: ModelHubWriteTarget,
+	target: ModelHubPoolTarget,
 	value: Readonly<Record<string, unknown>> | undefined,
 ): string | undefined {
 	try {
@@ -225,7 +225,7 @@ export function writeModelHubPool(
 }
 
 /** The raw pool `target` names in the global config, the layer {@link writeModelHubPool} replaces. */
-function storedGlobalPool(settings: Settings, target: ModelHubWriteTarget): unknown {
+function storedGlobalPool(settings: Settings, target: ModelHubPoolTarget): unknown {
 	const global = settings.getGlobalSettings();
 	const section =
 		target.kind === "role"
@@ -302,11 +302,12 @@ function modelGroupWriteBlocker(settings: Settings, name: string): string | unde
 }
 
 /**
- * Pool view of a role or chain entry; undefined for a legacy value or an unset entry. A global role
- * entry the settings merge drops as invalid yields a view with `invalid` set
- * ({@link invalidGlobalRolePool}); any other invalid entry yields undefined.
+ * Pool view of a role, chain or `modelGroups` entry; undefined for a legacy value or an unset entry.
+ * A global role entry the settings merge drops as invalid yields a view with `invalid` set
+ * ({@link invalidGlobalRolePool}); so does a defined group that fails validation.
  */
 function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubPool | undefined {
+	if (target.kind === "group") return modelGroupPool(settings, target.key);
 	const spec =
 		target.kind === "role" ? settings.getModelRoleSpec(target.key) : settings.getFallbackChainSpec(target.key);
 	if (spec === undefined && target.kind === "role") return invalidGlobalRolePool(settings, target.key);
@@ -345,6 +346,32 @@ function modelHubPool(settings: Settings, target: ModelHubPoolTarget): ModelHubP
 }
 
 /**
+ * Pool view of `modelGroups.<name>` with its default efforts; `invalid` lists the validator's
+ * problems when the definition fails validation. Undefined when no layer defines it.
+ */
+function modelGroupPool(settings: Settings, name: string): ModelHubPool | undefined {
+	const raw = cfgModelGroups.get(settings)[name];
+	if (raw === undefined) return undefined;
+	const group = settings.getModelGroup(name);
+	if (!group) {
+		const parsed = parseModelGroupDefinition(name, raw, "tolerant");
+		return {
+			source: { kind: "inline" },
+			strategy: "",
+			members: [],
+			funding: [],
+			invalid: parsed.ok
+				? "rejected by the settings merge"
+				: parsed.issues.map(issue => `${issue.path}: ${issue.message}`).join("; "),
+		};
+	}
+	const view = { ...describeGroup(group, undefined), source: { kind: "inline" as const } };
+	const blocker = modelGroupWriteBlocker(settings, name);
+	if (blocker !== undefined) return { ...view, readOnly: blocker };
+	return isRecord(raw) ? { ...view, raw } : { ...view, readOnly: "not a mapping" };
+}
+
+/**
  * Pool view of the global `modelRoles.<role>` entry when it is in group form and fails validation;
  * undefined otherwise. `invalid` lists the validator's problems.
  */
@@ -369,7 +396,7 @@ function withPoolLimits(
 	target: ModelHubPoolTarget,
 	pool: ModelHubPool | undefined,
 ): ModelHubPool | undefined {
-	if (!pool) return pool;
+	if (!pool || target.kind === "group") return pool;
 	const poolId = target.kind === "role" ? rolePoolId(target.key) : chainPoolId(target.key);
 	const limits = poolLimitsSummary(settings, poolId, settings.getStorage()?.usageLedger, Date.now());
 	return limits ? { ...pool, limits } : pool;
@@ -444,6 +471,7 @@ export function billingSummary(
  * Fallback chains report the provenance of the whole `retry.fallbackChains` record.
  */
 function poolWriteBlocker(settings: Settings, target: ModelHubPoolTarget): string | undefined {
+	if (target.kind === "group") return modelGroupWriteBlocker(settings, target.key);
 	const provenance =
 		target.kind === "role"
 			? settings.getModelRoleProvenance(target.key)
