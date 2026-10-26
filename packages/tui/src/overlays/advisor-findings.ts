@@ -1,9 +1,10 @@
 import { SelectList } from "../components/select-list";
+import { Input } from "../components/input";
 import { bottomBorder, divider, row, topBorder } from "../chrome/overlay-box";
 import { matchesKey } from "../keys";
 import { col, text } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
-import { CLOSE_ACTION, picker, pickerAction, pickerEvent } from "../native/picker";
+import { CLOSE_ACTION, picker, pickerAction, pickerEvent, pickerHits, pickerQuery } from "../native/picker";
 import { overlayCard } from "../native/overlay";
 import { getSelectListTheme } from "../theme/theme";
 import type { Component, TUI } from "../tui";
@@ -44,6 +45,11 @@ export class AdvisorFindingsOverlay implements Component {
 	#filter: "open" | "all";
 	#message = "";
 	#detailScroll = 0;
+	#search = new Input();
+	#searching = false;
+	#severity: string | undefined;
+	#category: string | undefined;
+	#owner: string | undefined;
 
 	constructor(
 		readonly ui: Pick<TUI, "requestRender" | "terminal">,
@@ -61,9 +67,36 @@ export class AdvisorFindingsOverlay implements Component {
 	}
 
 	#refresh(): void {
+		const tokens = this.#search.getValue().toLowerCase().split(/\s+/).filter(Boolean);
 		this.#findings = this.source
 			.getFindings()
 			.filter(finding => this.#filter === "all" || finding.status === "open")
+			.filter(
+				finding =>
+					(!this.#severity || (finding.severity ?? "nit") === this.#severity) &&
+					(this.#category === undefined || finding.category === this.#category) &&
+					(this.#owner === undefined || (finding.owner ?? "") === this.#owner) &&
+					tokens.every(token =>
+						[
+							finding.id,
+							finding.status,
+							finding.severity ?? "nit",
+							finding.category,
+							finding.anchor,
+							finding.owner ?? "",
+							...finding.reports.flatMap(report => [
+								report.advisor,
+								report.category ?? "",
+								report.defect,
+								report.impact ?? "",
+								report.fix ?? "",
+							]),
+						]
+							.join(" ")
+							.toLowerCase()
+							.includes(token),
+					),
+			)
 			.sort(
 				(a, b) =>
 					Number(b.status === "open") - Number(a.status === "open") ||
@@ -79,10 +112,23 @@ export class AdvisorFindingsOverlay implements Component {
 		);
 	}
 
+	#empty(): string {
+		return this.#search.getValue() || this.#severity || this.#category !== undefined || this.#owner !== undefined
+			? "No findings match. Clear filters to show findings."
+			: this.#filter === "all"
+				? "No advisor findings."
+				: "No open advisor findings.";
+	}
+
+	#filterHint(): string {
+		return sanitizeDisplayLine(
+			`Filter: ${this.#filter} · s severity=${this.#severity ?? "all"} · c category=${this.#category ?? "all"} · w owner=${this.#owner ?? "all"}`,
+		);
+	}
 	#details(): string[] {
 		const selected = this.#list.getSelectedItem()?.value;
 		const finding = this.#findings.find(entry => entry.id === selected);
-		if (!finding) return [this.#filter === "all" ? "No advisor findings." : "No open advisor findings."];
+		if (!finding) return [this.#empty()];
 		const lead = finding.reports.find(report => report.owner && report.category === undefined) ?? finding.reports[0];
 		return [
 			`${finding.id} [${finding.status}] ${finding.severity ?? "nit"}`,
@@ -102,8 +148,36 @@ export class AdvisorFindingsOverlay implements Component {
 	}
 
 	#action(action: string, value?: string): boolean {
-		if (action === "close") this.onClose();
-		else if (action === "filter" || action === "tab") {
+		this.#refresh();
+		if (action === "close") {
+			if (this.#searching || this.#search.getValue()) {
+				this.#search.setValue("");
+				this.#searching = false;
+			} else this.onClose();
+		} else if (action === "search") this.#searching = true;
+		else if (action === "searchDone") this.#searching = false;
+		else if (action === "clearFilters") {
+			this.#search.setValue("");
+			this.#searching = false;
+			this.#severity = undefined;
+			this.#category = undefined;
+			this.#owner = undefined;
+			this.#filter = "all";
+		} else if (action === "severity" || action === "category" || action === "owner") {
+			const all = this.source.getFindings();
+			const options =
+				action === "severity"
+					? ["blocker", "concern", "nit"]
+					: [
+							...new Set(all.map(finding => (action === "category" ? finding.category : (finding.owner ?? "")))),
+						].sort();
+			const current = action === "severity" ? this.#severity : action === "category" ? this.#category : this.#owner;
+			if (value !== undefined && !options.includes(value)) return false;
+			const next = value ?? options[current === undefined ? 0 : options.indexOf(current) + 1];
+			if (action === "severity") this.#severity = next;
+			else if (action === "category") this.#category = next;
+			else this.#owner = next;
+		} else if (action === "filter" || action === "tab") {
 			if (value !== undefined && value !== "open" && value !== "all") return false;
 			this.#filter = value ?? (this.#filter === "open" ? "all" : "open");
 			this.#detailScroll = 0;
@@ -131,7 +205,9 @@ export class AdvisorFindingsOverlay implements Component {
 		const preview = this.#details().map(line => text(line));
 		if (!cx.supports("picker")) {
 			return overlayCard("omp.advisor.findings", "Advisor findings", [
-				text(`Filter: ${this.#filter} · f open/all · r resolve · o reopen · esc close`),
+				text(this.#filterHint()),
+				text("/ search · f open/all · x clear filters · r resolve · o reopen · esc close"),
+				this.#search,
 				this.#list,
 				col(preview),
 				text(this.#message),
@@ -142,7 +218,9 @@ export class AdvisorFindingsOverlay implements Component {
 				title: "Advisor findings",
 				noun: "findings",
 				size: "lg",
-				query: null,
+				...pickerQuery(this.#searching || this.#search.getValue() ? this.#search : null),
+				placeholder: "Search findings…",
+				subtitle: this.#filterHint(),
 				tabs: [
 					{ id: "open", label: "Open" },
 					{ id: "all", label: "All" },
@@ -151,6 +229,7 @@ export class AdvisorFindingsOverlay implements Component {
 				items: this.#findings.map(finding => ({
 					id: finding.id,
 					label: sanitizeDisplayLine(finding.id),
+					hits: pickerHits(sanitizeDisplayLine(finding.id), this.#search.getValue().toLowerCase().split(/\s+/)),
 					detail: sanitizeDisplayLine(`${finding.category || "-"} at ${finding.anchor}`),
 					facts: {
 						status: finding.status,
@@ -167,13 +246,19 @@ export class AdvisorFindingsOverlay implements Component {
 				],
 				selected: this.#list.getSelectedItem()?.value ?? null,
 				preview: "side",
-				empty: this.#filter === "all" ? "No advisor findings." : "No open advisor findings.",
+				empty: this.#empty(),
 				message: this.#message || undefined,
 				actions: [
 					pickerAction("resolve", "Resolve", "r", { disabled: this.#list.getSelectedItem() ? undefined : true }),
 					pickerAction("reopen", "Reopen", "o", { disabled: this.#list.getSelectedItem() ? undefined : true }),
 					pickerAction("filter", "Show all", "f", { on: this.#filter === "all" }),
-					CLOSE_ACTION,
+					pickerAction("search", "Search", "/"),
+					...(this.#searching ? [pickerAction("searchDone", "Done searching", "enter")] : []),
+					pickerAction("severity", `Severity: ${sanitizeDisplayLine(this.#severity ?? "all")}`, "s"),
+					pickerAction("category", `Category: ${sanitizeDisplayLine(this.#category ?? "all")}`, "c"),
+					pickerAction("owner", `Owner: ${sanitizeDisplayLine(this.#owner ?? "all")}`, "w"),
+					pickerAction("clearFilters", "Clear filters", "x"),
+					this.#searching || this.#search.getValue() ? { ...CLOSE_ACTION, label: "Clear search" } : CLOSE_ACTION,
 				],
 			},
 			preview,
@@ -181,6 +266,17 @@ export class AdvisorFindingsOverlay implements Component {
 	}
 
 	handleNativeEvent(event: NativeUiEvent): boolean {
+		if (
+			(event.type === "edit" || event.type === "undo") &&
+			event.key === "" &&
+			(this.#searching || this.#search.getValue())
+		) {
+			this.#searching = true;
+			this.#search.handleNativeEvent(event);
+			this.#refresh();
+			this.ui.requestRender();
+			return true;
+		}
 		const action = pickerEvent(event);
 		if (!action) return false;
 		if (action.kind === "action") return this.#action(action.act, action.value);
@@ -194,7 +290,17 @@ export class AdvisorFindingsOverlay implements Component {
 
 	handleInput(data: string): void {
 		this.#refresh();
-		if (matchesKey(data, "escape")) this.#action("close");
+		if (this.#searching && !matchesKey(data, "escape")) {
+			if (matchesKey(data, "enter") || data === "\n") this.#searching = false;
+			else if (matchesKey(data, "up") || matchesKey(data, "down")) this.#list.handleInput(data);
+			else this.#search.handleInput(data);
+			this.#refresh();
+		} else if (matchesKey(data, "escape")) this.#action("close");
+		else if (data === "/") this.#action("search");
+		else if (data === "s") this.#action("severity");
+		else if (data === "c") this.#action("category");
+		else if (data === "w") this.#action("owner");
+		else if (data === "x") this.#action("clearFilters");
 		else if (data === "f") this.#action("filter");
 		else if (data === "r") this.#action("resolve");
 		else if (data === "o") this.#action("reopen");
@@ -215,10 +321,11 @@ export class AdvisorFindingsOverlay implements Component {
 		this.#detailScroll = Math.min(this.#detailScroll, Math.max(0, details.length - budget));
 		return [
 			topBorder(width, "Advisor findings"),
-			row(
-				truncateToWidth(`Filter: ${this.#filter} · f open/all · r resolve · o reopen · esc close`, width - 4),
-				width,
-			),
+			row(truncateToWidth(sanitizeDisplayLine(this.#filterHint()), width - 4), width),
+			row(truncateToWidth("/ search · f open/all · x clear · r resolve · o reopen · esc close", width - 4), width),
+			...(this.#searching || this.#search.getValue()
+				? this.#search.render(width - 4).map(line => row(truncateToWidth(line, width - 4), width))
+				: []),
 			...list.map(line => row(truncateToWidth(line, width - 4), width)),
 			divider(width),
 			...details

@@ -331,6 +331,200 @@ describe("credential pins", () => {
 		});
 	}
 
+	function unpinCommandRuntime(session: AgentSession) {
+		const showStatus = vi.fn();
+		return {
+			showStatus,
+			runtime: {
+				ctx: {
+					session,
+					showStatus,
+					editor: { setText: vi.fn() },
+					statusLine: { invalidate: vi.fn() },
+					ui: { requestRender: vi.fn() },
+				} as unknown as InteractiveModeContext,
+			},
+		};
+	}
+
+	function useCodexFallback(session: AgentSession): void {
+		const model = getBundledModel("openai-codex", "gpt-6.1-sol");
+		if (!model) throw new Error("Expected bundled Codex fallback model");
+		session.agent.setModel(model);
+	}
+
+	test("/session unpin removes the Anthropic API key pin after a Codex fallback, including on resume", async () => {
+		await store.saveApiKey("anthropic", "test-anthropic-api-key");
+		await storage.credentials.reload();
+		const account = storage.sessions.accounts("anthropic").find(candidate => candidate.type === "api_key");
+		if (!account) throw new Error("Expected stored API key");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(assistantMessage("anthropic", Date.now()));
+		const session = createSession(manager);
+		try {
+			expect(session.pinCurrentProviderAccount(account.credentialId)).toBe("pinned");
+			useCodexFallback(session);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+
+			expect(await executeBuiltinSlashCommand("/session unpin", runtime)).toBe(true);
+			expect(showStatus).toHaveBeenCalledWith("Removed this session's account pin for anthropic.");
+			expect(pinnedCredentialId(session.sessionId)).toBeUndefined();
+			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+			await manager.flush();
+			const file = manager.getSessionFile();
+			if (!file) throw new Error("Expected persisted session");
+			const resumed = await SessionManager.open(file);
+			expect(resumed.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+			expect(seedCredentialPins(storage, resumed, "resumed-after-unpin")).toEqual([]);
+			expect(pinnedCredentialId("resumed-after-unpin")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin refuses ambiguous provider pins and an explicit provider removes only its pin", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const session = createSession(manager);
+		try {
+			expect(session.pinCurrentProviderAccount(storedAccount("b").credentialId)).toBe("pinned");
+			manager.appendCredentialPin("google", "missing-google-account", true);
+			useCodexFallback(session);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			const before = manager.getEntries().length;
+
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith(
+				"This session has account pins for anthropic, google. Use /session unpin <provider> to choose one.",
+			);
+			expect(manager.getEntries()).toHaveLength(before);
+			expect(pinnedCredentialId(session.sessionId)).toBe(storedAccount("b").credentialId);
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+
+			await executeBuiltinSlashCommand("/session unpin anthropic", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for anthropic.");
+			expect(pinnedCredentialId(session.sessionId)).toBeUndefined();
+			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+
+			await executeBuiltinSlashCommand("/session unpin google extra", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Usage: /session unpin [provider]");
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin prefers the current provider pin over other provider pins", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const session = createSession(manager);
+		try {
+			expect(session.pinCurrentProviderAccount(storedAccount("a").credentialId)).toBe("pinned");
+			manager.appendCredentialPin("google", "missing-google-account", true);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for anthropic.");
+			expect(pinnedCredentialId(session.sessionId)).toBeUndefined();
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin ignores automatic affinity and pins outside the resumed branch", async () => {
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		manager.appendCredentialPin("anthropic", accountHash("a"), true);
+		const branchPoint = manager.getLeafId();
+		if (!branchPoint) throw new Error("Expected branch point");
+		manager.appendCredentialPin("google", "other-branch-pin", true);
+		manager.branch(branchPoint);
+		manager.appendCredentialPin("openai-codex", "automatic-affinity");
+		const session = createSession(manager);
+		try {
+			useCodexFallback(session);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for anthropic.");
+			expect(manager.getCredentialPins().has("google")).toBe(false);
+			expect(manager.getCredentialPins().get("openai-codex")?.hash).toBe("automatic-affinity");
+			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin removes an unavailable explicit provider pin after fallback", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		manager.appendCredentialPin("google", "missing-account", true);
+		const session = createSession(manager);
+		try {
+			useCodexFallback(session);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin google", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for google.");
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin removes an ignored provider pin after fallback without changing the account pool", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		manager.appendCredentialPin("anthropic", accountHash("b"), true);
+		const scope = new SessionAccountPoolScope(storage, { anthropic: [identityKey("a")] }, manager.getSessionId());
+		const session = createSession(manager, scope);
+		try {
+			useCodexFallback(session);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for anthropic.");
+			expect(manager.getCredentialPins().get("anthropic")?.exclusive).toBe(false);
+			expect(storage.sessions.isRestricted("anthropic", session.sessionId)).toBe(true);
+			expect(storage.sessions.accounts("anthropic", session.sessionId).map(account => account.accountId)).toEqual([
+				"account-a",
+			]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin keeps current-provider live pin precedence without a recorded pin", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const session = createSession(manager);
+		try {
+			expect(storage.sessions.pin("anthropic", session.sessionId, storedAccount("a").credentialId)).toBe(true);
+			manager.appendCredentialPin("google", "other-provider-pin", true);
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith("Removed this session's account pin for anthropic.");
+			expect(pinnedCredentialId(session.sessionId)).toBeUndefined();
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("/session unpin reports the current provider's project pin without removing another session pin", async () => {
+		const manager = SessionManager.inMemory(tempDir.path());
+		const session = createSession(manager);
+		try {
+			manager.appendCredentialPin("google", "other-provider-pin", true);
+			vi.spyOn(session, "unpinCurrentProviderAccount").mockReturnValue("project-pin");
+			const unpinProvider = vi.spyOn(session, "unpinProviderAccount");
+			const before = manager.getEntries().length;
+			const { runtime, showStatus } = unpinCommandRuntime(session);
+			await executeBuiltinSlashCommand("/session unpin", runtime);
+			expect(showStatus).toHaveBeenLastCalledWith(
+				"This session follows the project account pin for anthropic; remove it from auth.accountPins.",
+			);
+			expect(unpinProvider).not.toHaveBeenCalled();
+			expect(manager.getEntries()).toHaveLength(before);
+			expect(manager.getCredentialPins().get("google")?.exclusive).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("a fresh or reset provider session keeps the user's exclusive pin", async () => {
 		serveStoredTokens();
 		const session = createSession(SessionManager.inMemory(tempDir.path()));

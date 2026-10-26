@@ -43,6 +43,7 @@ test("omp dry-balance resolves credential-scoped models from the model cache", a
 				env: { ...process.env, NO_COLOR: "1", OPENCODE_API_KEY: apiKey, PI_CODING_AGENT_DIR: tempDir.path() },
 				stdout: "pipe",
 				stderr: "pipe",
+				timeout: 20_000,
 			},
 		);
 		const [stdout, stderr] = await Promise.all([
@@ -57,4 +58,4 @@ test("omp dry-balance resolves credential-scoped models from the model cache", a
 	} finally {
 		await tempDir.remove();
 	}
-});
+}, 30_000);

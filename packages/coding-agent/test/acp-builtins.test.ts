@@ -808,7 +808,7 @@ describe("ACP builtin slash commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/switch opus:low", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(temporarySpy).toHaveBeenCalledWith(available[0], "low");
+		expect(temporarySpy).toHaveBeenCalledWith(available[0], "low", { poolRole: undefined });
 		expect(setModelSpy).not.toHaveBeenCalled();
 		expect(output[0]).toContain("Session-only model: anthropic/claude-opus-4-5");
 	});
@@ -825,7 +825,7 @@ describe("ACP builtin slash commands", () => {
 
 		await executeAcpBuiltinSlashCommand("/switch @smol", runtime);
 
-		expect(temporarySpy).toHaveBeenCalledWith(available[1], undefined);
+		expect(temporarySpy).toHaveBeenCalledWith(available[1], undefined, { poolRole: undefined });
 	});
 
 	it("switch unknown: reports the selector and leaves the model alone", async () => {
@@ -836,7 +836,7 @@ describe("ACP builtin slash commands", () => {
 		await executeAcpBuiltinSlashCommand("/switch gpt-fake-9000", runtime);
 
 		expect(temporarySpy).not.toHaveBeenCalled();
-		expect(output[0]).toContain("Unknown model: gpt-fake-9000");
+		expect(output[0]).toBe('Model "gpt-fake-9000" not found. Run "omp models" to see available models.');
 	});
 
 	// Removed TUI-only and dropped commands fall through as false
@@ -1622,10 +1622,13 @@ describe("wave 5 — adapters and polish", () => {
 
 	// /model with unknown id
 	it("/model gpt-fake-9000: returns unknown-model message", async () => {
-		const { output, runtime } = createRuntime();
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-opus-4-5" }];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
 		const result = await executeAcpBuiltinSlashCommand("/model gpt-fake-9000", runtime);
 		expect(result).toEqual({ consumed: true, failed: true });
-		expect(output[0]).toContain("Unknown model");
+		expect(output[0]).toBe('Model "gpt-fake-9000" not found. Run "omp models" to see available models.');
+		expect(setModelSpy).not.toHaveBeenCalled();
 	});
 
 	// /usage bar character

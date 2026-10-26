@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import {
 	decodeTernReply,
 	isTernUnavailable,
@@ -19,6 +21,53 @@ afterEach(async () => {
 });
 
 describe("TernSocketClient", () => {
+	it.skipIf(!process.getuid)("rejects regular files and symlinks before sending a greeting", async () => {
+		daemon = await startFakeDaemon(() => ({ ok: {} }));
+		const file = path.join(path.dirname(daemon.socketPath), "not-a-socket");
+		const link = path.join(path.dirname(daemon.socketPath), "socket-link");
+		await fs.writeFile(file, "");
+		await fs.symlink(daemon.socketPath, link);
+		for (const socketPath of [file, link]) {
+			client = new TernSocketClient({ socketPath });
+			await expect(client.connect()).rejects.toThrow("must be a socket owned by the current user");
+			expect(client.connected).toBe(false);
+			client.close();
+		}
+		expect(daemon.hellos).toHaveLength(0);
+	});
+
+	it.skipIf(!process.getuid)("rejects sockets owned by another uid before sending a greeting", async () => {
+		daemon = await startFakeDaemon(() => ({ ok: {} }));
+		const stat = await fs.lstat(daemon.socketPath);
+		const getuid = spyOn(process, "getuid").mockReturnValue(stat.uid + 1);
+		try {
+			client = new TernSocketClient({ socketPath: daemon.socketPath });
+			await expect(client.connect()).rejects.toThrow("must be a socket owned by the current user");
+			expect(client.connected).toBe(false);
+			expect(daemon.hellos).toHaveLength(0);
+		} finally {
+			getuid.mockRestore();
+		}
+	});
+
+	it("connects without a uid ownership check when process.getuid is unavailable", async () => {
+		daemon = await startFakeDaemon(() => ({ ok: {} }));
+		const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+		Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+		try {
+			client = new TernSocketClient({ socketPath: daemon.socketPath });
+			await client.connect();
+			expect(client.connected).toBe(true);
+			expect(daemon.hellos).toHaveLength(1);
+		} finally {
+			if (descriptor) {
+				Object.defineProperty(process, "getuid", descriptor);
+			} else {
+				Reflect.deleteProperty(process, "getuid");
+			}
+		}
+	});
+
 	it("greets with a JSON hello and correlates answers by id", async () => {
 		const held: number[] = [];
 		daemon = await startFakeDaemon((op, id) => {

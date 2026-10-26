@@ -116,7 +116,10 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 
 In an interactive session, `/switch @role/member[:level]` and `/switch +group/member[:level]`
 use the same member syntax without saving a model assignment. Repeating `/switch @role` advances
-its active kept pool pick; `/switch @role/next` advances explicitly, including from an inactive role.
+its active kept pool pick; `/switch @role/next` advances past the active role's currently served
+member, including after retry fallback. For an inactive role it advances from the kept pick, or
+the initial strategy pick if none is kept. If only the active member is eligible, it reports
+`No other eligible member of pool "<role>"` without switching.
 `next` is reserved for that operation, not a literal role-pool member name. `/switch` argument
 completion lists roles after `@`, groups after `+`, and members after the pool's `/`.
 With no argument, `/switch` opens the Alt+P session picker; `/model` still opens the model hub.

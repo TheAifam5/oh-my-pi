@@ -10,6 +10,7 @@ import {
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { withAuth } from "@oh-my-pi/pi-ai/auth-retry";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 
 const PROVIDER = "unit-account-pins";
@@ -107,6 +108,23 @@ describe("AuthStorage account names and exclusive pins", () => {
 		expect(rotation.switched).toBe(false);
 		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
 		expect(storage.sessions.release(PROVIDER, SESSION)).toBe(false);
+		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
+	});
+
+	test("low credits do not bypass an exclusive account pin during auth recovery", async () => {
+		const storage = await storageWithAccounts();
+		const pinnedId = credentialId(storage, "personal");
+		expect(storage.sessions.pin(PROVIDER, SESSION, pinnedId)).toBe(true);
+		const failure = new AIError.ProviderHttpError("Your credit balance is too low to access the Anthropic API.", 400);
+		const attempted: string[] = [];
+		await expect(
+			withAuth(storage.keys.resolver(PROVIDER, { sessionId: SESSION }), async key => {
+				attempted.push(key);
+				throw failure;
+			}),
+		).rejects.toBe(failure);
+		expect(attempted).toEqual(["access-a"]);
+		expect(storage.sessions.accounts(PROVIDER, SESSION).find(account => account.pinned)?.credentialId).toBe(pinnedId);
 		expect(await storage.keys.get(PROVIDER, SESSION)).toBe("access-a");
 	});
 

@@ -103,6 +103,7 @@ describe("AgentSession eager todo enforcement", () => {
 	let sharedAuthStorage: AuthStorage;
 	let sharedModelRegistry: ModelRegistry;
 	let previousNoTitle: string | undefined;
+	let previousInteractiveHost: boolean;
 	const observedCalls: ObservedPromptCall[] = [];
 
 	async function createSession(
@@ -227,6 +228,7 @@ describe("AgentSession eager todo enforcement", () => {
 	});
 
 	beforeEach(async () => {
+		previousInteractiveHost = setInteractiveHost(false);
 		previousNoTitle = Bun.env.PI_NO_TITLE;
 		delete Bun.env.PI_NO_TITLE;
 		tempDir = TempDir.createSync("@pi-agent-session-eager-todo-");
@@ -241,6 +243,7 @@ describe("AgentSession eager todo enforcement", () => {
 			await session.dispose();
 		}
 		vi.restoreAllMocks();
+		setInteractiveHost(previousInteractiveHost);
 		if (previousNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 		else Bun.env.PI_NO_TITLE = previousNoTitle;
 		tempDir.removeSync();
@@ -422,9 +425,6 @@ describe("AgentSession eager todo enforcement", () => {
 	});
 
 	it("does not refresh todo-init titles for headless subagent sessions", async () => {
-		// Issue #5910: a subagent (agentKind "sub") in a non-interactive host has no
-		// operator-visible title, so a todo-init replan refresh only wastes a
-		// tiny-model LLM call. isInteractiveHost() defaults false under bun test.
 		await recreateSession({ "title.refreshOnReplan": true }, { agentKind: "sub" });
 		await session.setSessionName("Old auto title", "auto");
 		const priorUser: AgentMessage = {

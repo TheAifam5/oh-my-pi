@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { isAuthRetryableError } from "@oh-my-pi/pi-ai/error/auth-classify";
 import { classify, Flag, is, isUsageLimit, retriable } from "@oh-my-pi/pi-ai/error/flags";
 import {
 	calculateRateLimitBackoffMs,
@@ -42,6 +43,43 @@ function googleRpc429(reason: string, retryDelay?: string, message = "Resource e
 }
 
 describe("parseRateLimitReason", () => {
+	it("classifies Anthropic low credit balance and insufficient credit codes as account exhaustion", () => {
+		const messages = [
+			"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}',
+			'{"error":{"type":"insufficient_credit","message":"Payment required"}}',
+			"insufficient_credits",
+			"Insufficient credits",
+			"Not enough available credits",
+			"This request would exceed your available credits given your current in-flight requests.",
+		];
+		for (const message of messages) {
+			expect(parseRateLimitReason(message)).toBe("QUOTA_EXHAUSTED");
+			expect(matchesUsageLimitText(message)).toBe(true);
+			expect(isUsageLimitOutcome(400, message)).toBe(true);
+			expect(isUsageLimit(new ProviderHttpError(message, 400))).toBe(true);
+		}
+		for (const code of ["insufficient_credit", "insufficient_credits"]) {
+			expect(isUsageLimit(new ProviderHttpError("Request rejected", 400, { code }))).toBe(true);
+		}
+	});
+
+	it("does not rotate on credit balance lookup failures or unrelated invalid requests", () => {
+		for (const message of [
+			"Failed to fetch credit balance",
+			"Credit balance is unavailable",
+			"Insufficient permissions to fetch credit balance",
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"Insufficient permissions to fetch credit balance"}}',
+			"invalid_request_error: messages must not be empty",
+			"insufficient_credit_estimate",
+		]) {
+			expect(parseRateLimitReason(message)).toBe("UNKNOWN");
+			expect(isUsageLimitOutcome(400, message)).toBe(false);
+			expect(isUsageLimit(new ProviderHttpError(message, 400))).toBe(false);
+			expect(isAuthRetryableError(new ProviderHttpError(message, 400))).toBe(false);
+		}
+	});
+
 	it("classifies Google Quota exceeded as QUOTA_EXHAUSTED", () => {
 		expect(
 			parseRateLimitReason("Cloud Code Assist API error (429): Quota exceeded for aiplatform.googleapis.com"),

@@ -24,7 +24,11 @@ import {
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable, loadPuppeteer } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import {
+	connectPuppeteer,
+	ensureChromiumExecutable,
+	loadPuppeteer,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -738,6 +742,104 @@ describe("pickElectronTarget", () => {
 			cdp.stop(true);
 		}
 	});
+});
+
+describe("browser connection error redaction", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const secretEndpoint =
+		"ws://cdp-user:cdp-password@127.0.0.1:9222/devtools/browser/private?token=cdp-token#cdp-fragment";
+	const safeEndpoint = "ws://127.0.0.1:9222/devtools/browser/private";
+
+	function expectRedacted(error: unknown, endpoint: string): void {
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain(endpoint);
+		for (const secret of ["cdp-user", "cdp-password", "cdp-token", "cdp-fragment"]) {
+			expect(message).not.toContain(secret);
+			expect(String(error)).not.toContain(secret);
+		}
+		expect((error as Error).cause).toBeUndefined();
+	}
+
+	test("redacts the registry's connected-browser discovery timeout", async () => {
+		const cdpUrl = "http://cdp-user:cdp-password@127.0.0.1:9222/discovery?token=cdp-token#cdp-fragment";
+		vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(5_000);
+		const error = await rejectionOf(acquireBrowser({ kind: "connected", cdpUrl }, { cwd: process.cwd() }));
+		expectRedacted(error, "http://127.0.0.1:9222/discovery");
+		expect((error as Error).message).toContain("Timed out waiting for CDP endpoint");
+	});
+
+	test("redacts the registry's connected-browser websocket failure", async () => {
+		const puppeteer = await loadPuppeteer();
+		const server = Bun.serve({
+			port: 0,
+			fetch: () => Response.json({ webSocketDebuggerUrl: secretEndpoint }),
+		});
+		const cdpUrl = `http://cdp-user:cdp-password@127.0.0.1:${server.port}/discovery?token=cdp-token#cdp-fragment`;
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ webSocketDebuggerUrl: secretEndpoint }));
+		vi.spyOn(puppeteer, "connect").mockRejectedValue(new Error(`Could not connect to ${secretEndpoint}`));
+		try {
+			const error = await rejectionOf(acquireBrowser({ kind: "connected", cdpUrl }, { cwd: process.cwd() }));
+			expectRedacted(error, safeEndpoint);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test.each([
+		["ordinary Error", new Error("Unexpected server response: 404")],
+		["ErrorEvent", { message: `WebSocket connection to '${secretEndpoint}' failed: 404` }],
+		["endpoint-bearing Error", new Error(`Could not connect to ${secretEndpoint}`)],
+	])("redacts websocket credentials from %s failures", async (_name, failure) => {
+		const puppeteer = await loadPuppeteer();
+		vi.spyOn(puppeteer, "connect").mockRejectedValue(failure);
+		const error = await rejectionOf(connectPuppeteer(puppeteer, { browserWSEndpoint: secretEndpoint }));
+		expectRedacted(error, safeEndpoint);
+	});
+
+	test("redacts the discovered websocket URL when connection fails", async () => {
+		const puppeteer = await loadPuppeteer();
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ webSocketDebuggerUrl: secretEndpoint }));
+		vi.spyOn(puppeteer, "connect").mockRejectedValue(new Error(`Could not connect to ${secretEndpoint}`));
+		const error = await rejectionOf(connectPuppeteer(puppeteer, { browserURL: "http://127.0.0.1:9222" }));
+		expectRedacted(error, safeEndpoint);
+	});
+
+	test("redacts discovery URL credentials from fetch failures", async () => {
+		const puppeteer = await loadPuppeteer();
+		const browserURL = "http://cdp-user:cdp-password@127.0.0.1:9222?token=cdp-token#cdp-fragment";
+		const versionURL = new URL("/json/version", browserURL);
+		vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error(`Failed to fetch ${versionURL} from ${browserURL}`));
+		const error = await rejectionOf(connectPuppeteer(puppeteer, { browserURL }));
+		expectRedacted(error, "http://127.0.0.1:9222/json/version");
+	});
+
+	test("drops credential-bearing causes from discovery failures", async () => {
+		const puppeteer = await loadPuppeteer();
+		const browserURL = "http://cdp-user:cdp-password@127.0.0.1:9222?token=cdp-token#cdp-fragment";
+		vi.spyOn(globalThis, "fetch").mockRejectedValue(
+			new Error("fetch failed", { cause: new Error(`Request to ${browserURL} failed`) }),
+		);
+		const error = await rejectionOf(connectPuppeteer(puppeteer, { browserURL }));
+		expectRedacted(error, "http://127.0.0.1:9222/");
+	});
+
+	test.each([new Response("denied", { status: 403 }), Response.json({})])(
+		"redacts discovery URL credentials from invalid discovery responses",
+		async response => {
+			const puppeteer = await loadPuppeteer();
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+			const error = await rejectionOf(
+				connectPuppeteer(puppeteer, {
+					browserURL: "http://cdp-user:cdp-password@127.0.0.1:9222?token=cdp-token#cdp-fragment",
+				}),
+			);
+			expectRedacted(error, "http://127.0.0.1:9222/json/version");
+		},
+	);
 });
 
 describe("resolveSpawnArgs", () => {

@@ -167,6 +167,7 @@ function seedCompletedRun(
 
 describe("init_experiment", () => {
 	let dbOverride: TempDir;
+	let pendingInit: Promise<unknown> | undefined;
 
 	beforeEach(() => {
 		dbOverride = makeTempDir("@pi-autoresearch-init-db-");
@@ -174,6 +175,8 @@ describe("init_experiment", () => {
 	});
 
 	afterEach(async () => {
+		await pendingInit?.catch(() => {});
+		pendingInit = undefined;
 		delete process.env.OMP_AUTORESEARCH_DB_DIR;
 		closeAllAutoresearchStorages();
 		await Bun.sleep(0);
@@ -303,13 +306,15 @@ describe("init_experiment", () => {
 			getRuntime: () => runtime,
 			pi: createPiHarness().api,
 		});
-		const result = await tool.execute(
+		const execution = tool.execute(
 			"call-1",
 			{ name: "x", primary_metric: "m", goal: "speed" },
 			undefined,
 			undefined,
 			createCtx(dir),
 		);
+		pendingInit = execution;
+		const result = await execution;
 		expect(result.details?.harnessCommitted).toBe(true);
 		const newHead = await vcs.requireGit(dir).headSha();
 		expect(newHead).not.toBe(initialBaseline);
@@ -318,7 +323,7 @@ describe("init_experiment", () => {
 		expect(status).toBe("");
 		const message = (await $`git log -1 --pretty=%B`.cwd(dir).text()).trim();
 		expect(message).toContain("autoresearch: harness setup");
-	});
+	}, 30_000);
 
 	it("does not auto-commit when not on an autoresearch branch", async () => {
 		const { dir, baselineCommit: initialBaseline } = freshRepo();

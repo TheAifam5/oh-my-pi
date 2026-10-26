@@ -184,7 +184,18 @@ describe("HTML export template", () => {
 
 		const packDir = path.join(tempRoot, "production-package");
 		await Bun.write(path.join(packDir, "package.json"), Bun.file(path.join(packageDir, "package.json")));
-		await Bun.write(path.join(packDir, "bun.lock"), Bun.file(path.resolve(packageDir, "../../bun.lock")));
+		const workspaceManifest = await Bun.file(path.resolve(packageDir, "../../package.json")).json();
+		await Bun.write(
+			path.join(tempRoot, "package.json"),
+			JSON.stringify({
+				private: true,
+				workspaces: {
+					packages: ["production-package"],
+					catalog: workspaceManifest.workspaces.catalog,
+				},
+			}),
+		);
+		await Bun.write(path.join(tempRoot, "bun.lock"), Bun.file(path.resolve(packageDir, "../../bun.lock")));
 		for (const entry of await fs.promises.readdir(productionBundleDir)) {
 			await Bun.write(path.join(packDir, "dist", entry), Bun.file(path.join(productionBundleDir, entry)));
 		}

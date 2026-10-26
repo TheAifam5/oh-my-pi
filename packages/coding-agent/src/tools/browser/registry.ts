@@ -13,6 +13,7 @@ import {
 	DEFAULT_VIEWPORT,
 	launchHeadlessBrowser,
 	loadPuppeteer,
+	redactBrowserErrorMessage,
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
@@ -245,7 +246,12 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	}
 	if (kind.kind === "connected") {
 		const cdpUrl = normalizeConnectedCdpUrl(kind.cdpUrl);
-		await waitForCdp(cdpUrl, 5_000, opts.signal);
+		try {
+			await waitForCdp(cdpUrl, 5_000, opts.signal);
+		} catch (error) {
+			if (error instanceof ToolAbortError) throw error;
+			throw new ToolError(redactBrowserErrorMessage(error instanceof Error ? error.message : String(error)));
+		}
 		const puppeteer = await loadPuppeteer();
 		const browser = await connectPuppeteer(puppeteer, {
 			browserURL: cdpUrl,

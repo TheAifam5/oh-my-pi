@@ -17,6 +17,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { buildSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -44,8 +45,10 @@ import {
 	retryFallbackBillingRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-groups";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -1689,6 +1692,163 @@ describe("model role pools", () => {
 					advanceActiveRole: true,
 				});
 				expect(selected.model && selectorOf(selected.model)).toBe(selectorOf(ANTHROPIC));
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["missing", "stale", "fallback", "recovered"] as const)(
+			"switches from the actual default member with a %s cursor and wraps through the command handler",
+			async cursor => {
+				const settings = Settings.isolated({
+					modelRoles: { default: pool("priority", [ANTHROPIC, OPENAI]) },
+				});
+				const keys = vi.spyOn(modelRegistry, "getApiKey");
+				const { session } = await createAgentSession(startupOptions(settings));
+				try {
+					const initial = await session.resolveRoleModelAsync("default");
+					expect(initial.model && selectorOf(initial.model)).toBe(selectorOf(ANTHROPIC));
+					await session.setModelTemporary(OPENAI);
+					session.sessionManager.appendModelChange(selectorOf(OPENAI), "default");
+					if (cursor === "recovered") {
+						modelRegistry.suppressSelector(selectorOf(ANTHROPIC), Date.now() + 60_000);
+					}
+					if (cursor !== "missing") await session.resolveRoleModelAsync("default");
+					if (cursor === "fallback") session.sessionManager.appendModelChange(selectorOf(OPENAI), "fallback");
+					if (cursor === "recovered") modelRegistry.clearSuppressedSelectors();
+					keys.mockClear();
+					const showError = vi.fn();
+					const showStatus = vi.fn();
+					const runtime = {
+						ctx: {
+							editor: { setText: vi.fn() },
+							session,
+							viewSession: session,
+							settings,
+							showError,
+							showStatus,
+							switchSessionModel: async (model: Model, level?: ConfiguredThinkingLevel, role?: string) => {
+								await session.setModelTemporary(model, level, { poolRole: role });
+								showStatus(`@${role} → ${selectorOf(model)}`);
+							},
+						} as unknown as InteractiveModeContext,
+					};
+					for (const model of [ANTHROPIC, OPENAI, ANTHROPIC]) {
+						expect(await executeBuiltinSlashCommand("/switch @default/next", runtime)).toBe(true);
+						expect(session.model && selectorOf(session.model)).toBe(selectorOf(model));
+						expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
+						expect(showStatus).toHaveBeenLastCalledWith(`@default → ${selectorOf(model)}`);
+					}
+					expect(showError).not.toHaveBeenCalled();
+					expect(keys).toHaveBeenCalled();
+					expect(keys.mock.calls.every(([, sessionId]) => sessionId === session.sessionId)).toBe(true);
+				} finally {
+					await session.dispose();
+				}
+			},
+		);
+
+		it("wraps past the active member when its credentials are no longer available", async () => {
+			const settings = Settings.isolated({
+				modelRoles: { default: pool("priority", [ANTHROPIC, OPENAI, GOOGLE]) },
+			});
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				await session.setModelTemporary(GOOGLE);
+				session.sessionManager.appendModelChange(selectorOf(GOOGLE), "default");
+				const registry = session.modelRegistry;
+				const available = registry.getAvailable().filter(model => model.provider !== GOOGLE.provider);
+				const configuredAuth = registry.hasConfiguredAuth.bind(registry);
+				vi.spyOn(registry, "getAvailable").mockReturnValue(available);
+				vi.spyOn(registry, "hasConfiguredAuth").mockImplementation(
+					model => model.provider !== GOOGLE.provider && configuredAuth(model),
+				);
+				const showError = vi.fn();
+				const runtime = {
+					ctx: {
+						editor: { setText: vi.fn() },
+						session,
+						viewSession: session,
+						settings,
+						showError,
+						showStatus: vi.fn(),
+						switchSessionModel: async (model: Model, level?: ConfiguredThinkingLevel, role?: string) => {
+							await session.setModelTemporary(model, level, { poolRole: role });
+						},
+					} as unknown as InteractiveModeContext,
+				};
+				await executeBuiltinSlashCommand("/switch @default/next", runtime);
+				expect(showError).not.toHaveBeenCalled();
+				expect(session.model && selectorOf(session.model)).toBe(selectorOf(ANTHROPIC));
+				expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("advances between distinct effort members of the same model", async () => {
+			const settings = Settings.isolated({
+				modelRoles: {
+					default: {
+						strategy: "priority",
+						strategyOptions: { order: ["low", "high"] },
+						models: {
+							low: { model: selectorOf(ANTHROPIC), defaultEffort: "low" },
+							high: { model: selectorOf(ANTHROPIC), defaultEffort: "high" },
+						},
+					},
+				},
+			});
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				for (const [selector, level] of [
+					["@default/low", Effort.Low],
+					["@default/next", Effort.High],
+					["@default/next", Effort.Low],
+				] as const) {
+					const selected = await resolveSessionModelSelector(selector, session, settings);
+					expect(selected.error).toBeUndefined();
+					expect(selected.model).toBeDefined();
+					expect(selected.thinkingLevel).toBe(level);
+					await session.setModelTemporary(selected.model!, selected.thinkingLevel, {
+						poolRole: selected.poolRole,
+					});
+					expect(session.thinkingLevel).toBe(level);
+					expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
+				}
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("reports an unavailable next member without switching or changing the default role", async () => {
+			const settings = Settings.isolated({
+				modelRoles: { default: pool("priority", [ANTHROPIC, OPENAI]) },
+			});
+			const { session } = await createAgentSession(startupOptions(settings));
+			try {
+				await session.setModelTemporary(OPENAI);
+				session.sessionManager.appendModelChange(selectorOf(OPENAI), "default");
+				modelRegistry.suppressSelector(selectorOf(ANTHROPIC), Date.now() + 60_000);
+				const before = session.model;
+				const showError = vi.fn();
+				const switchSessionModel = vi.fn();
+				const runtime = {
+					ctx: {
+						editor: { setText: vi.fn() },
+						session,
+						viewSession: session,
+						settings,
+						showError,
+						showStatus: vi.fn(),
+						switchSessionModel,
+					} as unknown as InteractiveModeContext,
+				};
+				await executeBuiltinSlashCommand("/switch @default/next", runtime);
+				expect(showError).toHaveBeenCalledWith('No other eligible member of pool "default"');
+				expect(switchSessionModel).not.toHaveBeenCalled();
+				expect(session.model).toBe(before);
+				expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
 			} finally {
 				await session.dispose();
 			}

@@ -477,14 +477,101 @@ describe("advisor findings delivery", () => {
 			});
 		});
 
-		it("treats an unknown finding id as no relation", async () => {
+		it("rejects unknown relation targets without recording or delivering a finding", async () => {
 			await withOpenFinding(async tools => {
-				await advise(tools.get("Performance"), related("security", "Timing leak.", "F99", "disputes", "nit"));
-				const queued = asides().join("\n");
-				expect(queued).toContain('finding="F1"');
-				expect(queued).not.toContain("relation=");
-				expect(session.getAdvisorFindings()[0]?.reports.at(-1)?.relation).toBeUndefined();
+				const before = structuredClone(session.getAdvisorFindings());
+				const ack = await advise(tools.get("Performance"), related("security", "Fixed.", "F99", "resolved", "nit"));
+				expect(ack).toContain("Rejected: finding F99 is unknown in this session");
+				expect(session.getAdvisorFindings()).toEqual(before);
+				expect(steered()).toHaveLength(0);
+				expect(asides()).toHaveLength(0);
 			});
+		});
+
+		for (const restored of [false, true]) {
+			for (const pending of [false, true]) {
+				it(`acknowledges paraphrased resolutions without mutation or another card (restored=${restored}, pending=${pending})`, async () => {
+					let ledger = new AdvisorFindingsLedger({ ownerOf: () => "Security" });
+					const delivered: string[] = [];
+					const options = () => ({
+						ledger,
+						advisor: "Security",
+						resolveAnchorIdentity: async (where: AdviseParams["where"]) => JSON.stringify(where),
+					});
+					let tool = new AdviseTool(advice => delivered.push(advice.note), undefined, options());
+					await tool.execute("open", report("security", "Token compared with ==."));
+					tool.beginUpdate(pending);
+					await tool.execute(
+						"resolve",
+						related("security", "Constant-time compare landed.", "F1", "resolved", "nit"),
+					);
+					if (restored) {
+						tool.flushDeferredNotes();
+						const snapshot = structuredClone(ledger.toEntry());
+						ledger = new AdvisorFindingsLedger({ ownerOf: () => "Security" });
+						ledger.load(snapshot);
+						tool = new AdviseTool(advice => delivered.push(advice.note), undefined, options());
+					}
+					const before = structuredClone(ledger.toEntry());
+					const deliveredBefore = delivered.length;
+					for (const advisor of ["Security", "Performance"]) {
+						const reporter =
+							advisor === "Security"
+								? tool
+								: new AdviseTool(advice => delivered.push(advice.note), undefined, { ...options(), advisor });
+						reporter.beginUpdate(true);
+						const ack = await reporter.execute("repeat", {
+							...related(
+								"security",
+								"The updated comparison now prevents timing leaks.",
+								"F1",
+								"resolved",
+								"nit",
+							),
+							where: { ...ANCHOR, line: ANCHOR.line + 10, endLine: ANCHOR.line + 12 },
+						});
+						expect(ack.isError).not.toBe(true);
+						expect(ack.content).toEqual([
+							{ type: "text", text: "Already resolved: F1. No new report or delivery." },
+						]);
+						expect(ledger.toEntry()).toEqual(before);
+					}
+					expect(delivered).toHaveLength(deliveredBefore);
+					tool.flushDeferredNotes();
+					expect(delivered).toHaveLength(deliveredBefore + (pending && !restored ? 1 : 0));
+					expect(ledger.list().map(finding => finding.id)).toEqual(["F1"]);
+				});
+			}
+		}
+
+		it("requires explicit reopening for a stale relation and preserves genuine new findings", async () => {
+			const ledger = new AdvisorFindingsLedger({ ownerOf: () => "Security" });
+			const delivered: string[] = [];
+			const tool = new AdviseTool(advice => delivered.push(advice.finding ?? ""), undefined, {
+				ledger,
+				advisor: "Security",
+			});
+			await tool.execute("open", report("security", "Token compared with ==."));
+			await tool.execute("resolve", related("security", "Constant-time compare landed.", "F1", "resolved", "nit"));
+			const before = structuredClone(ledger.toEntry());
+			tool.beginUpdate(false);
+			const stale = await tool.execute("stale", related("security", "Timing leak returned.", "F1", "adds"));
+			expect(stale.isError).toBe(true);
+			expect(ledger.toEntry()).toEqual(before);
+			expect(delivered).toEqual(["F1", "F1"]);
+			expect(ledger.reopen("F1")).toBe("reopened");
+			await tool.execute("regression", related("security", "Timing leak returned.", "F1", "adds"));
+			expect(ledger.get("F1")?.status).toBe("open");
+			expect(ledger.get("F1")?.reports.at(-1)?.relation).toBe("adds");
+			expect(delivered.at(-1)).toBe("F1");
+			ledger.resolve("F1");
+			tool.beginUpdate(false);
+			await tool.execute("new", report("security", "Different comparison leaks timing."));
+			expect(ledger.list().map(finding => [finding.id, finding.status])).toEqual([
+				["F1", "resolved"],
+				["F2", "open"],
+			]);
+			expect(delivered.at(-1)).toBe("F2");
 		});
 	});
 

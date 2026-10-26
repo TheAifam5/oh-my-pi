@@ -836,6 +836,8 @@ export function classify(error: unknown, api?: Api): number {
 			const { status: codeStatus, code } = link;
 			if (
 				code === "usage_limit_reached" ||
+				code === "insufficient_credit" ||
+				code === "insufficient_credits" ||
 				(code === "insufficient_quota" && !isDashScopeTokenLimitText(link.message)) ||
 				(codeStatus === 402 &&
 					(is402BillingCapBody(link.message) ||

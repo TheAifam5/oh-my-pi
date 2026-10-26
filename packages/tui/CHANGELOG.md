@@ -5,6 +5,8 @@
 ### Changed
 
 - `/models` pool routing and profile overrides and `/account` account, limit, and pin editors use typed object-scoped preference sheets in Tern and settings lists in the terminal; refused text and numeric edits keep their draft, cursor, and field warning
+- Hub preference choice menus stage selection until Enter or an option click, cancel on Escape, and retain refused drafts; ordered multi keyboard edits expose their draft order and highlighted option in Tern
+- `/advisor findings` supports text search and severity, category, and owner filters in Tern and ANSI, preserves matching finding selections across refreshes, and offers clear filters even with no results
 - `/account` in Tern is a table: providers and policy pages as scopes, accounts grouped by provider with Billing, State, Type, Routing, Pins and Limits columns, and each field as an action
 - `/models` Roles view shows pools, pool members and fallbacks in separate Model, Thinking, Billing and Routing columns, aligned in the TUI and as table columns in Tern
 - `/models` Roles and Groups and `/account` offer explicit `/` search with matching-row selection preservation, highlighted Tern label hits, and no-results text; Enter restores row shortcuts and Escape clears the search first

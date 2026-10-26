@@ -529,6 +529,26 @@ export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> 
 	}
 
 	#admit(args: AdviseParams, anchorIdentity: string): AgentToolResult<AdviseDetails> {
+		if (args.relatesTo !== undefined && args.relation !== undefined) {
+			const target = this.#ledger.get(args.relatesTo);
+			if (!target) {
+				return this.#rejected(
+					`Rejected: finding ${args.relatesTo} is unknown in this session. Use an existing finding ID, or omit both relation fields for a new finding.`,
+				);
+			}
+			if (target.status === "resolved" && args.relation === "resolved") {
+				return this.#result(
+					`Already resolved: ${target.id}. No new report or delivery.`,
+					args,
+					formatAdviseNote(args),
+				);
+			}
+			if (target.status !== "open") {
+				return this.#rejected(
+					`Rejected: finding ${target.id} is ${target.status}. Ask the main agent to reopen it for a regression, or omit both relation fields for a new finding.`,
+				);
+			}
+		}
 		const note = formatAdviseNote(args);
 		const advice: AdvisorAdvice = {
 			note,
@@ -595,8 +615,8 @@ export class AdviseTool implements AgentTool<Type<AdviseParams>, AdviseDetails> 
 	 * it takes effect as: `duplicate` only when the report's anchor identity
 	 * matches the finding's or both anchors are `approach` anchors (whose
 	 * topics are free text), `resolved` only from the finding's owner (else
-	 * `disputes`). Undefined for an unknown or closed id or an unmatched
-	 * duplicate: the report then counts as unrelated.
+	 * `disputes`). Undefined without a relation or for an unmatched duplicate:
+	 * the report then counts as unrelated. Unknown and closed IDs are handled before admission.
 	 */
 	#relatedFinding(
 		args: AdviseParams,

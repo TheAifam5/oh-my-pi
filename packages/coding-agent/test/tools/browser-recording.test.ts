@@ -12,7 +12,14 @@ import { $which } from "@oh-my-pi/pi-utils/which";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
-const FFMPEG_AVAILABLE = Boolean($which("ffmpeg") && $which("ffprobe"));
+const ffmpeg = $which("ffmpeg");
+const ffprobe = $which("ffprobe");
+const encoders = ffmpeg
+	? Bun.spawnSync([ffmpeg, "-hide_banner", "-encoders"], { stdout: "pipe", stderr: "pipe" })
+	: undefined;
+const encoderList = encoders?.exitCode === 0 ? new TextDecoder().decode(encoders.stdout) : "";
+const FFMPEG_AVAILABLE =
+	Boolean(ffprobe) && /^\s*V\S*\s+libx264\s/m.test(encoderList) && /^\s*V\S*\s+libvpx(?:-vp9)?\s/m.test(encoderList);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-recording-"));
 const session: ToolSession = {
 	cwd: root,

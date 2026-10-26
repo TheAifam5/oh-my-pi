@@ -585,7 +585,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		sessions.push(session);
 
 		const closeSpy = vi.fn();
-		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
+		const releaseSpy = vi.fn();
+		const providerState = { close: closeSpy, releaseSession: releaseSpy } satisfies ProviderSessionState;
+		session.providerSessionState.set("openai-codex-responses", providerState);
 
 		const mutatedSessionManager = await SessionManager.open(sessionFile, tempDir);
 		mutatedSessionManager.appendModelChange(modelSelector(openaiModel));
@@ -597,8 +599,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		expect(session.model?.provider).toBe(openaiModel.provider);
 		expect(session.model?.id).toBe(openaiModel.id);
-		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(session.providerSessionState.size).toBe(0);
+		expect(releaseSpy).toHaveBeenCalledTimes(1);
+		expect(releaseSpy).toHaveBeenCalledWith(session.sessionId);
+		expect(closeSpy).not.toHaveBeenCalled();
+		expect(session.providerSessionState.size).toBe(1);
+		expect(session.providerSessionState.get("openai-codex-responses")).toBe(providerState);
 		expectAssistantReplayMetadataPreserved(findRuntimeAssistant(session, assistantText));
 	});
 

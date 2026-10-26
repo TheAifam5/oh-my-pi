@@ -240,6 +240,9 @@ describe("browser executable selection", () => {
 				const env = {
 					...process.env,
 					HOME: home,
+					PI_PROFILE: "",
+					PI_CONFIG_DIR: ".omp",
+					PI_CODING_AGENT_DIR: "",
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
@@ -300,6 +303,9 @@ describe("browser executable selection", () => {
 				const env = {
 					...process.env,
 					HOME: path.join(tempDir.path(), "home"),
+					PI_PROFILE: "",
+					PI_CONFIG_DIR: ".omp",
+					PI_CODING_AGENT_DIR: "",
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),

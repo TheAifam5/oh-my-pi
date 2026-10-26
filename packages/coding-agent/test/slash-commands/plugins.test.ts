@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { withOmpExtensionRootScope } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { loadSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { writeInstalledPluginsRegistry } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -38,6 +39,8 @@ describe("/plugins live enable and disable", () => {
 		registryPath = path.join(pluginsDir, "installed_plugins.json");
 		lockPath = path.join(pluginsDir, "omp-plugins.lock.json");
 		spyOn(piUtils, "getPluginsDir").mockReturnValue(pluginsDir);
+		spyOn(piUtils, "getPluginsNodeModules").mockReturnValue(path.join(pluginsDir, "node_modules"));
+		spyOn(piUtils, "getPluginsPackageJson").mockReturnValue(path.join(pluginsDir, "package.json"));
 		spyOn(piUtils, "getPluginsLockfile").mockReturnValue(lockPath);
 		spyOn(piUtils, "getMarketplacesRegistryPath").mockReturnValue(path.join(root, "marketplaces.json"));
 	});
@@ -80,7 +83,7 @@ describe("/plugins live enable and disable", () => {
 
 		let visibleSkills = 0;
 		const ctx = makeContext(root, async () => {
-			const { skills } = await loadSkills({ cwd: root });
+			const { skills } = await loadSkills({ cwd: root, extensionRoots: ROOTS });
 			visibleSkills = skills.filter(skill => skill.name === "market-skill").length;
 		});
 		await executeBuiltinSlashCommand(`/plugins enable ${id}`, { ctx });
@@ -92,6 +95,10 @@ describe("/plugins live enable and disable", () => {
 
 	test("npm toggle changes the discovered skills in the running TUI session", async () => {
 		const name = "example-npm";
+		await Bun.write(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({ name: "omp-plugins", private: true, dependencies: { [name]: "1.0.0" } }),
+		);
 		await Bun.write(
 			lockPath,
 			JSON.stringify({
@@ -109,10 +116,12 @@ describe("/plugins live enable and disable", () => {
 		);
 		let visibleSkills = 0;
 		const ctx = makeContext(root, async () => {
-			const { skills } = await loadSkills({ cwd: root });
+			const { skills } = await loadSkills({ cwd: root, extensionRoots: ROOTS });
 			visibleSkills = skills.filter(skill => skill.name === "npm-skill").length;
 		});
-		await executeBuiltinSlashCommand(`/plugins enable ${name}`, { ctx });
+		await withOmpExtensionRootScope([], "explicit-only", () =>
+			executeBuiltinSlashCommand(`/plugins enable ${name}`, { ctx }),
+		);
 		expect(visibleSkills).toBe(1);
 
 		await executeBuiltinSlashCommand(`/plugins disable ${name}`, { ctx });

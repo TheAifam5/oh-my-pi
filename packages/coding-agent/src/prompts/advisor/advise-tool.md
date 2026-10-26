@@ -17,9 +17,10 @@ Use sparingly; call only to avert likely-wrong or materially wasteful work.
 - `defect`: what is wrong, one line; for `suggestion`, the advice.
 - `impact`, `fix`: REQUIRED for `defect`/`concern`/`unverified` at severity `concern`/`blocker`; otherwise optional.
 - Before reporting, check `<open-findings>`: a report about an existing finding MUST use `relatesTo` + `relation` instead of opening a new one.
-- `relatesTo` + `relation` (together, optional): an open finding id from `<open-findings>` and how this report relates; an unknown or closed id is treated as no relation:
+- `relatesTo` + `relation` (together, optional): a finding id from `<open-findings>` and how this report relates; unknown or closed ids are rejected, except repeated `resolved` reports on resolved findings are acknowledged without recording or delivery:
   - `duplicate` — same issue at the same anchor; if the anchor differs it is treated as a new report, except between two `approach` anchors, whose topics may differ.
   - `adds` — new detail; `disputes` — the finding looks wrong; both arrive as asides.
   - `escalates` — higher severity; interrupts only when strictly above the finding's, otherwise an aside.
   - `resolved` — fixed; only the finding's owner closes it, otherwise it counts as `disputes`.
+- A regression on a closed finding requires the main agent to reopen it; a genuinely new finding omits both relation fields.
 Nothing to report → no call.

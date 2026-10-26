@@ -87,7 +87,17 @@ test("native findings prioritize open severity and expose lead details, flags, r
 	]) {
 		expect(preview).toContain(detail);
 	}
-	expect(props(overlay).actions?.map(action => action.id)).toEqual(["resolve", "reopen", "filter", "close"]);
+	expect(props(overlay).actions?.map(action => action.id)).toEqual([
+		"resolve",
+		"reopen",
+		"filter",
+		"search",
+		"severity",
+		"category",
+		"owner",
+		"clearFilters",
+		"close",
+	]);
 	overlay.handleNativeEvent({ type: "action", key: "", act: "tab", value: "open", mods: [] });
 	expect(props(overlay).items?.map(item => item.id)).toEqual(["F3", "F2"]);
 	overlay.handleNativeEvent({ type: "action", key: "", act: "resolve", mods: [] });
@@ -195,4 +205,110 @@ test("untrusted finding metadata and preview text cannot inject terminal control
 		expect(line).not.toMatch(/\t|\u0000|\u0007|\u0085|\u001b\]/);
 		expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 	}
+});
+
+test("search covers report text and metadata, keeps matching selection, and restores shortcuts on Enter", () => {
+	const findings = [
+		finding("F1", { category: "correctness", owner: "Reviewer" }),
+		finding("F2", { severity: "blocker" }),
+	];
+	const overlay = sheet(findings, "all");
+	overlay.handleNativeEvent({ type: "select", key: "", item: "F1" });
+	overlay.handleInput("/");
+	overlay.handleInput("timing");
+	expect(props(overlay).query).toBe("timing");
+	expect(props(overlay).selected).toBe("F1");
+	expect(props(overlay).items).toHaveLength(2);
+	overlay.handleInput("\r");
+	overlay.handleInput("r");
+	expect(findings[0]?.status).toBe("resolved");
+	expect(findings[1]?.status).toBe("open");
+	overlay.handleInput("o");
+	expect(findings[0]?.status).toBe("open");
+	overlay.handleInput("/");
+	overlay.handleInput("\x1b");
+	overlay.handleInput("/");
+	overlay.handleInput("reviewer correctness");
+	expect(props(overlay).items?.map(item => item.id)).toEqual(["F1"]);
+	expect(Bun.stripANSI(overlay.render(100).join("\n"))).toContain("reviewer correctness");
+});
+
+test("native filters compose with search, preserve IDs across source refresh, and empty results can clear", () => {
+	const findings = [
+		finding("F1", { severity: "blocker", category: "security", owner: "Security" }),
+		finding("F2", { severity: "blocker", category: "correctness", owner: "Reviewer" }),
+		finding("F3", { severity: "nit" }),
+	];
+	const overlay = sheet(findings);
+	const action = (act: string, value?: string) =>
+		overlay.handleNativeEvent({ type: "action", key: "", act, value, mods: [] });
+	overlay.handleNativeEvent({ type: "select", key: "", item: "F2" });
+	action("severity", "blocker");
+	expect(props(overlay).selected).toBe("F2");
+	action("category", "correctness");
+	action("owner", "Reviewer");
+	expect(props(overlay).items?.map(item => item.id)).toEqual(["F2"]);
+	findings.unshift(finding("F0"));
+	expect(props(overlay).selected).toBe("F2");
+	action("search");
+	overlay.handleNativeEvent({ type: "edit", key: "", from: 0, to: 0, len: 0, text: "absent", cursor: 6 });
+	expect(props(overlay).query).toBe("absent");
+	expect(props(overlay).cursor).toBe(6);
+	expect(props(overlay).selected).toBeNull();
+	expect(props(overlay).items).toEqual([]);
+	expect(props(overlay).actions?.find(entry => entry.id === "clearFilters")).toBeDefined();
+	expect(Bun.stripANSI(overlay.render(100).join("\n"))).toContain("Clear filters");
+	action("resolve");
+	expect(findings.find(entry => entry.id === "F2")?.status).toBe("open");
+	expect(action("owner", "not-an-owner")).toBe(false);
+	action("clearFilters");
+	expect(props(overlay).query).toBeNull();
+	expect(props(overlay).tab).toBe("all");
+	expect(props(overlay).items).toHaveLength(4);
+});
+
+test("keyboard discovery filters and clear share native state and callbacks stay local to each source", () => {
+	const leftFindings = [finding("F1", { severity: "blocker" }), finding("F2")];
+	const rightFindings = [finding("F1", { severity: "blocker" })];
+	const left = sheet(leftFindings, "all");
+	const right = sheet(rightFindings, "all");
+	left.handleInput("s");
+	expect(props(left).items?.map(item => item.id)).toEqual(["F1"]);
+	left.handleInput("c");
+	left.handleInput("w");
+	expect(props(left).subtitle).toContain("category=security");
+	expect(props(left).subtitle).toContain("owner=Security");
+	left.handleInput("r");
+	expect(leftFindings[0]?.status).toBe("resolved");
+	expect(rightFindings[0]?.status).toBe("open");
+	right.handleNativeEvent({ type: "action", key: "", act: "resolve", mods: [] });
+	left.handleInput("o");
+	expect(leftFindings[0]?.status).toBe("open");
+	expect(rightFindings[0]?.status).toBe("resolved");
+	left.handleInput("x");
+	expect(props(left).items).toHaveLength(2);
+	expect(props(left).subtitle).toContain("severity=all");
+});
+
+test("native editing a retained query resumes search after finishing", () => {
+	const overlay = sheet([finding("F1", { anchor: "first.ts" }), finding("F2", { anchor: "second.ts" })]);
+	overlay.handleInput("/");
+	overlay.handleInput("first");
+	overlay.handleInput("\r");
+	expect(props(overlay).items?.map(item => item.id)).toEqual(["F1"]);
+	expect(
+		overlay.handleNativeEvent({
+			type: "edit",
+			key: "",
+			from: 0,
+			to: 5,
+			len: 5,
+			text: "second",
+			cursor: 6,
+		}),
+	).toBe(true);
+	expect(props(overlay).query).toBe("second");
+	expect(props(overlay).cursor).toBe(6);
+	expect(props(overlay).items?.map(item => item.id)).toEqual(["F2"]);
+	expect(props(overlay).actions?.some(action => action.id === "searchDone")).toBe(true);
 });

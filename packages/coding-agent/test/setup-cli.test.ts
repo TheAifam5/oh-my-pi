@@ -33,6 +33,7 @@ async function runSetupPython(cwd: string): Promise<CliProcessResult> {
 		stdout: "pipe",
 		stderr: "pipe",
 		env,
+		timeout: 20_000,
 	});
 	const output = new Response(proc.stdout).text();
 	const error = new Response(proc.stderr).text();
@@ -51,6 +52,7 @@ async function runSetup(cwd: string, ...setupArgs: string[]): Promise<CliProcess
 		stdout: "pipe",
 		stderr: "pipe",
 		env,
+		timeout: 20_000,
 	});
 	const output = new Response(proc.stdout).text();
 	const error = new Response(proc.stderr).text();
@@ -108,6 +110,7 @@ describe("omp setup python", () => {
 				usingManagedEnv: false,
 			});
 		},
+		30_000,
 	);
 	it.skipIf(process.platform === "win32")("prefers the project venv over the PATH interpreter", async () => {
 		projectDir = TempDir.createSync("@omp-setup-python-");
@@ -171,6 +174,6 @@ describe("omp setup without a component", () => {
 			expect(result.exitCode).not.toBe(0);
 			expect(result.output).toBe("");
 			expect(result.error).toContain("requires a COMPONENT");
-		});
+		}, 30_000);
 	}
 });

@@ -1,12 +1,13 @@
 import type { TspPrefsControl, TspPrefsProps, TspPrefsRow } from "@oh-my-pi/pi-wire";
 import { Input } from "../components/input";
 import { SettingsList, type SettingItem } from "../components/settings-list";
+import { SelectList } from "../components/select-list";
 import { matchesKey } from "../keys";
 import { matchesSelectCancel } from "../keybinding-matchers";
 import { node } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
 import type { Component } from "../tui";
-import { getSettingsListTheme, theme } from "../theme/theme";
+import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
 import { truncateToWidth, wrapTextWithAnsi } from "../utils";
 
@@ -27,7 +28,23 @@ export class HubPrefs implements Component {
 	#errors = new Map<string, string>();
 	#input: { id: string; input: Input } | undefined;
 	#multi: { id: string; values: string[]; list: SettingsList } | undefined;
+	#choice: { id: string; list: SelectList } | undefined;
 	#busy = false;
+	#fallbackList: Component = {
+		render: width => (this.#choice?.list ?? this.#multi?.list ?? this.#list).render(width),
+		describe: cx => (this.#choice?.list ?? this.#multi?.list ?? this.#list).describe(cx),
+		handleNativeEvent: event => {
+			if (this.#busy) return;
+			if (this.#choice) this.#choice.list.handleNativeEvent(event);
+			else if (this.#multi) this.#multi.list.handleNativeEvent(event);
+			else if (event.type === "select" || event.type === "activate") {
+				const wasSelected = this.#list.getSelectedItem()?.id === event.item;
+				this.focus(event.item);
+				if (event.type === "activate" || wasSelected) this.#activate(event.item);
+			}
+			this.#render();
+		},
+	};
 
 	constructor(title: string, fields: () => HubPrefsField[], close: () => void, render: () => void) {
 		this.#title = sanitizeDisplaySingleLine(title);
@@ -79,9 +96,36 @@ export class HubPrefs implements Component {
 	#activate(id: string): void {
 		const field = this.#fields().find(field => field.id === id);
 		if (!field || field.disabled || this.#busy) return;
+		this.#choice = undefined;
+		this.#multi = undefined;
+		this.#input = undefined;
 		const control = field.control;
 		if (control.k === "switch") void this.#apply(id, !control.on);
 		else if (control.k === "choice") {
+			if (
+				control.style === "menu" ||
+				(control.style !== "segmented" &&
+					(control.options.length < 2 ||
+						control.options.length > 4 ||
+						control.options.reduce((length, option) => length + option.label.length, 0) > 28))
+			) {
+				const list = new SelectList(
+					control.options.map(option => ({
+						value: option.value,
+						label: sanitizeDisplaySingleLine(option.label),
+						description: sanitizeDisplaySingleLine(option.detail ?? ""),
+					})),
+					12,
+					getSelectListTheme(),
+					{ search: "never" },
+				);
+				list.setSelectedValue(control.value);
+				list.onSelect = item => {
+					if (this.#choice?.id === id && !this.#busy) void this.#apply(id, item.value);
+				};
+				this.#choice = { id, list };
+				return;
+			}
 			const index = control.options.findIndex(option => option.value === control.value);
 			const next = control.options[(index + 1) % control.options.length];
 			if (next) void this.#apply(id, next.value);
@@ -171,6 +215,7 @@ export class HubPrefs implements Component {
 			this.#errors.delete(id);
 			this.#input = undefined;
 			this.#multi = undefined;
+			this.#choice = undefined;
 		}
 		this.#refresh();
 		this.#render();
@@ -178,7 +223,14 @@ export class HubPrefs implements Component {
 
 	handleInput(data: string): void {
 		if (this.#busy) return;
-		if (this.#input) {
+		if (this.#choice) {
+			const choice = this.#choice;
+			if (matchesSelectCancel(data)) this.#choice = undefined;
+			else if (matchesKey(data, "enter") || data === "\n") {
+				const value = choice.list.getSelectedItem()?.value;
+				if (value !== undefined) void this.#apply(choice.id, value);
+			} else choice.list.handleInput(data);
+		} else if (this.#input) {
 			if (matchesSelectCancel(data)) this.#input = undefined;
 			else if (matchesKey(data, "enter") || data === "\n") {
 				void this.#apply(this.#input.id, this.#input.input.getValue());
@@ -215,7 +267,7 @@ export class HubPrefs implements Component {
 		const rows = [
 			theme.bold(truncateToWidth(this.#title, width)),
 			"",
-			...(this.#multi?.list ?? this.#list).render(width),
+			...(this.#choice?.list ?? this.#multi?.list ?? this.#list).render(width),
 		];
 		if (this.#multi)
 			rows.push(...wrapTextWithAnsi(sanitizeDisplaySingleLine(`Order: ${this.#multi.values.join(" → ")}`), width));
@@ -224,12 +276,17 @@ export class HubPrefs implements Component {
 			const error = this.#errors.get(this.#input.id);
 			if (error) rows.push(...wrapTextWithAnsi(theme.fg("warning", error), width));
 		}
+		const stagedId = this.#choice?.id ?? this.#multi?.id;
+		if (stagedId) {
+			const error = this.#errors.get(stagedId);
+			if (error) rows.push(...wrapTextWithAnsi(theme.fg("warning", error), width));
+		}
 		return rows;
 	}
 
 	describe(cx: DescribeContext): NativeNode {
 		if (!cx.supports("prefs"))
-			return node("col", {}, [this.#multi?.list ?? this.#list, ...(this.#input ? [this.#input.input] : [])]);
+			return node("col", {}, [this.#fallbackList, ...(this.#input ? [this.#input.input] : [])]);
 		const props: TspPrefsProps = {
 			title: this.#title,
 			pages: [{ id: "object", label: this.#title }],
@@ -250,14 +307,22 @@ export class HubPrefs implements Component {
 								? sanitizeDisplaySingleLine(field.disabled)
 								: undefined,
 						warning: this.#errors.get(field.id),
-						control: this.#displayControl(field.control),
+						control: this.#displayControl(
+							field.control.k === "multi" && this.#multi?.id === field.id
+								? { ...field.control, values: this.#multi.values }
+								: field.control,
+						),
 					})),
 				},
 			],
 			focus: this.#list.getSelectedItem()?.id,
 			editing: this.#input
 				? { row: this.#input.id, draft: this.#input.input.getValue(), cursor: this.#input.input.getCursor() }
-				: null,
+				: this.#choice
+					? { row: this.#choice.id, option: this.#choice.list.getSelectedItem()?.value }
+					: this.#multi
+						? { row: this.#multi.id, option: this.#multi.list.getSelectedItem()?.id }
+						: null,
 		};
 		return node("prefs", props);
 	}
@@ -294,6 +359,16 @@ export class HubPrefs implements Component {
 			const field = this.#fields().find(field => field.id === event.item);
 			if (!field || field.disabled) return;
 			const control = field.control;
+			if (control.k === "choice" && this.#choice?.id === event.item && typeof event.value === "string")
+				this.#choice.list.setSelectedValue(event.value);
+			if (control.k === "multi" && this.#multi?.id === event.item && Array.isArray(event.value)) {
+				if (!this.#validate(control, event.value)) {
+					this.#multi.values.splice(0, this.#multi.values.length, ...event.value);
+					for (const option of control.options) {
+						this.#multi.list.updateValue(option.value, this.#multi.values.includes(option.value) ? "on" : "off");
+					}
+				}
+			}
 			if (typeof event.value === "string" && (control?.k === "text" || control?.k === "number")) {
 				const current = this.#input;
 				if (current?.id !== event.item) {
@@ -305,14 +380,22 @@ export class HubPrefs implements Component {
 			void this.#apply(event.item, event.value);
 		} else if (event.type === "edit" || event.type === "undo") this.#input?.input.handleNativeEvent(event);
 		else if (event.type === "select") {
-			if ("item" in event && typeof event.item === "string") this.focus(event.item);
+			if ("item" in event && typeof event.item === "string") {
+				const choice = this.#choice;
+				if (choice && event.item.startsWith(`${choice.id}=`)) {
+					choice.list.setSelectedValue(event.item.slice(choice.id.length + 1));
+				} else this.focus(event.item);
+			}
 		} else if (event.type === "activate") {
 			this.focus(event.item);
 			this.#activate(event.item);
 		} else if (event.type === "action") {
 			if (event.act === "close") {
-				if (this.#input) this.#input = undefined;
-				else this.#close();
+				if (this.#input || this.#choice || this.#multi) {
+					this.#input = undefined;
+					this.#choice = undefined;
+					this.#multi = undefined;
+				} else if (!event.value) this.#close();
 			} else if (event.act === "edit" && event.value) {
 				this.focus(event.value);
 				this.#activate(event.value);

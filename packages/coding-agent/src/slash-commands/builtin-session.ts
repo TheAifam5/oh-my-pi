@@ -312,8 +312,39 @@ async function handleSessionDrainCommand(
 	await output(lines.join("\n"));
 }
 
-async function handleSessionUnpinCommand(session: AgentSession, output: SlashCommandRuntime["output"]): Promise<void> {
-	await output(describeSessionUnpinOutcome(session.unpinCurrentProviderAccount(), session.model?.provider ?? ""));
+async function handleSessionUnpinCommand(
+	arg: string,
+	session: AgentSession,
+	output: SlashCommandRuntime["output"],
+): Promise<void> {
+	if (arg && !/^\S+$/.test(arg)) {
+		await output("Usage: /session unpin [provider]");
+		return;
+	}
+	let provider = arg;
+	if (!provider) {
+		const currentProvider = session.model?.provider ?? "";
+		const currentOutcome = session.unpinCurrentProviderAccount();
+		if (currentOutcome === "unpinned" || currentOutcome === "streaming" || currentOutcome === "project-pin") {
+			await output(describeSessionUnpinOutcome(currentOutcome, currentProvider));
+			return;
+		}
+		const providers = Array.from(session.sessionManager.getCredentialPins())
+			.filter(([, pin]) => pin.exclusive)
+			.map(([pinnedProvider]) => pinnedProvider);
+		if (providers.length === 0) {
+			await output(describeSessionUnpinOutcome(currentOutcome, currentProvider));
+			return;
+		}
+		if (providers.length > 1) {
+			await output(
+				`This session has account pins for ${providers.join(", ")}. Use /session unpin <provider> to choose one.`,
+			);
+			return;
+		}
+		provider = providers[0]!;
+	}
+	await output(describeSessionUnpinOutcome(session.unpinProviderAccount(provider), provider));
 }
 
 /**
@@ -381,7 +412,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "session",
 		description: "Session management commands",
 		acpDescription: "Show or configure the current session",
-		acpInputHint: "[info|delete|pin [account]|unpin|drain <account|off>]",
+		acpInputHint: "[info|delete|pin [account]|unpin [provider]|drain <account|off>]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
@@ -390,7 +421,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				description: "Use only one stored account for the current provider in this session",
 				usage: "[account]",
 			},
-			{ name: "unpin", description: "Remove this session's account pin for the current provider" },
+			{
+				name: "unpin",
+				description: "Remove the current provider's session account pin, or the only other session pin",
+				usage: "[provider]",
+			},
 			{
 				name: "drain",
 				description: "Use one OAuth account first until it is drained (--save keeps it for every session)",
@@ -433,15 +468,15 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await handleSessionPinCommand(rest, runtime.session, runtime.output);
 				return commandConsumed();
 			}
-			if (verb === "unpin" && !rest) {
-				await handleSessionUnpinCommand(runtime.session, runtime.output);
+			if (verb === "unpin") {
+				await handleSessionUnpinCommand(rest, runtime.session, runtime.output);
 				return commandConsumed();
 			}
 			if (verb === "drain") {
 				await handleSessionDrainCommand(rest, runtime.session, runtime.output);
 				return commandConsumed();
 			}
-			return usage("Usage: /session [info|delete|pin [account]|unpin|drain <account|off>]", runtime);
+			return usage("Usage: /session [info|delete|pin [account]|unpin [provider]|drain <account|off>]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -460,8 +495,8 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				clearSubmittedText(runtime);
 				return;
 			}
-			if (verb === "unpin" && !rest) {
-				await handleSessionUnpinCommand(runtime.ctx.session, text => runtime.ctx.showStatus(text));
+			if (verb === "unpin") {
+				await handleSessionUnpinCommand(rest, runtime.ctx.session, text => runtime.ctx.showStatus(text));
 				refreshStatusLine(runtime.ctx);
 				clearSubmittedText(runtime);
 				return;
@@ -475,7 +510,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if (!verb || (verb === "info" && !rest)) {
 				await runtime.ctx.handleSessionCommand();
 			} else {
-				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|unpin|drain <account|off>]");
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|unpin [provider]|drain <account|off>]");
 			}
 			clearSubmittedText(runtime);
 		},

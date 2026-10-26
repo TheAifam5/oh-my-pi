@@ -222,17 +222,56 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 	return loaded;
 }
 
-/** Normalize transport event rejections before they cross browser or worker boundaries. */
-export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: ConnectOptions): Promise<Browser> {
+function redactBrowserEndpoint(endpoint: string): string {
 	try {
+		const url = new URL(endpoint);
+		url.username = "";
+		url.password = "";
+		url.search = "";
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return endpoint.split(/[?#]/)[0].replace(/^([^:/?#]+:\/\/)[^/@]*@/, "$1");
+	}
+}
+
+/** Remove URL credentials, query strings, and fragments from browser connection diagnostics. */
+export function redactBrowserErrorMessage(message: string): string {
+	return message.replace(/(?:https?|wss?):\/\/[^\s"'<>]+/gi, redactBrowserEndpoint);
+}
+
+/** Connect to a browser and normalize failures without URL credentials, query strings, or fragments. */
+export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: ConnectOptions): Promise<Browser> {
+	let endpoint = options.browserWSEndpoint;
+	try {
+		if (options.browserURL && !options.browserWSEndpoint && !options.transport) {
+			const versionUrl = new URL("/json/version", options.browserURL);
+			const response = await fetch(versionUrl);
+			if (!response.ok) {
+				throw new Error(
+					`Failed to fetch browser webSocket URL from ${redactBrowserEndpoint(versionUrl.toString())}: HTTP ${response.status}`,
+				);
+			}
+			const version: unknown = await response.json();
+			if (!isRecord(version) || typeof version.webSocketDebuggerUrl !== "string") {
+				throw new Error(`Missing webSocketDebuggerUrl from ${redactBrowserEndpoint(versionUrl.toString())}`);
+			}
+			endpoint = version.webSocketDebuggerUrl;
+			options = { ...options, browserURL: undefined, browserWSEndpoint: endpoint };
+		}
 		return await puppeteer.connect(options);
 	} catch (error) {
-		// The WebSocket transports can reject with ErrorEvent rather than Error.
-		// Its message includes the actual debugger endpoint and handshake failure.
-		if (!(error instanceof Error) && isRecord(error) && typeof error.message === "string") {
-			throw new Error(error.message, { cause: error });
+		const failure = toError(error);
+		const message = isRecord(error) && typeof error.message === "string" ? error.message : failure.message;
+		const safeMessage = redactBrowserErrorMessage(message);
+		const target = endpoint ?? options.browserURL;
+		const safeEndpoint = target ? redactBrowserEndpoint(target) : undefined;
+		if (safeEndpoint && !safeMessage.includes(safeEndpoint)) {
+			throw new Error(
+				`${endpoint ? "WebSocket" : "Browser"} connection to '${safeEndpoint}' failed: ${safeMessage}`,
+			);
 		}
-		throw toError(error);
+		throw new Error(safeMessage);
 	}
 }
 

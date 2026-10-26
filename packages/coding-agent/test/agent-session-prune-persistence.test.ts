@@ -312,10 +312,20 @@ describe("AgentSession per-turn prune persistence", () => {
 			}
 		}
 
-		/** The advisor kept its own history and was not re-sent the transcript it never needed. */
+		/** The advisor retains prior input and a silent review without replaying the seeded transcript. */
 		function expectLastReviewIncremental(): void {
-			const request = JSON.stringify(advisorRequests.at(-1)?.messages);
-			expect(request).toContain(ADVISOR_REPLY);
+			const messages = advisorRequests.at(-1)?.messages;
+			const firstRequest = advisorRequests[0]?.messages;
+			if (!messages || !firstRequest) throw new Error("Expected both advisor review requests");
+			expect(firstRequest.length).toBeGreaterThan(0);
+			expect(messages.slice(0, firstRequest.length)).toEqual(firstRequest);
+			expect(messages[firstRequest.length]).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "" }],
+			});
+			const request = JSON.stringify(messages);
+			expect(request).toContain("turn one");
+			expect(request).not.toContain(ADVISOR_REPLY);
 			expect(request).not.toContain("Investigate every module of the project.");
 		}
 

@@ -545,7 +545,7 @@ describe("ModelRegistry", () => {
 			const calls: Array<{
 				provider: string;
 				sessionId: string | undefined;
-				options: { baseUrl?: string; modelId?: string; forceRefresh?: boolean; signal?: AbortSignal } | undefined;
+				options: unknown;
 			}> = [];
 			const originalGetWithCredential = authStorage.keys.getWithCredential.bind(authStorage.keys);
 			authStorage.keys.getWithCredential = async (provider, sessionId, options) => {
@@ -589,7 +589,12 @@ describe("ModelRegistry", () => {
 				options: {
 					baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
 					modelId: "glm-5.2",
+					accountIds: undefined,
+					minRemainingPct: undefined,
+					onReservedAccount: undefined,
 					forceRefresh: undefined,
+					refreshReason: undefined,
+					refuseBlockedEntitled: true,
 					signal: undefined,
 				},
 			});

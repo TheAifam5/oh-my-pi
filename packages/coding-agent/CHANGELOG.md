@@ -54,6 +54,7 @@
 
 ### Changed
 
+- Changed advisor tool sessions to require an explicit capability allow or replacement decision at compile time, while preserving live property descriptors and scoped memory receiver bindings
 - Changed background job notices to state the outcome: "failed" or "was cancelled" instead of always "has completed", and to mark failed or cancelled jobs in multi-job notices
 - Changed advisors to receive matching model-scoped always-apply rules, refreshed on model changes; unscoped rules remain excluded
 - Changed `session_start` to fire again after `/new`, resume, and fork with the matching `reason`; handlers also registered for `session_switch` or `session_branch` can skip these with `isSessionReplacementStart(event)`
@@ -67,6 +68,12 @@
 
 ### Fixed
 
+- Fixed `/session unpin` leaving an account pinned after model fallback to another provider; it now removes the only other session pin, or lists ambiguous providers without changing them, and accepts `/session unpin [provider]` for an explicit target
+- Fixed repeated advisor resolutions creating new open findings or cards, including paraphrased reports and restored ledgers; unknown and closed relation targets are rejected instead of silently becoming new findings
+- Fixed browser attach errors omitting the refused CDP endpoint or exposing endpoint credentials, query strings, or fragments
+- Fixed the Tern browser backend connecting to a `TERN_PANE_SOCKET` that is a symlink, not a socket, or owned by another user; platforms without user IDs keep the previous connection behavior
+- Fixed Anthropic low-credit-balance and `insufficient_credit` failures bypassing sibling account recovery before model fallback
+- Fixed `/switch @role/next` advancing from the session's actual active pool member after startup or retry fallback instead of selecting it again from a stale or missing pool cursor
 - Fixed advisor tools inheriting the primary session's peer messaging and findings-management capabilities and primary-bound eval tool lookups; directly granted filesystem tools and normal `advise` delivery remain available
 - Fixed primary model switches and Codex replay resets cancelling concurrent advisor requests with `session_disposed`; only the primary routing session is reset, while conversation teardown still cancels all owned connections
 - Advisors no longer replay no-finding chatter or fail quiet reviews on repeated output; loop failures retain bounded recovery without suppressing models session-wide

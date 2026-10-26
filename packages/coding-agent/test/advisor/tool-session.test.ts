@@ -75,6 +75,51 @@ describe("advisor peer isolation", () => {
 		expect(primary.enableIrc).toBe(true);
 	});
 
+	it("preserves descriptors, prototypes, and bound callbacks without reading blocked getters", () => {
+		class SessionIdentity {
+			#id = "primary-session";
+
+			getSessionId() {
+				return this.#id;
+			}
+		}
+		const identity = new SessionIdentity();
+		const primary = primaryToolSession(new AgentRegistry());
+		let blockedGetterReads = 0;
+		const prototype = {
+			get getToolByName() {
+				blockedGetterReads++;
+				throw new Error("Blocked capability getter must not run");
+			},
+		};
+		const source: ToolSession = Object.create(prototype, Object.getOwnPropertyDescriptors(primary));
+		Object.defineProperty(source, "getSessionId", {
+			value: identity.getSessionId.bind(identity),
+			writable: false,
+			enumerable: false,
+			configurable: false,
+		});
+		Object.defineProperty(source, "canPromptUser", {
+			get() {
+				return this.hasUI;
+			},
+			enumerable: false,
+			configurable: false,
+		});
+		const advisor = isolateAdvisorToolSession(source);
+		expect(Object.getPrototypeOf(advisor)).toBe(prototype);
+		for (const key of ["getSessionId", "canPromptUser"]) {
+			expect(Object.getOwnPropertyDescriptor(advisor, key)).toEqual(Object.getOwnPropertyDescriptor(source, key));
+		}
+		expect(advisor.getSessionId?.()).toBe("primary-session");
+		expect(advisor.canPromptUser).toBe(false);
+		advisor.hasUI = true;
+		expect(advisor.canPromptUser).toBe(true);
+		expect(source.canPromptUser).toBe(false);
+		expect(advisor.getToolByName).toBeUndefined();
+		expect(blockedGetterReads).toBe(0);
+	});
+
 	it("strips frozen capability properties and copies only the memory binding fields", () => {
 		const primary = primaryToolSession(new AgentRegistry());
 		const memoryContext = { settings: primary.settings, agentRegistry: primary.agentRegistry };

@@ -780,6 +780,12 @@ describe("streamSimple resolver auth retry", () => {
 			{ message: '{"error":{"code":"usage_limit_exceeded","message":"usage limit exceeded"}}' },
 			{ message: '{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}' },
 			{ message: "Upstream request failed: Insufficient account funds", status: 402 },
+			{
+				message:
+					'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}',
+				status: 400,
+			},
+			{ message: '{"error":{"type":"insufficient_credit","message":"Payment required"}}', status: 400 },
 		];
 		let activePayload = payloads[0]!;
 		let keys: unknown[] = [];

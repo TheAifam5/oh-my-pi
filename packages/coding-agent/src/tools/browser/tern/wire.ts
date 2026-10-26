@@ -15,6 +15,7 @@
  * protocol does not tie omp to a Tern build. A Tern from before it cannot read
  * the hello and hangs up.
  */
+import { lstatSync } from "node:fs";
 import * as net from "node:net";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -254,10 +255,11 @@ const PROTOCOL_ERROR_KINDS: Record<string, TernErrorKind> = {
 };
 
 /**
- * One connection to the Tern daemon. `connect` greets and waits for the
- * welcome; `request` sends one browser op and `fork` one fork, each resolving
- * its `ok` result (rejecting with a {@link TernError}). Requests run
- * concurrently; closing rejects everything pending.
+ * One connection to a Tern daemon. On platforms with `process.getuid`, the socket must be owned
+ * by the current uid; symlinks and non-sockets are rejected.
+ * `connect` greets and waits for the welcome; `request` sends one browser op and `fork` one fork,
+ * each resolving its `ok` result (rejecting with a {@link TernError}). Requests run concurrently;
+ * closing rejects everything pending.
  */
 export class TernSocketClient {
 	readonly #socketPath: string;
@@ -372,6 +374,23 @@ export class TernSocketClient {
 	}
 
 	async #open(): Promise<void> {
+		if (process.getuid) {
+			try {
+				const stat = lstatSync(this.#socketPath);
+				if (!stat.isSocket() || stat.uid !== process.getuid()) {
+					throw new TernError(
+						"connect",
+						`Tern daemon at ${this.#socketPath} must be a socket owned by the current user`,
+					);
+				}
+			} catch (error) {
+				if (error instanceof TernError) throw error;
+				throw new TernError(
+					"connect",
+					`Cannot inspect the Tern daemon socket at ${this.#socketPath}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		const socket = net.createConnection({ path: this.#socketPath });
 		this.#socket = socket;
 		const greeting = Promise.withResolvers<void>();

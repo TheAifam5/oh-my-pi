@@ -118,19 +118,19 @@ describe("--tools discovered-registry validation", () => {
 		// With `--tools python` the registry holds only always-on/custom tools, so
 		// the listing must not be limited to that filtered set.
 		expect(() => validateToolNames(["python"], ["goal", "custom_tool"])).toThrow(
-			/Built-in tools: read, bash, edit,.*\. Other registered tools: goal, custom_tool\./,
+			/Built-in tools: read, bash, edit,.*advisor_findings,.*\. Other registered tools: goal, custom_tool\./,
 		);
 	});
 
-	it("reports an unregistered built-in as unavailable, not unknown", () => {
+	it.each(["eval", "advisor_findings"])("reports unregistered built-in %s as unavailable, not unknown", name => {
 		let error: unknown;
 		try {
-			validateToolNames(["eval"], ["read"]);
+			validateToolNames([name], ["read"]);
 		} catch (caught) {
 			error = caught;
 		}
 		expect(error).toBeInstanceOf(CliUsageError);
-		expect((error as Error).message).toBe("Built-in tool unavailable in this session: eval.");
+		expect((error as Error).message).toBe(`Built-in tool unavailable in this session: ${name}.`);
 	});
 });
 

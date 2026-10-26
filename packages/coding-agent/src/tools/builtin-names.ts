@@ -1,5 +1,4 @@
 export const BUILTIN_TOOL_NAMES = [
-	"advisor_findings",
 	"read",
 	"bash",
 	"edit",
@@ -22,6 +21,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"task",
 	"wait",
 	"todo",
+	"advisor_findings",
 	"web_search",
 	"write",
 	"memory_edit",

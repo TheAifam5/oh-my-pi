@@ -123,6 +123,47 @@ describe("isAuthRetryableError", () => {
 });
 
 describe("withAuth", () => {
+	it("rotates through Anthropic siblings on low credits without refreshing the failed account", async () => {
+		const keys: string[] = [];
+		const contexts: ApiKeyResolveContext[] = [];
+		const pool = ["account-1", "account-2", "account-3"];
+		let nextSibling = 0;
+		const result = await withAuth(
+			ctx => {
+				contexts.push(ctx);
+				return ctx.error === undefined ? pool[0] : pool[++nextSibling];
+			},
+			async key => {
+				keys.push(key);
+				if (key === "account-3") return "success";
+				throw new ProviderHttpError("Your credit balance is too low to access the Anthropic API.", 400);
+			},
+		);
+		expect(result).toBe("success");
+		expect(keys).toEqual(pool);
+		expect(contexts.map(ctx => ctx.lastChance)).toEqual([false, true, true]);
+	});
+
+	it("preserves the low-credit error when the account resolver declines sibling recovery", async () => {
+		const failure = new ProviderHttpError("Request rejected", 400, { code: "insufficient_credit" });
+		const contexts: ApiKeyResolveContext[] = [];
+		const keys: string[] = [];
+		await expect(
+			withAuth(
+				ctx => {
+					contexts.push(ctx);
+					return ctx.error === undefined ? "account-1" : undefined;
+				},
+				async key => {
+					keys.push(key);
+					throw failure;
+				},
+			),
+		).rejects.toBe(failure);
+		expect(keys).toEqual(["account-1"]);
+		expect(contexts.map(ctx => ctx.lastChance)).toEqual([false, true]);
+	});
+
 	it("runs a single attempt for a static string key (no retry)", async () => {
 		const keys: Array<string | undefined> = [];
 		const result = await withAuth("static-key", async key => {

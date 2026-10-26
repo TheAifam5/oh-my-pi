@@ -57,6 +57,7 @@ import {
 } from "./pool-selection";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
 import { createRolePoolCall, pickRolePoolTarget } from "./role-pool-resolution";
+import { resolveRolePoolGroup } from "./retry-fallback-groups";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -303,6 +304,39 @@ export class ModelControls {
 		if (!target) return legacy();
 		const memberSelector = options.memberSelector ?? target.memberSelector;
 		if (memberSelector || options.advance) {
+			const activeRole = this.#host.sessionManager.getLastModelChangeRole({ skipEphemeral: true });
+			const currentModel = this.#model;
+			const currentSelector = currentModel ? formatModelStringWithRouting(currentModel) : undefined;
+			const currentPick =
+				previousPick &&
+				formatModelStringWithRouting(previousPick.model) === currentSelector &&
+				(previousPick.thinkingLevel === undefined || previousPick.thinkingLevel === this.configuredThinkingLevel())
+					? previousPick.selector.raw
+					: undefined;
+			const activeMember =
+				options.advance && currentModel && (activeRole === role || (role === "default" && !activeRole))
+					? (() => {
+							const members = resolveRolePoolGroup(settings, target.role)?.members ?? [];
+							const kept = currentPick ? members.find(member => member.selector === currentPick) : undefined;
+							if (kept) return kept;
+							let matchingModel: (typeof members)[number] | undefined;
+							for (const member of members) {
+								const resolved = resolveModelRoleValue(member.selector, this.#host.modelRegistry.getAll(), {
+									settings,
+									exact: true,
+								});
+								if (!resolved.model || formatModelStringWithRouting(resolved.model) !== currentSelector)
+									continue;
+								matchingModel ??= member;
+								if (resolved.thinkingLevel === this.configuredThinkingLevel()) return member;
+							}
+							return matchingModel;
+						})()
+					: undefined;
+			const keepOrder =
+				(!activeMember || activeMember.selector === previousPick?.selector.raw) &&
+				previousPick !== undefined &&
+				previousPick.rest.length + 1 === previousPick.members.length;
 			const context = {
 				modelRegistry: this.#host.modelRegistry,
 				sessionId: this.#host.sessionId(),
@@ -316,9 +350,9 @@ export class ModelControls {
 					memberSelector,
 					advance: options.advance,
 					thinkingLevel: options.thinkingLevel ?? target.thinkingLevel,
-					afterSelector: options.advance ? previousPick?.selector.raw : undefined,
+					afterSelector: options.advance ? (activeMember?.selector ?? previousPick?.selector.raw) : undefined,
 					afterOrder:
-						options.advance && previousPick
+						options.advance && previousPick && keepOrder
 							? [...previousPick.rest.map(member => member.raw), previousPick.selector.raw]
 							: undefined,
 				},
@@ -328,6 +362,9 @@ export class ModelControls {
 				{ ...call, selection: this.#poolSelection },
 			);
 			if (!pick) throw new RolePoolUnavailableError(target.role, []);
+			if (activeMember && pick.selector.raw === activeMember.selector) {
+				throw new Error(`No other eligible member of pool "${role}"`);
+			}
 			if (settings.revision === revision) this.#rolePoolPicks.set(role, { revision, pick, recorded: false });
 			return rolePickResolution(pick);
 		}
